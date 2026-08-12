@@ -51,6 +51,7 @@ class RunConfig:
     seed: int = 1337
     target_loss: float = 3.28
     expected_validation_tokens: int | None = None
+    expected_downstream_tokens: Mapping[str, int] | None = None
     timeout_seconds: float = 900.0
     passthrough_args: Sequence[str] = ()
     reference_contract: ReferenceContract | Mapping[str, Any] | None = None
@@ -73,6 +74,7 @@ class ValidationResult:
     validation_loss: float
     declared_metrics: Mapping[str, Any]
     evaluator_metrics: Mapping[str, Any]
+    evaluations: Mapping[str, Any] | None
     artifacts: Mapping[str, Path]
 
 

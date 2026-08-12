@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
+import hashlib
 import importlib.util
 from io import StringIO
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -30,6 +32,139 @@ class FakeDevice:
 
 
 class TrainerStaticTests(unittest.TestCase):
+    def test_periodic_validation_defaults_and_cli_overrides(self) -> None:
+        parser = trainer.build_parser()
+
+        official = trainer.resolve_config(
+            parser.parse_args(["--profile", "official"]), "tpu", 50_304
+        )
+        self.assertEqual(official.val_every, 250)
+        self.assertEqual(official.val_probe_batches, 8)
+        self.assertEqual(official.eval_batches, 320)
+
+        for profile in ("smoke", "dev"):
+            with self.subTest(profile=profile):
+                config = trainer.resolve_config(
+                    parser.parse_args(["--profile", profile]), "cpu", 256
+                )
+                self.assertEqual(config.val_every, 0)
+
+        overridden = trainer.resolve_config(
+            parser.parse_args(
+                [
+                    "--profile",
+                    "dev",
+                    "--val-every",
+                    "5",
+                    "--val-probe-batches",
+                    "3",
+                ]
+            ),
+            "cpu",
+            256,
+        )
+        self.assertEqual(overridden.val_every, 5)
+        self.assertEqual(overridden.val_probe_batches, 3)
+        disabled = trainer.resolve_config(
+            parser.parse_args(
+                [
+                    "--profile",
+                    "official",
+                    "--batch-size",
+                    "128",
+                    "--seq-len",
+                    "16384",
+                    "--val-every",
+                    "0",
+                    "--val-probe-batches",
+                    "99",
+                ]
+            ),
+            "tpu",
+            50_304,
+        )
+        self.assertEqual(disabled.val_every, 0)
+        self.assertEqual(disabled.eval_batches, 5)
+        self.assertEqual(disabled.val_probe_batches, 99)
+        custom_official = trainer.resolve_config(
+            parser.parse_args(
+                [
+                    "--profile",
+                    "official",
+                    "--batch-size",
+                    "128",
+                    "--seq-len",
+                    "16384",
+                ]
+            ),
+            "tpu",
+            50_304,
+        )
+        self.assertEqual(custom_official.eval_batches, 5)
+        self.assertEqual(custom_official.val_probe_batches, 5)
+        with self.assertRaisesRegex(ValueError, "must not exceed"):
+            trainer.resolve_config(
+                parser.parse_args(
+                    [
+                        "--profile",
+                        "dev",
+                        "--val-every",
+                        "1",
+                        "--val-probe-batches",
+                        "9",
+                    ]
+                ),
+                "cpu",
+                256,
+            )
+
+    def test_probe_schedule_excludes_final_step(self) -> None:
+        config = SimpleNamespace(val_every=3, steps=9)
+        selected = [
+            step
+            for step in range(1, config.steps + 1)
+            if trainer.should_run_validation_probe(step, config)
+        ]
+        self.assertEqual(selected, [3, 6])
+        self.assertFalse(
+            trainer.should_run_validation_probe(
+                1, SimpleNamespace(val_every=0, steps=10)
+            )
+        )
+
+    def test_validation_prefix_always_starts_at_batch_zero(self) -> None:
+        class Dataset:
+            def __init__(self) -> None:
+                self.indices: list[int] = []
+
+            def validation_batch(
+                self, index: int, batch_size: int, seq_len: int, vocab_size: int
+            ) -> tuple[np.ndarray, np.ndarray]:
+                del vocab_size
+                self.indices.append(index)
+                values = np.full((batch_size, seq_len), index, dtype=np.int32)
+                return values, values
+
+        dataset = Dataset()
+        config = SimpleNamespace(batch_size=2, seq_len=4, vocab_size=16)
+
+        def compiled_eval(
+            params: object, x: np.ndarray, y: np.ndarray, mask: np.ndarray
+        ) -> tuple[np.ndarray, np.ndarray]:
+            del params, y
+            loss = np.sum((x.astype(np.float32) + 1.0) * mask)
+            return np.asarray(loss, dtype=np.float32), np.asarray(mask.sum(), dtype=np.float32)
+
+        with patch.object(
+            trainer.jax, "device_put", side_effect=lambda value, _sharding: value
+        ):
+            loss, elapsed = trainer.evaluate_validation_prefix(
+                object(), dataset, compiled_eval, object(), config, 3
+            )
+        self.assertEqual(dataset.indices, [0, 1, 2])
+        self.assertAlmostEqual(loss, 2.0)
+        self.assertGreater(elapsed, 0.0)
+
     def test_training_csv_contains_every_step(self) -> None:
         history = np.asarray(
             [[2.0, 1.0e-3, 0.5], [1.5, 5.0e-4, 0.25]], dtype=np.float32
@@ -44,6 +179,132 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertEqual(len(rows), 3)
         self.assertTrue(rows[1].startswith("1,32,2.0,"))
         self.assertTrue(rows[2].startswith("2,64,1.5,"))
+
+    def test_validation_csv_contains_probes_and_canonical_final_row(self) -> None:
+        rows: list[trainer.ValidationRow] = [
+            trainer.ValidationRow(
+                250, 8_192_000, "fineweb_probe", "fineweb",
+                262_144, 4.0, np.exp(4.0), 0.25, False
+            ),
+            trainer.ValidationRow(
+                500, 16_384_000, "fineweb", "fineweb",
+                10_485_760, 3.5, np.exp(3.5), 8.0, True
+            ),
+            trainer.ValidationRow(
+                500, 16_384_000, "downstream", "science",
+                8_192, 3.0, np.exp(3.0), 0.03, False
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trainer.write_validation_csv(root, rows)
+            contents = (root / trainer.VALIDATION_CSV_NAME).read_text().splitlines()
+            temporary = root / f".{trainer.VALIDATION_CSV_NAME}.tmp"
+            self.assertFalse(temporary.exists())
+        self.assertEqual(
+            contents[0],
+            "step,tokens_processed,kind,domain,validation_tokens,validation_loss,"
+            "perplexity,validation_seconds,canonical",
+        )
+        self.assertEqual(
+            contents[1],
+            f"250,8192000,fineweb_probe,fineweb,262144,4.0,{np.exp(4.0)},0.25,false",
+        )
+        self.assertEqual(
+            contents[2],
+            f"500,16384000,fineweb,fineweb,10485760,3.5,{np.exp(3.5)},8.0,true",
+        )
+        self.assertEqual(len(contents), 4)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "canonical"):
+                trainer.write_validation_csv(Path(directory), (rows[0], rows[2]))
+
+    def test_downstream_batches_mask_document_boundaries_and_exact_targets(self) -> None:
+        domain = trainer.DownstreamDomain(
+            "science",
+            np.asarray([99, 10, 11, 12, 99, 20, 21], dtype=np.uint16),
+            (
+                trainer.DocumentSpan(0, 4, 1, 3),
+                trainer.DocumentSpan(4, 3, 5, 2),
+            ),
+        )
+        config = SimpleNamespace(batch_size=2, seq_len=2)
+        batches = trainer.downstream_batches(domain, config)
+        pairs = []
+        for x, y, mask in batches:
+            flat_x, flat_y, flat_mask = x.ravel(), y.ravel(), mask.ravel()
+            pairs.extend(
+                (int(flat_x[index]), int(flat_y[index]))
+                for index in np.flatnonzero(flat_mask)
+            )
+        self.assertEqual(pairs, [(99, 10), (10, 11), (11, 12), (99, 20), (20, 21)])
+        self.assertNotIn((12, 99), pairs)
+        self.assertEqual(sum(int(mask.sum()) for _, _, mask in batches), 5)
+
+    def test_repeatable_downstream_data_groups_standalone_documents(self) -> None:
+        parser = trainer.build_parser()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first.npy"
+            second = root / "second.npy"
+            np.save(first, np.asarray([99, 1, 2], dtype=np.uint16))
+            np.save(second, np.asarray([99, 3, 4, 5], dtype=np.uint16))
+            args = parser.parse_args(
+                [
+                    "--downstream-data", f"science={first}",
+                    "--downstream-data", f"science={second}",
+                ]
+            )
+            domains = trainer.load_downstream_domains(args, 256)
+        self.assertEqual(len(domains), 1)
+        self.assertEqual(domains[0].name, "science")
+        self.assertEqual(domains[0].scored_tokens, 5)
+        self.assertEqual(len(domains[0].documents), 2)
+
+    def test_gpt2_downstream_manifest_fits_padded_model_vocabulary(self) -> None:
+        parser = trainer.build_parser()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shard = root / "science.bin"
+            header = np.zeros(256, dtype="<i4")
+            header[:3] = (20_240_520, 1, 3)
+            tokens = np.asarray([50_256, 1, 2], dtype="<u2")
+            shard.write_bytes(header.tobytes() + tokens.tobytes())
+            manifest = root / "fresh10.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "kind": "fresh10",
+                        "tokenizer": {"name": "gpt2", "vocab_size": 50_257},
+                        "domains": [
+                            {
+                                "name": "science",
+                                "path": shard.name,
+                                "bytes": shard.stat().st_size,
+                                "tokens": 3,
+                                "scored_tokens": 2,
+                                "sha256": hashlib.sha256(shard.read_bytes()).hexdigest(),
+                                "documents": [
+                                    {
+                                        "token_offset": 0,
+                                        "token_count": 3,
+                                        "score_offset": 1,
+                                        "scored_tokens": 2,
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = parser.parse_args(["--downstream-manifest", str(manifest)])
+            domains = trainer.load_downstream_domains(args, 50_304)
+            self.assertEqual(domains[0].scored_tokens, 2)
+            with self.assertRaisesRegex(ValueError, "must fit the model vocabulary"):
+                trainer.load_downstream_domains(args, 50_000)
 
     def test_console_writes_only_to_stderr(self) -> None:
         stdout = StringIO()
@@ -138,6 +399,18 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertIn('"eval_compile_seconds":', source)
         self.assertIn('"total_compile_seconds":', source)
         self.assertNotIn('"compile_seconds":', source)
+        self.assertEqual(source.count("compiled_eval = jax.jit("), 1)
+        self.assertIn('"validation_curve": VALIDATION_CSV_NAME', source)
+        self.assertIn(
+            ").lower(params, sample_x, sample_y, sample_mask).compile()",
+            source,
+        )
+        probe = source.index("if should_run_validation_probe(step_index, config):")
+        synchronize = source.index(
+            "sync_tree((params, optimizer, last_metrics))", probe
+        )
+        evaluate = source.index("evaluate_validation_prefix(", synchronize)
+        self.assertLess(synchronize, evaluate)
 
 
 if __name__ == "__main__":

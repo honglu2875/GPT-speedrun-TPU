@@ -17,12 +17,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 from importlib import metadata as importlib_metadata
 import json
 import math
 import os
 from pathlib import Path
 import platform as host_platform
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -38,9 +40,11 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 RESULT_PREFIX = "SPEEDRUN_RESULT="
 CHECKPOINT_NAME = "checkpoint.npz"
 TRAINING_CSV_NAME = "training.csv"
+VALIDATION_CSV_NAME = "validation.csv"
 SCHEMA_VERSION = 1
 _VALID_TRACKS = ("open", "sample_efficiency")
 _VALID_PROFILES = ("smoke", "dev", "official")
+_DOMAIN_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 
 
 # A deliberately small, original corpus for offline and smoke-test use.  The
@@ -77,10 +81,46 @@ class Config:
     beta2: float
     grad_clip: float
     eval_batches: int
+    val_every: int
+    val_probe_batches: int
     log_every: int
     vocab_size: int
     compute_dtype: Any
     dtype_name: str
+
+
+@dataclass(frozen=True)
+class DocumentSpan:
+    """The target interval for one document inside a token shard."""
+
+    token_offset: int
+    token_count: int
+    score_offset: int
+    scored_tokens: int
+
+
+@dataclass(frozen=True)
+class DownstreamDomain:
+    name: str
+    tokens: np.ndarray
+    documents: tuple[DocumentSpan, ...]
+
+    @property
+    def scored_tokens(self) -> int:
+        return sum(document.scored_tokens for document in self.documents)
+
+
+@dataclass(frozen=True)
+class ValidationRow:
+    step: int
+    tokens_processed: int
+    kind: str
+    domain: str
+    validation_tokens: int
+    validation_loss: float
+    perplexity: float
+    validation_seconds: float
+    canonical: bool
 
 
 class Console:
@@ -183,6 +223,26 @@ class Console:
             f"\n  {self.paint('✓', 'green', 'bold')} "
             f"validation loss {self.paint(f'{validation_loss:.4f}', 'green', 'bold')} "
             f"in {self.paint(f'{elapsed:.3f}s', 'white', 'bold')}\n",
+            file=sys.stderr,
+        )
+
+    def validation_probe(
+        self, step: int, loss: float, batches: int, elapsed: float
+    ) -> None:
+        print(
+            f"  {self.paint('◇', 'cyan')} validation @ {step:,}  "
+            f"loss {self.paint(f'{loss:.4f}', 'yellow', 'bold')}  "
+            f"{batches} batches in {elapsed:.3f}s",
+            file=sys.stderr,
+        )
+
+    def downstream(
+        self, domain: str, loss: float, perplexity: float, tokens: int, elapsed: float
+    ) -> None:
+        print(
+            f"  {self.paint('◇', 'cyan')} {domain:<14} "
+            f"loss {self.paint(f'{loss:.4f}', 'yellow', 'bold')}  "
+            f"ppl {perplexity:.2f}  {tokens:,} tokens in {elapsed:.3f}s",
             file=sys.stderr,
         )
 
@@ -321,6 +381,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--smoke", action="store_true", help="alias for --profile smoke"
     )
     run.add_argument("--eval-batches", type=positive_int, default=None)
+    run.add_argument(
+        "--val-every",
+        type=nonnegative_int,
+        default=None,
+        help="run a deterministic validation probe every N optimizer steps; 0 disables probes",
+    )
+    run.add_argument(
+        "--val-probe-batches",
+        type=positive_int,
+        default=None,
+        help="fixed-prefix batches per periodic validation probe",
+    )
     run.add_argument("--log-every", type=positive_int, default=None)
     run.add_argument("--color", choices=("auto", "always", "never"), default="auto")
 
@@ -362,6 +434,25 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "raw", "llmc"),
         default="auto",
         help="raw binaries or llm.c 256-int-header shards",
+    )
+    data.add_argument(
+        "--downstream-manifest",
+        type=Path,
+        default=None,
+        help="fresh10 manifest containing domain shard paths and document spans",
+    )
+    data.add_argument(
+        "--downstream-root",
+        type=Path,
+        default=None,
+        help="directory containing shards named by --downstream-manifest",
+    )
+    data.add_argument(
+        "--downstream-data",
+        action="append",
+        default=[],
+        metavar="DOMAIN=PATH",
+        help="standalone downstream document; repeat paths and domains as needed",
     )
 
     model = parser.add_argument_group("model")
@@ -407,6 +498,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--grad-clip must be positive")
     if args.peak_tflops is not None and args.peak_tflops <= 0.0:
         raise ValueError("--peak-tflops must be positive")
+    if args.downstream_root is not None and args.downstream_manifest is None:
+        raise ValueError("--downstream-root requires --downstream-manifest")
+    if args.downstream_manifest is not None and args.downstream_data:
+        raise ValueError(
+            "--downstream-manifest and --downstream-data are mutually exclusive"
+        )
 
 
 def selected_profile(args: argparse.Namespace) -> str:
@@ -459,6 +556,17 @@ def resolve_config(args: argparse.Namespace, platform: str, vocab_size: int) -> 
         eval_batches = args.eval_batches
     else:
         eval_batches = defaults["eval"]
+    val_every = args.val_every if args.val_every is not None else (
+        250 if profile == "official" else 0
+    )
+    val_probe_batches = args.val_probe_batches if args.val_probe_batches is not None else (
+        min(8, eval_batches) if profile == "official" else eval_batches
+    )
+    if val_every > 0 and val_probe_batches > eval_batches:
+        raise ValueError(
+            "--val-probe-batches must not exceed the canonical evaluation batch "
+            f"count ({eval_batches}); got {val_probe_batches}"
+        )
     # Keep the UI lively without forcing a host synchronization on every short
     # calibration step. Step 1 and the final step are always printed separately.
     log_every = args.log_every if args.log_every is not None else max(10, steps // 20)
@@ -493,6 +601,8 @@ def resolve_config(args: argparse.Namespace, platform: str, vocab_size: int) -> 
         beta2=args.beta2,
         grad_clip=args.grad_clip,
         eval_batches=eval_batches,
+        val_every=val_every,
+        val_probe_batches=val_probe_batches,
         log_every=log_every,
         vocab_size=vocab_size,
         compute_dtype=compute_dtype,
@@ -650,6 +760,221 @@ def load_dataset(args: argparse.Namespace) -> tuple[TokenDataset, int]:
         TokenDataset(ShardedTokens(train_shards), ShardedTokens(validation_shards), source),
         vocab_size,
     )
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _manifest_integer(value: Any, field: str, *, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"fresh10 {field} must be an integer >= {minimum}")
+    return value
+
+
+def _validate_domain(
+    name: Any,
+    tokens: np.ndarray,
+    documents_payload: Sequence[Mapping[str, Any]],
+    *,
+    expected_scored_tokens: Any = None,
+    vocab_size: int,
+) -> DownstreamDomain:
+    if not isinstance(name, str) or not _DOMAIN_NAME.fullmatch(name):
+        raise ValueError(f"invalid downstream domain name: {name!r}")
+    if not documents_payload:
+        raise ValueError(f"downstream domain {name!r} contains no documents")
+    documents: list[DocumentSpan] = []
+    previous_end = 0
+    for index, document in enumerate(documents_payload):
+        if not isinstance(document, Mapping):
+            raise ValueError(f"fresh10 {name} document {index} must be an object")
+        prefix = f"{name}.documents[{index}]"
+        token_offset = _manifest_integer(document.get("token_offset"), f"{prefix}.token_offset")
+        token_count = _manifest_integer(
+            document.get("token_count"), f"{prefix}.token_count", minimum=2
+        )
+        score_offset = _manifest_integer(
+            document.get("score_offset"), f"{prefix}.score_offset", minimum=1
+        )
+        scored_tokens = _manifest_integer(
+            document.get("scored_tokens"), f"{prefix}.scored_tokens", minimum=1
+        )
+        token_end = token_offset + token_count
+        score_end = score_offset + scored_tokens
+        if token_offset < previous_end:
+            raise ValueError(f"fresh10 {name} document spans overlap or are unsorted")
+        if score_offset <= token_offset or score_end > token_end:
+            raise ValueError(
+                f"fresh10 {prefix} scored interval must follow a context token "
+                "and stay inside its document"
+            )
+        if token_end > len(tokens):
+            raise ValueError(
+                f"fresh10 {prefix} ends at token {token_end:,}, beyond shard "
+                f"length {len(tokens):,}"
+            )
+        previous_end = token_end
+        documents.append(
+            DocumentSpan(token_offset, token_count, score_offset, scored_tokens)
+        )
+    total_scored = sum(document.scored_tokens for document in documents)
+    if expected_scored_tokens is not None:
+        expected = _manifest_integer(
+            expected_scored_tokens, f"{name}.scored_tokens", minimum=1
+        )
+        if total_scored != expected:
+            raise ValueError(
+                f"fresh10 {name} spans score {total_scored:,} tokens; expected "
+                f"{expected:,}"
+            )
+    observed = np.asarray(tokens)
+    observed_min = int(observed.min())
+    observed_max = int(observed.max())
+    if observed_min < 0 or observed_max >= vocab_size:
+        raise ValueError(
+            f"downstream domain {name!r} token ids [{observed_min}, {observed_max}] "
+            f"do not fit vocab_size={vocab_size}"
+        )
+    return DownstreamDomain(name, tokens, tuple(documents))
+
+
+def load_downstream_domains(
+    args: argparse.Namespace, vocab_size: int
+) -> tuple[DownstreamDomain, ...]:
+    """Load canonical manifest shards or repeatable standalone documents."""
+
+    if args.downstream_manifest is None and not args.downstream_data:
+        return ()
+    if args.downstream_manifest is not None:
+        manifest_path = args.downstream_manifest.expanduser().resolve()
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"downstream manifest not found: {manifest_path}")
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid downstream manifest JSON: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("downstream manifest must contain a JSON object")
+        if payload.get("schema_version") != 1 or payload.get("kind") != "fresh10":
+            raise ValueError(
+                "downstream manifest must use schema_version=1 and kind='fresh10'"
+            )
+        tokenizer = payload.get("tokenizer")
+        tokenizer_vocab = tokenizer.get("vocab_size") if isinstance(tokenizer, dict) else None
+        if (
+            not isinstance(tokenizer, dict)
+            or tokenizer.get("name") != "gpt2"
+            or isinstance(tokenizer_vocab, bool)
+            or not isinstance(tokenizer_vocab, int)
+            or tokenizer_vocab != 50_257
+            or tokenizer_vocab > vocab_size
+        ):
+            raise ValueError(
+                "downstream manifest must use the 50,257-token GPT-2 tokenizer, "
+                f"which must fit the model vocabulary ({vocab_size})"
+            )
+        root = (
+            args.downstream_root.expanduser().resolve()
+            if args.downstream_root is not None
+            else manifest_path.parent
+        )
+        domain_payloads = payload.get("domains")
+        if not isinstance(domain_payloads, list) or not domain_payloads:
+            raise ValueError("downstream manifest domains must be a nonempty list")
+        domains: list[DownstreamDomain] = []
+        seen: set[str] = set()
+        for entry in domain_payloads:
+            if not isinstance(entry, dict):
+                raise ValueError("each downstream manifest domain must be an object")
+            name = entry.get("name")
+            if not isinstance(name, str) or not _DOMAIN_NAME.fullmatch(name):
+                raise ValueError(f"invalid downstream domain name: {name!r}")
+            if name in seen:
+                raise ValueError(f"duplicate downstream domain: {name}")
+            seen.add(name)
+            relative = entry.get("path")
+            if not isinstance(relative, str) or not relative:
+                raise ValueError(f"fresh10 {name}.path must be a nonempty string")
+            unresolved = Path(relative)
+            if unresolved.is_absolute() or ".." in unresolved.parts:
+                raise ValueError(f"fresh10 {name}.path must stay below the data root")
+            shard_path = (root / unresolved).resolve()
+            try:
+                shard_path.relative_to(root)
+            except ValueError as exc:
+                raise ValueError(f"fresh10 {name}.path escapes the data root") from exc
+            expected_bytes = entry.get("bytes")
+            if expected_bytes is not None and shard_path.stat().st_size != _manifest_integer(
+                expected_bytes, f"{name}.bytes", minimum=1
+            ):
+                raise ValueError(f"fresh10 {name} shard size does not match its manifest")
+            expected_hash = entry.get("sha256")
+            if expected_hash is not None:
+                if not isinstance(expected_hash, str) or not re.fullmatch(
+                    r"[0-9a-f]{64}", expected_hash
+                ):
+                    raise ValueError(f"fresh10 {name}.sha256 is invalid")
+                if file_sha256(shard_path) != expected_hash:
+                    raise ValueError(f"fresh10 {name} shard SHA-256 does not match")
+            tokens = load_token_file(shard_path, "uint16", "llmc")
+            expected_tokens = _manifest_integer(
+                entry.get("tokens"), f"{name}.tokens", minimum=2
+            )
+            if len(tokens) != expected_tokens:
+                raise ValueError(
+                    f"fresh10 {name} has {len(tokens):,} tokens; expected "
+                    f"{expected_tokens:,}"
+                )
+            documents = entry.get("documents")
+            if not isinstance(documents, list):
+                raise ValueError(f"fresh10 {name}.documents must be a list")
+            domains.append(
+                _validate_domain(
+                    name,
+                    tokens,
+                    documents,
+                    expected_scored_tokens=entry.get("scored_tokens"),
+                    vocab_size=vocab_size,
+                )
+            )
+        return tuple(domains)
+
+    grouped: dict[str, list[np.ndarray]] = {}
+    for specification in args.downstream_data:
+        if not isinstance(specification, str) or "=" not in specification:
+            raise ValueError("--downstream-data must use DOMAIN=PATH")
+        name, raw_path = specification.split("=", 1)
+        if not _DOMAIN_NAME.fullmatch(name) or not raw_path:
+            raise ValueError(f"invalid --downstream-data value: {specification!r}")
+        grouped.setdefault(name, []).append(
+            load_token_file(Path(raw_path), args.data_dtype, "auto")
+        )
+    domains = []
+    for name, shards in grouped.items():
+        documents_payload: list[dict[str, int]] = []
+        cursor = 0
+        for shard in shards:
+            if len(shard) < 2:
+                raise ValueError(f"downstream document for {name!r} has fewer than 2 tokens")
+            documents_payload.append(
+                {
+                    "token_offset": cursor,
+                    "token_count": len(shard),
+                    "score_offset": cursor + 1,
+                    "scored_tokens": len(shard) - 1,
+                }
+            )
+            cursor += len(shard)
+        tokens = np.concatenate(tuple(np.asarray(shard) for shard in shards))
+        domains.append(
+            _validate_domain(name, tokens, documents_payload, vocab_size=vocab_size)
+        )
+    return tuple(domains)
 
 
 def normal(rng: np.random.Generator, shape: tuple[int, ...], scale: float) -> np.ndarray:
@@ -836,8 +1161,153 @@ def train_step(
     }
 
 
-def eval_step(params: Any, x: jax.Array, y: jax.Array, config: Config) -> jax.Array:
-    return cross_entropy(params, x, y, config)
+def eval_step(
+    params: Any,
+    x: jax.Array,
+    y: jax.Array,
+    mask: jax.Array,
+    config: Config,
+) -> tuple[jax.Array, jax.Array]:
+    """Return a loss sum and exact target count for fixed-shape masked eval."""
+
+    logits = gpt_logits(params, x, config)
+    log_probabilities = jax.nn.log_softmax(logits, axis=-1)
+    selected = jnp.take_along_axis(log_probabilities, y[..., None], axis=-1)[..., 0]
+    mask = mask.astype(jnp.float32)
+    return (
+        -jnp.sum(selected * mask, dtype=jnp.float32),
+        jnp.sum(mask, dtype=jnp.float32),
+    )
+
+
+def should_run_validation_probe(step: int, config: Config) -> bool:
+    """Return whether this step gets a non-canonical fixed-prefix probe."""
+
+    return (
+        config.val_every > 0
+        and step < config.steps
+        and step % config.val_every == 0
+    )
+
+
+def evaluate_validation_prefix(
+    params: Any,
+    dataset: TokenDataset,
+    compiled_eval: Any,
+    data_sharding: NamedSharding,
+    config: Config,
+    batches: int,
+) -> tuple[float, float]:
+    """Synchronously evaluate batches ``0..batches-1`` of the fixed prefix."""
+
+    if batches <= 0:
+        raise ValueError("validation batch count must be positive")
+    started = time.perf_counter()
+    loss_sum = 0.0
+    scored_tokens = 0
+    mask_host = np.ones((config.batch_size, config.seq_len), dtype=np.float32)
+    mask = jax.device_put(mask_host, data_sharding)
+    for eval_index in range(batches):
+        eval_x_host, eval_y_host = dataset.validation_batch(
+            eval_index, config.batch_size, config.seq_len, config.vocab_size
+        )
+        eval_x = jax.device_put(eval_x_host, data_sharding)
+        eval_y = jax.device_put(eval_y_host, data_sharding)
+        batch_loss_sum, batch_scored = jax.device_get(
+            compiled_eval(params, eval_x, eval_y, mask)
+        )
+        loss_sum += float(batch_loss_sum)
+        scored_tokens += int(batch_scored)
+    elapsed = max(time.perf_counter() - started, 1.0e-12)
+    expected_tokens = batches * config.batch_size * config.seq_len
+    if scored_tokens != expected_tokens:
+        raise RuntimeError(
+            f"validation executable scored {scored_tokens:,} tokens; expected "
+            f"{expected_tokens:,}"
+        )
+    return (
+        finite_metric("validation_loss", loss_sum / scored_tokens),
+        finite_metric("validation_seconds", elapsed, positive=True),
+    )
+
+
+def downstream_batches(
+    domain: DownstreamDomain, config: Config
+) -> tuple[tuple[np.ndarray, np.ndarray, np.ndarray], ...]:
+    """Pack documents into fixed eval shapes without cross-document targets."""
+
+    rows: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    for document in domain.documents:
+        target = document.score_offset
+        remaining = document.scored_tokens
+        while remaining:
+            count = min(config.seq_len, remaining)
+            x = np.zeros((config.seq_len,), dtype=np.int32)
+            y = np.zeros((config.seq_len,), dtype=np.int32)
+            mask = np.zeros((config.seq_len,), dtype=np.float32)
+            x[:count] = domain.tokens[target - 1 : target - 1 + count]
+            y[:count] = domain.tokens[target : target + count]
+            mask[:count] = 1.0
+            rows.append((x, y, mask))
+            target += count
+            remaining -= count
+
+    batches: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    for start in range(0, len(rows), config.batch_size):
+        batch_rows = rows[start : start + config.batch_size]
+        x = np.zeros((config.batch_size, config.seq_len), dtype=np.int32)
+        y = np.zeros((config.batch_size, config.seq_len), dtype=np.int32)
+        mask = np.zeros((config.batch_size, config.seq_len), dtype=np.float32)
+        for row, (row_x, row_y, row_mask) in enumerate(batch_rows):
+            x[row], y[row], mask[row] = row_x, row_y, row_mask
+        batches.append((x, y, mask))
+    packed_tokens = int(sum(float(mask.sum()) for _, _, mask in batches))
+    if packed_tokens != domain.scored_tokens:
+        raise AssertionError(
+            f"packed {packed_tokens:,} targets for {domain.name}; expected "
+            f"{domain.scored_tokens:,}"
+        )
+    return tuple(batches)
+
+
+def evaluate_downstream_domain(
+    params: Any,
+    domain: DownstreamDomain,
+    compiled_eval: Any,
+    data_sharding: NamedSharding,
+    config: Config,
+) -> dict[str, float | int]:
+    """Evaluate one domain with exact masking and the shared eval executable."""
+
+    started = time.perf_counter()
+    loss_sum = 0.0
+    scored_tokens = 0
+    for x_host, y_host, mask_host in downstream_batches(domain, config):
+        x = jax.device_put(x_host, data_sharding)
+        y = jax.device_put(y_host, data_sharding)
+        mask = jax.device_put(mask_host, data_sharding)
+        batch_loss_sum, batch_scored = jax.device_get(
+            compiled_eval(params, x, y, mask)
+        )
+        loss_sum += float(batch_loss_sum)
+        scored_tokens += int(batch_scored)
+    elapsed = finite_metric(
+        f"downstream {domain.name} seconds",
+        max(time.perf_counter() - started, 1.0e-12),
+        positive=True,
+    )
+    if scored_tokens != domain.scored_tokens:
+        raise RuntimeError(
+            f"downstream {domain.name} scored {scored_tokens:,} tokens; expected "
+            f"{domain.scored_tokens:,}"
+        )
+    loss = finite_metric(f"downstream {domain.name} loss", loss_sum / scored_tokens)
+    return {
+        "loss": loss,
+        "perplexity": perplexity_from_loss(loss),
+        "scored_tokens": scored_tokens,
+        "seconds": elapsed,
+    }
 
 
 def parameter_count(params: Any) -> int:
@@ -924,6 +1394,49 @@ def write_training_csv(output_dir: Path, history: np.ndarray, config: Config) ->
                     float(loss),
                     float(learning_rate_value),
                     float(grad_norm),
+                )
+            )
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, destination)
+
+
+def write_validation_csv(output_dir: Path, rows: Sequence[ValidationRow]) -> None:
+    """Persist FineWeb probes/final and optional downstream domain scores."""
+
+    canonical_rows = [row for row in rows if row.canonical]
+    if len(canonical_rows) != 1 or canonical_rows[0].kind != "fineweb":
+        raise ValueError("validation history must contain one canonical in-distribution row")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    destination = output_dir / VALIDATION_CSV_NAME
+    temporary = output_dir / f".{VALIDATION_CSV_NAME}.tmp"
+    with temporary.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(
+            (
+                "step",
+                "tokens_processed",
+                "kind",
+                "domain",
+                "validation_tokens",
+                "validation_loss",
+                "perplexity",
+                "validation_seconds",
+                "canonical",
+            )
+        )
+        for row in rows:
+            writer.writerow(
+                (
+                    int(row.step),
+                    int(row.tokens_processed),
+                    row.kind,
+                    row.domain,
+                    int(row.validation_tokens),
+                    float(row.validation_loss),
+                    float(row.perplexity),
+                    float(row.validation_seconds),
+                    "true" if row.canonical else "false",
                 )
             )
         handle.flush()
@@ -1029,6 +1542,14 @@ def finite_metric(name: str, value: float, *, positive: bool = False) -> float:
     return value
 
 
+def perplexity_from_loss(loss: float) -> float:
+    try:
+        perplexity = math.exp(loss)
+    except OverflowError as exc:
+        raise FloatingPointError(f"loss {loss!r} overflows perplexity") from exc
+    return finite_metric("perplexity", perplexity, positive=True)
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     validate_args(args)
     console = Console(args.color)
@@ -1049,6 +1570,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     dataset, vocab_size = load_dataset(args)
     config = resolve_config(args, platform, vocab_size)
+    downstream_domains = load_downstream_domains(args, vocab_size)
     if config.batch_size % len(devices):
         raise ValueError(
             f"global batch size {config.batch_size} must be divisible by "
@@ -1080,6 +1602,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ("mesh", f"data={len(devices)} (replicated model)"),
             ("dataset", dataset.source),
             ("train / val tokens", f"{len(dataset.train):,} / {len(dataset.validation):,}"),
+            (
+                "downstream",
+                (
+                    f"{len(downstream_domains)} domains / "
+                    f"{sum(domain.scored_tokens for domain in downstream_domains):,} scored"
+                    if downstream_domains
+                    else "not requested"
+                ),
+            ),
             ("model", f"L{config.layers} D{config.d_model} H{config.heads} MLP×{config.mlp_mult}"),
             ("parameters", format_count(params_total)),
             ("global batch", f"{config.batch_size} × {config.seq_len} tokens"),
@@ -1100,8 +1631,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     # Compilation may not inspect real data. Shapes and dtypes are sufficient.
     sample_x = np.zeros((config.batch_size, config.seq_len), dtype=np.int32)
     sample_y = np.zeros((config.batch_size, config.seq_len), dtype=np.int32)
+    sample_mask = np.ones((config.batch_size, config.seq_len), dtype=np.float32)
     sample_x = jax.device_put(sample_x, data_sharding)
     sample_y = jax.device_put(sample_y, data_sharding)
+    sample_mask = jax.device_put(sample_mask, data_sharding)
 
     compiled_step = jax.jit(
         lambda p, o, x, y: train_step(p, o, x, y, config, decay_mask),
@@ -1112,10 +1645,33 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     compile_started = time.perf_counter()
     executable = compiled_step.lower(params, optimizer, sample_x, sample_y).compile()
     train_compile_seconds = time.perf_counter() - compile_started
-    sync_tree((params, optimizer))
-    console.phase("Training", f"compiled in {train_compile_seconds:.2f}s")
+
+    # Compile evaluation exactly once before the training clock. Periodic probes
+    # and the canonical final validation both reuse this executable.
+    console.phase("Compiling evaluation", "reused by probes and final validation")
+    eval_compile_started = time.perf_counter()
+    compiled_eval = jax.jit(
+        lambda p, x, y, mask: eval_step(p, x, y, mask, config),
+        in_shardings=(replicated, data_sharding, data_sharding, data_sharding),
+    ).lower(params, sample_x, sample_y, sample_mask).compile()
+    eval_compile_seconds = time.perf_counter() - eval_compile_started
+    total_compile_seconds = train_compile_seconds + eval_compile_seconds
+
+    sync_tree((params, optimizer, sample_x, sample_y, sample_mask))
+    probe_detail = (
+        f"; validation {config.val_probe_batches} batches every {config.val_every} steps"
+        if config.val_every
+        else "; periodic validation disabled"
+    )
+    console.phase(
+        "Training",
+        f"train compiled in {train_compile_seconds:.2f}s, "
+        f"eval in {eval_compile_seconds:.2f}s{probe_detail}",
+    )
 
     last_metrics: Mapping[str, jax.Array] | None = None
+    validation_rows: list[ValidationRow] = []
+    validation_probe_seconds = 0.0
     train_started = time.perf_counter()
     for step_index in range(1, config.steps + 1):
         batch_x, batch_y = dataset.batch(
@@ -1124,6 +1680,36 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         batch_x = jax.device_put(batch_x, data_sharding)
         batch_y = jax.device_put(batch_y, data_sharding)
         params, optimizer, last_metrics = executable(params, optimizer, batch_x, batch_y)
+        if should_run_validation_probe(step_index, config):
+            # Attribute all preceding asynchronous training work to training,
+            # then start the probe's own honest wall clock inside the helper.
+            sync_tree((params, optimizer, last_metrics))
+            probe_loss, probe_seconds = evaluate_validation_prefix(
+                params,
+                dataset,
+                compiled_eval,
+                data_sharding,
+                config,
+                config.val_probe_batches,
+            )
+            probe_tokens = config.val_probe_batches * config.batch_size * config.seq_len
+            validation_probe_seconds += probe_seconds
+            validation_rows.append(
+                ValidationRow(
+                    step=step_index,
+                    tokens_processed=step_index * config.batch_size * config.seq_len,
+                    kind="fineweb_probe",
+                    domain="fineweb",
+                    validation_tokens=probe_tokens,
+                    validation_loss=probe_loss,
+                    perplexity=perplexity_from_loss(probe_loss),
+                    validation_seconds=probe_seconds,
+                    canonical=False,
+                )
+            )
+            console.validation_probe(
+                step_index, probe_loss, config.val_probe_batches, probe_seconds
+            )
         should_log = (
             step_index == 1
             or step_index == config.steps
@@ -1150,36 +1736,106 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     training_history = np.asarray(jax.device_get(optimizer["history"]), dtype=np.float32)
     train_loss = finite_metric("train_loss", float(final_train["loss"]))
 
-    console.phase("Compiling evaluation", "compilation is outside train_seconds")
-    eval_x, eval_y = dataset.validation_batch(
-        0, config.batch_size, config.seq_len, config.vocab_size
-    )
-    eval_x = jax.device_put(eval_x, data_sharding)
-    eval_y = jax.device_put(eval_y, data_sharding)
-    eval_compile_started = time.perf_counter()
-    compiled_eval = jax.jit(
-        lambda p, x, y: eval_step(p, x, y, config),
-        in_shardings=(replicated, data_sharding, data_sharding),
-    ).lower(params, eval_x, eval_y).compile()
-    eval_compile_seconds = time.perf_counter() - eval_compile_started
-    total_compile_seconds = train_compile_seconds + eval_compile_seconds
     console.phase(
-        "Validation",
-        f"{config.eval_batches} deterministic batches; compiled in {eval_compile_seconds:.2f}s",
+        "Canonical validation",
+        f"{config.eval_batches} deterministic batches outside train_seconds",
     )
-    validation_losses: list[float] = [float(jax.device_get(compiled_eval(params, eval_x, eval_y)))]
-    for eval_index in range(1, config.eval_batches):
-        eval_x_host, eval_y_host = dataset.validation_batch(
-            eval_index, config.batch_size, config.seq_len, config.vocab_size
+    validation_loss, final_validation_seconds = evaluate_validation_prefix(
+        params,
+        dataset,
+        compiled_eval,
+        data_sharding,
+        config,
+        config.eval_batches,
+    )
+    validation_rows.append(
+        ValidationRow(
+            step=config.steps,
+            tokens_processed=tokens_processed,
+            kind="fineweb",
+            domain="fineweb",
+            validation_tokens=config.eval_batches * config.batch_size * config.seq_len,
+            validation_loss=validation_loss,
+            perplexity=perplexity_from_loss(validation_loss),
+            validation_seconds=final_validation_seconds,
+            canonical=True,
         )
-        eval_x = jax.device_put(eval_x_host, data_sharding)
-        eval_y = jax.device_put(eval_y_host, data_sharding)
-        validation_losses.append(float(jax.device_get(compiled_eval(params, eval_x, eval_y))))
-    validation_loss = finite_metric("validation_loss", float(np.mean(validation_losses)))
+    )
+
+    downstream_results: dict[str, dict[str, float | int]] = {}
+    if downstream_domains:
+        console.phase(
+            "Fresh-domain validation",
+            f"{len(downstream_domains)} domains outside train_seconds",
+        )
+        for domain in downstream_domains:
+            domain_result = evaluate_downstream_domain(
+                params, domain, compiled_eval, data_sharding, config
+            )
+            downstream_results[domain.name] = domain_result
+            validation_rows.append(
+                ValidationRow(
+                    step=config.steps,
+                    tokens_processed=tokens_processed,
+                    kind="downstream",
+                    domain=domain.name,
+                    validation_tokens=int(domain_result["scored_tokens"]),
+                    validation_loss=float(domain_result["loss"]),
+                    perplexity=float(domain_result["perplexity"]),
+                    validation_seconds=float(domain_result["seconds"]),
+                    canonical=False,
+                )
+            )
+            console.downstream(
+                domain.name,
+                float(domain_result["loss"]),
+                float(domain_result["perplexity"]),
+                int(domain_result["scored_tokens"]),
+                float(domain_result["seconds"]),
+            )
+        macro_loss = finite_metric(
+            "fresh10 macro loss",
+            float(np.mean([float(row["loss"]) for row in downstream_results.values()])),
+        )
+        macro_perplexity = perplexity_from_loss(macro_loss)
+        downstream_seconds = finite_metric(
+            "fresh10 seconds",
+            sum(float(row["seconds"]) for row in downstream_results.values()),
+            positive=True,
+        )
+        downstream_scored_tokens = sum(
+            int(row["scored_tokens"]) for row in downstream_results.values()
+        )
+        validation_rows.append(
+            ValidationRow(
+                step=config.steps,
+                tokens_processed=tokens_processed,
+                kind="downstream_macro",
+                domain="fresh10_macro",
+                validation_tokens=downstream_scored_tokens,
+                validation_loss=macro_loss,
+                perplexity=macro_perplexity,
+                validation_seconds=downstream_seconds,
+                canonical=False,
+            )
+        )
+        console.downstream(
+            "fresh10 macro",
+            macro_loss,
+            macro_perplexity,
+            downstream_scored_tokens,
+            downstream_seconds,
+        )
+    else:
+        console.phase("Fresh-domain validation", "skipped; no downstream data supplied")
 
     output_dir = args.output_dir.expanduser().resolve()
-    console.phase("Artifacts", f"{TRAINING_CSV_NAME} + {CHECKPOINT_NAME}")
+    console.phase(
+        "Artifacts",
+        f"{TRAINING_CSV_NAME} + {VALIDATION_CSV_NAME} + {CHECKPOINT_NAME}",
+    )
     write_training_csv(output_dir, training_history, config)
+    write_validation_csv(output_dir, validation_rows)
     save_checkpoint(output_dir, params, config, args.seed)
 
     tokens_per_second = finite_metric(
@@ -1196,6 +1852,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "builtin-byte-v1" if smoke_contract else "fineweb10b-gpt2"
     )
     tokenizer_id = args.tokenizer_id or ("byte" if smoke_contract else "gpt2")
+    fineweb_tokens = config.eval_batches * config.batch_size * config.seq_len
+    evaluations: dict[str, Any] = {
+        "fineweb": {
+            "loss": validation_loss,
+            "perplexity": perplexity_from_loss(validation_loss),
+            "scored_tokens": int(fineweb_tokens),
+            "seconds": finite_metric(
+                "final_validation_seconds", final_validation_seconds, positive=True
+            ),
+            "canonical": True,
+        }
+    }
+    if downstream_results:
+        evaluations["fresh10"] = {
+            "domains": downstream_results,
+            "macro_loss": macro_loss,
+            "macro_perplexity": macro_perplexity,
+            "scored_tokens": int(downstream_scored_tokens),
+            "seconds": downstream_seconds,
+        }
     result: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "status": "ok",
@@ -1203,7 +1879,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "profile": profile,
         "seed": int(args.seed),
         "checkpoint": CHECKPOINT_NAME,
-        "artifacts": {"training_curve": TRAINING_CSV_NAME},
+        "artifacts": {
+            "training_curve": TRAINING_CSV_NAME,
+            "validation_curve": VALIDATION_CSV_NAME,
+        },
         "system": system_metadata(devices),
         "contract": {
             "model_id": "reference-gpt-v1",
@@ -1219,12 +1898,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "tied_embeddings": True,
             },
         },
+        "evaluations": evaluations,
         "metrics": {
             "train_seconds": finite_metric("train_seconds", train_seconds, positive=True),
             "tokens_processed": int(tokens_processed),
             "validation_loss": validation_loss,
-            "validation_tokens": int(
-                config.eval_batches * config.batch_size * config.seq_len
+            "validation_tokens": int(fineweb_tokens),
+            "validation_probe_count": sum(
+                row.kind == "fineweb_probe" for row in validation_rows
+            ),
+            "validation_probe_seconds": finite_metric(
+                "validation_probe_seconds", validation_probe_seconds
+            ),
+            "final_validation_seconds": finite_metric(
+                "final_validation_seconds", final_validation_seconds, positive=True
             ),
             "train_loss": train_loss,
             "parameters": int(params_total),
@@ -1245,7 +1932,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         },
     }
     write_result(output_dir, result)
-    console.success(validation_loss, train_seconds)
+    console.success(validation_loss, final_validation_seconds)
     return result
 
 

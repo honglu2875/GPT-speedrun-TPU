@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
 import sys
 import tempfile
 import threading
@@ -45,6 +46,7 @@ parser.add_argument("--stderr-message", default="")
 parser.add_argument("--stderr-bytes", type=int, default=0)
 parser.add_argument("--sleep-after-stderr", type=float, default=0.0)
 parser.add_argument("--make-cache", action="store_true")
+parser.add_argument("--evaluations-json")
 args = parser.parse_args()
 if args.stderr_message:
     sys.stderr.write(args.stderr_message)
@@ -84,6 +86,8 @@ result = {
     },
     "system": {"platform": "test", "devices": 1},
 }
+if args.evaluations_json is not None:
+    result["evaluations"] = json.loads(args.evaluations_json)
 print("human log output")
 print("SPEEDRUN_RESULT=" + json.dumps(result, separators=(",", ":")))
 '''
@@ -112,6 +116,54 @@ class HarnessRunTests(unittest.TestCase):
         }
         values.update(changes)
         return RunConfig(**values)  # type: ignore[arg-type]
+
+    @staticmethod
+    def fresh10_evaluations(
+        domain_tokens: dict[str, int] | None = None,
+    ) -> dict[str, object]:
+        tokens = domain_tokens or {
+            name: 8_192
+            for name in (
+                "science",
+                "medicine",
+                "software",
+                "history",
+                "fiction",
+                "government",
+                "legal",
+                "economics",
+                "climate",
+                "education",
+            )
+        }
+        losses = {name: 2.0 + index / 10 for index, name in enumerate(tokens)}
+        macro_loss = math.fsum(losses.values()) / len(losses)
+        return {
+            "fineweb": {
+                "loss": 2.5,
+                "perplexity": math.exp(2.5),
+                "scored_tokens": 64,
+                "seconds": 0.25,
+                "canonical": True,
+            },
+            "fresh10": {
+                "domains": {
+                    name: {
+                        "loss": losses[name],
+                        "perplexity": math.exp(losses[name]),
+                        "scored_tokens": count,
+                        "seconds": 0.01 + index / 100,
+                    }
+                    for index, (name, count) in enumerate(tokens.items())
+                },
+                "macro_loss": macro_loss,
+                "macro_perplexity": math.exp(macro_loss),
+                "scored_tokens": sum(tokens.values()),
+                "seconds": math.fsum(
+                    0.01 + index / 100 for index in range(len(tokens))
+                ),
+            },
+        }
 
     def test_run_captures_validates_records_and_forwards_args(self) -> None:
         evaluator_calls: list[Path] = []
@@ -201,6 +253,61 @@ class HarnessRunTests(unittest.TestCase):
         self.assertEqual(outcome.record["metrics"]["validation_tokens"], 64)
         with self.assertRaisesRegex(ResultValidationError, "fixed validation prefix"):
             run_submission(self.config(expected_validation_tokens=65))
+
+    def test_fresh10_is_optional_without_expectations(self) -> None:
+        outcome = run_submission(self.config())
+        self.assertNotIn("evaluations", outcome.record)
+
+    def test_fresh10_contract_is_validated_and_preserved_in_record(self) -> None:
+        expected_tokens = {
+            name: 8_192
+            for name in (
+                "science",
+                "medicine",
+                "software",
+                "history",
+                "fiction",
+                "government",
+                "legal",
+                "economics",
+                "climate",
+                "education",
+            )
+        }
+        evaluations = self.fresh10_evaluations(expected_tokens)
+        outcome = run_submission(
+            self.config(
+                target_loss=2.6,
+                expected_validation_tokens=64,
+                expected_downstream_tokens=expected_tokens,
+                passthrough_args=("--evaluations-json", json.dumps(evaluations)),
+            )
+        )
+
+        self.assertTrue(outcome.record["qualified"])
+        self.assertEqual(outcome.record["metrics"]["validation_loss"], 2.5)
+        self.assertEqual(outcome.record["evaluations"], evaluations)
+        self.assertEqual(load_records(outcome.record_path)[0]["evaluations"], evaluations)
+
+        evaluations["fresh10"]["macro_loss"] = 99  # type: ignore[index]
+        self.assertNotEqual(
+            outcome.record["evaluations"]["fresh10"]["macro_loss"],  # type: ignore[index]
+            99,
+        )
+
+    def test_fresh10_expectations_require_evaluations(self) -> None:
+        expected = {f"domain-{index}": 8_192 for index in range(10)}
+        with self.assertRaisesRegex(ResultValidationError, "evaluations are required"):
+            run_submission(self.config(expected_downstream_tokens=expected))
+
+    def test_invalid_fresh10_config_fails_before_launch(self) -> None:
+        for expected in (
+            {f"domain-{index}": 8_192 for index in range(9)},
+            {**{f"domain-{index}": 8_192 for index in range(9)}, "domain-9": 0},
+        ):
+            with self.subTest(expected=expected):
+                with self.assertRaisesRegex(ConfigurationError, "expected_downstream_tokens"):
+                    run_submission(self.config(expected_downstream_tokens=expected))
 
     def test_provenance_hashes_inputs_and_copies_configured_values(self) -> None:
         trainer = self.root / "submissions" / "tiny" / "train.py"
@@ -366,6 +473,111 @@ class HarnessRunTests(unittest.TestCase):
 
 
 class ProtocolAndScoringTests(unittest.TestCase):
+    def test_evaluation_schema_rejects_inconsistent_fresh10_aggregates(self) -> None:
+        evaluations = HarnessRunTests.fresh10_evaluations()
+        expected = {
+            name: row["scored_tokens"]
+            for name, row in evaluations["fresh10"]["domains"].items()  # type: ignore[index,union-attr]
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            (run_dir / "model.npz").write_bytes(b"checkpoint")
+            base_payload = {
+                "schema_version": 1,
+                "status": "ok",
+                "checkpoint": "model.npz",
+                "metrics": {
+                    "train_seconds": 1.0,
+                    "tokens_processed": 1,
+                    "validation_loss": 2.5,
+                    "validation_tokens": 64,
+                },
+                "evaluations": evaluations,
+            }
+            validated = validate_result(
+                base_payload,
+                run_dir=run_dir,
+                track="open",
+                expected_validation_tokens=64,
+                expected_downstream_tokens=expected,
+            )
+            self.assertEqual(validated.evaluations, evaluations)
+
+            mutations = {
+                "fineweb canonical": lambda value: value["evaluations"]["fineweb"].update(
+                    canonical=False
+                ),
+                "fineweb loss": lambda value: value["evaluations"]["fineweb"].update(
+                    loss=2.4
+                ),
+                "macro loss": lambda value: value["evaluations"]["fresh10"].update(
+                    macro_loss=1.0
+                ),
+                "macro perplexity": lambda value: value["evaluations"]["fresh10"].update(
+                    macro_perplexity=1.0
+                ),
+                "total tokens": lambda value: value["evaluations"]["fresh10"].update(
+                    scored_tokens=81_919
+                ),
+                "domain tokens": lambda value: next(
+                    iter(value["evaluations"]["fresh10"]["domains"].values())
+                ).update(scored_tokens=8_191),
+                "nonfinite seconds": lambda value: next(
+                    iter(value["evaluations"]["fresh10"]["domains"].values())
+                ).update(seconds=float("inf")),
+                "nonpositive perplexity": lambda value: next(
+                    iter(value["evaluations"]["fresh10"]["domains"].values())
+                ).update(perplexity=0.0),
+                "inconsistent perplexity": lambda value: next(
+                    iter(value["evaluations"]["fresh10"]["domains"].values())
+                ).update(perplexity=42.0),
+                "inconsistent total seconds": lambda value: value["evaluations"][
+                    "fresh10"
+                ].update(seconds=42.0),
+            }
+            for label, mutate in mutations.items():
+                with self.subTest(label=label):
+                    candidate = json.loads(json.dumps(base_payload))
+                    mutate(candidate)
+                    with self.assertRaises(ResultValidationError):
+                        validate_result(
+                            candidate,
+                            run_dir=run_dir,
+                            track="open",
+                            expected_validation_tokens=64,
+                            expected_downstream_tokens=expected,
+                        )
+
+    def test_fresh10_domain_names_must_match_expected_mapping(self) -> None:
+        evaluations = HarnessRunTests.fresh10_evaluations()
+        expected = {
+            name: row["scored_tokens"]
+            for name, row in evaluations["fresh10"]["domains"].items()  # type: ignore[index,union-attr]
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            (run_dir / "model.npz").write_bytes(b"checkpoint")
+            domains = evaluations["fresh10"]["domains"]  # type: ignore[index]
+            domains["unexpected"] = domains.pop("science")  # type: ignore[union-attr]
+            payload = {
+                "schema_version": 1,
+                "status": "ok",
+                "checkpoint": "model.npz",
+                "metrics": {
+                    "train_seconds": 1.0,
+                    "tokens_processed": 1,
+                    "validation_loss": 2.5,
+                },
+                "evaluations": evaluations,
+            }
+            with self.assertRaisesRegex(ResultValidationError, "domain names"):
+                validate_result(
+                    payload,
+                    run_dir=run_dir,
+                    track="open",
+                    expected_downstream_tokens=expected,
+                )
+
     def test_empty_leaderboard_renders(self) -> None:
         rendered = render_leaderboard([], track="open")
         self.assertIn("No qualifying runs.", rendered)

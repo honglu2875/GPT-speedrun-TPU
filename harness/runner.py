@@ -120,6 +120,7 @@ def run_submission(config: RunConfig, *, evaluator: Evaluator | None = None) -> 
         track=config.track,
         reference_contract=config.reference_contract,
         expected_validation_tokens=config.expected_validation_tokens,
+        expected_downstream_tokens=config.expected_downstream_tokens,
         evaluator=evaluator,
     )
     # Preserve the exact accepted payload independently from potentially noisy logs.
@@ -183,6 +184,10 @@ def run_submission(config: RunConfig, *, evaluator: Evaluator | None = None) -> 
         "command": command,
         "provenance": provenance,
     }
+    if validated.evaluations is not None:
+        # Validation returns a JSON round-trip copy, so the immutable record keeps
+        # the entire accepted evaluation block without retaining caller aliases.
+        record["evaluations"] = dict(validated.evaluations)
 
     keep_checkpoint = config.checkpoint_retention == "all" or (
         config.checkpoint_retention == "qualifying" and qualified
@@ -433,6 +438,22 @@ def _validate_config(
         or config.expected_validation_tokens <= 0
     ):
         raise ConfigurationError("expected_validation_tokens must be a positive integer")
+    if config.expected_downstream_tokens is not None:
+        if not isinstance(config.expected_downstream_tokens, Mapping):
+            raise ConfigurationError("expected_downstream_tokens must be a mapping")
+        if len(config.expected_downstream_tokens) != 10:
+            raise ConfigurationError(
+                "expected_downstream_tokens must contain exactly 10 domains"
+            )
+        for name, count in config.expected_downstream_tokens.items():
+            if not isinstance(name, str) or not name or name.strip() != name:
+                raise ConfigurationError(
+                    "expected_downstream_tokens keys must be non-empty, trimmed strings"
+                )
+            if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+                raise ConfigurationError(
+                    f"expected_downstream_tokens[{name!r}] must be a positive integer"
+                )
     # Validate the configured contract before launching an expensive TPU job.
     try:
         reference_contract_dict(config.reference_contract)

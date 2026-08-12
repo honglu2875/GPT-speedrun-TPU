@@ -1,0 +1,1363 @@
+{
+  "schema_version": 1,
+  "kind": "fresh10",
+  "name": "fresh10-gpt2-v1",
+  "description": "Ten-domain, document-bounded downstream perplexity diagnostic.",
+  "publication_not_before": "2025-05-01",
+  "prepared_source": {
+    "repository": "quintic/fresh10",
+    "revision": "69427969d58fa128f2295ea111f5f67c4fb66f06"
+  },
+  "tokenizer": {
+    "name": "gpt2",
+    "implementation": "tiktoken 0.11.0",
+    "vocab_size": 50257,
+    "eot_token": 50256,
+    "document_prefix_token": 50256
+  },
+  "format": {
+    "name": "llm.c-gpt2-v1",
+    "header_bytes": 1024,
+    "magic": 20240520,
+    "version": 1,
+    "token_dtype": "little-endian uint16"
+  },
+  "domains": [
+    {
+      "name": "science",
+      "path": "shards/fresh10_science.bin",
+      "url": "https://huggingface.co/datasets/quintic/fresh10/resolve/69427969d58fa128f2295ea111f5f67c4fb66f06/shards/fresh10_science.bin",
+      "tokens": 8196,
+      "scored_tokens": 8192,
+      "bytes": 17416,
+      "sha256": "d05f644b650c335510b56b993a4d51d266ca244cce365cde8e8ebf5b27f61a2c",
+      "documents": [
+        {
+          "id": "axon-diameter-screen",
+          "title": "A high-resolution phenotypic screen identifies regulators of CNS axon diameter in zebrafish",
+          "authors": [
+            "Maria A. Eichel-Vogel",
+            "Daniel Y. H. Soong",
+            "Melody N. Sequeira",
+            "Maya L. A. Ibenfeldt",
+            "Katy L. H. Marshall-Phelps",
+            "Jenea M. Bin",
+            "David A. Lyons"
+          ],
+          "publisher": "PLOS Biology",
+          "source_url": "https://journals.plos.org/plosbiology/article?id=10.1371%2Fjournal.pbio.3003895",
+          "published_date": "2026-07-17",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Creative Commons Attribution 4.0 International",
+            "url": "https://creativecommons.org/licenses/by/4.0/"
+          },
+          "extraction_notes": "PLOS #artText; metadata, references, supporting material, figures, tables, captions, and citation markers removed.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "c3a03da5c5d1691eb6386ba604372959667f1793a38e06664b947448550bf40f",
+          "text_path": "texts/science/axon-diameter-screen.txt",
+          "text_bytes": 59203,
+          "text_sha256": "3d225dda5977a830208ef02228b09358d5f0f4f63cc197877db087ee3b7f7053",
+          "token_offset": 0,
+          "token_count": 2049,
+          "score_offset": 1,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "macromolecules-ai",
+          "title": "What will be the future of computational biology for macromolecules in the era of AI?",
+          "authors": [
+            "Arne Elofsson",
+            "Nir Ben-Tal"
+          ],
+          "publisher": "PLOS Computational Biology",
+          "source_url": "https://journals.plos.org/ploscompbiol/article?id=10.1371%2Fjournal.pcbi.1014467",
+          "published_date": "2026-07-08",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Creative Commons Attribution 4.0 International",
+            "url": "https://creativecommons.org/licenses/by/4.0/"
+          },
+          "extraction_notes": "PLOS #artText; metadata, references, supporting material, figures, tables, captions, and citation markers removed.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "70c2d6cd8e70fb880290370e0ce876bdd6a53e86979fe2b7bdc3839073c1e7e2",
+          "text_path": "texts/science/macromolecules-ai.txt",
+          "text_bytes": 14622,
+          "text_sha256": "275464c344f1ec64dcd3a0c082978e29443d9bbce2c47019555f58ac51447f04",
+          "token_offset": 2049,
+          "token_count": 2049,
+          "score_offset": 2050,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "enzyme-sequence-embeddings",
+          "title": "Mind the gap: An embedding guide to safely travel in sequence space",
+          "authors": [
+            "Adam Wu",
+            "Jakub Lála",
+            "Quentin Trolliet",
+            "Abhinav Rajendran",
+            "Stefano Angioletti-Uberti"
+          ],
+          "publisher": "PLOS Computational Biology",
+          "source_url": "https://journals.plos.org/ploscompbiol/article?id=10.1371%2Fjournal.pcbi.1014433",
+          "published_date": "2026-07-09",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Creative Commons Attribution 4.0 International",
+            "url": "https://creativecommons.org/licenses/by/4.0/"
+          },
+          "extraction_notes": "PLOS #artText; metadata, references, supporting material, figures, tables, captions, and citation markers removed.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "fbed7f035ad695331716246a2d9dfb4502a30ba276c4ffd274266814c96cff6b",
+          "text_path": "texts/science/enzyme-sequence-embeddings.txt",
+          "text_bytes": 60948,
+          "text_sha256": "af128b0b2656402bc70e29afde435fff3c608cadea3ef1d37f8b2af8d7208639",
+          "token_offset": 4098,
+          "token_count": 2049,
+          "score_offset": 4099,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "microbiome-signatures",
+          "title": "Extracting host-specific developmental signatures from longitudinal microbiome data",
+          "authors": [
+            "Balázs Erdős",
+            "Christos Chatzis",
+            "Jonathan Thorsen",
+            "Jakob Stokholm",
+            "Age K. Smilde",
+            "Morten A. Rasmussen",
+            "Evrim Acar"
+          ],
+          "publisher": "PLOS Computational Biology",
+          "source_url": "https://journals.plos.org/ploscompbiol/article?id=10.1371%2Fjournal.pcbi.1014486",
+          "published_date": "2026-07-06",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Creative Commons Attribution 4.0 International",
+            "url": "https://creativecommons.org/licenses/by/4.0/"
+          },
+          "extraction_notes": "PLOS #artText; metadata, references, supporting material, figures, tables, captions, and citation markers removed.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "8ecb538aaeae873321aa0dd786d7c61c6ef92ca792914f08f4c3f1dc0dfdc918",
+          "text_path": "texts/science/microbiome-signatures.txt",
+          "text_bytes": 46231,
+          "text_sha256": "e253362a0d0fca528ea90734a21142d84cbc92016d7988f5ca283a2987b4e632",
+          "token_offset": 6147,
+          "token_count": 2049,
+          "score_offset": 6148,
+          "scored_tokens": 2048
+        }
+      ]
+    },
+    {
+      "name": "medicine",
+      "path": "shards/fresh10_medicine.bin",
+      "url": "https://huggingface.co/datasets/quintic/fresh10/resolve/69427969d58fa128f2295ea111f5f67c4fb66f06/shards/fresh10_medicine.bin",
+      "tokens": 8196,
+      "scored_tokens": 8192,
+      "bytes": 17416,
+      "sha256": "058eb6ee25dbcfa3bc9974b6a2cb464bdcbc13729132e0e5cbf5d7c3a25c9eb6",
+      "documents": [
+        {
+          "id": "pneumonia-hospitalisation",
+          "title": "Prediction of hospitalisation in young children with pneumonia in Malawi: A machine learning-based approach",
+          "authors": [
+            "Patrick Staunton",
+            "Mohammad Adib Makrooni",
+            "Master Chisale",
+            "Billy Nyambolo",
+            "Joseph Wu",
+            "Damien McCarthy",
+            "Mark Ledwidge",
+            "Yasir Bin Nisar",
+            "Chris Watson",
+            "Balwani Mbakaya",
+            "Cathal Seoighe",
+            "Joe Gallagher"
+          ],
+          "publisher": "PLOS Medicine",
+          "source_url": "https://journals.plos.org/plosmedicine/article?id=10.1371%2Fjournal.pmed.1005122",
+          "published_date": "2026-06-09",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Creative Commons Attribution 4.0 International",
+            "url": "https://creativecommons.org/licenses/by/4.0/"
+          },
+          "extraction_notes": "Parsed the PLOS #artText body; retained headings and prose; removed site chrome, article metadata, references, supporting information, figures, tables, captions, and inline citation markers.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "9a03bb7f5d296e0b5a59b11fd208c67a26afceda122049fd82f537ecdb212aae",
+          "text_path": "texts/medicine/pneumonia-hospitalisation.txt",
+          "text_bytes": 42449,
+          "text_sha256": "7a31f7d30a550f696c71a975b850a3ac41fa7dbdd6068a70a9ef76233098b48d",
+          "token_offset": 0,
+          "token_count": 2049,
+          "score_offset": 1,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "lung-allograft-multiomics",
+          "title": "Multi-omics biomarkers of endothelial dysregulation preceding chronic lung allograft dysfunction",
+          "authors": [
+            "Giulia Iacono",
+            "Christina Begka",
+            "Bailey Cardwell",
+            "Carmel Daunt",
+            "Roxanne Chatzis",
+            "Celine Pattaroni",
+            "Alana Butler",
+            "Matthew Macowan",
+            "Bronwyn Levvey",
+            "Gregory I. Snell",
+            "Glen P. Westall",
+            "Benjamin J. Marsland"
+          ],
+          "publisher": "PLOS Medicine",
+          "source_url": "https://journals.plos.org/plosmedicine/article?id=10.1371%2Fjournal.pmed.1004725",
+          "published_date": "2026-06-23",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Creative Commons Attribution 4.0 International",
+            "url": "https://creativecommons.org/licenses/by/4.0/"
+          },
+          "extraction_notes": "Parsed the PLOS #artText body; retained headings and prose; removed site chrome, article metadata, references, supporting information, figures, tables, captions, and inline citation markers.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "00341760ff22aff739bc577c2ed5492a6085bcc90a1e8a40fea7043605caa13b",
+          "text_path": "texts/medicine/lung-allograft-multiomics.txt",
+          "text_bytes": 37873,
+          "text_sha256": "c737ef0d3ad7957da3b2d9605a247f72f769c466c0ac8080121a195495776cf7",
+          "token_offset": 2049,
+          "token_count": 2049,
+          "score_offset": 2050,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "statins-type2-diabetes",
+          "title": "Cardiovascular outcomes and safety associated with statin therapy for primary prevention in older adults with type 2 diabetes",
+          "authors": [
+            "Linda Chan",
+            "Wanchun Xu",
+            "Esther W. Y. Chan",
+            "Eric Yuk Fai Wan"
+          ],
+          "publisher": "PLOS Medicine",
+          "source_url": "https://journals.plos.org/plosmedicine/article?id=10.1371%2Fjournal.pmed.1005136",
+          "published_date": "2026-06-24",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Creative Commons Attribution 4.0 International",
+            "url": "https://creativecommons.org/licenses/by/4.0/"
+          },
+          "extraction_notes": "Parsed the PLOS #artText body; retained headings and prose; removed site chrome, article metadata, references, supporting information, figures, tables, captions, and inline citation markers.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "3312c9e78a4d41b283ede21036c8097abbe9478d49c34ac5edaf1bf4cc5f245b",
+          "text_path": "texts/medicine/statins-type2-diabetes.txt",
+          "text_bytes": 44250,
+          "text_sha256": "4b6b1b1aea19364297dc83136645c45138fdf7121cf0220516f872ab053c8b75",
+          "token_offset": 4098,
+          "token_count": 2049,
+          "score_offset": 4099,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "retinal-neurodegeneration",
+          "title": "Plasma proteomic signatures of early retinal neurodegeneration in diabetes: a multi-cohort study",
+          "authors": [
+            "Huangdong Li",
+            "Ziyu Zhu",
+            "Shaopeng Yang",
+            "Weijing Cheng",
+            "Shaoying Tan",
+            "Zhuoyao Xin",
+            "Lei Zhang",
+            "Zhuoting Zhu",
+            "Shida Chen",
+            "Wenyong Huang",
+            "Wei Wang"
+          ],
+          "publisher": "PLOS Medicine",
+          "source_url": "https://journals.plos.org/plosmedicine/article?id=10.1371%2Fjournal.pmed.1004868",
+          "published_date": "2026-06-02",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Creative Commons Attribution 4.0 International",
+            "url": "https://creativecommons.org/licenses/by/4.0/"
+          },
+          "extraction_notes": "Parsed the PLOS #artText body; retained headings and prose; removed site chrome, article metadata, references, supporting information, figures, tables, captions, and inline citation markers.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "a3aa23259bd3b908a8d1257b8cf1af0462ec5a2ab8b7d13c886f809443dc028b",
+          "text_path": "texts/medicine/retinal-neurodegeneration.txt",
+          "text_bytes": 52835,
+          "text_sha256": "43e6f15e3c5519bdc8809993a92184ab5f6340e1848f21457ac6d54b6c69f996",
+          "token_offset": 6147,
+          "token_count": 2049,
+          "score_offset": 6148,
+          "scored_tokens": 2048
+        }
+      ]
+    },
+    {
+      "name": "software",
+      "path": "shards/fresh10_software.bin",
+      "url": "https://huggingface.co/datasets/quintic/fresh10/resolve/69427969d58fa128f2295ea111f5f67c4fb66f06/shards/fresh10_software.bin",
+      "tokens": 8196,
+      "scored_tokens": 8192,
+      "bytes": 17416,
+      "sha256": "988f1dcd940f074128a28e2865a2ab5b4d7a327d6333487d2c2e495717fbde40",
+      "documents": [
+        {
+          "id": "jax-changelog",
+          "title": "JAX change log through 0.11.0",
+          "authors": [
+            "JAX project contributors"
+          ],
+          "publisher": "JAX project",
+          "source_url": "https://raw.githubusercontent.com/jax-ml/jax/jax-v0.11.0/CHANGELOG.md",
+          "published_date": "2026-07-16",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Apache License 2.0",
+            "url": "https://www.apache.org/licenses/LICENSE-2.0"
+          },
+          "extraction_notes": "Canonical UTF-8 release document from the immutable upstream tag; line endings and horizontal whitespace normalized.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "ae3e67a867779d10159a7b2080db061a3f54a191752d429bf6f7ffd56f0a8f90",
+          "text_path": "texts/software/jax-changelog.txt",
+          "text_bytes": 187187,
+          "text_sha256": "447e5567910d8819ab38648887c3f309a4105df9f8f080d7615fc6513566ffc3",
+          "token_offset": 0,
+          "token_count": 2049,
+          "score_offset": 1,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "python-3146-news",
+          "title": "Python 3.14.6 changelog",
+          "authors": [
+            "Python Software Foundation contributors"
+          ],
+          "publisher": "Python Software Foundation",
+          "source_url": "https://raw.githubusercontent.com/python/cpython/v3.14.6/Misc/NEWS.d/3.14.6.rst",
+          "published_date": "2026-06-10",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Python Software Foundation License Version 2",
+            "url": "https://docs.python.org/3/license.html"
+          },
+          "extraction_notes": "Canonical UTF-8 release document from the immutable upstream tag; line endings and horizontal whitespace normalized.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "132fca6fb51ad437e5003e83eb1d942158715ec04d5c48849ebd990354b6f1dc",
+          "text_path": "texts/software/python-3146-news.txt",
+          "text_bytes": 16632,
+          "text_sha256": "1abfd1a7f5a5c127ea3f61dae43c4b197b5db5c2449f8164c216db2936a9b9f9",
+          "token_offset": 2049,
+          "token_count": 2049,
+          "score_offset": 2050,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "numpy-240-notes",
+          "title": "NumPy 2.4.0 release notes",
+          "authors": [
+            "NumPy developers"
+          ],
+          "publisher": "NumPy project",
+          "source_url": "https://raw.githubusercontent.com/numpy/numpy/v2.4.0/doc/source/release/2.4.0-notes.rst",
+          "published_date": "2025-12-20",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "BSD 3-Clause License",
+            "url": "https://opensource.org/license/bsd-3-clause"
+          },
+          "extraction_notes": "Canonical UTF-8 release document from the immutable upstream tag; line endings and horizontal whitespace normalized.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "ef3fa0a344a5936ee5bca726c42810972716254fd1a46d73fb13c0133ede7adc",
+          "text_path": "texts/software/numpy-240-notes.txt",
+          "text_bytes": 30373,
+          "text_sha256": "a653d4eb0d96f4a4dcd3b8cd31ef3489d1e8040a934b352904e01811d7763abe",
+          "token_offset": 4098,
+          "token_count": 2049,
+          "score_offset": 4099,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "postgresql-18-notes",
+          "title": "PostgreSQL 18 release notes",
+          "authors": [
+            "PostgreSQL Global Development Group"
+          ],
+          "publisher": "PostgreSQL Global Development Group",
+          "source_url": "https://raw.githubusercontent.com/postgres/postgres/REL_18_0/doc/src/sgml/release-18.sgml",
+          "published_date": "2025-09-25",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "PostgreSQL License",
+            "url": "https://www.postgresql.org/about/licence/"
+          },
+          "extraction_notes": "Canonical release-notes SGML from the immutable upstream tag; comments and markup removed, with line endings and horizontal whitespace normalized.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "4e81e9857eef3d9a7a96dbc9b90f8131c486b5c87d9293a0d28d526b2559a930",
+          "text_path": "texts/software/postgresql-18-notes.txt",
+          "text_bytes": 42929,
+          "text_sha256": "b4e8d15299bde25739ab4098eed08344c4428dd7201d7f9caa4f8fe42d1f60bb",
+          "token_offset": 6147,
+          "token_count": 2049,
+          "score_offset": 6148,
+          "scored_tokens": 2048
+        }
+      ]
+    },
+    {
+      "name": "history",
+      "path": "shards/fresh10_history.bin",
+      "url": "https://huggingface.co/datasets/quintic/fresh10/resolve/69427969d58fa128f2295ea111f5f67c4fb66f06/shards/fresh10_history.bin",
+      "tokens": 8196,
+      "scored_tokens": 8192,
+      "bytes": 17416,
+      "sha256": "87361dd6d7a5ad6697c099c99a83731a3629a698d0c95ec60efce58b72bb7035",
+      "documents": [
+        {
+          "id": "dead-sea-scrolls",
+          "title": "Dating ancient manuscripts using radiocarbon and AI-based writing style analysis",
+          "authors": [
+            "Mladen Popović",
+            "Maruf A. Dhali",
+            "Lambert Schomaker",
+            "Johannes van der Plicht",
+            "Kaare Lund Rasmussen",
+            "Jacopo La Nasa",
+            "Ilaria Degano",
+            "Maria Perla Colombini",
+            "Eibert Tigchelaar"
+          ],
+          "publisher": "PLOS ONE",
+          "source_url": "https://journals.plos.org/plosone/article?id=10.1371%2Fjournal.pone.0323185",
+          "published_date": "2025-06-04",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Creative Commons Attribution 4.0 International",
+            "url": "https://creativecommons.org/licenses/by/4.0/"
+          },
+          "extraction_notes": "Parsed the PLOS #artText body; retained headings and prose; removed site chrome, article metadata, references, supporting information, figures, tables, captions, and inline citation markers.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "89111faa35fe27a9852f812785b00f727c97d38303963e63e6684d8329b89c99",
+          "text_path": "texts/history/dead-sea-scrolls.txt",
+          "text_bytes": 28577,
+          "text_sha256": "db6ff1f627762de00ced314e46cbd11b66f79c2ac0736c3b69e392479f4c6b6b",
+          "token_offset": 0,
+          "token_count": 2049,
+          "score_offset": 1,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "thera-eruption",
+          "title": "The Minoan Thera eruption predates Pharaoh Ahmose: Radiocarbon dating of Egyptian 17th to early 18th Dynasty museum objects",
+          "authors": [
+            "Hendrik J. Bruins",
+            "Johannes van der Plicht"
+          ],
+          "publisher": "PLOS ONE",
+          "source_url": "https://journals.plos.org/plosone/article?id=10.1371%2Fjournal.pone.0330702",
+          "published_date": "2025-09-10",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Creative Commons Attribution 4.0 International",
+            "url": "https://creativecommons.org/licenses/by/4.0/"
+          },
+          "extraction_notes": "Parsed the PLOS #artText body; retained headings and prose; removed site chrome, article metadata, references, supporting information, figures, tables, captions, and inline citation markers.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "13f40572100e2766d585d5b8870c995788e76dfff48f2e81a97ad793b1bb89b4",
+          "text_path": "texts/history/thera-eruption.txt",
+          "text_bytes": 114168,
+          "text_sha256": "af44c1df6ce81b1af359d9a4d1069dd210987c27254699c2c918909c58a8e7a8",
+          "token_offset": 2049,
+          "token_count": 2049,
+          "score_offset": 2050,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "mesoamerican-cuisine",
+          "title": "Amorphous carbonized objects and their contribution to reconstructing ancient Mesoamerican cuisine",
+          "authors": [
+            "Clarissa Cagnato",
+            "Nawa Sugiyama",
+            "Laura Longo",
+            "Alessandro Bonetto",
+            "Matteo Parisatto",
+            "Elena Longo",
+            "Marko Prasek",
+            "Giuliana Tromba",
+            "Antonio Marcomini",
+            "Elena Badetti"
+          ],
+          "publisher": "PLOS ONE",
+          "source_url": "https://journals.plos.org/plosone/article?id=10.1371%2Fjournal.pone.0334457",
+          "published_date": "2025-11-19",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Creative Commons Attribution 4.0 International",
+            "url": "https://creativecommons.org/licenses/by/4.0/"
+          },
+          "extraction_notes": "Parsed the PLOS #artText body; retained headings and prose; removed site chrome, article metadata, references, supporting information, figures, tables, captions, and inline citation markers.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "322aa29cd86257969f28277ebe22c22e5b0f9e478bd2f60602123f36a84efe8b",
+          "text_path": "texts/history/mesoamerican-cuisine.txt",
+          "text_bytes": 46151,
+          "text_sha256": "b6826207d968c4b2528f27dcd4baedbea00510f367f33a6fb766d9f99028477e",
+          "token_offset": 4098,
+          "token_count": 2049,
+          "score_offset": 4099,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "mongolian-pastoralism",
+          "title": "3000 yr-old patterns of mobile pastoralism revealed by multiple isotopes and radiocarbon dating of ancient horses from the Mongolian Altai",
+          "authors": [
+            "Antoine Zazzo",
+            "Maël Le Corre",
+            "Nicolas Lazzerini",
+            "Charlotte Marchina",
+            "Noost Bayarkhuu",
+            "Vincent Bernard",
+            "Mathilde Cervel",
+            "Denis Fiorillo",
+            "Dominique Joly",
+            "Michel Lemoine",
+            "Philippe Telouk",
+            "François Thil",
+            "Tsagaan Turbat",
+            "Vincent Balter",
+            "Aurélie Coulon",
+            "Sébastien Lepetz"
+          ],
+          "publisher": "PLOS ONE",
+          "source_url": "https://journals.plos.org/plosone/article?id=10.1371%2Fjournal.pone.0322431",
+          "published_date": "2025-05-07",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Creative Commons Attribution 4.0 International",
+            "url": "https://creativecommons.org/licenses/by/4.0/"
+          },
+          "extraction_notes": "Parsed the PLOS #artText body; retained headings and prose; removed site chrome, article metadata, references, supporting information, figures, tables, captions, and inline citation markers.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "179d38d37afb6b8540d7cfc7c4335caa309376383b51ace7993aed3281255f7e",
+          "text_path": "texts/history/mongolian-pastoralism.txt",
+          "text_bytes": 54822,
+          "text_sha256": "39d79d9eefd38eb9313dd303f81e087116bb49f5025a56c3266102759cff480f",
+          "token_offset": 6147,
+          "token_count": 2049,
+          "score_offset": 6148,
+          "scored_tokens": 2048
+        }
+      ]
+    },
+    {
+      "name": "fiction",
+      "path": "shards/fresh10_fiction.bin",
+      "url": "https://huggingface.co/datasets/quintic/fresh10/resolve/69427969d58fa128f2295ea111f5f67c4fb66f06/shards/fresh10_fiction.bin",
+      "tokens": 8196,
+      "scored_tokens": 8192,
+      "bytes": 17416,
+      "sha256": "c2dda33106944d60c6d0fe8f640770dba98667a0d1951718d893891d74afc2f1",
+      "documents": [
+        {
+          "id": "garden-of-the-gods",
+          "title": "GARDEN OF THE GODS",
+          "authors": [
+            "sprawlingstar"
+          ],
+          "publisher": "SCP Wiki",
+          "source_url": "https://scp-wiki.wikidot.com/garden-of-the-gods",
+          "published_date": "2026-01-01",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Creative Commons Attribution-ShareAlike 3.0 Unported",
+            "url": "https://creativecommons.org/licenses/by-sa/3.0/"
+          },
+          "extraction_notes": "SCP #page-content with site widgets/licensing/navigation removed; deterministic body boundary begins at Item#: 8007, excluding promo cards and isolated footnote/update UI before the case file.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "15618af271897e253d059edbbebe0127dc3ac59860a221da5933e84a5a60dbfb",
+          "text_path": "texts/fiction/garden-of-the-gods.txt",
+          "text_bytes": 31858,
+          "text_sha256": "961e847a08b5a6a5e199938c14d44a88b290d20120e014b2b2745047cd5f8b8b",
+          "token_offset": 0,
+          "token_count": 2049,
+          "score_offset": 1,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "scp-3930-does-not-exist",
+          "title": "SCP-3930 Does Not Exist",
+          "authors": [
+            "badooga"
+          ],
+          "publisher": "SCP Wiki",
+          "source_url": "https://scp-wiki.wikidot.com/scp-3930-does-not-exist",
+          "published_date": "2026-02-06",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Creative Commons Attribution-ShareAlike 3.0 Unported",
+            "url": "https://creativecommons.org/licenses/by-sa/3.0/"
+          },
+          "extraction_notes": "SCP #page-content with site widgets/licensing/navigation removed; deterministic body boundary begins at the first narrative sentence 'You wake up.', excluding duplicate teaser, author box, title, warnings, and navigation.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "3a791ae19b9149e7c5987869de5b33371451ac583160e3df6dfb9c19d00dcf01",
+          "text_path": "texts/fiction/scp-3930-does-not-exist.txt",
+          "text_bytes": 15928,
+          "text_sha256": "2a8be32e5093b28418edf7f07a50135f1f2b4a6efe33417dd36e4f154167964a",
+          "token_offset": 2049,
+          "token_count": 2049,
+          "score_offset": 2050,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "coworker-satan",
+          "title": "MY COWORKER IS FUCKING SATAN",
+          "authors": [
+            "FigaroFigaroFigaro"
+          ],
+          "publisher": "SCP Wiki",
+          "source_url": "https://scp-wiki.wikidot.com/my-coworker-is-fucking-satan",
+          "published_date": "2026-02-05",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Creative Commons Attribution-ShareAlike 3.0 Unported",
+            "url": "https://creativecommons.org/licenses/by-sa/3.0/"
+          },
+          "extraction_notes": "SCP #page-content with hidden code, site widgets/licensing/navigation, title, and author box removed; deterministic body boundary begins at September 30, 2025.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "55065cfbbe99fc8e8737d8912a85736344f85f0c6e20ffd30e0e50ef9de26d6a",
+          "text_path": "texts/fiction/coworker-satan.txt",
+          "text_bytes": 8979,
+          "text_sha256": "69511b466afeaf3447742913155ee5182854cd8eb0fa2975d24de014a957fb4e",
+          "token_offset": 4098,
+          "token_count": 2049,
+          "score_offset": 4099,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "pilares",
+          "title": "Pilares",
+          "authors": [
+            "Din-Bidor"
+          ],
+          "publisher": "SCP Wiki",
+          "source_url": "https://scp-wiki.wikidot.com/pilares",
+          "published_date": "2025-11-01",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Creative Commons Attribution-ShareAlike 3.0 Unported",
+            "url": "https://creativecommons.org/licenses/by-sa/3.0/"
+          },
+          "extraction_notes": "SCP #page-content with site widgets/licensing/navigation removed; full narrative body retained from its opening sentence.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "f1a3d04621fce4ac3c28cd8e8c1c27bbe7456bec787636867bfa896d622178c5",
+          "text_path": "texts/fiction/pilares.txt",
+          "text_bytes": 25860,
+          "text_sha256": "8757337923d001a1a36790c79d664dac2dc39cee48709fa2b0a04aa32069df8b",
+          "token_offset": 6147,
+          "token_count": 2049,
+          "score_offset": 6148,
+          "scored_tokens": 2048
+        }
+      ]
+    },
+    {
+      "name": "government",
+      "path": "shards/fresh10_government.bin",
+      "url": "https://huggingface.co/datasets/quintic/fresh10/resolve/69427969d58fa128f2295ea111f5f67c4fb66f06/shards/fresh10_government.bin",
+      "tokens": 8196,
+      "scored_tokens": 8192,
+      "bytes": 17416,
+      "sha256": "6dbcb488fceea1c29ef81827c9666c6b77653e9915dfaaa7cb439cb0f82b6908",
+      "documents": [
+        {
+          "id": "congressional-commissions",
+          "title": "Congressional Commissions: Overview and Considerations for Congress",
+          "authors": [
+            "Congressional Research Service"
+          ],
+          "publisher": "Congressional Research Service / Library of Congress",
+          "source_url": "https://www.congress.gov/crs_external_products/R/PDF/R40076/R40076.31.pdf",
+          "published_date": "2026-01-21",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "United States government work (public domain in the United States)",
+            "url": "https://www.congress.gov/crs-products"
+          },
+          "extraction_notes": "Converted selected report page ranges [(5, 11)] with pdftohtml XML; retained body/heading font geometry and removed small-print footnotes/references, repeated headers/footers, figures, tables, captions, and sources. Selected pages omit cover, contents, and end matter. Removed the whole sentence containing one identified third-party quotation from the Federal Reserve selection.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "c60acfe912a2bc0676e862cc5fb1815f03f403642bc64088a93b77e3fd8d12f2",
+          "text_path": "texts/government/congressional-commissions.txt",
+          "text_bytes": 15840,
+          "text_sha256": "4f7b215bba71c7c2d114dc7fd364ee9e0c491869c5ce5a4d11e5db75f1856acd",
+          "token_offset": 0,
+          "token_count": 2049,
+          "score_offset": 1,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "federal-reserve-policy",
+          "title": "Federal Reserve: Policy Issues in the 119th Congress",
+          "authors": [
+            "Congressional Research Service"
+          ],
+          "publisher": "Congressional Research Service / Library of Congress",
+          "source_url": "https://www.congress.gov/crs_external_products/R/PDF/R48390/R48390.6.pdf",
+          "published_date": "2026-01-14",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "United States government work (public domain in the United States)",
+            "url": "https://www.congress.gov/crs-products"
+          },
+          "extraction_notes": "Converted selected report page ranges [(4, 15)] with pdftohtml XML; retained body/heading font geometry and removed small-print footnotes/references, repeated headers/footers, figures, tables, captions, and sources. Selected pages omit cover, contents, and end matter. Removed the whole sentence containing one identified third-party quotation from the Federal Reserve selection.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "d2e64a4ef0b7fa8703c8f1cca800cdad00fd432033aef31736e43f4332f2c4bd",
+          "text_path": "texts/government/federal-reserve-policy.txt",
+          "text_bytes": 25821,
+          "text_sha256": "5a7dd92845d25c02764db26e802ae16a37a6c704c96e6af508f86b0c41dfcf7a",
+          "token_offset": 2049,
+          "token_count": 2049,
+          "score_offset": 2050,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "universal-service-fund",
+          "title": "The Universal Service Fund and Related FCC Broadband Programs: Overview and Considerations for Congress",
+          "authors": [
+            "Congressional Research Service"
+          ],
+          "publisher": "Congressional Research Service / Library of Congress",
+          "source_url": "https://www.congress.gov/crs_external_products/R/PDF/R47621/R47621.10.pdf",
+          "published_date": "2026-01-21",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "United States government work (public domain in the United States)",
+            "url": "https://www.congress.gov/crs-products"
+          },
+          "extraction_notes": "Converted selected report page ranges [(5, 6), (8, 15)] with pdftohtml XML; retained body/heading font geometry and removed small-print footnotes/references, repeated headers/footers, figures, tables, captions, and sources. Selected pages omit cover, contents, and end matter. Removed the whole sentence containing one identified third-party quotation from the Federal Reserve selection.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "dcc0a0f2c7dc2023680bbc708a966cc19a381799a37fcec2bce03b8b494cb19b",
+          "text_path": "texts/government/universal-service-fund.txt",
+          "text_bytes": 20761,
+          "text_sha256": "5c8165ce3918dcf98825f604e7142f59adb9fa8ca9ee323df42b8e7e53cb7202",
+          "token_offset": 4098,
+          "token_count": 2049,
+          "score_offset": 4099,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "federal-rd-funding",
+          "title": "Federal Research and Development (R&D) Funding: FY2026",
+          "authors": [
+            "Congressional Research Service"
+          ],
+          "publisher": "Congressional Research Service / Library of Congress",
+          "source_url": "https://www.congress.gov/crs_external_products/R/PDF/R48694/R48694.9.pdf",
+          "published_date": "2025-12-23",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "United States government work (public domain in the United States)",
+            "url": "https://www.congress.gov/crs-products"
+          },
+          "extraction_notes": "Converted selected report page ranges [(5, 18)] with pdftohtml XML; retained body/heading font geometry and removed small-print footnotes/references, repeated headers/footers, figures, tables, captions, and sources. Selected pages omit cover, contents, and end matter. Removed the whole sentence containing one identified third-party quotation from the Federal Reserve selection.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "5308d2523897ac879d9bafe030a217baacc7a586f8c86c5add6bc8122abda812",
+          "text_path": "texts/government/federal-rd-funding.txt",
+          "text_bytes": 20823,
+          "text_sha256": "715e77489fdba951d260835a4c5d53621726f330a3e30e92c0b64e6333cdbd01",
+          "token_offset": 6147,
+          "token_count": 2049,
+          "score_offset": 6148,
+          "scored_tokens": 2048
+        }
+      ]
+    },
+    {
+      "name": "legal",
+      "path": "shards/fresh10_legal.bin",
+      "url": "https://huggingface.co/datasets/quintic/fresh10/resolve/69427969d58fa128f2295ea111f5f67c4fb66f06/shards/fresh10_legal.bin",
+      "tokens": 8196,
+      "scored_tokens": 8192,
+      "bytes": 17416,
+      "sha256": "40891949cca8e35f9c663f4a93ab841ee7f61874a4c0dbb8c39a4b062cc14241",
+      "documents": [
+        {
+          "id": "west-virginia-bpj",
+          "title": "West Virginia v. B. P. J.",
+          "authors": [
+            "Supreme Court of the United States"
+          ],
+          "publisher": "Supreme Court of the United States",
+          "source_url": "https://www.supremecourt.gov/opinions/25pdf/24-43_2b35.pdf",
+          "published_date": "2026-06-30",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Public domain (17 U.S.C. § 105)",
+            "url": "https://www.govinfo.gov/content/pkg/USCODE-2023-title17/html/USCODE-2023-title17-chap1-sec105.htm"
+          },
+          "extraction_notes": "Official opinion PDF extracted page-by-page with pypdf; whitespace and line endings normalized.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "43a1a329994be812c65f8b6f6bfd8c78f746b893b1ae3357510c603d44842fca",
+          "text_path": "texts/legal/west-virginia-bpj.txt",
+          "text_bytes": 158125,
+          "text_sha256": "ba991d6195b4eca09256772de6fe3e06ac301a5725a2dcabac865298c4f1a59c",
+          "token_offset": 0,
+          "token_count": 2049,
+          "score_offset": 1,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "nrsc-fec",
+          "title": "National Republican Senatorial Committee v. Federal Election Commission",
+          "authors": [
+            "Supreme Court of the United States"
+          ],
+          "publisher": "Supreme Court of the United States",
+          "source_url": "https://www.supremecourt.gov/opinions/25pdf/24-621_h315.pdf",
+          "published_date": "2026-06-30",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Public domain (17 U.S.C. § 105)",
+            "url": "https://www.govinfo.gov/content/pkg/USCODE-2023-title17/html/USCODE-2023-title17-chap1-sec105.htm"
+          },
+          "extraction_notes": "Official opinion PDF extracted page-by-page with pypdf; whitespace and line endings normalized.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "2ab561ae2a85eb7f2a37fc875d09b5c5362353d68300a27825fa28317a7d2010",
+          "text_path": "texts/legal/nrsc-fec.txt",
+          "text_bytes": 106740,
+          "text_sha256": "6deb9ad95dd8dafe33130a6c2c292a9d12d639e9a8b9bc78985f1957e38b3e08",
+          "token_offset": 2049,
+          "token_count": 2049,
+          "score_offset": 2050,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "trump-barbara",
+          "title": "Trump v. Barbara",
+          "authors": [
+            "Supreme Court of the United States"
+          ],
+          "publisher": "Supreme Court of the United States",
+          "source_url": "https://www.supremecourt.gov/opinions/25pdf/25-365_new_5if6.pdf",
+          "published_date": "2026-06-30",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Public domain (17 U.S.C. § 105)",
+            "url": "https://www.govinfo.gov/content/pkg/USCODE-2023-title17/html/USCODE-2023-title17-chap1-sec105.htm"
+          },
+          "extraction_notes": "Official opinion PDF extracted page-by-page with pypdf; whitespace and line endings normalized.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "333dc0571f511a0fddd74bd49d3d3b7dabbe83613ae4cfcfae3dbbd823860152",
+          "text_path": "texts/legal/trump-barbara.txt",
+          "text_bytes": 405862,
+          "text_sha256": "2a5a45ea8a16e73a58c565f94ae0e8716d1e4fdbd784c652e3f88d98515e8b0a",
+          "token_offset": 4098,
+          "token_count": 2049,
+          "score_offset": 4099,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "watson-rnc",
+          "title": "Watson v. Republican National Committee",
+          "authors": [
+            "Supreme Court of the United States"
+          ],
+          "publisher": "Supreme Court of the United States",
+          "source_url": "https://www.supremecourt.gov/opinions/25pdf/24-1260_g3cn.pdf",
+          "published_date": "2026-06-29",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Public domain (17 U.S.C. § 105)",
+            "url": "https://www.govinfo.gov/content/pkg/USCODE-2023-title17/html/USCODE-2023-title17-chap1-sec105.htm"
+          },
+          "extraction_notes": "Official opinion PDF extracted page-by-page with pypdf; whitespace and line endings normalized.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "c0e45a7071ac9a5cf7626940d41f11aa037c9e17e02979ae9a418cbfd351deb0",
+          "text_path": "texts/legal/watson-rnc.txt",
+          "text_bytes": 102384,
+          "text_sha256": "60be714edb22dd4b3c9dbf44316bb24ae5edc09d7aeba2150e38fccd09f0829b",
+          "token_offset": 6147,
+          "token_count": 2049,
+          "score_offset": 6148,
+          "scored_tokens": 2048
+        }
+      ]
+    },
+    {
+      "name": "economics",
+      "path": "shards/fresh10_economics.bin",
+      "url": "https://huggingface.co/datasets/quintic/fresh10/resolve/69427969d58fa128f2295ea111f5f67c4fb66f06/shards/fresh10_economics.bin",
+      "tokens": 8196,
+      "scored_tokens": 8192,
+      "bytes": 17416,
+      "sha256": "c2b096367406dfe3f0e8e386ef590d64fa3e0a402ecfa9e0e91930408346e06d",
+      "documents": [
+        {
+          "id": "monetary-policy-report",
+          "title": "Monetary Policy Report – July 2026, recent economic and financial developments",
+          "authors": [
+            "Board of Governors of the Federal Reserve System"
+          ],
+          "publisher": "Board of Governors of the Federal Reserve System",
+          "source_url": "https://www.federalreserve.gov/monetarypolicy/2026-07-mpr-part1.htm",
+          "published_date": "2026-07-10",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Public domain (17 U.S.C. § 105)",
+            "url": "https://www.govinfo.gov/content/pkg/USCODE-2023-title17/html/USCODE-2023-title17-chap1-sec105.htm"
+          },
+          "extraction_notes": "Official Federal Reserve HTML #article body; navigation, figures, tables, forms, sharing widgets, related links, scripts, and styles removed.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "ccc412bb8b25198f093017f2f8f71189e4a0dcb3a38175525566eac5fc34d1b9",
+          "text_path": "texts/economics/monetary-policy-report.txt",
+          "text_bytes": 54647,
+          "text_sha256": "2d5bed4db4a52028c217e4b7a5a24b073eec676a70a47ed748c1aeab4e6a93a0",
+          "token_offset": 0,
+          "token_count": 2049,
+          "score_offset": 1,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "financial-stability-report",
+          "title": "Funding Risks — Financial Stability Report, May 2026",
+          "authors": [
+            "Board of Governors of the Federal Reserve System"
+          ],
+          "publisher": "Board of Governors of the Federal Reserve System",
+          "source_url": "https://www.federalreserve.gov/publications/2026-may-financial-stability-report-funding-risks.htm",
+          "published_date": "2026-05-08",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Public domain (17 U.S.C. § 105)",
+            "url": "https://www.govinfo.gov/content/pkg/USCODE-2023-title17/html/USCODE-2023-title17-chap1-sec105.htm"
+          },
+          "extraction_notes": "Official Federal Reserve HTML #article body; navigation, figures, tables, forms, sharing widgets, related links, scripts, and styles removed.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "9991c7c877f1d3c453d80a0fc3cc4ed199517133a87b6d98dfafcccb90bdd4ad",
+          "text_path": "texts/economics/financial-stability-report.txt",
+          "text_bytes": 13405,
+          "text_sha256": "dbd91464802005161a81f04e40a5f11621998acf0765a0cc2cbe95f0725b0e0e",
+          "token_offset": 2049,
+          "token_count": 2049,
+          "score_offset": 2050,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "household-well-being",
+          "title": "Employment and Job Quality — Economic Well-Being of U.S. Households in 2025",
+          "authors": [
+            "Board of Governors of the Federal Reserve System"
+          ],
+          "publisher": "Board of Governors of the Federal Reserve System",
+          "source_url": "https://www.federalreserve.gov/publications/2026-economic-well-being-of-us-households-in-2025-employment-and-job-quality.htm",
+          "published_date": "2026-05-13",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Public domain (17 U.S.C. § 105)",
+            "url": "https://www.govinfo.gov/content/pkg/USCODE-2023-title17/html/USCODE-2023-title17-chap1-sec105.htm"
+          },
+          "extraction_notes": "Official Federal Reserve HTML #article body; navigation, figures, tables, forms, sharing widgets, related links, scripts, and styles removed.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "a9304fc95646f57975fe96b6cc8a4ea4a72b89d81a7832cb830973a90e0005f6",
+          "text_path": "texts/economics/household-well-being.txt",
+          "text_bytes": 12930,
+          "text_sha256": "542b9856052cc1fd422dd6b61e1c722226e0277158ccd2a0d1aaf9e62c97df79",
+          "token_offset": 4098,
+          "token_count": 2049,
+          "score_offset": 4099,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "supervision-regulation",
+          "title": "Supervisory Developments — Supervision and Regulation Report, June 2026",
+          "authors": [
+            "Board of Governors of the Federal Reserve System"
+          ],
+          "publisher": "Board of Governors of the Federal Reserve System",
+          "source_url": "https://www.federalreserve.gov/publications/2026-june-supervision-and-regulation-report-supervisory-developments.htm",
+          "published_date": "2026-06-11",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Public domain (17 U.S.C. § 105)",
+            "url": "https://www.govinfo.gov/content/pkg/USCODE-2023-title17/html/USCODE-2023-title17-chap1-sec105.htm"
+          },
+          "extraction_notes": "Official Federal Reserve HTML #article body; navigation, figures, tables, forms, sharing widgets, related links, scripts, and styles removed.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "c497b5a701d9a109e3780f8b662cd76a44dd977897cd4f815de250b44f141f6e",
+          "text_path": "texts/economics/supervision-regulation.txt",
+          "text_bytes": 20454,
+          "text_sha256": "88987c044d83e11eff67db58fbf5c5b264aa6c833770a0391e3217eb3a1561fa",
+          "token_offset": 6147,
+          "token_count": 2049,
+          "score_offset": 6148,
+          "scored_tokens": 2048
+        }
+      ]
+    },
+    {
+      "name": "climate",
+      "path": "shards/fresh10_climate.bin",
+      "url": "https://huggingface.co/datasets/quintic/fresh10/resolve/69427969d58fa128f2295ea111f5f67c4fb66f06/shards/fresh10_climate.bin",
+      "tokens": 8196,
+      "scored_tokens": 8192,
+      "bytes": 17416,
+      "sha256": "d2f96a1cb771641610761ee5c461ce81823d3826766a568ed9ab3db4d727a815",
+      "documents": [
+        {
+          "id": "urban-thermal-inequity",
+          "title": "Urban thermal inequity: Advancing thermal justice transitions for vulnerable low-income populations",
+          "authors": [
+            "Konstantina Vasilakopoulou",
+            "Ansar Khan",
+            "Priyadarsini Rajagopalan",
+            "Samantha Wijewardane",
+            "Matthaios Santamouris"
+          ],
+          "publisher": "PLOS Climate",
+          "source_url": "https://journals.plos.org/climate/article?id=10.1371%2Fjournal.pclm.0000968",
+          "published_date": "2026-06-18",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Creative Commons Attribution 4.0 International",
+            "url": "https://creativecommons.org/licenses/by/4.0/"
+          },
+          "extraction_notes": "Parsed the PLOS #artText body; retained headings and prose; removed site chrome, article metadata, references, supporting information, figures, tables, captions, and inline citation markers.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "33598243499fa41cc91527b35c9e9ffac126eb4dc65b608543a1e415488f4cc4",
+          "text_path": "texts/climate/urban-thermal-inequity.txt",
+          "text_bytes": 32116,
+          "text_sha256": "b96796c2b75fe646183bc2e43627e6b0701adc1cddd0fb129cd5584cde66328a",
+          "token_offset": 0,
+          "token_count": 2049,
+          "score_offset": 1,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "climate-hygiene-roadmap",
+          "title": "Climate change, hygiene, and health: A research roadmap for climate adaptation",
+          "authors": [
+            "Jessica Gerard",
+            "Lauren D’Mello-Guyett",
+            "Jane Falconer",
+            "Camille Heylen",
+            "Sari Kovats",
+            "Robert Dreibelbis"
+          ],
+          "publisher": "PLOS Climate",
+          "source_url": "https://journals.plos.org/climate/article?id=10.1371%2Fjournal.pclm.0000907",
+          "published_date": "2026-05-11",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Creative Commons Attribution 4.0 International",
+            "url": "https://creativecommons.org/licenses/by/4.0/"
+          },
+          "extraction_notes": "Parsed the PLOS #artText body; retained headings and prose; removed site chrome, article metadata, references, supporting information, figures, tables, captions, and inline citation markers.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "5dda37cf54ccccc8004d2da8b5ee0c0e5804c108e68b8d00f4ed4a3d8cee6dec",
+          "text_path": "texts/climate/climate-hygiene-roadmap.txt",
+          "text_bytes": 32158,
+          "text_sha256": "b757467898d6b2abc50c40f852b90b77669beb9d116a31d5411faf823c1b3f07",
+          "token_offset": 2049,
+          "token_count": 2049,
+          "score_offset": 2050,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "india-post-ar6",
+          "title": "A post-AR6 update on observed and projected climate change in India",
+          "authors": [
+            "Chirag Dhara",
+            "Aditi Deshpande",
+            "Mathew Koll Roxy",
+            "Padmini Dalpadado",
+            "Mandira Singh Shrestha"
+          ],
+          "publisher": "PLOS Climate",
+          "source_url": "https://journals.plos.org/climate/article?id=10.1371%2Fjournal.pclm.0000724",
+          "published_date": "2025-11-20",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Creative Commons Attribution 4.0 International",
+            "url": "https://creativecommons.org/licenses/by/4.0/"
+          },
+          "extraction_notes": "Parsed the PLOS #artText body; retained headings and prose; removed site chrome, article metadata, references, supporting information, figures, tables, captions, and inline citation markers.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "2eb33e7e7d7b5689942e88d141747e66d4bb554028238be8f1bb4a4a784b906c",
+          "text_path": "texts/climate/india-post-ar6.txt",
+          "text_bytes": 56388,
+          "text_sha256": "6e3666c2e317e37b37f83c345b3aee815de74cac676efd86463c05d907cb67d7",
+          "token_offset": 4098,
+          "token_count": 2049,
+          "score_offset": 4099,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "multidecadal-variability",
+          "title": "Comparison of multidecadal variability in climate reanalyses and global models",
+          "authors": [
+            "Andrew Westgate",
+            "Sergey Kravtsov"
+          ],
+          "publisher": "PLOS Climate",
+          "source_url": "https://journals.plos.org/climate/article?id=10.1371%2Fjournal.pclm.0000519",
+          "published_date": "2025-10-07",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Creative Commons Attribution 4.0 International",
+            "url": "https://creativecommons.org/licenses/by/4.0/"
+          },
+          "extraction_notes": "Parsed the PLOS #artText body; retained headings and prose; removed site chrome, article metadata, references, supporting information, figures, tables, captions, and inline citation markers.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "5c53c63948ea1b4a9f38852ea5cc0431f008bc4add05ba279f9821aa0e81c0df",
+          "text_path": "texts/climate/multidecadal-variability.txt",
+          "text_bytes": 61093,
+          "text_sha256": "29359eb52c5da1c39dd4b69d0ae28e6e986c5c1ab9b24ae238cb195621f1d6a7",
+          "token_offset": 6147,
+          "token_count": 2049,
+          "score_offset": 6148,
+          "scored_tokens": 2048
+        }
+      ]
+    },
+    {
+      "name": "education",
+      "path": "shards/fresh10_education.bin",
+      "url": "https://huggingface.co/datasets/quintic/fresh10/resolve/69427969d58fa128f2295ea111f5f67c4fb66f06/shards/fresh10_education.bin",
+      "tokens": 8196,
+      "scored_tokens": 8192,
+      "bytes": 17416,
+      "sha256": "eba31904e8c5a841c83d369aded3958c40a542e6014b682a78ccd1f4bbeb6c84",
+      "documents": [
+        {
+          "id": "sports-ed-dual-path",
+          "title": "A dual-path framework for enhancing student engagement and learning outcomes in sports education",
+          "authors": [
+            "Guifeng Zheng",
+            "Yanting Wang",
+            "Juan Du"
+          ],
+          "publisher": "PLOS ONE",
+          "source_url": "https://journals.plos.org/plosone/article?id=10.1371%2Fjournal.pone.0345809",
+          "published_date": "2026-03-25",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Creative Commons Attribution 4.0 International",
+            "url": "https://creativecommons.org/licenses/by/4.0/"
+          },
+          "extraction_notes": "Parsed the PLOS #artText body; retained headings and prose; removed site chrome, article metadata, references, supporting information, figures, tables, captions, and inline citation markers.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "857a4ca4822d0a40060c31300238ae00ee78c3f8fc6cb5dec4606ec2b95a629d",
+          "text_path": "texts/education/sports-ed-dual-path.txt",
+          "text_bytes": 44441,
+          "text_sha256": "477051109e59308fbcff57bc98d2daa9d848af7733ad4eb9d3299ce97489d25c",
+          "token_offset": 0,
+          "token_count": 2049,
+          "score_offset": 1,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "online-learning-cognitive-load",
+          "title": "Cognitive load and pedagogical tension in multi-platform online learning: Evidence from Chinese higher education",
+          "authors": [
+            "Xiaoqin Qiu",
+            "Nengsheng Qiu"
+          ],
+          "publisher": "PLOS ONE",
+          "source_url": "https://journals.plos.org/plosone/article?id=10.1371%2Fjournal.pone.0347566",
+          "published_date": "2026-04-21",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Creative Commons Attribution 4.0 International",
+            "url": "https://creativecommons.org/licenses/by/4.0/"
+          },
+          "extraction_notes": "Parsed the PLOS #artText body; retained headings and prose; removed site chrome, article metadata, references, supporting information, figures, tables, captions, and inline citation markers.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "715a66fcd0054dd606c1296fdd9447017edf4e4155072100d751059c939c1ddd",
+          "text_path": "texts/education/online-learning-cognitive-load.txt",
+          "text_bytes": 47003,
+          "text_sha256": "010a11775132a51c866909a51848ea9ac9e6e71d403222d65ae2045e732bde19",
+          "token_offset": 2049,
+          "token_count": 2049,
+          "score_offset": 2050,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "genai-design-education",
+          "title": "Teacher support for generative AI use and design learning outcomes in fashion design education",
+          "authors": [
+            "Zhiyi Zhang"
+          ],
+          "publisher": "PLOS ONE",
+          "source_url": "https://journals.plos.org/plosone/article?id=10.1371%2Fjournal.pone.0347428",
+          "published_date": "2026-05-06",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Creative Commons Attribution 4.0 International",
+            "url": "https://creativecommons.org/licenses/by/4.0/"
+          },
+          "extraction_notes": "Parsed the PLOS #artText body; retained headings and prose; removed site chrome, article metadata, references, supporting information, figures, tables, captions, and inline citation markers.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "817a1de255395f7372f8e12cf4753c56639883db569a3362bb425fe1421a9465",
+          "text_path": "texts/education/genai-design-education.txt",
+          "text_bytes": 76686,
+          "text_sha256": "c862698bcac3ffe014c645860e157b19a1e70d8183acf9b8d8fd7929955b80e6",
+          "token_offset": 4098,
+          "token_count": 2049,
+          "score_offset": 4099,
+          "scored_tokens": 2048
+        },
+        {
+          "id": "student-achievement-ml",
+          "title": "What factors enhance students' achievement? A machine learning and interpretable methods approach",
+          "authors": [
+            "Hui Mao",
+            "Ribesh Khanal",
+            "ChengZhang Qu",
+            "HuaFeng Kong",
+            "TingYao Jiang"
+          ],
+          "publisher": "PLOS ONE",
+          "source_url": "https://journals.plos.org/plosone/article?id=10.1371%2Fjournal.pone.0323345",
+          "published_date": "2025-05-16",
+          "retrieved_date": "2026-08-12",
+          "license": {
+            "name": "Creative Commons Attribution 4.0 International",
+            "url": "https://creativecommons.org/licenses/by/4.0/"
+          },
+          "extraction_notes": "Parsed the PLOS #artText body; retained headings and prose; removed site chrome, article metadata, references, supporting information, figures, tables, captions, and inline citation markers.",
+          "quality": {
+            "scored_prefix_manual_audit": "passed",
+            "automated_head_checks": "no CSS markers; plausible whitespace; at most two 36+ letter runs"
+          },
+          "raw_sha256": "c746f674425e16987394c2b3ec748c7d4acb6875e9409a3d6f5197a92129c070",
+          "text_path": "texts/education/student-achievement-ml.txt",
+          "text_bytes": 61842,
+          "text_sha256": "d7f8704483ff96612e2d46c7ac716b1624a7580d6dd3ef5a77a8b32199492e04",
+          "token_offset": 6147,
+          "token_count": 2049,
+          "score_offset": 6148,
+          "scored_tokens": 2048
+        }
+      ]
+    }
+  ]
+}

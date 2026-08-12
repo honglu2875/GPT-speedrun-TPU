@@ -14,7 +14,7 @@ from typing import Callable
 from harness.doctor import CheckResult
 
 from .config import repo_root
-from .data import DataError, verify_dataset
+from .data import DataError, verify_dataset, verify_fresh10
 
 
 _EXPECTED_RUNTIME = {"jax": "0.11.0", "jaxlib": "0.11.0", "libtpu": "0.0.44.1"}
@@ -187,11 +187,26 @@ def check_prepared_data(path: Path, profile: str) -> CheckResult:
         prepared = verify_dataset(manifest, path, train_shards=shards, verify_hash=True)
     except (DataError, OSError) as exc:
         return CheckResult("dataset", "warning", str(exc), "run `speedrun prepare`")
+    fresh_detail = ""
+    if profile == "official":
+        try:
+            downstream = verify_fresh10(path, verify_hash=True)
+        except (DataError, OSError) as exc:
+            return CheckResult(
+                "dataset",
+                "warning",
+                f"FineWeb is ready, but Fresh10 is not: {exc}",
+                "run `speedrun prepare --profile official`",
+            )
+        fresh_detail = (
+            f" + Fresh10 {len(downstream.domains)} domains / "
+            f"{downstream.scored_tokens:,} scored"
+        )
     return CheckResult(
         "dataset",
         "ok",
         f"{prepared.name}: {prepared.train_tokens:,} train + "
-        f"{prepared.validation_tokens:,} validation tokens",
+        f"{prepared.validation_tokens:,} validation tokens{fresh_detail}",
     )
 
 

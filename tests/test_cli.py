@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from speedrun import cli
 from speedrun.config import ConfigError, LocalConfig
-from speedrun.data import PreparedDataset
+from speedrun.data import Fresh10Domain, PreparedDataset, PreparedFresh10
 
 
 class CliTests(unittest.TestCase):
@@ -21,6 +21,8 @@ class CliTests(unittest.TestCase):
             ["--out", "/tmp/elsewhere"],
             ["--prof=smoke"],
             ["--data-f", "raw"],
+            ["--downstream-manifest", "other.json"],
+            ["--down", "other.json"],
         ):
             with self.subTest(arguments=arguments), self.assertRaisesRegex(
                 ConfigError, "harness-controlled|controlled by the harness"
@@ -102,6 +104,70 @@ class CliTests(unittest.TestCase):
         self.assertEqual(provenance["train_files"], ["train-1.bin"])
         self.assertEqual(provenance["validation_prefix_tokens"], 16)
         self.assertNotIn("/dev/shm", str(provenance))
+
+    def test_fresh10_provenance_records_stable_domain_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "data" / "manifests" / "fresh10.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text("{}", encoding="utf-8")
+            prepared = PreparedDataset(
+                name="tiny",
+                root=Path("/dev/shm"),
+                manifest_path=manifest,
+                manifest_sha256="a" * 64,
+                train_files=(Path("/dev/shm/train.bin"),),
+                validation_files=(Path("/dev/shm/val.bin"),),
+                train_tokens=10,
+                validation_tokens=10,
+                validation_prefix_tokens=8,
+            )
+            domain = Fresh10Domain(
+                name="science",
+                path=Path("/dev/shm/fresh10-science.bin"),
+                token_count=8196,
+                scored_tokens=8192,
+                sha256="b" * 64,
+                documents=(),
+            )
+            fresh10 = PreparedFresh10(
+                name="fresh10-v1",
+                root=Path("/dev/shm"),
+                manifest_path=manifest,
+                manifest_sha256="c" * 64,
+                domains=(domain,),
+            )
+            provenance = cli._data_provenance(
+                prepared,
+                profile="official",
+                integrity="sha256",
+                repo=root,
+                fresh10=fresh10,
+            )["fresh10"]
+        self.assertEqual(provenance["scored_tokens"], 8192)
+        self.assertEqual(provenance["domains"]["science"]["sha256"], "b" * 64)
+        self.assertNotIn("/dev/shm", str(provenance))
+
+    def test_verify_recovers_recorded_fresh10_contract(self) -> None:
+        record = {
+            "provenance": {
+                "fresh10": {
+                    "domains": {
+                        "science": {"scored_tokens": 8_192},
+                        "legal": {"scored_tokens": 4_096},
+                    }
+                }
+            }
+        }
+        self.assertEqual(
+            cli._recorded_downstream_tokens(record),
+            {"science": 8_192, "legal": 4_096},
+        )
+        self.assertIsNone(cli._recorded_downstream_tokens({"provenance": {}}))
+        with self.assertRaisesRegex(cli.HarnessError, "invalid domain row"):
+            cli._recorded_downstream_tokens(
+                {"provenance": {"fresh10": {"domains": {"science": {"scored_tokens": 0}}}}}
+            )
 
 
 if __name__ == "__main__":

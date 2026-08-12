@@ -96,3 +96,23 @@ this project's code; it does not replace the corpus terms. The prepared shard
 bytes are pinned exactly, but the prepared repository does not identify an
 immutable raw-corpus or preprocessing-code revision, so that earlier lineage is
 recorded as upstream-claimed rather than independently reconstructed here.
+
+## Fresh10 diagnostic
+
+Official preparation also downloads `fresh10`, a diagnostic-only temporal
+out-of-distribution set hosted in the public
+[`quintic/fresh10`](https://huggingface.co/datasets/quintic/fresh10) dataset
+repository. Its checked-in manifest pins an immutable Hub revision and the
+SHA-256 of every domain shard. A shard contains four independent recent
+documents; each span stores one GPT-2 end-of-text context token followed by
+exactly 2,048 scored tokens. Evaluation therefore scores 8,192 targets per
+domain and 81,920 overall without allowing a target to cross a source boundary.
+
+The ten fixed domains are science, medicine, software, history, fiction,
+government, legal, economics, climate, and education. Per-document metadata in
+the manifest includes title, publisher, source and license URLs, publication and
+retrieval dates, raw/canonical text hashes, and exact token offsets. Licenses
+remain per source—this mixed collection has no single replacement license—and
+the repository's Apache-2.0 license covers code only. The Hub dataset card lists
+attribution and reuse obligations. Fresh10 loss and perplexity are reported per
+domain and as a macro diagnostic; they never affect qualification.

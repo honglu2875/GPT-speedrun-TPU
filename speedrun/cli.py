@@ -39,10 +39,14 @@ from .config import (
 )
 from .data import (
     DataError,
+    FRESH10_DOMAINS,
+    PreparedFresh10,
     PreparedDataset,
     prepare as prepare_data,
+    prepare_fresh10,
     sha256_file,
     verify_dataset,
+    verify_fresh10,
 )
 from .doctor import data_selection, environment_checks
 
@@ -296,6 +300,19 @@ def command_prepare(args: argparse.Namespace) -> int:
             timeout=args.timeout,
         )
     _print_prepared(prepared, style)
+    if proposed.data_profile == "official":
+        style.heading("Fresh-domain diagnostic")
+        if args.check_only:
+            fresh10 = verify_fresh10(data_path)
+        else:
+            fresh10 = prepare_fresh10(
+                data_path,
+                offline=args.offline,
+                force=args.force,
+                progress=_progress_reporter(style),
+                timeout=args.timeout,
+            )
+        _print_fresh10(fresh10, style)
     return 0
 
 
@@ -351,6 +368,14 @@ def command_run(args: argparse.Namespace) -> int:
     else:
         style.note("SHA-256 scan skipped; headers and exact shard selection still checked")
 
+    fresh10: PreparedFresh10 | None = None
+    if profile == "official":
+        fresh10 = verify_fresh10(data_path, verify_hash=True)
+        style.ok(
+            f"{fresh10.name}: {len(fresh10.domains)} domains / "
+            f"{fresh10.scored_tokens:,} scored tokens"
+        )
+
     dataset_id, tokenizer_id = _data_identity(profile)
     passthrough = [
         "--data-format",
@@ -366,6 +391,9 @@ def command_run(args: argparse.Namespace) -> int:
         passthrough.extend(("--train-data", str(train_file)))
     for validation_file in prepared.validation_files:
         passthrough.extend(("--val-data", str(validation_file)))
+    if fresh10 is not None:
+        passthrough.extend(("--downstream-manifest", str(fresh10.manifest_path)))
+        passthrough.extend(("--downstream-root", str(fresh10.root)))
     forwarded = list(args.trainer_args)
     if forwarded and forwarded[0] == "--":
         forwarded.pop(0)
@@ -389,6 +417,11 @@ def command_run(args: argparse.Namespace) -> int:
             expected_validation_tokens=(
                 prepared.validation_prefix_tokens if profile == "official" else None
             ),
+            expected_downstream_tokens=(
+                {domain.name: domain.scored_tokens for domain in fresh10.domains}
+                if fresh10 is not None
+                else None
+            ),
             passthrough_args=tuple(passthrough),
             reference_contract=reference,
             checkpoint_retention=retention,
@@ -398,6 +431,7 @@ def command_run(args: argparse.Namespace) -> int:
                 profile=profile,
                 integrity="headers+size" if args.skip_data_check else "sha256",
                 repo=root,
+                fresh10=fresh10,
             ),
         )
     )
@@ -407,6 +441,14 @@ def command_run(args: argparse.Namespace) -> int:
     style.heading("Recorded result")
     print(f"  {marker}  loss {metrics['validation_loss']:.4f}  target ≤ {target_loss:.4f}")
     print(f"  train {metrics['train_seconds']:.3f}s  tokens {metrics['tokens_processed']:,}")
+    evaluations = outcome.record.get("evaluations")
+    if isinstance(evaluations, dict):
+        fresh = evaluations.get("fresh10")
+        if isinstance(fresh, dict):
+            print(
+                f"  fresh10 macro loss {float(fresh['macro_loss']):.4f}  "
+                f"ppl {float(fresh['macro_perplexity']):.2f}"
+            )
     print(f"  run {outcome.run_id}\n")
     return 0
 
@@ -426,11 +468,17 @@ def command_verify(args: argparse.Namespace) -> int:
         str(record["profile"]) if record is not None else config.default_profile
     )
     reference = _reference_contract(profile) if track == "sample_efficiency" else None
+    expected_downstream = (
+        _recorded_downstream_tokens(record)
+        if profile == "official" and record is not None
+        else None
+    )
     result = verify_run(
         run_dir,
         track=track,
         reference_contract=reference,
         expected_validation_tokens=10_485_760 if profile == "official" else None,
+        expected_downstream_tokens=expected_downstream,
     )
     if record is not None:
         stdout_sha256 = sha256_file(run_dir / "stdout.log")
@@ -661,6 +709,13 @@ def _print_prepared(prepared: PreparedDataset, style: Style) -> None:
     print(f"  fixed prefix   {prepared.validation_prefix_tokens:,} validation predictions")
 
 
+def _print_fresh10(prepared: PreparedFresh10, style: Style) -> None:
+    style.ok(f"fresh10 ready at {prepared.root}")
+    print(f"  manifest       sha256:{prepared.manifest_sha256[:12]}")
+    print(f"  domains        {len(prepared.domains)} ({', '.join(FRESH10_DOMAINS)})")
+    print(f"  scored tokens  {prepared.scored_tokens:,} total")
+
+
 def _reference_contract(profile: str) -> ReferenceContract:
     dataset_id, tokenizer_id = _data_identity(profile)
     models: dict[str, dict[str, Any]] = {
@@ -726,6 +781,7 @@ def _data_provenance(
     profile: str,
     integrity: str,
     repo: Path,
+    fresh10: PreparedFresh10 | None = None,
 ) -> dict[str, Any]:
     try:
         manifest_path = prepared.manifest_path.resolve().relative_to(repo.resolve()).as_posix()
@@ -734,7 +790,7 @@ def _data_provenance(
     manifest_file_sha256 = (
         sha256_file(prepared.manifest_path) if prepared.manifest_path.is_file() else None
     )
-    return {
+    result: dict[str, Any] = {
         "dataset": {
             "name": prepared.name,
             "profile": profile,
@@ -751,6 +807,58 @@ def _data_provenance(
             "validation_prefix_tokens": prepared.validation_prefix_tokens,
         }
     }
+    if fresh10 is not None:
+        try:
+            fresh_manifest_path = (
+                fresh10.manifest_path.resolve().relative_to(repo.resolve()).as_posix()
+            )
+        except ValueError:
+            fresh_manifest_path = str(fresh10.manifest_path.resolve())
+        result["fresh10"] = {
+            "name": fresh10.name,
+            "manifest": {
+                "path": fresh_manifest_path,
+                "sha256": sha256_file(fresh10.manifest_path),
+                "canonical_sha256": fresh10.manifest_sha256,
+            },
+            "integrity": "sha256",
+            "scored_tokens": fresh10.scored_tokens,
+            "domains": {
+                domain.name: {
+                    "file": domain.path.name,
+                    "sha256": domain.sha256,
+                    "scored_tokens": domain.scored_tokens,
+                }
+                for domain in fresh10.domains
+            },
+        }
+    return result
+
+
+def _recorded_downstream_tokens(record: dict[str, Any]) -> dict[str, int] | None:
+    """Recover the Fresh10 identity/count contract captured for a prior run."""
+
+    provenance = record.get("provenance")
+    fresh10 = provenance.get("fresh10") if isinstance(provenance, dict) else None
+    domains = fresh10.get("domains") if isinstance(fresh10, dict) else None
+    if domains is None:
+        return None
+    if not isinstance(domains, dict):
+        raise HarnessError("recorded Fresh10 provenance has invalid domains")
+    result: dict[str, int] = {}
+    for name, row in domains.items():
+        count = row.get("scored_tokens") if isinstance(row, dict) else None
+        if (
+            not isinstance(name, str)
+            or not name
+            or name.strip() != name
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count <= 0
+        ):
+            raise HarnessError("recorded Fresh10 provenance has an invalid domain row")
+        result[name] = count
+    return result
 
 
 def _ensure_artifacts_inside_repo(path: Path, root: Path) -> None:
@@ -776,6 +884,9 @@ def _reject_reserved_trainer_args(arguments: Sequence[str]) -> None:
         "--data-format",
         "--dataset-id",
         "--tokenizer-id",
+        "--downstream-manifest",
+        "--downstream-root",
+        "--downstream-data",
         "--color",
     }
     for argument in arguments:

@@ -64,7 +64,7 @@ are never timed.
 |---|---:|---|
 | `smoke` | generated locally | CPU/CI end-to-end checks |
 | `dev` | 100M train + 100M validation tokens (~400 MB cached) | quick TPU iteration |
-| `official` | 900M train + 100M validation tokens (~2.0 GB cached) | record attempts |
+| `official` | 900M train + 100M validation tokens, plus Fresh10 (~2.0 GB cached) | record attempts |
 
 Official evaluation covers exactly the first 10,485,760 validation predictions.
 The harness requires official result events to report that exact coverage;
@@ -103,12 +103,41 @@ the TPU and transfer only after timed training, so retaining the complete curve
 does not add a synchronization to every step. The harness records its SHA-256
 for later collation across runs.
 
+The reference also writes `validation.csv`. On the official profile it probes
+the first eight validation batches every 250 optimizer steps by default, then
+records the exact canonical validation as its final row. Probe synchronization
+and evaluation are included in `train_seconds`; the final canonical evaluation
+is not. Both training and evaluation executables compile once on synthetic
+zero-valued inputs before timing. Use `--val-every 0` to disable probes, or
+`--val-every N --val-probe-batches M` to change their cadence and prefix size.
+Smoke and development runs do not probe unless explicitly enabled.
+
 The reference is intentionally a readable baseline. A 20-step, official-shape
 calibration on this TPU v4-8 sustained about **351k tokens/s** after compilation
 (roughly 302 estimated TFLOP/s and 27% analytic MFU). Its current 19,073-step
 schedule processes about 625M tokens and is not yet claimed to reach 3.28; use
 it to measure the machine while optimized entries and a target-capable schedule
 are developed.
+
+### Fresh-domain diagnostic
+
+The canonical FineWeb validation loss remains the only qualification metric. A
+separate `fresh10` diagnostic covers ten tiny, temporally fresh domains
+with exactly 8,192 scored GPT-2 tokens each: science, medicine, software,
+history, open-licensed fiction, government, legal, economics, climate, and
+education. Source documents
+are published after the pinned FineWeb snapshot, license-audited, cleaned by
+a versioned deterministic recipe, and frozen by URL/revision plus SHA-256.
+
+`fresh10` reports each domain independently and a macro-average beside FineWeb.
+It does not change qualification, and “fresh” means a strong temporal contamination
+control rather than a proof that no equivalent passage ever appeared online.
+The one-file trainer accepts the frozen set with
+`--downstream-manifest data/manifests/fresh10.json --downstream-root PATH`.
+It reuses one fixed-shape masked evaluation executable, excludes padding and
+cross-document targets, and writes the domain rows plus `fresh10_macro` to
+`validation.csv`. Repeat `--downstream-data DOMAIN=PATH` for small standalone
+pretokenized documents outside the canonical set.
 
 Useful commands:
 

@@ -61,8 +61,19 @@ not inspect real training or validation tokens.
 Immediately before timing, the submission restores its declared initial state
 and random generator. The timed region covers every real training step and its
 input transfer. It ends only after the final device result has been synchronized
-with the host (for example, using `jax.block_until_ready`). Evaluation and
-checkpoint serialization follow outside the timed region.
+with the host (for example, using `jax.block_until_ready`). Any periodic
+validation performed between optimizer steps is part of the timed region;
+submissions must synchronize the preceding training work before timing such a
+probe. The canonical final evaluation and checkpoint serialization follow
+outside the timed region.
+
+Official reference runs also evaluate the versioned `fresh10` diagnostic after
+training: ten domains with exactly 8,192 scored GPT-2 tokens apiece. Document
+boundaries are reset and masked so no target crosses sources. Reports preserve
+each domain's loss, perplexity, scored-token count, and evaluation time, plus
+the arithmetic mean of domain losses (and its exponentiated perplexity). These
+scores appear beside FineWeb for diagnosis only; they never affect the 3.28
+qualification threshold or either track's ordering.
 
 Each official run receives a fresh persistent compilation-cache directory.
 Reports include both synchronized training time and cold process wall time.

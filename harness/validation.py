@@ -18,6 +18,11 @@ RESULT_PREFIX = "SPEEDRUN_RESULT="
 SCHEMA_VERSION = 1
 MAX_RESULT_BYTES = 1_000_000
 _ARTIFACT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+FRESH10_DOMAIN_COUNT = 10
+FRESH10_TOKENS_PER_DOMAIN = 8_192
+FRESH10_TOTAL_TOKENS = FRESH10_DOMAIN_COUNT * FRESH10_TOKENS_PER_DOMAIN
+_EVALUATION_REL_TOLERANCE = 1.0e-6
+_EVALUATION_ABS_TOLERANCE = 1.0e-9
 
 
 def parse_result_line(stdout: str) -> dict[str, Any]:
@@ -123,6 +128,190 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _expected_downstream_contract(
+    expected_tokens: Any,
+) -> dict[str, int] | None:
+    """Normalize an optional caller-owned Fresh10 identity/count contract."""
+
+    token_contract: dict[str, int] | None = None
+    if expected_tokens is not None:
+        if not isinstance(expected_tokens, Mapping):
+            raise ResultValidationError("expected_downstream_tokens must be a mapping")
+        token_contract = {}
+        for name, count in expected_tokens.items():
+            if not isinstance(name, str) or not name or name.strip() != name:
+                raise ResultValidationError(
+                    "expected_downstream_tokens keys must be non-empty, trimmed strings"
+                )
+            token_contract[name] = _positive_integer(
+                count, f"expected_downstream_tokens[{name!r}]"
+            )
+        if len(token_contract) != FRESH10_DOMAIN_COUNT:
+            raise ResultValidationError(
+                f"expected_downstream_tokens must contain exactly {FRESH10_DOMAIN_COUNT} domains"
+            )
+
+    return token_contract
+
+
+def _evaluation_row(
+    value: Any,
+    name: str,
+    *,
+    expected_tokens: int | None = None,
+    canonical: bool = False,
+) -> tuple[dict[str, Any], float, int, float]:
+    row = _plain_object(value, name)
+    loss = _finite_number(row.get("loss"), f"{name}.loss")
+    perplexity = _finite_number(row.get("perplexity"), f"{name}.perplexity")
+    if perplexity <= 0.0:
+        raise ResultValidationError(f"{name}.perplexity must be greater than zero")
+    try:
+        expected_perplexity = math.exp(loss)
+    except OverflowError as exc:
+        raise ResultValidationError(f"{name}.loss is too large for finite perplexity") from exc
+    _require_close(perplexity, expected_perplexity, f"{name}.perplexity")
+    scored_tokens = _positive_integer(row.get("scored_tokens"), f"{name}.scored_tokens")
+    seconds = _finite_number(row.get("seconds"), f"{name}.seconds")
+    if canonical and row.get("canonical") is not True:
+        raise ResultValidationError(f"{name}.canonical must be true")
+    if expected_tokens is not None and scored_tokens != expected_tokens:
+        raise ResultValidationError(
+            f"{name}.scored_tokens must be exactly {expected_tokens:,}; "
+            f"got {scored_tokens:,}"
+        )
+    return dict(row), loss, scored_tokens, seconds
+
+
+def _require_close(actual: float, expected: float, name: str) -> None:
+    if not math.isclose(
+        actual,
+        expected,
+        rel_tol=_EVALUATION_REL_TOLERANCE,
+        abs_tol=_EVALUATION_ABS_TOLERANCE,
+    ):
+        raise ResultValidationError(
+            f"{name} is inconsistent: expected {expected!r}, got {actual!r}"
+        )
+
+
+def _validate_evaluations(
+    value: Any,
+    *,
+    validation_loss: float,
+    expected_validation_tokens: int | None,
+    expected_downstream_tokens: Any,
+) -> dict[str, Any]:
+    evaluations = _plain_object(value, "evaluations")
+    expected_downstream = _expected_downstream_contract(expected_downstream_tokens)
+
+    fineweb_tokens = expected_validation_tokens
+    fineweb, fineweb_loss, _, _ = _evaluation_row(
+        evaluations.get("fineweb"),
+        "evaluations.fineweb",
+        expected_tokens=fineweb_tokens,
+        canonical=True,
+    )
+    del fineweb
+    _require_close(fineweb_loss, validation_loss, "evaluations.fineweb.loss")
+
+    if "fresh10" not in evaluations:
+        if expected_downstream is not None:
+            raise ResultValidationError(
+                "evaluations.fresh10 is required by the downstream evaluation contract"
+            )
+        return json.loads(json.dumps(evaluations, ensure_ascii=False, allow_nan=False))
+
+    fresh10 = _plain_object(evaluations["fresh10"], "evaluations.fresh10")
+    domains = _plain_object(fresh10.get("domains"), "evaluations.fresh10.domains")
+    if len(domains) != FRESH10_DOMAIN_COUNT:
+        raise ResultValidationError(
+            "evaluations.fresh10.domains must contain exactly "
+            f"{FRESH10_DOMAIN_COUNT} named rows"
+        )
+    if any(
+        not isinstance(name, str) or not name or name.strip() != name
+        for name in domains
+    ):
+        raise ResultValidationError(
+            "evaluations.fresh10 domain names must be non-empty, trimmed strings"
+        )
+    if expected_downstream is not None and set(domains) != set(expected_downstream):
+        missing = sorted(set(expected_downstream) - set(domains))
+        unexpected = sorted(set(domains) - set(expected_downstream))
+        detail = []
+        if missing:
+            detail.append("missing " + ", ".join(missing))
+        if unexpected:
+            detail.append("unexpected " + ", ".join(unexpected))
+        raise ResultValidationError(
+            "evaluations.fresh10 domain names do not match the expected contract"
+            + (": " + "; ".join(detail) if detail else "")
+        )
+
+    losses: list[float] = []
+    domain_seconds: list[float] = []
+    scored_total = 0
+    for name, row in domains.items():
+        expected_tokens = (
+            expected_downstream[name]
+            if expected_downstream is not None
+            else FRESH10_TOKENS_PER_DOMAIN
+        )
+        _normalized, loss, scored_tokens, seconds = _evaluation_row(
+            row,
+            f"evaluations.fresh10.domains[{name!r}]",
+            expected_tokens=expected_tokens,
+        )
+        losses.append(loss)
+        domain_seconds.append(seconds)
+        scored_total += scored_tokens
+
+    macro_loss = _finite_number(
+        fresh10.get("macro_loss"), "evaluations.fresh10.macro_loss"
+    )
+    expected_macro_loss = math.fsum(losses) / FRESH10_DOMAIN_COUNT
+    _require_close(
+        macro_loss, expected_macro_loss, "evaluations.fresh10.macro_loss"
+    )
+    macro_perplexity = _finite_number(
+        fresh10.get("macro_perplexity"), "evaluations.fresh10.macro_perplexity"
+    )
+    if macro_perplexity <= 0.0:
+        raise ResultValidationError(
+            "evaluations.fresh10.macro_perplexity must be greater than zero"
+        )
+    try:
+        expected_macro_perplexity = math.exp(expected_macro_loss)
+    except OverflowError as exc:
+        raise ResultValidationError(
+            "evaluations.fresh10.macro_loss is too large for finite perplexity"
+        ) from exc
+    _require_close(
+        macro_perplexity,
+        expected_macro_perplexity,
+        "evaluations.fresh10.macro_perplexity",
+    )
+    declared_total = _positive_integer(
+        fresh10.get("scored_tokens"), "evaluations.fresh10.scored_tokens"
+    )
+    if declared_total != scored_total:
+        raise ResultValidationError(
+            "evaluations.fresh10.scored_tokens must equal the sum of domain rows: "
+            f"expected {scored_total:,}, got {declared_total:,}"
+        )
+    declared_seconds = _finite_number(
+        fresh10.get("seconds"), "evaluations.fresh10.seconds"
+    )
+    _require_close(
+        declared_seconds,
+        math.fsum(domain_seconds),
+        "evaluations.fresh10.seconds",
+    )
+
+    return json.loads(json.dumps(evaluations, ensure_ascii=False, allow_nan=False))
+
+
 def validate_result(
     payload: Mapping[str, Any],
     *,
@@ -130,6 +319,7 @@ def validate_result(
     track: str,
     reference_contract: ReferenceContract | Mapping[str, Any] | None = None,
     expected_validation_tokens: int | None = None,
+    expected_downstream_tokens: Mapping[str, int] | None = None,
     evaluator: Evaluator | None = None,
 ) -> ValidationResult:
     """Validate a trainer result and, optionally, independently evaluate it."""
@@ -156,6 +346,23 @@ def validate_result(
                 "metrics.validation_tokens must match the fixed validation prefix: "
                 f"expected {expected_validation_tokens:,}, got {validation_tokens:,}"
             )
+    downstream_required = expected_downstream_tokens is not None
+    if "evaluations" in payload:
+        evaluations = _validate_evaluations(
+            payload["evaluations"],
+            validation_loss=loss,
+            expected_validation_tokens=expected_validation_tokens,
+            expected_downstream_tokens=expected_downstream_tokens,
+        )
+    elif downstream_required:
+        # Normalize the caller contract first so malformed expectations fail with
+        # the most useful error even when the result omitted evaluations entirely.
+        _expected_downstream_contract(expected_downstream_tokens)
+        raise ResultValidationError(
+            "evaluations are required by the downstream evaluation contract"
+        )
+    else:
+        evaluations = None
     checkpoint = contained_file(run_dir, payload.get("checkpoint"))
     artifact_paths: dict[str, Path] = {}
     artifacts = payload.get("artifacts", {})
@@ -213,6 +420,7 @@ def validate_result(
         validation_loss=loss,
         declared_metrics=dict(metrics),
         evaluator_metrics=dict(evaluator_metrics),
+        evaluations=evaluations,
         artifacts=artifact_paths,
     )
 
@@ -230,6 +438,7 @@ def verify_run(
     track: str = "open",
     reference_contract: ReferenceContract | Mapping[str, Any] | None = None,
     expected_validation_tokens: int | None = None,
+    expected_downstream_tokens: Mapping[str, int] | None = None,
     evaluator: Evaluator | None = None,
 ) -> ValidationResult:
     """Re-validate an existing run from its captured stdout log."""
@@ -244,5 +453,6 @@ def verify_run(
         track=track,
         reference_contract=reference_contract,
         expected_validation_tokens=expected_validation_tokens,
+        expected_downstream_tokens=expected_downstream_tokens,
         evaluator=evaluator,
     )
