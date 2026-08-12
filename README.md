@@ -41,11 +41,12 @@ uv --cache-dir /tmp/uv-cache run --frozen --no-sync speedrun prepare
 ```
 
 It asks for the data-cache root, data and run profiles, persistent artifact
-directory, default track, checkpoint retention, colors, and loss target. It can
-then probe JAX/TPU health and prepare the selected dataset. Personal choices are
-stored in the gitignored `.speedrun.toml`; official constants remain versioned
-in Git. The personal target applies to smoke/development work; the official
-target is fixed at 3.28 and may only be tightened explicitly.
+directory, default track, checkpoint retention, colors, and a
+smoke/development loss target. It can then probe JAX/TPU health and prepare the
+selected dataset. Personal choices are stored in the gitignored
+`.speedrun.toml`; official constants remain versioned in Git. The personal
+target applies only to smoke/development work; the official target is fixed at
+3.28 and may only be tightened explicitly.
 
 On this node, `shm/` is a symlink to the 201 GiB RAM filesystem and is an ideal
 ephemeral data cache:
@@ -154,25 +155,31 @@ window with Make variables such as `DATA_PATH`, `PROFILE_OUTPUT`,
 `make report` scans completed folders beneath `runs/`, checks their recorded
 artifact hashes when an immutable record is available, and writes one
 self-contained static `report.html` with no CDN dependency. A multi-select run
-sidebar controls overlays. Complete official open runs are selected initially
-only when they use the exact 624,984,064-token budget; official
-sample-efficiency runs are also selected. Smoke, development, and partial runs
-remain available but start unchecked and are labeled diagnostic or partial.
+sidebar controls overlays. The baseline report admission qualification includes
+complete official open runs only when they use the exact 624,984,064-token
+budget and have validation loss at or below **3.76**; complete official
+sample-efficiency runs must meet the same qualification. Smoke, development,
+partial, and runs that do not meet it are omitted with a reported reason. The
+baseline report admission qualification is intentionally not configurable and
+is distinct from the official competition qualification of 3.28.
+
 One global selector switches every time-series chart
 between **equi-FLOP** (the default, using analytic cumulative estimated FLOPs)
-and **equi-step**. Existing columns are plotted immediately; future overall or
-per-layer gradient/update/parameter L1/L2 norms, means, standard deviations,
-and third/fourth moments are discovered when their artifacts add numeric fields;
-the report explicitly lists which requested diagnostics were not recorded.
+and **equi-step**. Official reference runs record `diagnostics.csv` at step 1,
+every 250 steps, and the final step. The report exposes separate
+**Gradient / Update / Parameter** buttons, with one chart for each L1/L2 norm,
+mean, standard deviation, and centered third/fourth moment. Timeline charts use
+the whole-model values; final-snapshot charts show embeddings, every transformer
+block, and the final normalization. Because the final parameter point is
+post-update, it exactly describes the saved checkpoint even when qualifying-only
+retention later removes that file. Compatible retained checkpoints are used only
+as a legacy fallback for runs that predate `diagnostics.csv`.
 
-Retained per-layer data uses a documented NPZ naming convention: array keys begin
-with `params/` (also `param/` or `parameters/`), `grads/` (also `grad/` or
-`gradients/`), or `updates/` (also `update/`), followed by a logical layer path
-such as `blocks/0/`, `layers/0/`, or `h/0/`. Arrays sharing a family and layer
-number are aggregated before the report computes L1/L2 norm, mean, standard
-deviation, central third/fourth moments, minimum, and maximum. The current
-reference checkpoint records parameters only; qualifying-only retention may
-remove even that checkpoint, which the report identifies without inventing data.
+Charts render into bounded, downsampled canvases only after an input or resize
+event—there is no animation loop or idle redraw. Hover inspects the nearest
+curve, the wheel zooms, pointer dragging pans, and reset/double-click restores
+the full extent. The expand button opens any chart in a temporary full-panel
+dialog; Escape closes it. All code and data remain inside the static HTML.
 
 ### Fresh-domain diagnostic
 

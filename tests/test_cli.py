@@ -8,6 +8,7 @@ from unittest.mock import patch
 from speedrun import cli
 from speedrun.config import ConfigError, LocalConfig
 from speedrun.data import Fresh10Domain, PreparedDataset, PreparedFresh10
+from speedrun.report import REPORT_ADMISSION_QUALIFICATION_LOSS
 
 
 class CliTests(unittest.TestCase):
@@ -80,6 +81,22 @@ class CliTests(unittest.TestCase):
         self.assertTrue(require_tpu)
         self.assertTrue(download)
         self.assertTrue(save)
+
+    def test_report_admission_has_no_customization_surface(self) -> None:
+        self.assertEqual(REPORT_ADMISSION_QUALIFICATION_LOSS, 3.76)
+        report = cli.build_parser().parse_args(["report"])
+        self.assertFalse(hasattr(report, "admission_loss"))
+        self.assertFalse(hasattr(LocalConfig(), "report_admission_loss"))
+        prepare = cli.build_parser().parse_args(["prepare"])
+        target_action = next(
+            action for action in cli.build_parser()._subparsers._group_actions[0]
+            .choices["prepare"]._actions
+            if action.dest == "target_loss"
+        )
+        self.assertIn("smoke/development", target_action.help)
+        self.assertIsNone(prepare.target_loss)
+        with self.assertRaises(SystemExit):
+            cli.build_parser().parse_args(["report", "--admission-loss", "3.9"])
 
     def test_dataset_provenance_uses_stable_names_not_cache_paths(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

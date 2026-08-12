@@ -49,7 +49,7 @@ from .data import (
     verify_fresh10,
 )
 from .doctor import data_selection, environment_checks
-from .report import build_report
+from .report import REPORT_ADMISSION_QUALIFICATION_LOSS, build_report
 
 
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -126,7 +126,11 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--run-profile", choices=_PROFILES, help="default run profile")
     prepare.add_argument("--checkpoints", choices=_RETENTION, help="checkpoint retention policy")
     prepare.add_argument("--color", choices=_COLORS, help="terminal color preference")
-    prepare.add_argument("--target-loss", type=_nonnegative_float, help="qualification target")
+    prepare.add_argument(
+        "--target-loss",
+        type=_nonnegative_float,
+        help="default qualification target for smoke/development runs only",
+    )
     prepare.add_argument("--train-shards", type=_positive_int, help="override train shard count")
     prepare.add_argument("--offline", action="store_true", help="forbid network access")
     prepare.add_argument("--check-only", action="store_true", help="verify without mutation")
@@ -574,7 +578,8 @@ def command_report(args: argparse.Namespace) -> int:
     )
     print(
         f"report {relative}: {len(summary.included)} run(s) plotted, "
-        f"{len(summary.skipped)} skipped"
+        f"{len(summary.skipped)} skipped; baseline report admission qualification: "
+        f"validation loss <= {REPORT_ADMISSION_QUALIFICATION_LOSS:.4f}"
     )
     for run_id, reason in summary.skipped.items():
         print(f"  skipped {run_id}: {reason}")
@@ -653,7 +658,9 @@ def _prepare_wizard(
         },
     )
     color = _choose("Terminal colors", _COLORS, config.color, style)
-    target = _ask_float("Qualification loss target", config.target_loss, style)
+    target = _ask_float(
+        "Smoke/development qualification target", config.target_loss, style
+    )
     run_diagnostics = _confirm("Run environment diagnostics now", run_diagnostics, style)
     if run_diagnostics:
         require_tpu = _confirm("Require a healthy four-chip TPU v4-8", require_tpu, style)

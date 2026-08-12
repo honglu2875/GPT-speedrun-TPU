@@ -21,6 +21,13 @@ The initial quality target is a validation loss at or below **3.28**. Results
 below lower milestones such as 3.27 and 3.26 are retained in the run record so
 the target can become more ambitious after the baseline is calibrated.
 
+The report has a separate, versioned baseline report admission qualification:
+validation loss at or below **3.76**. Generated reports include only complete
+official runs that meet this qualification; excluded runs and their immutable
+artifacts remain on disk. The baseline report admission qualification is not
+user-configurable and never changes the official competition qualification of
+3.28, checkpoint retention, leaderboard eligibility, or ranking.
+
 Downloading, hashing, and tokenizing data are never part of a timed run.
 Training data may be staged in RAM before timing, but real host-to-device input
 transfer is part of training time. Periodic validation probes are also timed;
@@ -111,6 +118,14 @@ with their size and SHA-256; the reference uses this for its per-step CSV curve.
 Its curve records steps, predicted tokens, analytic cumulative estimated FLOPs,
 learning rate, loss, and gradient norm. Estimated FLOPs are a versioned analytic
 model diagnostic rather than a hardware-counter score.
+
+The reference additionally records sparse optimizer diagnostics at step 1,
+every 250 steps, and the final step. Each point contains post-update parameter,
+pre-clipping gradient, and signed actual-update L1/L2 norms, mean, population
+standard deviation, and centered third/fourth moments for the whole model and
+each logical scope. Diagnostic compilation is outside `train_seconds`; sampled
+device computation and synchronization are inside it. These measurements never
+affect qualification or ranking.
 
 ## Qualification and records
 

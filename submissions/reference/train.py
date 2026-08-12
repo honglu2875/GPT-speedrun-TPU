@@ -42,10 +42,20 @@ RESULT_PREFIX = "SPEEDRUN_RESULT="
 CHECKPOINT_NAME = "checkpoint.npz"
 TRAINING_CSV_NAME = "training.csv"
 VALIDATION_CSV_NAME = "validation.csv"
+DIAGNOSTICS_CSV_NAME = "diagnostics.csv"
 SCHEMA_VERSION = 1
 _VALID_TRACKS = ("open", "sample_efficiency")
 _VALID_PROFILES = ("smoke", "dev", "official")
 _DOMAIN_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_DIAGNOSTIC_FAMILIES = ("param", "grad", "update")
+_DIAGNOSTIC_STATS = (
+    "l1_norm",
+    "l2_norm",
+    "mean",
+    "std",
+    "third_moment",
+    "fourth_moment",
+)
 
 
 # A deliberately small, original corpus for offline and smoke-test use.  The
@@ -84,6 +94,7 @@ class Config:
     eval_batches: int
     val_every: int
     val_probe_batches: int
+    diagnostics_every: int
     log_every: int
     vocab_size: int
     compute_dtype: Any
@@ -122,6 +133,14 @@ class ValidationRow:
     perplexity: float
     validation_seconds: float
     canonical: bool
+
+
+@dataclass(frozen=True)
+class DiagnosticPoint:
+    """Host-side statistics captured at one optimizer step."""
+
+    step: int
+    values: np.ndarray
 
 
 class Console:
@@ -410,6 +429,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=positive_int,
         default=None,
         help="fixed-prefix batches per periodic validation probe",
+    )
+    run.add_argument(
+        "--diagnostics-every",
+        type=nonnegative_int,
+        default=None,
+        help=(
+            "capture sparse parameter, pre-clipping gradient, and actual update "
+            "statistics every N steps; 0 disables diagnostics"
+        ),
     )
     run.add_argument("--log-every", type=positive_int, default=None)
     run.add_argument("--color", choices=("auto", "always", "never"), default="auto")
@@ -712,6 +740,11 @@ def resolve_config(args: argparse.Namespace, platform: str, vocab_size: int) -> 
     # Keep the UI lively without forcing a host synchronization on every short
     # calibration step. Step 1 and the final step are always printed separately.
     log_every = args.log_every if args.log_every is not None else max(10, steps // 20)
+    diagnostics_every = (
+        args.diagnostics_every
+        if args.diagnostics_every is not None
+        else (250 if profile == "official" else 0)
+    )
     warmup_steps = (
         args.warmup_steps
         if args.warmup_steps is not None
@@ -744,6 +777,7 @@ def resolve_config(args: argparse.Namespace, platform: str, vocab_size: int) -> 
         eval_batches=eval_batches,
         val_every=val_every,
         val_probe_batches=val_probe_batches,
+        diagnostics_every=diagnostics_every,
         log_every=log_every,
         vocab_size=vocab_size,
         compute_dtype=compute_dtype,
@@ -1250,18 +1284,25 @@ def weight_decay_mask(params: Any) -> Any:
     return jax.tree_util.tree_map(lambda value: bool(value.ndim >= 2), params)
 
 
-def train_step(
+def _apply_training_update(
     params: Any,
     optimizer: Mapping[str, Any],
     x: jax.Array,
     y: jax.Array,
     config: Config,
     decay_mask: Any | None = None,
-) -> tuple[Any, dict[str, Any], dict[str, jax.Array]]:
+) -> tuple[Any, dict[str, Any], dict[str, jax.Array], Any]:
+    """Apply one ordinary update and also return the raw, pre-clip gradient.
+
+    Both the ordinary and sparse-diagnostic executables use this exact function.
+    Diagnostics therefore do not substitute a different optimizer formula.
+    """
+
     if decay_mask is None:
         decay_mask = weight_decay_mask(params)
     loss, gradients = jax.value_and_grad(cross_entropy)(params, x, y, config)
     gradients = jax.tree_util.tree_map(lambda grad: grad.astype(jnp.float32), gradients)
+    raw_gradients = gradients
     squared_norms = [jnp.sum(jnp.square(grad)) for grad in jax.tree_util.tree_leaves(gradients)]
     grad_norm = jnp.sqrt(sum(squared_norms))
     clip_scale = jnp.minimum(1.0, config.grad_clip / (grad_norm + 1.0e-6))
@@ -1295,11 +1336,158 @@ def train_step(
     params = jax.tree_util.tree_map(update, params, m, v, decay_mask)
     history_row = jnp.stack((loss, lr, grad_norm)).astype(jnp.float32)
     history = optimizer["history"].at[step - 1].set(history_row)
-    return params, {"step": step, "m": m, "v": v, "history": history}, {
-        "loss": loss,
-        "grad_norm": grad_norm,
-        "learning_rate": lr,
-    }
+    return (
+        params,
+        {"step": step, "m": m, "v": v, "history": history},
+        {
+            "loss": loss,
+            "grad_norm": grad_norm,
+            "learning_rate": lr,
+        },
+        raw_gradients,
+    )
+
+
+def train_step(
+    params: Any,
+    optimizer: Mapping[str, Any],
+    x: jax.Array,
+    y: jax.Array,
+    config: Config,
+    decay_mask: Any | None = None,
+) -> tuple[Any, dict[str, Any], dict[str, jax.Array]]:
+    params, optimizer, metrics, _ = _apply_training_update(
+        params, optimizer, x, y, config, decay_mask
+    )
+    return params, optimizer, metrics
+
+
+def diagnostic_scopes(tree: Mapping[str, Any]) -> tuple[tuple[str, int | None, tuple[Any, ...]], ...]:
+    """Group a parameter-shaped tree into stable logical report scopes."""
+
+    embeddings = tuple(
+        jax.tree_util.tree_leaves(
+            (tree["token_embedding"], tree["position_embedding"])
+        )
+    )
+    blocks = tuple(
+        (
+            "block",
+            layer,
+            tuple(jax.tree_util.tree_leaves(block)),
+        )
+        for layer, block in enumerate(tree["blocks"])
+    )
+    final_norm = tuple(
+        jax.tree_util.tree_leaves(
+            (tree["final_ln_scale"], tree["final_ln_bias"])
+        )
+    )
+    return (
+        ("overall", None, tuple(jax.tree_util.tree_leaves(tree))),
+        ("embeddings", None, embeddings),
+        *blocks,
+        ("final_norm", None, final_norm),
+    )
+
+
+def diagnostic_scope_metadata(
+    params: Mapping[str, Any],
+) -> tuple[tuple[str, int | None, int], ...]:
+    """Return scope labels and exact element counts without device work."""
+
+    return tuple(
+        (scope, layer, sum(int(value.size) for value in leaves))
+        for scope, layer, leaves in diagnostic_scopes(params)
+    )
+
+
+def _diagnostic_stat_vector(values: Sequence[jax.Array]) -> jax.Array:
+    """Return norms and stable two-pass centered moments for several arrays."""
+
+    values32 = tuple(value.astype(jnp.float32) for value in values)
+    count = sum(int(value.size) for value in values32)
+    if count <= 0:  # pragma: no cover - model scopes are statically nonempty
+        raise ValueError("diagnostic scope cannot be empty")
+    zero = jnp.asarray(0.0, dtype=jnp.float32)
+    total = sum((jnp.sum(value) for value in values32), zero)
+    mean = total / float(count)
+
+    # The mean is completed before the centered reduction, rather than deriving
+    # variance and higher moments from cancellation-prone raw power sums.
+    l1_sum = sum((jnp.sum(jnp.abs(value)) for value in values32), zero)
+    square_sum = sum((jnp.sum(jnp.square(value)) for value in values32), zero)
+    variance_sum = sum(
+        (jnp.sum(jnp.square(value - mean)) for value in values32), zero
+    )
+    third_sum = sum(
+        (jnp.sum(jnp.power(value - mean, 3)) for value in values32), zero
+    )
+    fourth_sum = sum(
+        (jnp.sum(jnp.power(value - mean, 4)) for value in values32), zero
+    )
+    return jnp.stack(
+        (
+            l1_sum,
+            jnp.sqrt(jnp.maximum(square_sum, zero)),
+            mean,
+            jnp.sqrt(jnp.maximum(variance_sum / float(count), zero)),
+            third_sum / float(count),
+            fourth_sum / float(count),
+        )
+    ).astype(jnp.float32)
+
+
+def diagnostic_values(
+    params_before: Mapping[str, Any],
+    raw_gradients: Mapping[str, Any],
+    params_after: Mapping[str, Any],
+) -> jax.Array:
+    """Return ``[scope, family, stat]`` sparse diagnostic values.
+
+    ``param`` observes the parameter after this step, so the final point exactly
+    matches the checkpoint. ``grad`` is the raw gradient before global clipping.
+    ``update`` is the signed actual delta ``params_after - params_before``,
+    including clipping, AdamW, and decay.
+    """
+
+    updates = jax.tree_util.tree_map(
+        lambda after, before: after - before, params_after, params_before
+    )
+    family_scopes = tuple(
+        diagnostic_scopes(tree)
+        for tree in (params_after, raw_gradients, updates)
+    )
+    scope_count = len(family_scopes[0])
+    return jnp.stack(
+        tuple(
+            jnp.stack(
+                tuple(
+                    _diagnostic_stat_vector(family_scopes[family][scope][2])
+                    for family in range(len(_DIAGNOSTIC_FAMILIES))
+                )
+            )
+            for scope in range(scope_count)
+        )
+    )
+
+
+def diagnostic_train_step(
+    params: Any,
+    optimizer: Mapping[str, Any],
+    x: jax.Array,
+    y: jax.Array,
+    config: Config,
+    decay_mask: Any | None = None,
+) -> tuple[Any, dict[str, Any], dict[str, jax.Array], jax.Array]:
+    """Run the same update as :func:`train_step` and emit sparse statistics."""
+
+    params_before = params
+    params, optimizer, metrics, raw_gradients = _apply_training_update(
+        params, optimizer, x, y, config, decay_mask
+    )
+    values = diagnostic_values(params_before, raw_gradients, params)
+    return params, optimizer, metrics, values
 
 
 def eval_step(
@@ -1328,6 +1516,16 @@ def should_run_validation_probe(step: int, config: Config) -> bool:
         config.val_every > 0
         and step < config.steps
         and step % config.val_every == 0
+    )
+
+
+def should_run_diagnostics(step: int, config: Config) -> bool:
+    """Capture the first/final updates plus the configured sparse cadence."""
+
+    return config.diagnostics_every > 0 and (
+        step == 1
+        or step == config.steps
+        or step % config.diagnostics_every == 0
     )
 
 
@@ -1564,6 +1762,83 @@ def write_training_csv(
     os.replace(temporary, destination)
 
 
+def write_diagnostics_csv(
+    output_dir: Path,
+    points: Sequence[DiagnosticPoint],
+    scope_metadata: Sequence[tuple[str, int | None, int]],
+    config: Config,
+    flops_per_token: int,
+) -> None:
+    """Atomically persist long-form sparse optimizer diagnostics."""
+
+    if not points:
+        raise ValueError("diagnostic history cannot be empty")
+    if flops_per_token <= 0:
+        raise ValueError("flops_per_token must be positive")
+    expected_shape = (
+        len(scope_metadata),
+        len(_DIAGNOSTIC_FAMILIES),
+        len(_DIAGNOSTIC_STATS),
+    )
+    if points[-1].step != config.steps:
+        raise ValueError("diagnostic history must include the final optimizer step")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    destination = output_dir / DIAGNOSTICS_CSV_NAME
+    temporary = output_dir / f".{DIAGNOSTICS_CSV_NAME}.tmp"
+    tokens_per_step = config.batch_size * config.seq_len
+    with temporary.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(
+            (
+                "step",
+                "tokens_processed",
+                "cumulative_estimated_flops",
+                "scope",
+                "layer",
+                "family",
+                "stat",
+                "value",
+                "element_count",
+            )
+        )
+        previous_step = 0
+        for point in points:
+            if point.step <= previous_step or point.step > config.steps:
+                raise ValueError("diagnostic steps must be unique and increasing")
+            previous_step = point.step
+            values = np.asarray(point.values, dtype=np.float32)
+            if values.shape != expected_shape:
+                raise ValueError(
+                    f"diagnostic values have shape {values.shape}; "
+                    f"expected {expected_shape}"
+                )
+            if not np.all(np.isfinite(values)):
+                raise FloatingPointError(
+                    f"diagnostic values at step {point.step} must be finite"
+                )
+            tokens_processed = point.step * tokens_per_step
+            cumulative_flops = tokens_processed * flops_per_token
+            for scope_index, (scope, layer, element_count) in enumerate(scope_metadata):
+                for family_index, family in enumerate(_DIAGNOSTIC_FAMILIES):
+                    for stat_index, stat in enumerate(_DIAGNOSTIC_STATS):
+                        writer.writerow(
+                            (
+                                point.step,
+                                tokens_processed,
+                                cumulative_flops,
+                                scope,
+                                "" if layer is None else layer,
+                                family,
+                                stat,
+                                float(values[scope_index, family_index, stat_index]),
+                                element_count,
+                            )
+                        )
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, destination)
+
+
 def write_validation_csv(output_dir: Path, rows: Sequence[ValidationRow]) -> None:
     """Persist FineWeb probes/final and optional downstream domain scores."""
 
@@ -1755,6 +2030,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     host_params = init_params(config, args.seed)
     host_optimizer = init_optimizer(host_params, config.steps)
     decay_mask = weight_decay_mask(host_params)
+    diagnostic_metadata = diagnostic_scope_metadata(host_params)
     params_total = parameter_count(host_params)
     flops_per_token = int(
         6 * params_total + 12 * config.layers * config.d_model * config.seq_len
@@ -1781,6 +2057,14 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             ("parameters", format_count(params_total)),
             ("global batch", f"{config.batch_size} × {config.seq_len} tokens"),
             ("compute", config.dtype_name),
+            (
+                "diagnostics",
+                (
+                    f"step 1 / every {config.diagnostics_every} / final"
+                    if config.diagnostics_every
+                    else "disabled"
+                ),
+            ),
             ("train tokens", format_count(tokens_processed)),
             ("estimated FLOPs", format_count(flops_per_token * tokens_processed)),
             (
@@ -1819,6 +2103,25 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     executable = compiled_step.lower(params, optimizer, sample_x, sample_y).compile()
     train_compile_seconds = time.perf_counter() - compile_started
 
+    diagnostic_executable: Any | None = None
+    diagnostic_compile_seconds = 0.0
+    if config.diagnostics_every:
+        console.phase(
+            "Compiling sparse diagnostics",
+            "separate executable; compilation is outside train_seconds",
+        )
+        diagnostic_compile_started = time.perf_counter()
+        diagnostic_executable = jax.jit(
+            lambda p, o, x, y: diagnostic_train_step(
+                p, o, x, y, config, decay_mask
+            ),
+            in_shardings=(replicated, replicated, data_sharding, data_sharding),
+            donate_argnums=(0, 1),
+        ).lower(params, optimizer, sample_x, sample_y).compile()
+        diagnostic_compile_seconds = (
+            time.perf_counter() - diagnostic_compile_started
+        )
+
     # Compile evaluation exactly once when it is requested. Diagnostic XProf
     # runs can skip this executable entirely, keeping their setup focused on the
     # training step being inspected.
@@ -1837,7 +2140,11 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             in_shardings=(replicated, data_sharding, data_sharding, data_sharding),
         ).lower(params, sample_x, sample_y, sample_mask).compile()
         eval_compile_seconds = time.perf_counter() - eval_compile_started
-    total_compile_seconds = train_compile_seconds + eval_compile_seconds
+    total_compile_seconds = (
+        train_compile_seconds
+        + diagnostic_compile_seconds
+        + eval_compile_seconds
+    )
 
     sync_tree((params, optimizer, sample_x, sample_y, sample_mask))
     probe_detail = (
@@ -1856,6 +2163,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     )
 
     last_metrics: Mapping[str, jax.Array] | None = None
+    diagnostic_device_points: list[tuple[int, jax.Array]] = []
     validation_rows: list[ValidationRow] = []
     validation_probe_seconds = 0.0
     train_started = time.perf_counter()
@@ -1896,9 +2204,19 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                 )
                 batch_x = jax.device_put(batch_x, data_sharding)
                 batch_y = jax.device_put(batch_y, data_sharding)
-                params, optimizer, last_metrics = executable(
-                    params, optimizer, batch_x, batch_y
-                )
+                if should_run_diagnostics(step_index, config):
+                    if diagnostic_executable is None:  # defensive invariant
+                        raise AssertionError("diagnostic executable was not compiled")
+                    params, optimizer, last_metrics, diagnostic_values_at_step = (
+                        diagnostic_executable(params, optimizer, batch_x, batch_y)
+                    )
+                    diagnostic_device_points.append(
+                        (step_index, diagnostic_values_at_step)
+                    )
+                else:
+                    params, optimizer, last_metrics = executable(
+                        params, optimizer, batch_x, batch_y
+                    )
                 if should_run_validation_probe(step_index, config):
                     # Attribute all preceding asynchronous training work to training,
                     # then start the probe's own honest wall clock inside the helper.
@@ -1970,10 +2288,16 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
 
     if last_metrics is None:  # defensive: argparse prevents zero steps
         raise AssertionError("training produced no metrics")
-    sync_tree((params, optimizer, last_metrics))
+    # Sparse diagnostic reductions are part of benchmark time even if their
+    # result branch is otherwise independent of the next optimizer state.
+    sync_tree((params, optimizer, last_metrics, diagnostic_device_points))
     train_seconds = max(time.perf_counter() - train_started, 1.0e-12)
     final_train = jax.device_get(last_metrics)
     training_history = np.asarray(jax.device_get(optimizer["history"]), dtype=np.float32)
+    diagnostic_points = tuple(
+        DiagnosticPoint(step, np.asarray(jax.device_get(values), dtype=np.float32))
+        for step, values in diagnostic_device_points
+    )
     train_loss = finite_metric("train_loss", float(final_train["loss"]))
 
     if diagnostic_mode:
@@ -1981,6 +2305,14 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         write_training_csv(
             output_dir, training_history, config, flops_per_token=flops_per_token
         )
+        if diagnostic_points:
+            write_diagnostics_csv(
+                output_dir,
+                diagnostic_points,
+                diagnostic_metadata,
+                config,
+                flops_per_token,
+            )
         diagnostic_rate = finite_metric(
             "tokens_per_second", tokens_processed / train_seconds, positive=True
         )
@@ -1993,6 +2325,14 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                 ("train loss", f"{train_loss:.4f}"),
                 ("diagnostic rate", f"{format_rate(diagnostic_rate)} tok/s"),
                 ("training curve", output_dir / TRAINING_CSV_NAME),
+                (
+                    "diagnostics",
+                    (
+                        output_dir / DIAGNOSTICS_CSV_NAME
+                        if diagnostic_points
+                        else "disabled"
+                    ),
+                ),
                 ("XProf trace", xprof_dir),
             ),
         )
@@ -2094,13 +2434,22 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         console.phase("Fresh-domain validation", "skipped; no downstream data supplied")
 
     output_dir = args.output_dir.expanduser().resolve()
-    console.phase(
-        "Artifacts",
-        f"{TRAINING_CSV_NAME} + {VALIDATION_CSV_NAME} + {CHECKPOINT_NAME}",
-    )
+    artifact_names = [TRAINING_CSV_NAME, VALIDATION_CSV_NAME]
+    if diagnostic_points:
+        artifact_names.append(DIAGNOSTICS_CSV_NAME)
+    artifact_names.append(CHECKPOINT_NAME)
+    console.phase("Artifacts", " + ".join(artifact_names))
     write_training_csv(
         output_dir, training_history, config, flops_per_token=flops_per_token
     )
+    if diagnostic_points:
+        write_diagnostics_csv(
+            output_dir,
+            diagnostic_points,
+            diagnostic_metadata,
+            config,
+            flops_per_token,
+        )
     write_validation_csv(output_dir, validation_rows)
     save_checkpoint(output_dir, params, config, args.seed)
 
@@ -2148,6 +2497,11 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         "artifacts": {
             "training_curve": TRAINING_CSV_NAME,
             "validation_curve": VALIDATION_CSV_NAME,
+            **(
+                {"diagnostics": DIAGNOSTICS_CSV_NAME}
+                if diagnostic_points
+                else {}
+            ),
         },
         "system": system_metadata(devices),
         "contract": {
@@ -2175,6 +2529,8 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             "validation_probe_count": sum(
                 row.kind == "fineweb_probe" for row in validation_rows
             ),
+            "diagnostic_point_count": len(diagnostic_points),
+            "diagnostics_every": int(config.diagnostics_every),
             "validation_probe_seconds": finite_metric(
                 "validation_probe_seconds", validation_probe_seconds
             ),
@@ -2193,6 +2549,9 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             ),
             "eval_compile_seconds": finite_metric(
                 "eval_compile_seconds", eval_compile_seconds
+            ),
+            "diagnostic_compile_seconds": finite_metric(
+                "diagnostic_compile_seconds", diagnostic_compile_seconds
             ),
             "total_compile_seconds": finite_metric(
                 "total_compile_seconds", total_compile_seconds

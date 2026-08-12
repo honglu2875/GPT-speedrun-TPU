@@ -76,6 +76,7 @@ baseline: preflight
 	  --eval-batches 320 \
 	  --val-every 250 \
 	  --val-probe-batches 8 \
+	  --diagnostics-every 250 \
 	  --log-every 953 \
 	  --peak-tflops 1100
 
@@ -107,6 +108,7 @@ profile: preflight
 	  --eval-batches 320 \
 	  --val-every 0 \
 	  --val-probe-batches 8 \
+	  --diagnostics-every 0 \
 	  --log-every 100 \
 	  --peak-tflops 1100 \
 	  --data-format llmc \

@@ -14,6 +14,25 @@ norm. The history is accumulated on the device and copied after `train_seconds`,
 so curve capture does not introduce a host synchronization on every step. The
 token, schedule, and FLOP columns are derived without device-side logging.
 
+Official runs also write sparse, long-form `diagnostics.csv` points at step 1,
+every 250 steps, and the final step. Set `--diagnostics-every N` to change the
+cadence or `--diagnostics-every 0` to disable them; smoke and development
+profiles default to disabled. Each point covers the whole model, embeddings,
+every zero-based transformer block, and the final normalization, with
+`param`/`grad`/`update` families and L1 norm, L2 norm, mean, standard deviation,
+third centered moment, and fourth centered moment. Parameters are observed after
+the sampled update, so the final parameter point exactly matches the checkpoint;
+gradients are observed before global clipping, and updates are the signed actual
+parameter delta after clipping, AdamW, and weight decay. Centered moments use a
+two-pass calculation.
+
+The diagnostic step is a separately compiled version of the same optimizer
+update. Ordinary steps continue to use the compact baseline executable, and an
+exact CPU regression test checks that both executables produce identical model
+and optimizer state. Compilation remains outside `train_seconds`; all diagnostic
+device computation and synchronization are inside it. Values are transferred
+and the CSV is atomically written only after the synchronized training clock.
+
 `validation.csv` records periodic fixed-prefix probes plus the canonical final
 evaluation. Official runs default to eight batches every 250 optimizer steps;
 smoke and development runs default to no probes. Each probe synchronizes the
@@ -50,7 +69,8 @@ For a bounded XProf diagnostic, pass `--xprof-dir`, `--xprof-start-step`, and
 skips evaluation compilation, all validation, checkpointing, and the competition
 result event; it writes only `training.csv` and the trace. The top-level
 `make profile` target supplies the complete 100-step reference command and
-starts the viewer after capture.
+starts the viewer after capture. That template explicitly passes
+`--diagnostics-every 0` so sparse reductions do not pollute the XProf window.
 
 Use the harness instead of invoking this file directly so data and results are
 validated and recorded:

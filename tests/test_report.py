@@ -8,6 +8,7 @@ import tempfile
 import unittest
 
 from speedrun.report import (
+    REPORT_ADMISSION_QUALIFICATION_LOSS,
     ReportError,
     _attach_flops,
     _checkpoint_layer_stats,
@@ -20,6 +21,118 @@ from speedrun.report import (
 
 
 class ReportTests(unittest.TestCase):
+    def test_report_strictly_admits_only_complete_official_runs_at_3_76(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "runs"
+            cases = {
+                "admitted-boundary": ("sample_efficiency", "official", 20, 3.76),
+                "not-admitted": ("sample_efficiency", "official", 20, 3.76001),
+                "development": ("sample_efficiency", "dev", 20, 3.0),
+                "partial-open": ("open", "official", 20, 3.0),
+            }
+            for name, (track, profile, tokens, validation_loss) in cases.items():
+                run = runs / name
+                run.mkdir(parents=True)
+                (run / "training.csv").write_text(
+                    "step,tokens_processed,train_loss\n1,10,4.5\n2,20,4.0\n",
+                    encoding="utf-8",
+                )
+                _write_result(
+                    run,
+                    validation_artifact=False,
+                    track=track,
+                    profile=profile,
+                    tokens=tokens,
+                    validation_loss=validation_loss,
+                )
+
+            summary = build_report(runs, root / "report.html")
+            payload = _payload((root / "report.html").read_text(encoding="utf-8"))
+
+        self.assertEqual(REPORT_ADMISSION_QUALIFICATION_LOSS, 3.76)
+        self.assertEqual(summary.included, ("admitted-boundary",))
+        self.assertIn(
+            "does not meet the baseline report admission qualification",
+            summary.skipped["not-admitted"],
+        )
+        self.assertIn(
+            "requires profile='official'", summary.skipped["development"]
+        )
+        self.assertIn("open run is incomplete", summary.skipped["partial-open"])
+        self.assertEqual(payload["meta"]["admissionQualificationLoss"], 3.76)
+
+    def test_long_form_diagnostics_build_all_family_and_final_scope_charts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "runs"
+            run = runs / "diagnostic-run"
+            run.mkdir(parents=True)
+            (run / "training.csv").write_text(
+                "step,tokens_processed,cumulative_estimated_flops,train_loss\n"
+                "1,10,1000,4.5\n"
+                "2,20,2000,4.0\n",
+                encoding="utf-8",
+            )
+            _write_diagnostics(run / "diagnostics.csv")
+            _write_result(
+                run,
+                validation_artifact=False,
+                diagnostics_artifact=True,
+            )
+
+            summary = build_report(runs, root / "report.html")
+            html = (root / "report.html").read_text(encoding="utf-8")
+            payload = _payload(html)
+
+        self.assertEqual(summary.included, (run.name,))
+        self.assertEqual(
+            {chart["family"] for chart in payload["diagnosticCharts"]},
+            {"grad", "update", "param"},
+        )
+        self.assertEqual(len(payload["diagnosticCharts"]), 18)
+        self.assertEqual(len(payload["layerCharts"]), 18)
+        parameter_mean = next(
+            chart
+            for chart in payload["layerCharts"]
+            if chart["family"] == "param" and chart["stat"] == "mean"
+        )
+        self.assertEqual(
+            [point[2] for point in parameter_mean["series"][0]["points"]],
+            ["embeddings", "block 0", "final norm"],
+        )
+        self.assertIn('id="family-control"', html)
+        self.assertIn('id="focus-dialog"', html)
+        self.assertIn("c.onwheel=e=>zoom(e,item)", html)
+        self.assertNotIn("setInterval", html)
+
+    def test_incomplete_diagnostics_grid_excludes_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "runs"
+            run = runs / "truncated-diagnostics"
+            run.mkdir(parents=True)
+            (run / "training.csv").write_text(
+                "step,tokens_processed,cumulative_estimated_flops,train_loss\n"
+                "1,10,1000,4.5\n"
+                "2,20,2000,4.0\n",
+                encoding="utf-8",
+            )
+            diagnostics = run / "diagnostics.csv"
+            _write_diagnostics(diagnostics)
+            lines = diagnostics.read_text(encoding="utf-8").splitlines()
+            diagnostics.write_text("\n".join(lines[:-1]) + "\n", encoding="utf-8")
+            _write_result(
+                run,
+                validation_artifact=False,
+                diagnostics_artifact=True,
+            )
+
+            summary = build_report(runs, root / "report.html")
+
+        self.assertFalse(summary.included)
+        self.assertIn("incomplete diagnostic grid", summary.skipped[run.name])
+
     def test_standalone_report_includes_sound_run_and_both_axis_modes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -35,7 +148,7 @@ class ReportTests(unittest.TestCase):
             (run / "validation.csv").write_text(
                 "step,tokens_processed,kind,domain,validation_loss\n"
                 "1,10,fineweb_probe,fineweb,4.4\n"
-                "2,20,fineweb,fineweb,3.9\n",
+                "2,20,fineweb,fineweb,3.7\n",
                 encoding="utf-8",
             )
             _write_result(run)
@@ -47,8 +160,8 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(summary.included, ("complete-run",))
         self.assertFalse(summary.skipped)
         self.assertEqual(payload["meta"]["defaultXAxis"], "flops")
-        self.assertFalse(payload["runs"][0]["selected"])
-        self.assertEqual(payload["runs"][0]["classification"], "diagnostic")
+        self.assertTrue(payload["runs"][0]["selected"])
+        self.assertEqual(payload["runs"][0]["classification"], "official")
         self.assertEqual(payload["runs"][0]["flopSource"], "derived: result metrics.flops_per_token × tokens_processed")
         train = next(chart for chart in payload["timeCharts"] if chart["key"] == "train_loss")
         self.assertEqual(train["series"][0]["points"][-1], [2.0, 2000.0, 4.0])
@@ -64,7 +177,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("not recorded: gradient L1 norm", coverage)
         self.assertIn("update fourth moment", coverage)
         self.assertIn("parameter fourth moment", coverage)
-        self.assertIn("discovered automatically", coverage)
+        self.assertIn("parameter fourth moment", coverage)
         self.assertNotRegex(html, r'<script[^>]+src=|<link[^>]+href=')
         self.assertNotIn(".slice(0,10)", html)
         self.assertNotIn("Math.min(...xs)", html)
@@ -166,7 +279,7 @@ class ReportTests(unittest.TestCase):
             )
             validation.write_text(
                 "step,tokens_processed,kind,domain,validation_loss\n"
-                "2,20,fineweb,fineweb,3.9\n",
+                "2,20,fineweb,fineweb,3.7\n",
                 encoding="utf-8",
             )
             _write_result(run)
@@ -174,13 +287,13 @@ class ReportTests(unittest.TestCase):
                 "run_id": run.name,
                 "status": "ok",
                 "submission": "reference",
-                "track": "open",
-                "profile": "dev",
+                "track": "sample_efficiency",
+                "profile": "official",
                 "seed": 1,
                 "metrics": {
                     "tokens_processed": 20,
                     "train_seconds": 1.0,
-                    "validation_loss": 3.9,
+                    "validation_loss": 3.7,
                 },
                 "artifacts": {
                     "training_curve": {
@@ -327,13 +440,13 @@ class ReportTests(unittest.TestCase):
                 "run_id": run.name,
                 "status": "ok",
                 "submission": "</script><script>alert(1)</script>",
-                "track": "open",
-                "profile": "dev",
+                "track": "sample_efficiency",
+                "profile": "official",
                 "seed": 1,
                 "metrics": {
                     "tokens_processed": 20,
                     "train_seconds": 1.0,
-                    "validation_loss": 3.9,
+                    "validation_loss": 3.7,
                 },
                 "artifacts": {
                     "training_curve": {
@@ -353,27 +466,70 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn(record["submission"], html)
 
 
-def _write_result(run: Path, *, validation_artifact: bool = True) -> None:
+def _write_result(
+    run: Path,
+    *,
+    validation_artifact: bool = True,
+    diagnostics_artifact: bool = False,
+    track: str = "sample_efficiency",
+    profile: str = "official",
+    tokens: int = 20,
+    validation_loss: float = 3.7,
+) -> None:
     artifacts = {"training_curve": "training.csv"}
     if validation_artifact:
         artifacts["validation_curve"] = "validation.csv"
+    if diagnostics_artifact:
+        artifacts["diagnostics"] = "diagnostics.csv"
     result = {
         "schema_version": 1,
         "status": "ok",
-        "track": "open",
-        "profile": "dev",
+        "track": track,
+        "profile": profile,
         "seed": 1,
         "checkpoint": "checkpoint.npz",
         "artifacts": artifacts,
         "metrics": {
-            "tokens_processed": 20,
+            "tokens_processed": tokens,
             "train_seconds": 1.0,
             "train_loss": 4.0,
-            "validation_loss": 3.9,
+            "validation_loss": validation_loss,
             "flops_per_token": 100,
         },
     }
     (run / "result.json").write_text(json.dumps(result), encoding="utf-8")
+
+
+def _write_diagnostics(path: Path) -> None:
+    families = ("param", "grad", "update")
+    statistics = (
+        "l1_norm",
+        "l2_norm",
+        "mean",
+        "std",
+        "third_moment",
+        "fourth_moment",
+    )
+    scopes = (
+        ("overall", "", 6),
+        ("embeddings", "", 2),
+        ("block", "0", 3),
+        ("final_norm", "", 1),
+    )
+    rows = [
+        "step,tokens_processed,cumulative_estimated_flops,scope,layer,"
+        "family,stat,value,element_count"
+    ]
+    for step in (1, 2):
+        for scope_index, (scope, layer, element_count) in enumerate(scopes):
+            for family_index, family in enumerate(families):
+                for stat_index, statistic in enumerate(statistics):
+                    value = step + scope_index / 10 + family_index / 100 + stat_index / 1000
+                    rows.append(
+                        f"{step},{step * 10},{step * 1000},{scope},{layer},"
+                        f"{family},{statistic},{value},{element_count}"
+                    )
+    path.write_text("\n".join(rows) + "\n", encoding="utf-8")
 
 
 def _record_for_run(run: Path, *, validation: bool) -> dict[str, object]:
@@ -381,14 +537,14 @@ def _record_for_run(run: Path, *, validation: bool) -> dict[str, object]:
         "run_id": run.name,
         "status": "ok",
         "submission": "reference",
-        "track": "open",
-        "profile": "dev",
+        "track": "sample_efficiency",
+        "profile": "official",
         "seed": 1,
         "qualified": True,
         "metrics": {
             "tokens_processed": 20,
             "train_seconds": 1.0,
-            "validation_loss": 3.9,
+            "validation_loss": 3.7,
         },
         "artifacts": {
             "training_curve": {

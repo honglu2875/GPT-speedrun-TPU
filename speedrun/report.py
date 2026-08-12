@@ -24,6 +24,7 @@ _MAX_JSON_BYTES = 4 * 1024 * 1024
 _MAX_CSV_BYTES = 128 * 1024 * 1024
 _MAX_CHART_POINTS = 1_400
 _OFFICIAL_OPEN_TOKENS = 624_984_064
+REPORT_ADMISSION_QUALIFICATION_LOSS = 3.76
 _LAYER_KEY = re.compile(r"(?:^|/)(?:blocks?|layers?|h)(?:/|_)(\d+)(?:/|$)")
 _COLORS = (
     "#7dd3fc",
@@ -58,6 +59,27 @@ _VALIDATION_REQUIRED = (
     "kind",
     "domain",
     "validation_loss",
+)
+_DIAGNOSTIC_REQUIRED = (
+    "step",
+    "tokens_processed",
+    "cumulative_estimated_flops",
+    "scope",
+    "layer",
+    "family",
+    "stat",
+    "value",
+    "element_count",
+)
+_DIAGNOSTIC_SCOPES = frozenset({"overall", "embeddings", "block", "final_norm"})
+_DIAGNOSTIC_FAMILIES = ("grad", "update", "param")
+_DIAGNOSTIC_STATS = (
+    "l1_norm",
+    "l2_norm",
+    "mean",
+    "std",
+    "third_moment",
+    "fourth_moment",
 )
 _PRIMARY_TRAIN_METRICS = ("train_loss", "learning_rate")
 _LAYER_METRICS = (
@@ -95,6 +117,7 @@ class _Run:
     validation: list[dict[str, Any]]
     train_metrics: tuple[str, ...]
     flop_source: str
+    diagnostics: list[dict[str, Any]] = field(default_factory=list)
     layer_stats: dict[str, list[dict[str, float]]] = field(default_factory=dict)
     notices: list[str] = field(default_factory=list)
 
@@ -138,6 +161,14 @@ def build_report(
             )
             continue
         try:
+            admission_reason = _report_admission_reason(candidate)
+        except (OSError, ReportError, json.JSONDecodeError) as exc:
+            skipped[candidate.name] = str(exc)
+            continue
+        if admission_reason is not None:
+            skipped[candidate.name] = admission_reason
+            continue
+        try:
             run = _read_run(candidate, records.get(candidate.name), max_chart_points)
         except (OSError, ReportError, csv.Error, json.JSONDecodeError) as exc:
             skipped[candidate.name] = str(exc)
@@ -156,6 +187,43 @@ def build_report(
         skipped=skipped,
         notices=tuple(notices),
     )
+
+
+def _report_admission_reason(run_dir: Path) -> str | None:
+    """Apply the cheap, versioned report filter before hashing large artifacts."""
+
+    result_path = _regular_file(run_dir, "result.json")
+    if result_path.stat().st_size > _MAX_JSON_BYTES:
+        raise ReportError("result.json is implausibly large")
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    if not isinstance(result, dict):
+        raise ReportError("result.json is not an object")
+    if result.get("schema_version") != 1 or result.get("status") != "ok":
+        raise ReportError("result.json is not a successful schema-v1 result")
+    profile = result.get("profile")
+    if profile != "official":
+        return (
+            "baseline report admission qualification requires "
+            f"profile='official'; found {profile!r}"
+        )
+    track = result.get("track")
+    if track not in {"open", "sample_efficiency"}:
+        raise ReportError("result track is invalid")
+    metrics = _object(result.get("metrics"), "result metrics")
+    tokens = _positive_int(metrics.get("tokens_processed"), "tokens_processed")
+    if track == "open" and tokens != _OFFICIAL_OPEN_TOKENS:
+        return (
+            "open run is incomplete: expected exactly "
+            f"{_OFFICIAL_OPEN_TOKENS:,} training tokens, found {tokens:,}"
+        )
+    validation_loss = _finite(metrics.get("validation_loss"), "validation_loss")
+    if validation_loss > REPORT_ADMISSION_QUALIFICATION_LOSS:
+        return (
+            "run does not meet the baseline report admission qualification: "
+            f"validation loss {validation_loss:.6g} > "
+            f"{REPORT_ADMISSION_QUALIFICATION_LOSS:.6g}"
+        )
+    return None
 
 
 def _read_ledger(
@@ -246,14 +314,173 @@ def _read_run(path: Path, record: dict[str, Any] | None, limit: int) -> _Run:
         train_metrics=metric_names,
         flop_source=flop_source,
     )
+    diagnostics_path = _artifact_path(
+        path, result, "diagnostics", "diagnostics.csv", required=False
+    )
+    if diagnostics_path is not None:
+        _check_record_artifact(diagnostics_path, path, record, "diagnostics")
+        run.diagnostics = _read_diagnostics(diagnostics_path, training)
+    else:
+        run.notices.append(
+            f"{run_id}: diagnostics.csv was not recorded; diagnostic plots are unavailable."
+        )
     if record is None:
         run.notices.append(f"{run_id}: not present in records.jsonl (shown as unledgered).")
     elif "qualified" in record and not isinstance(record["qualified"], bool):
         run.notices.append(f"{run_id}: invalid ledger qualified flag was ignored.")
-    _read_checkpoint_layers(path, run)
+    # Long-form diagnostics already contain final param/grad/update scope values.
+    # Avoid hashing and scanning a large checkpoint when that artifact is present.
+    if not run.diagnostics:
+        _read_checkpoint_layers(path, run)
     # Store the limit on the transient object without widening the public payload.
     run.result["_report_point_limit"] = limit
     return run
+
+
+def _read_diagnostics(
+    path: Path, training: Sequence[Mapping[str, float]]
+) -> list[dict[str, Any]]:
+    """Read the optional long-form diagnostics artifact without importing JAX."""
+
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fields = reader.fieldnames
+        if not fields or len(fields) != len(set(fields)):
+            raise ReportError("diagnostics.csv has a missing or duplicate header")
+        missing = [name for name in _DIAGNOSTIC_REQUIRED if name not in fields]
+        if missing:
+            raise ReportError("diagnostics.csv is missing: " + ", ".join(missing))
+        raw_rows = list(reader)
+    if not raw_rows:
+        raise ReportError("diagnostics.csv has no data rows")
+
+    by_step = {int(row["step"]): row for row in training}
+    parsed: list[dict[str, Any]] = []
+    identities: set[tuple[int, str, int | None, str, str]] = set()
+    identities_by_step: dict[int, set[tuple[str, int | None, str, str]]] = {}
+    counts_by_scope: dict[tuple[str, int | None], int] = {}
+    previous_step = 0
+    for number, raw in enumerate(raw_rows, 2):
+        prefix = f"diagnostics.csv:{number}"
+        step = _positive_int_text(raw.get("step"), f"{prefix} step")
+        training_row = by_step.get(step)
+        if training_row is None:
+            raise ReportError(f"{prefix} step is outside training.csv")
+        if step < previous_step:
+            raise ReportError("diagnostics.csv steps must be ordered")
+        tokens = _positive_int_text(raw.get("tokens_processed"), f"{prefix} tokens")
+        if tokens != int(training_row["tokens_processed"]):
+            raise ReportError(f"{prefix} token count disagrees with training.csv")
+        estimated_flops = _finite_text(
+            raw.get("cumulative_estimated_flops"), f"{prefix} cumulative FLOPs"
+        )
+        if estimated_flops <= 0 or not _close(
+            estimated_flops, float(training_row["estimated_flops"])
+        ):
+            raise ReportError(f"{prefix} cumulative FLOPs disagree with training.csv")
+        scope = (raw.get("scope") or "").strip()
+        family = (raw.get("family") or "").strip()
+        statistic = (raw.get("stat") or "").strip()
+        if scope not in _DIAGNOSTIC_SCOPES:
+            raise ReportError(f"{prefix} scope is invalid")
+        if family not in _DIAGNOSTIC_FAMILIES:
+            raise ReportError(f"{prefix} family is invalid")
+        if statistic not in _DIAGNOSTIC_STATS:
+            raise ReportError(f"{prefix} stat is invalid")
+        layer_text = (raw.get("layer") or "").strip()
+        if scope == "block":
+            if not re.fullmatch(r"0|[1-9][0-9]*", layer_text):
+                raise ReportError(f"{prefix} block layer is not a non-negative integer")
+            layer: int | None = int(layer_text)
+        else:
+            if layer_text:
+                raise ReportError(f"{prefix} layer must be blank outside block scope")
+            layer = None
+        identity = (step, scope, layer, family, statistic)
+        if identity in identities:
+            raise ReportError(f"{prefix} duplicates an earlier diagnostic identity")
+        identities.add(identity)
+        identities_by_step.setdefault(step, set()).add(
+            (scope, layer, family, statistic)
+        )
+        element_count = _positive_int_text(
+            raw.get("element_count"), f"{prefix} element_count"
+        )
+        scope_identity = (scope, layer)
+        previous_count = counts_by_scope.setdefault(scope_identity, element_count)
+        if previous_count != element_count:
+            raise ReportError(
+                f"{prefix} element_count changes within diagnostic scope"
+            )
+        parsed.append(
+            {
+                "step": step,
+                "tokens_processed": tokens,
+                "estimated_flops": estimated_flops,
+                "scope": scope,
+                "layer": layer,
+                "family": family,
+                "stat": statistic,
+                "value": _finite_text(raw.get("value"), f"{prefix} value"),
+                "element_count": element_count,
+            }
+        )
+        previous_step = step
+
+    _validate_diagnostic_grid(identities_by_step, counts_by_scope)
+    if parsed[0]["step"] != 1:
+        raise ReportError("diagnostics.csv must include optimizer step 1")
+    if parsed[-1]["step"] != int(training[-1]["step"]):
+        raise ReportError("diagnostics.csv does not contain the final training step")
+    return parsed
+
+
+def _validate_diagnostic_grid(
+    identities_by_step: Mapping[
+        int, set[tuple[str, int | None, str, str]]
+    ],
+    counts_by_scope: Mapping[tuple[str, int | None], int],
+) -> None:
+    """Require every sampled point to contain the complete version-one grid."""
+
+    expected_scopes = set(counts_by_scope)
+    mandatory = {("overall", None), ("embeddings", None), ("final_norm", None)}
+    if not mandatory.issubset(expected_scopes):
+        raise ReportError(
+            "diagnostics.csv is missing an overall, embeddings, or final_norm scope"
+        )
+    block_layers = sorted(
+        int(layer)
+        for scope, layer in expected_scopes
+        if scope == "block" and layer is not None
+    )
+    if not block_layers or block_layers != list(range(block_layers[-1] + 1)):
+        raise ReportError(
+            "diagnostics.csv block scopes must be contiguous and start at layer 0"
+        )
+    expected_grid = {
+        (scope, layer, family, statistic)
+        for scope, layer in expected_scopes
+        for family in _DIAGNOSTIC_FAMILIES
+        for statistic in _DIAGNOSTIC_STATS
+    }
+    for step, identities in identities_by_step.items():
+        if identities != expected_grid:
+            missing = len(expected_grid - identities)
+            extra = len(identities - expected_grid)
+            raise ReportError(
+                f"diagnostics.csv step {step} has an incomplete diagnostic grid "
+                f"({missing} missing, {extra} unexpected rows)"
+            )
+    component_count = sum(
+        count
+        for scope, count in counts_by_scope.items()
+        if scope != ("overall", None)
+    )
+    if counts_by_scope[("overall", None)] != component_count:
+        raise ReportError(
+            "diagnostics.csv overall element_count disagrees with its model scopes"
+        )
 
 
 def _check_identity(
@@ -751,7 +978,9 @@ def _layer_identity(key: str) -> tuple[str, int] | None:
 
 
 def _report_payload(
-    runs: Sequence[_Run], skipped: Mapping[str, str], notices: Sequence[str]
+    runs: Sequence[_Run],
+    skipped: Mapping[str, str],
+    notices: Sequence[str],
 ) -> dict[str, Any]:
     run_rows: list[dict[str, Any]] = []
     for index, run in enumerate(runs):
@@ -765,7 +994,7 @@ def _report_payload(
             if isinstance(run.record, dict) and isinstance(run.record.get("submission"), str)
             else _submission_from_run_id(run.run_id)
         )
-        selected, classification = _default_run_selection(
+        _, classification = _default_run_selection(
             str(result["track"]), str(result["profile"]), int(metrics["tokens_processed"])
         )
         qualified = run.record.get("qualified") if run.record else None
@@ -779,7 +1008,7 @@ def _report_payload(
                 "track": result["track"],
                 "profile": result["profile"],
                 "classification": classification,
-                "selected": selected,
+                "selected": True,
                 "seed": result["seed"],
                 "color": _COLORS[index % len(_COLORS)],
                 "ledger": run.record is not None,
@@ -791,7 +1020,8 @@ def _report_payload(
                 "validationLoss": metrics.get("validation_loss"),
                 "fresh10Loss": fresh_loss,
                 "qualified": qualified,
-                "hasLayerStats": bool(run.layer_stats),
+                "hasLayerStats": bool(run.layer_stats)
+                or any(row["scope"] != "overall" for row in run.diagnostics),
             }
         )
 
@@ -816,31 +1046,20 @@ def _report_payload(
             time_charts.append(chart)
     time_charts.append(_training_chart(runs, "learning_rate", "Learning rate", "rate"))
 
-    reserved = {
-        "step",
-        "tokens_processed",
-        "estimated_flops",
-        "cumulative_estimated_flops",
-        "train_loss",
-        "learning_rate",
-    }
-    extras: list[str] = []
-    for run in runs:
-        for metric in run.train_metrics:
-            if metric not in reserved and metric not in extras and _diagnostic_metric(metric):
-                extras.append(metric)
-    for metric in sorted(extras, key=_metric_sort_key):
-        time_charts.append(
-            _training_chart(runs, metric, _humanize(metric), _metric_unit(metric))
-        )
     time_charts = [chart for chart in time_charts if chart["series"]]
 
     recorded_overall = {
+        (str(row["family"]), str(row["stat"]))
+        for run in runs
+        for row in run.diagnostics
+        if row["scope"] == "overall"
+    }
+    recorded_overall.update(
         identity
         for run in runs
         for metric in run.train_metrics
         if (identity := _overall_metric_identity(metric)) is not None
-    }
+    )
     requested_overall = [
         (family, statistic)
         for family in ("grad", "update", "param")
@@ -868,41 +1087,22 @@ def _report_payload(
         + (", ".join(recorded_labels) if recorded_labels else "none")
         + "; not recorded: "
         + (", ".join(missing_overall) if missing_overall else "none")
-        + ". Future numeric training.csv columns with grad/update/param metric names "
-        "are discovered automatically."
+        + "."
     ]
 
-    layer_charts: list[dict[str, Any]] = []
-    for family in ("param", "grad", "update"):
-        for metric in _LAYER_METRICS:
-            series = []
-            for run in runs:
-                points = [
-                    [int(row["layer"]), row[metric]]
-                    for row in run.layer_stats.get(family, [])
-                    if metric in row
-                ]
-                if points:
-                    series.append({"run": run.run_id, "points": points})
-            if series:
-                layer_charts.append(
-                    {
-                        "key": f"layer_{family}_{metric}",
-                        "title": f"{family.title()} · {_humanize(metric)} by layer",
-                        "yLabel": _metric_unit(metric),
-                        "series": series,
-                    }
-                )
+    diagnostic_charts = _overall_diagnostic_charts(runs)
+    layer_charts = _final_diagnostic_charts(runs)
 
     missing_final_families = []
-    for family in ("grad", "update"):
-        if not any(family in run.layer_stats for run in runs):
+    for family in _DIAGNOSTIC_FAMILIES:
+        if not any(chart["family"] == family for chart in layer_charts):
             missing_final_families.append(family)
     if missing_final_families:
         notices = list(notices) + [
             "Final-checkpoint "
             + "/".join(missing_final_families)
-            + " layer metrics are unavailable; they will appear when checkpoints record those arrays."
+            + " scope metrics are unavailable; they appear when diagnostics.csv is recorded "
+            "or a retained checkpoint contains those arrays."
         ]
 
     return {
@@ -912,9 +1112,13 @@ def _report_payload(
             "skipped": len(skipped),
             "defaultXAxis": "flops",
             "flopsLabel": "Estimated cumulative FLOPs",
+            "admissionQualificationLoss": REPORT_ADMISSION_QUALIFICATION_LOSS,
+            "profile": "official",
+            "openTrainingTokens": _OFFICIAL_OPEN_TOKENS,
         },
         "runs": run_rows,
         "timeCharts": time_charts,
+        "diagnosticCharts": diagnostic_charts,
         "layerCharts": layer_charts,
         "notices": list(dict.fromkeys(notices)),
         "skipped": [{"run": key, "reason": value} for key, value in skipped.items()],
@@ -943,6 +1147,130 @@ def _training_chart(
         "yLabel": y_label,
         "series": series,
     }
+
+
+def _overall_diagnostic_charts(runs: Sequence[_Run]) -> list[dict[str, Any]]:
+    """Build one timeline chart per family/statistic pair.
+
+    Long-form diagnostics are authoritative.  The legacy scalar training columns
+    remain a read-only fallback so older official artifacts do not lose the one
+    gradient norm they already recorded.
+    """
+
+    charts: list[dict[str, Any]] = []
+    for family in _DIAGNOSTIC_FAMILIES:
+        for statistic in _DIAGNOSTIC_STATS:
+            series: list[dict[str, Any]] = []
+            for run in runs:
+                rows = [
+                    row
+                    for row in run.diagnostics
+                    if row["scope"] == "overall"
+                    and row["family"] == family
+                    and row["stat"] == statistic
+                ]
+                if rows:
+                    points = [
+                        [row["step"], row["estimated_flops"], row["value"]]
+                        for row in rows
+                    ]
+                else:
+                    legacy = next(
+                        (
+                            metric
+                            for metric in run.train_metrics
+                            if _overall_metric_identity(metric) == (family, statistic)
+                        ),
+                        None,
+                    )
+                    points = (
+                        [
+                            [row["step"], row["estimated_flops"], row[legacy]]
+                            for row in run.training
+                            if legacy in row
+                        ]
+                        if legacy is not None
+                        else []
+                    )
+                if points:
+                    limit = int(run.result.get("_report_point_limit", _MAX_CHART_POINTS))
+                    series.append(
+                        {"run": run.run_id, "points": _lttb(points, limit, x_index=1)}
+                    )
+            if series:
+                charts.append(
+                    {
+                        "key": f"overall_{family}_{statistic}",
+                        "family": family,
+                        "stat": statistic,
+                        "title": _humanize(statistic),
+                        "yLabel": _metric_unit(statistic),
+                        "series": series,
+                    }
+                )
+    return charts
+
+
+def _final_diagnostic_charts(runs: Sequence[_Run]) -> list[dict[str, Any]]:
+    """Build final-step embeddings/block/final-norm plots for each family."""
+
+    charts: list[dict[str, Any]] = []
+    for family in _DIAGNOSTIC_FAMILIES:
+        for statistic in _DIAGNOSTIC_STATS:
+            series: list[dict[str, Any]] = []
+            for run in runs:
+                final_step = int(run.training[-1]["step"])
+                rows = [
+                    row
+                    for row in run.diagnostics
+                    if row["step"] == final_step
+                    and row["scope"] != "overall"
+                    and row["family"] == family
+                    and row["stat"] == statistic
+                ]
+                points = _diagnostic_scope_points(rows)
+                if not points:
+                    # Checkpoint-derived arrays are a useful fallback for legacy
+                    # runs, but diagnostics.csv wins whenever both exist.
+                    points = [
+                        [int(row["layer"]), row[statistic], f"block {int(row['layer'])}"]
+                        for row in run.layer_stats.get(family, [])
+                        if statistic in row
+                    ]
+                if points:
+                    series.append({"run": run.run_id, "points": points})
+            if series:
+                charts.append(
+                    {
+                        "key": f"layer_{family}_{statistic}",
+                        "family": family,
+                        "stat": statistic,
+                        "title": _humanize(statistic),
+                        "yLabel": _metric_unit(statistic),
+                        "series": series,
+                    }
+                )
+    return charts
+
+
+def _diagnostic_scope_points(rows: Sequence[Mapping[str, Any]]) -> list[list[Any]]:
+    block_layers = [int(row["layer"]) for row in rows if row["scope"] == "block"]
+    final_position = (max(block_layers) + 1) if block_layers else 1
+    positions = {
+        "embeddings": (-1, "embeddings"),
+        "final_norm": (final_position, "final norm"),
+    }
+    points: list[list[Any]] = []
+    for row in rows:
+        scope = str(row["scope"])
+        if scope == "block":
+            layer = int(row["layer"])
+            points.append([layer, row["value"], f"block {layer}"])
+        elif scope in positions:
+            position, label = positions[scope]
+            points.append([position, row["value"], label])
+    points.sort(key=lambda point: point[0])
+    return points
 
 
 def _validation_chart(
@@ -1221,6 +1549,7 @@ _HTML = r'''<!doctype html>
 <style>
 :root{--bg:#080b12;--panel:#101521;--panel2:#151b29;--line:#273247;--text:#edf4ff;--muted:#91a0b8;--accent:#7dd3fc;--good:#86efac;--warn:#fde047;--bad:#fca5a5;--radius:14px;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--text);background:var(--bg);font-synthesis:none}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 75% -10%,#17233a 0,transparent 35rem),var(--bg);min-height:100vh}button,input{font:inherit}.shell{display:grid;grid-template-columns:280px minmax(0,1fr);min-height:100vh}.sidebar{position:sticky;top:0;height:100vh;overflow:auto;border-right:1px solid var(--line);background:rgba(10,14,23,.94);backdrop-filter:blur(16px);padding:20px}.brand{font-weight:800;letter-spacing:.02em;font-size:17px}.brand b{color:var(--accent)}.subtle{color:var(--muted);font-size:12px;line-height:1.5}.side-actions{display:flex;gap:7px;margin:18px 0 10px}.ghost{border:1px solid var(--line);color:var(--muted);background:var(--panel);border-radius:8px;padding:6px 9px;cursor:pointer}.ghost:hover{color:var(--text);border-color:#41516d}.search{width:100%;border:1px solid var(--line);background:#090d16;color:var(--text);padding:9px 10px;border-radius:9px;outline:none}.search:focus{border-color:var(--accent)}.run-list{display:grid;gap:7px;margin-top:12px}.run-toggle{display:grid;grid-template-columns:auto 10px 1fr;gap:9px;align-items:start;padding:9px;border:1px solid transparent;border-radius:10px;cursor:pointer}.run-toggle:hover{background:var(--panel);border-color:var(--line)}.run-toggle input{margin-top:3px;accent-color:var(--accent)}.dot{width:9px;height:9px;border-radius:50%;margin-top:4px;box-shadow:0 0 14px currentColor}.run-name{font-size:12px;font-weight:650;overflow-wrap:anywhere}.run-meta{display:block;color:var(--muted);font-size:10px;margin-top:3px}.main{min-width:0;padding:26px 28px 60px}.top{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:20px}.eyebrow{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent);font-weight:750}.top h1{font-size:clamp(25px,3vw,42px);letter-spacing:-.04em;margin:5px 0 7px}.stats{display:flex;gap:8px;flex-wrap:wrap}.pill{border:1px solid var(--line);background:rgba(16,21,33,.8);border-radius:999px;padding:7px 10px;color:var(--muted);font-size:12px}.pill strong{color:var(--text)}.axis-control{flex:none;border:1px solid var(--line);border-radius:11px;padding:4px;background:#090d16;display:flex}.axis-control label{cursor:pointer}.axis-control input{position:absolute;opacity:0;pointer-events:none}.axis-control span{display:block;padding:8px 11px;border-radius:7px;color:var(--muted);font-size:12px;font-weight:700}.axis-control input:checked+span{background:var(--panel2);color:var(--text);box-shadow:0 1px 5px #0008}.axis-hint{text-align:right;color:var(--muted);font-size:10px;margin-top:6px}.notice-wrap{display:grid;gap:7px;margin:16px 0}.notice{padding:10px 12px;border:1px solid #3d3940;background:#18161c;color:#c6b9c6;border-radius:10px;font-size:12px}.section-title{margin:30px 0 12px;font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,410px),1fr));gap:12px}.chart{background:linear-gradient(145deg,rgba(20,27,42,.92),rgba(12,17,27,.92));border:1px solid var(--line);border-radius:var(--radius);padding:15px;min-width:0}.chart-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:7px}.chart h2{font-size:14px;margin:0;letter-spacing:-.01em}.chart-unit{color:var(--muted);font-size:10px}.canvas-wrap{height:270px;position:relative}.chart canvas{display:block;width:100%;height:100%;touch-action:none}.tooltip{position:fixed;z-index:20;pointer-events:none;background:#070a11ec;border:1px solid #36435b;border-radius:8px;padding:7px 9px;box-shadow:0 12px 30px #000a;font-size:11px;line-height:1.45;display:none;max-width:270px}.empty{border:1px dashed var(--line);border-radius:var(--radius);padding:30px;color:var(--muted);text-align:center}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:var(--radius);background:var(--panel)}table{border-collapse:collapse;width:100%;font-size:12px;white-space:nowrap}th,td{text-align:right;padding:10px 12px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em}th:first-child,td:first-child{text-align:left}tbody tr:last-child td{border-bottom:0}.status{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:7px}.footer{color:var(--muted);font-size:11px;margin-top:26px}.mobile-runs{display:none}.skip details{color:var(--muted);font-size:12px}.skip summary{cursor:pointer}.skip code{color:var(--bad);white-space:normal;overflow-wrap:anywhere}@media(max-width:850px){.shell{grid-template-columns:1fr}.sidebar{display:none;position:fixed;z-index:30;width:min(88vw,320px);box-shadow:20px 0 70px #000;height:100vh}.sidebar.open{display:block}.main{padding:20px 14px 50px}.mobile-runs{display:inline-flex}.top{align-items:stretch;flex-direction:column}.axis-control{align-self:flex-start}.axis-hint{text-align:left}.canvas-wrap{height:240px}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+.chart-head{align-items:center}.chart-tools{display:flex;align-items:center;gap:5px}.icon-button{border:1px solid transparent;background:transparent;color:var(--muted);border-radius:7px;padding:4px 7px;cursor:pointer;line-height:1}.icon-button:hover,.icon-button:focus-visible{border-color:var(--line);color:var(--text);outline:none}.chart canvas{cursor:crosshair}.chart canvas.dragging{cursor:grabbing}.chart.family-hidden{display:none}.family-control{display:flex;gap:5px;margin:12px 0;flex-wrap:wrap}.family-control button{border:1px solid var(--line);background:#090d16;color:var(--muted);border-radius:8px;padding:7px 11px;cursor:pointer;font-weight:700;font-size:12px}.family-control button.active{background:var(--panel2);color:var(--text);border-color:#49617f}.tooltip{z-index:60}.focus-dialog{width:min(96vw,1500px);height:min(94vh,980px);padding:0;border:1px solid #43516a;border-radius:16px;background:var(--panel);color:var(--text);box-shadow:0 30px 100px #000d}.focus-dialog::backdrop{background:#03050ae8;backdrop-filter:blur(4px)}.focus-shell{height:100%;display:flex;flex-direction:column;padding:16px}.focus-head{display:flex;justify-content:space-between;align-items:center;gap:12px}.focus-head h2{font-size:17px;margin:0}.focus-canvas{flex:1;min-height:0;margin-top:8px}.focus-canvas canvas{display:block;width:100%;height:100%;touch-action:none;cursor:crosshair}.interaction-hint{color:var(--muted);font-size:10px;margin-top:7px}@media(max-width:850px){.focus-dialog{width:100vw;height:100vh;max-width:none;max-height:none;border-radius:0}}
 </style>
 </head>
 <body>
@@ -1240,40 +1569,69 @@ _HTML = r'''<!doctype html>
   <div class="notice-wrap" id="notices"></div>
   <div class="section-title">Run summary</div><div id="summary"></div>
   <div class="section-title">Training timeline</div><div class="charts" id="time-charts"></div>
-  <div class="section-title">Final checkpoint · x = logical layer</div><div class="charts" id="layer-charts"></div>
+  <div class="section-title">Overall diagnostics timeline</div>
+  <div class="family-control" id="family-control" role="group" aria-label="Diagnostic family"></div>
+  <div class="charts" id="diagnostic-charts"></div>
+  <div class="section-title">Final diagnostic snapshot · x = model scope / logical layer</div><div class="charts" id="layer-charts"></div>
   <div class="skip" id="skipped"></div>
   <div class="footer" id="footer"></div>
 </main>
 </div>
 <div class="tooltip" id="tooltip"></div>
+<dialog class="focus-dialog" id="focus-dialog" aria-labelledby="focus-title">
+  <div class="focus-shell">
+    <div class="focus-head"><h2 id="focus-title"></h2><div><button class="ghost" id="focus-reset">Reset view</button> <button class="ghost" id="focus-close">Close</button></div></div>
+    <div class="interaction-hint">Wheel to zoom · drag to pan · double-click to reset · Esc to close</div>
+    <div class="focus-canvas"><canvas id="focus-canvas"></canvas></div>
+  </div>
+</dialog>
 <script type="application/json" id="report-data">__REPORT_DATA__</script>
 <script>
 (()=>{'use strict';
 const D=JSON.parse(document.getElementById('report-data').textContent), runMap=new Map(D.runs.map(r=>[r.id,r]));
-const visible=new Set(D.runs.filter(r=>r.selected).map(r=>r.id)); let axis='flops', charts=[], frame=0;
+const visible=new Set(D.runs.filter(r=>r.selected).map(r=>r.id)), families=['grad','update','param'];
+let axis='flops', family='grad', charts=[], frame=0, focusItem=null;
 const $=id=>document.getElementById(id), esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt=(n,d=3)=>{if(n==null||!Number.isFinite(+n))return '—';n=+n;const a=Math.abs(n);if(a>=1e18)return (n/1e18).toFixed(2)+' EF';if(a>=1e15)return (n/1e15).toFixed(2)+' PF';if(a>=1e12)return (n/1e12).toFixed(2)+' T';if(a>=1e9)return (n/1e9).toFixed(2)+' B';if(a>=1e6)return (n/1e6).toFixed(2)+' M';if(a>=1e3)return (n/1e3).toFixed(2)+' k';if(a>0&&a<.001)return n.toExponential(2);const f=n.toFixed(d);return d?f.replace(/(\.\d*?[1-9])0+$|\.0+$/,'$1'):f};
 function init(){
- $('stats').innerHTML=`<span class="pill"><strong>${D.meta.included}</strong> plotted</span><span class="pill"><strong>${D.meta.skipped}</strong> skipped</span><span class="pill">default <strong>equi-FLOP</strong></span>`;
+ $('stats').innerHTML=`<span class="pill"><strong>${D.meta.included}</strong> included</span><span class="pill"><strong>${D.meta.skipped}</strong> excluded</span><span class="pill">baseline report admission qualification · val ≤ <strong>${fmt(D.meta.admissionQualificationLoss,4)}</strong></span><span class="pill">default <strong>equi-FLOP</strong></span>`;
  $('notices').innerHTML=D.notices.map(n=>`<div class="notice">${esc(n)}</div>`).join('');
  buildRuns(); buildSummary(); buildCharts(); buildSkipped();
  $('footer').textContent=`Generated ${new Date(D.meta.generatedAt).toLocaleString()} · portable HTML · no network or external JavaScript`;
- document.querySelectorAll('input[name=axis]').forEach(r=>r.addEventListener('change',()=>{axis=r.value;$('axis-hint').textContent=axis==='flops'?'Estimated cumulative FLOPs':'Optimizer step';schedule()}));
- $('all-runs').onclick=()=>{D.runs.forEach(r=>visible.add(r.id));syncChecks();schedule()}; $('no-runs').onclick=()=>{visible.clear();syncChecks();schedule()};
+ document.querySelectorAll('input[name=axis]').forEach(r=>r.addEventListener('change',()=>{axis=r.value;resetViews();$('axis-hint').textContent=axis==='flops'?'Estimated cumulative FLOPs':'Optimizer step';schedule()}));
+ $('all-runs').onclick=()=>{D.runs.forEach(r=>visible.add(r.id));syncChecks();resetViews();schedule()}; $('no-runs').onclick=()=>{visible.clear();syncChecks();resetViews();schedule()};
  $('run-search').oninput=e=>{const q=e.target.value.toLowerCase();document.querySelectorAll('.run-toggle').forEach(x=>x.hidden=!x.dataset.search.includes(q))};
  $('open-runs').onclick=()=>{$('sidebar').classList.add('open')}; $('close-runs').onclick=()=>{$('sidebar').classList.remove('open')};
+ $('focus-close').onclick=()=>closeFocus(); $('focus-reset').onclick=()=>{if(focusItem){focusItem.view=null;redraw(focusItem)}};
+ $('focus-dialog').addEventListener('close',finishFocus);
+ new ResizeObserver(()=>{if(focusItem&&$('focus-dialog').open)redraw(focusItem)}).observe($('focus-dialog'));
  new ResizeObserver(schedule).observe(document.querySelector('.main')); schedule();
 }
-function buildRuns(){$('run-list').innerHTML=D.runs.map(r=>`<label class="run-toggle" data-search="${esc((r.label+' '+r.id+' '+r.classification).toLowerCase())}"><input type="checkbox" data-run="${esc(r.id)}" ${r.selected?'checked':''}><span class="dot" style="color:${r.color};background:${r.color}"></span><span class="run-name">${esc(r.label)}<small class="run-meta">${esc(r.classification)} · step ${fmt(r.finalStep,0)} · val ${fmt(r.validationLoss,4)}${r.ledger?' · ledger ✓':' · unledgered'}</small></span></label>`).join('')||'<p class="subtle">No plot-able runs found.</p>';document.querySelectorAll('[data-run]').forEach(x=>x.onchange=()=>{x.checked?visible.add(x.dataset.run):visible.delete(x.dataset.run);schedule()})}
+function buildRuns(){$('run-list').innerHTML=D.runs.map(r=>`<label class="run-toggle" data-search="${esc((r.label+' '+r.id+' '+r.classification).toLowerCase())}"><input type="checkbox" data-run="${esc(r.id)}" ${r.selected?'checked':''}><span class="dot" style="color:${r.color};background:${r.color}"></span><span class="run-name">${esc(r.label)}<small class="run-meta">${esc(r.classification)} · step ${fmt(r.finalStep,0)} · val ${fmt(r.validationLoss,4)}${r.ledger?' · ledger ✓':' · unledgered'}</small></span></label>`).join('')||'<p class="subtle">No plot-able runs found.</p>';document.querySelectorAll('[data-run]').forEach(x=>x.onchange=()=>{x.checked?visible.add(x.dataset.run):visible.delete(x.dataset.run);resetViews();schedule()})}
 function syncChecks(){document.querySelectorAll('[data-run]').forEach(x=>x.checked=visible.has(x.dataset.run))}
-function buildSummary(){if(!D.runs.length){$('summary').innerHTML='<div class="empty">No completed runs passed the report integrity checks.</div>';return}$('summary').innerHTML=`<div class="table-wrap"><table><thead><tr><th>Run</th><th>Class</th><th>Steps</th><th>Tokens</th><th>Train s</th><th>Train loss</th><th>Val loss</th><th>Fresh10</th><th>FLOP x</th><th>Checkpoint layers</th></tr></thead><tbody>${D.runs.map(r=>`<tr><td><span class="status" style="background:${r.color}"></span>${esc(r.label)}</td><td>${esc(r.classification)}</td><td>${fmt(r.finalStep,0)}</td><td>${fmt(r.tokens,0)}</td><td>${fmt(r.trainSeconds,2)}</td><td>${fmt(r.trainLoss,4)}</td><td>${fmt(r.validationLoss,4)}</td><td>${fmt(r.fresh10Loss,4)}</td><td title="${esc(r.flopSource)}">${r.flopSource.startsWith('derived:')?'derived':'logged'}</td><td>${r.hasLayerStats?'yes':'—'}</td></tr>`).join('')}</tbody></table></div>`}
-function buildCharts(){charts=[];makeGroup($('time-charts'),D.timeCharts,'time');makeGroup($('layer-charts'),D.layerCharts,'layer');if(!D.layerCharts.length)$('layer-charts').innerHTML='<div class="empty">No retained checkpoint contains recognized per-layer arrays. Qualifying retention may intentionally remove checkpoints.</div>'}
-function makeGroup(root,data,type){root.innerHTML=data.map((c,i)=>`<article class="chart"><div class="chart-head"><h2>${esc(c.title)}</h2><span class="chart-unit">${esc(c.yLabel)}</span></div><div class="canvas-wrap"><canvas aria-label="${esc(c.title)}"></canvas></div></article>`).join('');root.querySelectorAll('canvas').forEach((canvas,i)=>{const item={canvas,data:data[i],type};canvas.onpointermove=e=>tip(e,item);canvas.onpointerleave=hideTip;charts.push(item)})}
-function buildSkipped(){if(!D.skipped.length)return;$('skipped').innerHTML=`<div class="section-title">Excluded by integrity scan</div>${D.skipped.map(x=>`<details><summary>${esc(x.run)}</summary><code>${esc(x.reason)}</code></details>`).join('')}`}
-function schedule(){cancelAnimationFrame(frame);frame=requestAnimationFrame(()=>charts.forEach(draw))}
-function bounds(item){let x0=Infinity,x1=-Infinity,y0=Infinity,y1=-Infinity,count=0;for(const s of item.data.series){if(!visible.has(s.run))continue;for(const p of s.points){const x=item.type==='layer'?p[0]:p[axis==='flops'?1:0],y=item.type==='layer'?p[1]:p[2];if(Number.isFinite(x)&&Number.isFinite(y)){x0=Math.min(x0,x);x1=Math.max(x1,x);y0=Math.min(y0,y);y1=Math.max(y1,y);count++}}}if(!count)return null;if(x0===x1){x0-=.5;x1+=.5}if(y0===y1){const q=Math.abs(y0)*.05||.5;y0-=q;y1+=q}else{const q=(y1-y0)*.08;y0-=q;y1+=q}return{x0,x1,y0,y1}}
-function draw(item){const c=item.canvas,rect=c.getBoundingClientRect(),dpr=Math.min(devicePixelRatio||1,2),w=Math.max(1,rect.width),h=Math.max(1,rect.height);if(c.width!==Math.round(w*dpr)||c.height!==Math.round(h*dpr)){c.width=Math.round(w*dpr);c.height=Math.round(h*dpr)}const g=c.getContext('2d');g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,w,h);const m={l:54,r:14,t:12,b:31},b=bounds(item);if(!b){g.fillStyle='#91a0b8';g.font='12px system-ui';g.textAlign='center';g.fillText('No selected run has this metric',w/2,h/2);return}const X=x=>m.l+(x-b.x0)/(b.x1-b.x0)*(w-m.l-m.r),Y=y=>m.t+(b.y1-y)/(b.y1-b.y0)*(h-m.t-m.b);g.strokeStyle='#253047';g.lineWidth=1;g.fillStyle='#7e8da6';g.font='10px ui-monospace,monospace';for(let i=0;i<=4;i++){const y=m.t+(h-m.t-m.b)*i/4,v=b.y1-(b.y1-b.y0)*i/4;g.beginPath();g.moveTo(m.l,y);g.lineTo(w-m.r,y);g.stroke();g.textAlign='right';g.fillText(fmt(v,3),m.l-7,y+3)}for(let i=0;i<=4;i++){const x=m.l+(w-m.l-m.r)*i/4,v=b.x0+(b.x1-b.x0)*i/4;g.textAlign=i===0?'left':i===4?'right':'center';g.fillText(fmt(v,item.type==='layer'?0:2),x,h-9)}for(const s of item.data.series){if(!visible.has(s.run))continue;const r=runMap.get(s.run);g.strokeStyle=r.color;g.fillStyle=r.color;g.lineWidth=1.7;g.globalAlpha=.9;g.beginPath();let n=0;for(const p of s.points){const x=item.type==='layer'?p[0]:p[axis==='flops'?1:0],y=item.type==='layer'?p[1]:p[2];if(!Number.isFinite(x)||!Number.isFinite(y))continue;n?g.lineTo(X(x),Y(y)):g.moveTo(X(x),Y(y));n++}g.stroke();if(n<=20)for(const p of s.points){const x=item.type==='layer'?p[0]:p[axis==='flops'?1:0],y=item.type==='layer'?p[1]:p[2];g.beginPath();g.arc(X(x),Y(y),2.3,0,Math.PI*2);g.fill()}}g.globalAlpha=1;item._plot={b,m,w,h,X,Y}}
-function tip(e,item){if(!item._plot)return;const rect=item.canvas.getBoundingClientRect(),px=e.clientX-rect.left;let best=null;for(const s of item.data.series){if(!visible.has(s.run))continue;for(const p of s.points){const x=item.type==='layer'?p[0]:p[axis==='flops'?1:0],y=item.type==='layer'?p[1]:p[2],dist=Math.abs(item._plot.X(x)-px);if(!best||dist<best.dist)best={dist,p,x,y,run:runMap.get(s.run)}}}if(!best||best.dist>30){hideTip();return}const xname=item.type==='layer'?'layer':axis==='flops'?'estimated FLOPs':'step',t=$('tooltip');t.innerHTML=`<b style="color:${best.run.color}">${esc(best.run.label)}</b><br>${xname}: ${fmt(best.x,item.type==='layer'||axis==='step'?0:2)}<br>${esc(item.data.title)}: ${fmt(best.y,5)}`;t.style.display='block';t.style.left=Math.min(innerWidth-285,e.clientX+13)+'px';t.style.top=Math.min(innerHeight-90,e.clientY+13)+'px'}function hideTip(){$('tooltip').style.display='none'}
+function buildSummary(){if(!D.runs.length){$('summary').innerHTML=`<div class="empty">No complete official run met the baseline report admission qualification (validation loss ≤ ${fmt(D.meta.admissionQualificationLoss,4)}).</div>`;return}$('summary').innerHTML=`<div class="table-wrap"><table><thead><tr><th>Run</th><th>Class</th><th>Steps</th><th>Tokens</th><th>Train s</th><th>Train loss</th><th>Val loss</th><th>Fresh10</th><th>FLOP x</th><th>Final scopes</th></tr></thead><tbody>${D.runs.map(r=>`<tr><td><span class="status" style="background:${r.color}"></span>${esc(r.label)}</td><td>${esc(r.classification)}</td><td>${fmt(r.finalStep,0)}</td><td>${fmt(r.tokens,0)}</td><td>${fmt(r.trainSeconds,2)}</td><td>${fmt(r.trainLoss,4)}</td><td>${fmt(r.validationLoss,4)}</td><td>${fmt(r.fresh10Loss,4)}</td><td title="${esc(r.flopSource)}">${r.flopSource.startsWith('derived:')?'derived':'logged'}</td><td>${r.hasLayerStats?'yes':'—'}</td></tr>`).join('')}</tbody></table></div>`}
+function buildCharts(){charts=[];makeGroup($('time-charts'),D.timeCharts,'time');makeGroup($('diagnostic-charts'),D.diagnosticCharts,'time');makeGroup($('layer-charts'),D.layerCharts,'layer');buildFamilies();if(!D.diagnosticCharts.length)$('diagnostic-charts').innerHTML='<div class="empty">No included run recorded overall diagnostics.</div>';if(!D.layerCharts.length)$('layer-charts').innerHTML='<div class="empty">No included run recorded final model-scope diagnostics or retained compatible layer arrays.</div>'}
+function makeGroup(root,data,type){root.innerHTML=data.map(c=>`<article class="chart" data-family="${esc(c.family||'')}"><div class="chart-head"><h2>${esc(c.title)}</h2><div class="chart-tools"><span class="chart-unit">${esc(c.yLabel)}</span><button class="icon-button reset-chart" title="Reset view" aria-label="Reset ${esc(c.title)} view">↺</button><button class="icon-button expand-chart" title="Open full panel" aria-label="Enlarge ${esc(c.title)}">⛶</button></div></div><div class="canvas-wrap"><canvas aria-label="${esc(c.title)}"></canvas></div></article>`).join('');[...root.querySelectorAll('.chart')].forEach((article,i)=>{const item={canvas:article.querySelector('canvas'),article,data:data[i],type,view:null,drag:null};article.querySelector('.reset-chart').onclick=()=>{item.view=null;redraw(item)};article.querySelector('.expand-chart').onclick=()=>openFocus(item);attachCanvas(item);charts.push(item)})}
+function buildFamilies(){const available=new Set([...D.diagnosticCharts,...D.layerCharts].map(c=>c.family));family=families.find(x=>available.has(x))||'grad';$('family-control').innerHTML=families.map(x=>`<button data-family-button="${x}" aria-pressed="false" ${available.has(x)?'':'disabled'}>${x==='param'?'Parameter':x[0].toUpperCase()+x.slice(1)}</button>`).join('');document.querySelectorAll('[data-family-button]').forEach(b=>b.onclick=()=>{family=b.dataset.familyButton;applyFamily()});applyFamily()}
+function applyFamily(){document.querySelectorAll('[data-family-button]').forEach(b=>{const active=b.dataset.familyButton===family;b.classList.toggle('active',active);b.setAttribute('aria-pressed',String(active))});charts.forEach(item=>{if(item.data.family)item.article.classList.toggle('family-hidden',item.data.family!==family)});setFamilyEmpty($('diagnostic-charts'),D.diagnosticCharts,'No overall '+family+' diagnostics were recorded.');setFamilyEmpty($('layer-charts'),D.layerCharts,'No final model-scope '+family+' diagnostics were recorded.');schedule()}
+function setFamilyEmpty(root,data,message){let empty=root.querySelector('.family-empty');const missing=!data.some(c=>c.family===family);if(missing&&!empty){empty=document.createElement('div');empty.className='empty family-empty';root.appendChild(empty)}if(empty){empty.textContent=message;empty.hidden=!missing}}
+function buildSkipped(){if(!D.skipped.length)return;$('skipped').innerHTML=`<div class="section-title">Excluded by official profile / completeness / baseline report admission qualification / integrity scan</div>${D.skipped.map(x=>`<details><summary>${esc(x.run)}</summary><code>${esc(x.reason)}</code></details>`).join('')}`}
+function schedule(){cancelAnimationFrame(frame);frame=requestAnimationFrame(()=>{charts.forEach(item=>{if(!item.article.classList.contains('family-hidden'))draw(item)});if(focusItem&&$('focus-dialog').open)draw(focusItem)})}
+function redraw(item){cancelAnimationFrame(item._frame||0);item._frame=requestAnimationFrame(()=>draw(item))}
+function resetViews(){charts.forEach(item=>item.view=null);if(focusItem)focusItem.view=null}
+function xOf(item,p){return item.type==='layer'?p[0]:p[axis==='flops'?1:0]}function yOf(item,p){return item.type==='layer'?p[1]:p[2]}
+function dataBounds(item){let x0=Infinity,x1=-Infinity,y0=Infinity,y1=-Infinity,count=0;for(const s of item.data.series){if(!visible.has(s.run))continue;for(const p of s.points){const x=xOf(item,p),y=yOf(item,p);if(Number.isFinite(x)&&Number.isFinite(y)){x0=Math.min(x0,x);x1=Math.max(x1,x);y0=Math.min(y0,y);y1=Math.max(y1,y);count++}}}if(!count)return null;if(x0===x1){x0-=.5;x1+=.5}if(y0===y1){const q=Math.abs(y0)*.05||.5;y0-=q;y1+=q}else{const q=(y1-y0)*.08;y0-=q;y1+=q}return{x0,x1,y0,y1}}
+function bounds(item){const base=dataBounds(item);return base?(item.view||base):null}
+function draw(item){const c=item.canvas,rect=c.getBoundingClientRect(),dpr=Math.min(devicePixelRatio||1,2),w=Math.max(1,rect.width),h=Math.max(1,rect.height);if(c.width!==Math.round(w*dpr)||c.height!==Math.round(h*dpr)){c.width=Math.round(w*dpr);c.height=Math.round(h*dpr)}const g=c.getContext('2d');g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,w,h);const m={l:54,r:14,t:12,b:31},b=bounds(item);if(!b){g.fillStyle='#91a0b8';g.font='12px system-ui';g.textAlign='center';g.fillText('No selected run has this metric',w/2,h/2);item._plot=null;return}const X=x=>m.l+(x-b.x0)/(b.x1-b.x0)*(w-m.l-m.r),Y=y=>m.t+(b.y1-y)/(b.y1-b.y0)*(h-m.t-m.b);g.strokeStyle='#253047';g.lineWidth=1;g.fillStyle='#7e8da6';g.font='10px ui-monospace,monospace';for(let i=0;i<=4;i++){const y=m.t+(h-m.t-m.b)*i/4,v=b.y1-(b.y1-b.y0)*i/4;g.beginPath();g.moveTo(m.l,y);g.lineTo(w-m.r,y);g.stroke();g.textAlign='right';g.fillText(fmt(v,3),m.l-7,y+3)}for(let i=0;i<=4;i++){const x=m.l+(w-m.l-m.r)*i/4,v=b.x0+(b.x1-b.x0)*i/4;g.textAlign=i===0?'left':i===4?'right':'center';g.fillText(fmt(v,item.type==='layer'?0:2),x,h-9)}g.save();g.beginPath();g.rect(m.l,m.t,w-m.l-m.r,h-m.t-m.b);g.clip();for(const s of item.data.series){if(!visible.has(s.run))continue;const r=runMap.get(s.run);g.strokeStyle=r.color;g.fillStyle=r.color;g.lineWidth=1.7;g.globalAlpha=.9;g.beginPath();let n=0;for(const p of s.points){const x=xOf(item,p),y=yOf(item,p);if(!Number.isFinite(x)||!Number.isFinite(y))continue;n?g.lineTo(X(x),Y(y)):g.moveTo(X(x),Y(y));n++}g.stroke();if(n<=20)for(const p of s.points){const x=xOf(item,p),y=yOf(item,p);g.beginPath();g.arc(X(x),Y(y),2.3,0,Math.PI*2);g.fill()}}g.restore();g.globalAlpha=1;item._plot={b,m,w,h,X,Y}}
+function attachCanvas(item){const c=item.canvas;c.onwheel=e=>zoom(e,item);c.ondblclick=()=>{item.view=null;redraw(item)};c.onpointerdown=e=>{if(e.button!==0||!item._plot)return;item.drag={x:e.clientX,y:e.clientY,b:{...item._plot.b}};c.setPointerCapture(e.pointerId);c.classList.add('dragging');hideTip()};c.onpointermove=e=>{if(item.drag){pan(e,item);return}tip(e,item)};c.onpointerup=c.onpointercancel=e=>{item.drag=null;c.classList.remove('dragging');if(c.hasPointerCapture(e.pointerId))c.releasePointerCapture(e.pointerId)};c.onpointerleave=()=>{if(!item.drag)hideTip()}}
+function zoom(e,item){if(!item._plot)return;e.preventDefault();const p=item._plot,base=dataBounds(item);if(!base)return;const rect=item.canvas.getBoundingClientRect(),fx=Math.max(0,Math.min(1,(e.clientX-rect.left-p.m.l)/(p.w-p.m.l-p.m.r))),fy=Math.max(0,Math.min(1,(e.clientY-rect.top-p.m.t)/(p.h-p.m.t-p.m.b))),factor=Math.exp(Math.max(-1,Math.min(1,e.deltaY*.0015))),bx=base.x1-base.x0,by=base.y1-base.y0,sx=Math.max(bx*1e-9,Math.min(bx*100,(p.b.x1-p.b.x0)*factor)),sy=Math.max(by*1e-9,Math.min(by*100,(p.b.y1-p.b.y0)*factor)),cx=p.b.x0+(p.b.x1-p.b.x0)*fx,cy=p.b.y1-(p.b.y1-p.b.y0)*fy;item.view={x0:cx-sx*fx,x1:cx+sx*(1-fx),y0:cy-sy*(1-fy),y1:cy+sy*fy};redraw(item)}
+function pan(e,item){const d=item.drag,p=item._plot,dx=e.clientX-d.x,dy=e.clientY-d.y,sx=-dx/(p.w-p.m.l-p.m.r)*(d.b.x1-d.b.x0),sy=dy/(p.h-p.m.t-p.m.b)*(d.b.y1-d.b.y0);item.view={x0:d.b.x0+sx,x1:d.b.x1+sx,y0:d.b.y0+sy,y1:d.b.y1+sy};redraw(item)}
+function nearest(series,item,target){let lo=0,hi=series.length;while(lo<hi){const mid=(lo+hi)>>1;if(xOf(item,series[mid])<target)lo=mid+1;else hi=mid}let best=null;for(const i of [lo-1,lo])if(i>=0&&i<series.length){const p=series[i],dist=Math.abs(xOf(item,p)-target);if(!best||dist<best.dist)best={p,dist}}return best}
+function tip(e,item){if(!item._plot)return;const rect=item.canvas.getBoundingClientRect(),px=e.clientX-rect.left,py=e.clientY-rect.top,target=item._plot.b.x0+(px-item._plot.m.l)/(item._plot.w-item._plot.m.l-item._plot.m.r)*(item._plot.b.x1-item._plot.b.x0);let best=null;for(const s of item.data.series){if(!visible.has(s.run))continue;const found=nearest(s.points,item,target);if(!found)continue;const x=xOf(item,found.p),y=yOf(item,found.p),dx=item._plot.X(x)-px,dy=item._plot.Y(y)-py,dist=Math.hypot(dx,dy);if(!best||dist<best.dist)best={dist,p:found.p,x,y,run:runMap.get(s.run)}}if(!best||best.dist>42){hideTip();return}const xname=item.type==='layer'?(best.p[2]||'model scope'):axis==='flops'?'estimated FLOPs':'step',xline=item.type==='layer'?esc(xname):esc(xname)+': '+fmt(best.x,axis==='step'?0:2),t=$('tooltip');t.innerHTML=`<b style="color:${best.run.color}">${esc(best.run.label)}</b><br>${xline}<br>${esc(item.data.title)}: ${fmt(best.y,5)}`;t.style.display='block';t.style.left=Math.max(4,Math.min(innerWidth-285,e.clientX+13))+'px';t.style.top=Math.max(4,Math.min(innerHeight-90,e.clientY+13))+'px'}
+function hideTip(){$('tooltip').style.display='none'}
+function openFocus(source){const dialog=$('focus-dialog'),title=(source.data.family?source.data.family.toUpperCase()+' · ':'')+source.data.title;$('focus-title').textContent=title;$('focus-canvas').setAttribute('aria-label',title);focusItem={canvas:$('focus-canvas'),data:source.data,type:source.type,view:source.view?{...source.view}:null,drag:null,source};attachCanvas(focusItem);dialog.showModal();requestAnimationFrame(()=>draw(focusItem))}
+function closeFocus(){const dialog=$('focus-dialog');if(dialog.open)dialog.close()}
+function finishFocus(){hideTip();if(focusItem){focusItem.source.view=focusItem.view?{...focusItem.view}:null;redraw(focusItem.source)}focusItem=null}
 init();
 })();
 </script>

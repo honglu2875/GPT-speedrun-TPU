@@ -162,6 +162,7 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertEqual(official.val_every, 250)
         self.assertEqual(official.val_probe_batches, 8)
         self.assertEqual(official.eval_batches, 320)
+        self.assertEqual(official.diagnostics_every, 250)
 
         for profile in ("smoke", "dev"):
             with self.subTest(profile=profile):
@@ -169,6 +170,7 @@ class TrainerStaticTests(unittest.TestCase):
                     parser.parse_args(["--profile", profile]), "cpu", 256
                 )
                 self.assertEqual(config.val_every, 0)
+                self.assertEqual(config.diagnostics_every, 0)
 
         overridden = trainer.resolve_config(
             parser.parse_args(
@@ -269,6 +271,20 @@ class TrainerStaticTests(unittest.TestCase):
             )
         )
 
+    def test_diagnostic_schedule_includes_first_cadence_and_final(self) -> None:
+        config = SimpleNamespace(diagnostics_every=3, steps=8)
+        selected = [
+            step
+            for step in range(1, config.steps + 1)
+            if trainer.should_run_diagnostics(step, config)
+        ]
+        self.assertEqual(selected, [1, 3, 6, 8])
+        self.assertFalse(
+            trainer.should_run_diagnostics(
+                1, SimpleNamespace(diagnostics_every=0, steps=1)
+            )
+        )
+
     def test_validation_prefix_always_starts_at_batch_zero(self) -> None:
         class Dataset:
             def __init__(self) -> None:
@@ -320,6 +336,114 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertEqual(len(rows), 3)
         self.assertTrue(rows[1].startswith("1,32,320,2.0,"))
         self.assertTrue(rows[2].startswith("2,64,640,1.5,"))
+
+    def test_diagnostics_csv_is_long_form_and_atomic(self) -> None:
+        metadata = (("overall", None, 7), ("block", 0, 4))
+        shape = (len(metadata), 3, 6)
+        values = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+        config = SimpleNamespace(steps=2, batch_size=4, seq_len=8)
+        points = (
+            trainer.DiagnosticPoint(1, values),
+            trainer.DiagnosticPoint(2, values + 1.0),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trainer.write_diagnostics_csv(root, points, metadata, config, 10)
+            destination = root / trainer.DIAGNOSTICS_CSV_NAME
+            rows = destination.read_text(encoding="utf-8").splitlines()
+            self.assertFalse((root / ".diagnostics.csv.tmp").exists())
+        self.assertEqual(
+            rows[0],
+            "step,tokens_processed,cumulative_estimated_flops,scope,layer,"
+            "family,stat,value,element_count",
+        )
+        self.assertEqual(len(rows), 1 + 2 * 2 * 3 * 6)
+        self.assertEqual(rows[1], "1,32,320,overall,,param,l1_norm,0.0,7")
+        self.assertIn("2,64,640,block,0,update,fourth_moment,", rows[-1])
+
+    def test_diagnostic_statistics_use_postupdate_param_raw_gradient_and_signed_delta(self) -> None:
+        params = {
+            "token_embedding": np.asarray([[1.0, 2.0]], dtype=np.float32),
+            "position_embedding": np.asarray([[3.0, 4.0]], dtype=np.float32),
+            "blocks": [
+                {"weight": np.asarray([-1.0, 1.0], dtype=np.float32)}
+            ],
+            "final_ln_scale": np.asarray([2.0], dtype=np.float32),
+            "final_ln_bias": np.asarray([0.0], dtype=np.float32),
+        }
+        gradients = trainer.jax.tree_util.tree_map(
+            lambda value: np.full_like(value, 2.0), params
+        )
+        after = trainer.jax.tree_util.tree_map(
+            lambda value: value + np.float32(-0.25), params
+        )
+        values = np.asarray(trainer.diagnostic_values(params, gradients, after))
+        metadata = trainer.diagnostic_scope_metadata(params)
+        self.assertEqual(
+            metadata,
+            (("overall", None, 8), ("embeddings", None, 4),
+             ("block", 0, 2), ("final_norm", None, 2)),
+        )
+        flattened = np.concatenate(
+            [np.ravel(value) for value in trainer.jax.tree_util.tree_leaves(after)]
+        ).astype(np.float32)
+        expected_param = np.asarray(
+            [
+                np.abs(flattened).sum(),
+                np.linalg.norm(flattened),
+                flattened.mean(),
+                flattened.std(),
+                np.mean((flattened - flattened.mean()) ** 3),
+                np.mean((flattened - flattened.mean()) ** 4),
+            ]
+        )
+        np.testing.assert_allclose(values[0, 0], expected_param, rtol=1e-6)
+        self.assertAlmostEqual(float(values[0, 1, 2]), 2.0)
+        self.assertAlmostEqual(float(values[0, 2, 2]), -0.25)
+
+    def test_diagnostic_executable_preserves_ordinary_optimizer_trajectory(self) -> None:
+        parser = trainer.build_parser()
+        config = trainer.resolve_config(
+            parser.parse_args(
+                [
+                    "--profile", "smoke", "--steps", "2", "--diagnostics-every", "1"
+                ]
+            ),
+            "cpu",
+            256,
+        )
+        host_params = trainer.init_params(config, 7)
+        decay_mask = trainer.weight_decay_mask(host_params)
+        x = np.arange(config.batch_size * config.seq_len, dtype=np.int32).reshape(
+            config.batch_size, config.seq_len
+        ) % config.vocab_size
+        y = (x + 1) % config.vocab_size
+
+        ordinary = trainer.jax.jit(
+            lambda p, o, bx, by: trainer.train_step(
+                p, o, bx, by, config, decay_mask
+            )
+        )
+        diagnostic = trainer.jax.jit(
+            lambda p, o, bx, by: trainer.diagnostic_train_step(
+                p, o, bx, by, config, decay_mask
+            )
+        )
+        params_a = trainer.jax.tree_util.tree_map(np.copy, host_params)
+        params_b = trainer.jax.tree_util.tree_map(np.copy, host_params)
+        optimizer_a = trainer.init_optimizer(params_a, config.steps)
+        optimizer_b = trainer.init_optimizer(params_b, config.steps)
+        params_a, optimizer_a, metrics_a = ordinary(params_a, optimizer_a, x, y)
+        params_b, optimizer_b, metrics_b, diagnostics = diagnostic(
+            params_b, optimizer_b, x, y
+        )
+        trainer.sync_tree((params_a, optimizer_a, params_b, optimizer_b, diagnostics))
+        for left, right in zip(
+            trainer.jax.tree_util.tree_leaves((params_a, optimizer_a, metrics_a)),
+            trainer.jax.tree_util.tree_leaves((params_b, optimizer_b, metrics_b)),
+            strict=True,
+        ):
+            np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
 
     def test_validation_csv_contains_probes_and_canonical_final_row(self) -> None:
         rows: list[trainer.ValidationRow] = [
