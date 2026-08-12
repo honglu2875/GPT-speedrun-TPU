@@ -109,7 +109,7 @@ class Style:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="speedrun",
-        description="Prepare, run, and score single-file JAX trainers on TPU v4-8.",
+        description="Prepare, run, and score single-entry JAX trainers on TPU v4-8.",
     )
     parser.add_argument("--version", action="version", version="%(prog)s 0.1.0")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -604,7 +604,7 @@ def command_clone(args: argparse.Namespace) -> int:
     shutil.copy2(source_config, destination / "config.yaml")
     if (source / "README.md").is_file():
         shutil.copy2(source / "README.md", destination / "README.md")
-    print(f"cloned {args.source} -> {args.name} ({destination / 'train.py'})")
+    print(f"cloned {args.source} -> {args.name} ({destination})")
     return 0
 
 

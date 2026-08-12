@@ -124,9 +124,10 @@ records the exact canonical validation as its final FineWeb row. Fresh10 rows
 may follow it. Probe synchronization
 and evaluation are included in `train_seconds`; the final canonical evaluation
 is not. Both training and evaluation executables compile once on synthetic
-zero-valued inputs before timing. Use `--val-every 0` to disable probes, or
-`--val-every N --val-probe-batches M` to change their cadence and prefix size.
-Smoke and development runs do not probe unless explicitly enabled.
+zero-valued inputs before timing. Use `--val-every N` for a temporary diagnostic
+cadence override; change `val_probe_batches` in a cloned YAML profile when the
+prefix size is part of the experiment. Smoke and development runs do not probe
+unless explicitly enabled.
 
 The reference is intentionally readable rather than target-capable. The full
 19,073-step calibration on this TPU v4-8 processed exactly **624,984,064**
@@ -159,8 +160,8 @@ An exact runtime/source lookup table supplies measured seeds; an explicit
 synthetic autotuner can populate a local cache before real compilation. The
 tiled loss streams vocabulary blocks and recomputes them in backward instead of
 materializing full logits. Switching loss implementations keeps all 50,304
-storage classes by default; reducing `--semantic-vocab-size` changes the model
-objective and is not a mere kernel toggle.
+storage classes by default; reducing `semantic_vocab_size` in a cloned YAML
+profile changes the model objective and is not a mere kernel toggle.
 
 The canonical full-step benchmark improved from 93.196 ms to 75.191 ms with
 custom attention and dense loss (435.79k tokens/s, +23.9%). The tiled loss was
@@ -268,8 +269,9 @@ The YAML is schema-versioned and contains complete `smoke`, `dev`, and
 caller's working directory—and rejects duplicate/unknown keys, unsafe YAML
 features, type/range errors, symlinks, and attempts to replace static settings
 with hidden launch flags. The harness records both the source SHA-256 and the
-fully resolved profile. Short XProf diagnostics may override only their bounded
-duration and instrumentation cadence; those overrides are recorded explicitly.
+fully resolved profile. Bounded operational overrides—duration and
+instrumentation cadence—are recorded explicitly; fold any setting that defines
+a new experiment back into the cloned YAML before publishing a result.
 
 ## Tracks
 

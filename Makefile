@@ -64,7 +64,6 @@ baseline: preflight
 profile: preflight
 	mkdir -p "$(PROFILE_OUTPUT)"
 	$(UV_RUN) submissions/$(SUBMISSION)/train.py \
-	  --config "$(CURDIR)/submissions/$(SUBMISSION)/config.yaml" \
 	  --output-dir "$(PROFILE_OUTPUT)" \
 	  --seed 1337 \
 	  --track open \

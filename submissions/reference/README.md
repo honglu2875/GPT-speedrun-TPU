@@ -41,9 +41,9 @@ smoke and development runs default to no probes. Each probe synchronizes the
 preceding training update, and the entire probe pause counts toward
 `train_seconds`. The canonical final evaluation remains outside that clock.
 The evaluation executable is compiled once on synthetic zeros and reused; no
-real validation tokens are inspected during compilation. Override the defaults
-with `--val-every` and `--val-probe-batches`, or pass `--val-every 0` to disable
-periodic probes.
+real validation tokens are inspected during compilation. Temporarily override
+the cadence with `--val-every` (including `--val-every 0`); change
+`val_probe_batches` in a cloned config when the prefix size is experimental.
 
 When the harness supplies the pinned Fresh10 manifest, the same compiled masked
 evaluation executable scores ten post-FineWeb domains after canonical
@@ -72,19 +72,18 @@ The official YAML profile selects `attention_backend: tpu_flash` and
 `loss_backend: dense`. The top-level `make baseline` reads those settings
 without repeating them as flags. This promotes the
 hardware-validated attention improvement without changing the output objective,
-model, schedule, or token budget. An official TPU invocation with no explicit
-attention flag resolves to the same backend; smoke, CPU, and development
-profiles continue to default to dense. The trainer still exposes three
-attention implementations for controlled comparisons:
+model, schedule, or token budget. The smoke and development YAML profiles stay
+dense. A cloned config can select any of three attention implementations for
+controlled comparisons:
 
-- `--attention-backend tpu_flash` selects the trainable custom Pallas causal
+- `attention_backend: tpu_flash` selects the trainable custom Pallas causal
   attention forward, dQ, and dK/dV kernels. It currently requires TPU BF16,
   supports head dimensions up to 128 (divisible by 8), and safely right-pads
   arbitrary sequence lengths to 128-wide tiles. `jax_flash` is retained as a
   JAX-provided control.
-- `--attention-backend dense` retains the readable materialized-attention
+- `attention_backend: dense` retains the readable materialized-attention
   control used for the completed 3.75788 calibration.
-- `--loss-backend tiled` streams the tied output projection and cross entropy
+- `loss_backend: tiled` streams the tied output projection and cross entropy
   over vocabulary tiles, with an online FP32 log-sum-exp and a recomputing
   custom VJP. It never constructs the complete token-by-vocabulary logits.
 

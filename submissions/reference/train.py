@@ -581,7 +581,10 @@ def _config_int(value: Any, label: str, *, minimum: int) -> int:
 def _config_float(value: Any, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"config.yaml {label} must be a finite number")
-    result = float(value)
+    try:
+        result = float(value)
+    except OverflowError as exc:
+        raise ValueError(f"config.yaml {label} must be a finite number") from exc
     if not math.isfinite(result):
         raise ValueError(f"config.yaml {label} must be a finite number")
     return result
@@ -784,6 +787,30 @@ def _parse_experiment_profile(
         )
     if result.d_model % result.heads:
         raise ValueError(f"config.yaml {prefix}.model.d_model must be divisible by heads")
+    if result.attention_backend != "dense" and result.dtype_name != "bfloat16":
+        raise ValueError(
+            f"config.yaml {prefix}.kernels.attention_backend "
+            f"{result.attention_backend} requires training.dtype bfloat16"
+        )
+    tokens_per_step = result.batch_size * result.seq_len
+    if result.train_tokens is not None and result.train_tokens % tokens_per_step:
+        raise ValueError(
+            f"config.yaml {prefix}.training.train_tokens must be divisible by "
+            f"batch_size * seq_len ({tokens_per_step:,})"
+        )
+    if profile == "official":
+        validation_tokens = 10_485_760
+        if validation_tokens % tokens_per_step:
+            raise ValueError(
+                f"config.yaml {prefix} batch_size * seq_len must divide the "
+                f"official {validation_tokens:,}-prediction validation prefix"
+            )
+        required_eval_batches = validation_tokens // tokens_per_step
+        if result.eval_batches != required_eval_batches:
+            raise ValueError(
+                f"config.yaml {prefix}.evaluation.eval_batches must be "
+                f"{required_eval_batches} for the official validation prefix"
+            )
     if result.val_every and result.val_probe_batches > result.eval_batches:
         raise ValueError(
             f"config.yaml {prefix}.evaluation.val_probe_batches must not exceed eval_batches"
@@ -842,7 +869,10 @@ def reject_static_cli_overrides(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train a decoder-only GPT with JAX on TPU (or run a tiny CPU smoke test).",
+        description=(
+            "Train a decoder-only GPT with JAX. Static experiment settings come "
+            "from config.yaml beside this entry script."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         allow_abbrev=False,
     )
@@ -876,7 +906,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--smoke", action="store_true", help="alias for --profile smoke"
     )
-    run.add_argument("--eval-batches", type=positive_int, default=None)
+    run.add_argument(
+        "--eval-batches", type=positive_int, default=None, help=argparse.SUPPRESS
+    )
     run.add_argument(
         "--val-every",
         type=nonnegative_int,
@@ -887,7 +919,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--val-probe-batches",
         type=positive_int,
         default=None,
-        help="fixed-prefix batches per periodic validation probe",
+        help=argparse.SUPPRESS,
     )
     run.add_argument(
         "--diagnostics-every",
@@ -961,7 +993,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="dtype for raw .bin token files",
     )
     data.add_argument("--val-fraction", type=float, default=0.05)
-    data.add_argument("--vocab-size", type=positive_int, default=None)
+    data.add_argument(
+        "--vocab-size", type=positive_int, default=None, help=argparse.SUPPRESS
+    )
     data.add_argument("--dataset-id", default=None, help="stable dataset identifier for records")
     data.add_argument("--tokenizer-id", default=None, help="stable tokenizer identifier for records")
     data.add_argument(
@@ -991,21 +1025,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     model = parser.add_argument_group("model")
-    model.add_argument("--batch-size", type=positive_int, default=None, help="global batch size")
-    model.add_argument("--seq-len", type=positive_int, default=None)
-    model.add_argument("--layers", type=positive_int, default=None)
-    model.add_argument("--heads", type=positive_int, default=None)
-    model.add_argument("--d-model", type=positive_int, default=None)
-    model.add_argument("--mlp-mult", type=positive_int, default=None)
-    model.add_argument("--dtype", choices=("bfloat16", "float32"), default=None)
+    model.add_argument("--batch-size", type=positive_int, default=None, help=argparse.SUPPRESS)
+    model.add_argument("--seq-len", type=positive_int, default=None, help=argparse.SUPPRESS)
+    model.add_argument("--layers", type=positive_int, default=None, help=argparse.SUPPRESS)
+    model.add_argument("--heads", type=positive_int, default=None, help=argparse.SUPPRESS)
+    model.add_argument("--d-model", type=positive_int, default=None, help=argparse.SUPPRESS)
+    model.add_argument("--mlp-mult", type=positive_int, default=None, help=argparse.SUPPRESS)
+    model.add_argument(
+        "--dtype", choices=("bfloat16", "float32"), default=None,
+        help=argparse.SUPPRESS,
+    )
     model.add_argument(
         "--attention-backend",
         choices=("dense", "jax_flash", "tpu_flash"),
         default=None,
-        help=(
-            "legacy compatibility surface; the backend is authoritative in "
-            "sibling config.yaml and CLI values are rejected"
-        ),
+        help=argparse.SUPPRESS,
     )
     model.add_argument(
         "--attention-tuning-cache",
@@ -1028,29 +1062,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--loss-backend",
         choices=("dense", "tiled"),
         default=None,
-        help="dense logits or bounded-memory tiled tied-output cross entropy",
+        help=argparse.SUPPRESS,
     )
     model.add_argument(
         "--semantic-vocab-size",
         type=positive_int,
         default=None,
-        help="real output classes when the embedding table has padded storage rows",
+        help=argparse.SUPPRESS,
     )
     model.add_argument(
         "--vocab-tile-size",
         type=positive_int,
         default=None,
-        help="static vocabulary tile for --loss-backend tiled",
+        help=argparse.SUPPRESS,
     )
 
     optim = parser.add_argument_group("optimization")
-    optim.add_argument("--learning-rate", type=float, default=None)
-    optim.add_argument("--min-lr-ratio", type=float, default=None)
-    optim.add_argument("--warmup-steps", type=nonnegative_int, default=None)
-    optim.add_argument("--weight-decay", type=float, default=None)
-    optim.add_argument("--beta1", type=float, default=None)
-    optim.add_argument("--beta2", type=float, default=None)
-    optim.add_argument("--grad-clip", type=float, default=None)
+    optim.add_argument("--learning-rate", type=float, default=None, help=argparse.SUPPRESS)
+    optim.add_argument("--min-lr-ratio", type=float, default=None, help=argparse.SUPPRESS)
+    optim.add_argument("--warmup-steps", type=nonnegative_int, default=None, help=argparse.SUPPRESS)
+    optim.add_argument("--weight-decay", type=float, default=None, help=argparse.SUPPRESS)
+    optim.add_argument("--beta1", type=float, default=None, help=argparse.SUPPRESS)
+    optim.add_argument("--beta2", type=float, default=None, help=argparse.SUPPRESS)
+    optim.add_argument("--grad-clip", type=float, default=None, help=argparse.SUPPRESS)
     optim.add_argument(
         "--peak-tflops",
         type=float,
