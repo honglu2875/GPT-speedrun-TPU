@@ -37,12 +37,12 @@ import jax.numpy as jnp
 import jaxlib
 import numpy as np
 from jax.experimental import multihost_utils
+import yaml
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from speedrun.kernels import (
     AttentionConfig,
     AttentionTiles,
-    DEFAULT_VOCAB_TILE_SIZE,
     make_causal_attention,
     select_attention_tiles,
     tiled_tied_cross_entropy,
@@ -62,6 +62,10 @@ TRAINING_CSV_NAME = "training.csv"
 VALIDATION_CSV_NAME = "validation.csv"
 DIAGNOSTICS_CSV_NAME = "diagnostics.csv"
 SCHEMA_VERSION = 1
+CONFIG_SCHEMA_VERSION = 1
+CONFIG_FILENAME = "config.yaml"
+CONFIG_PATH = Path(__file__).resolve().with_name(CONFIG_FILENAME)
+_MAX_CONFIG_BYTES = 256 * 1024
 _VALID_TRACKS = ("open", "sample_efficiency")
 _VALID_PROFILES = ("smoke", "dev", "official")
 _DOMAIN_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
@@ -124,6 +128,96 @@ class Config:
     vocab_tile_size: int
     compute_dtype: Any
     dtype_name: str
+    config_schema_version: int
+    config_sha256: str
+    config_profile: str
+    config_overrides: tuple[tuple[str, int], ...]
+
+
+@dataclass(frozen=True)
+class ExperimentProfile:
+    """One fully explicit, versioned profile loaded from sibling config.yaml."""
+
+    schema_version: int
+    source_sha256: str
+    name: str
+    steps: int | None
+    train_tokens: int | None
+    batch_size: int
+    seq_len: int
+    dtype_name: str
+    layers: int
+    heads: int
+    d_model: int
+    mlp_mult: int
+    vocab_size: int
+    semantic_vocab_size: int
+    attention_backend: str
+    loss_backend: str
+    vocab_tile_size: int
+    learning_rate: float
+    min_lr_ratio: float
+    warmup_steps: int
+    weight_decay: float
+    beta1: float
+    beta2: float
+    grad_clip: float
+    eval_batches: int
+    val_every: int
+    val_probe_batches: int
+    diagnostics_every: int
+    log_every: int
+
+
+class _StrictSafeLoader(yaml.SafeLoader):
+    """Safe YAML loader which rejects duplicate mapping keys."""
+
+
+def _construct_unique_mapping(
+    loader: _StrictSafeLoader, node: yaml.nodes.MappingNode, deep: bool = False
+) -> dict[Any, Any]:
+    loader.flatten_mapping(node)
+    result: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in result
+        except TypeError as exc:
+            raise ValueError("config.yaml mapping keys must be scalar values") from exc
+        if duplicate:
+            raise ValueError(f"config.yaml contains duplicate key {key!r}")
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
+
+
+_StrictSafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping
+)
+
+
+_STATIC_CLI_FIELDS = {
+    "eval_batches": "--eval-batches",
+    "val_probe_batches": "--val-probe-batches",
+    "vocab_size": "--vocab-size",
+    "batch_size": "--batch-size",
+    "seq_len": "--seq-len",
+    "layers": "--layers",
+    "heads": "--heads",
+    "d_model": "--d-model",
+    "mlp_mult": "--mlp-mult",
+    "dtype": "--dtype",
+    "attention_backend": "--attention-backend",
+    "loss_backend": "--loss-backend",
+    "semantic_vocab_size": "--semantic-vocab-size",
+    "vocab_tile_size": "--vocab-tile-size",
+    "learning_rate": "--learning-rate",
+    "min_lr_ratio": "--min-lr-ratio",
+    "warmup_steps": "--warmup-steps",
+    "weight_decay": "--weight-decay",
+    "beta1": "--beta1",
+    "beta2": "--beta2",
+    "grad_clip": "--grad-clip",
+}
 
 
 @dataclass(frozen=True)
@@ -238,8 +332,12 @@ class Console:
     def table(self, title: str, rows: Sequence[tuple[str, object]]) -> None:
         if not self.active:
             return
-        width = max(
-            52, *(max(20, len(str(k))) + len(str(v)) + 7 for k, v in rows)
+        # Keep configuration cards readable in ordinary terminals. Provenance
+        # remains complete in result.json/checkpoints; the live card is a
+        # compact summary and must never grow to a digest- or JSON-sized width.
+        width = min(
+            78,
+            max(52, *(max(20, len(str(k))) + len(str(v)) + 7 for k, v in rows)),
         )
         inner = width - 2
         heading = f" {title} "
@@ -252,8 +350,14 @@ class Console:
             file=sys.stderr,
         )
         for key, value in rows:
-            key_text = f"{key:<20}"
+            raw_key = str(key)
+            if len(raw_key) > 20:
+                raw_key = raw_key[:19] + "…"
+            key_text = f"{raw_key:<20}"
             value_text = str(value)
+            value_limit = max(8, inner - 23)
+            if len(value_text) > value_limit:
+                value_text = value_text[: value_limit - 1] + "…"
             padding = max(1, inner - 2 - len(key_text) - len(value_text))
             print(
                 "  "
@@ -456,6 +560,306 @@ def nonnegative_int(text: str) -> int:
     return value
 
 
+def _config_mapping(value: Any, label: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"config.yaml {label} must be a mapping")
+    if any(not isinstance(key, str) for key in value):
+        raise ValueError(f"config.yaml {label} keys must be strings")
+    return value
+
+
+def _config_keys(
+    value: Any,
+    label: str,
+    required: set[str],
+    *,
+    optional: set[str] = frozenset(),
+) -> Mapping[str, Any]:
+    mapping = _config_mapping(value, label)
+    keys = set(mapping)
+    missing = sorted(required - keys)
+    unknown = sorted(keys - required - optional)
+    if missing:
+        raise ValueError(
+            f"config.yaml {label} is missing required key(s): {', '.join(missing)}"
+        )
+    if unknown:
+        raise ValueError(
+            f"config.yaml {label} contains unknown key(s): {', '.join(unknown)}"
+        )
+    return mapping
+
+
+def _config_int(value: Any, label: str, *, minimum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(
+            f"config.yaml {label} must be an integer >= {minimum}; got {value!r}"
+        )
+    return value
+
+
+def _config_float(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"config.yaml {label} must be a finite number")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"config.yaml {label} must be a finite number")
+    return result
+
+
+def _config_choice(value: Any, label: str, choices: Sequence[str]) -> str:
+    if not isinstance(value, str) or value not in choices:
+        raise ValueError(
+            f"config.yaml {label} must be one of {', '.join(choices)}; got {value!r}"
+        )
+    return value
+
+
+def resolve_experiment_config_path(requested: Path | None) -> Path:
+    """Resolve the one accepted config path: config.yaml beside this trainer."""
+
+    if CONFIG_PATH.is_symlink() or not CONFIG_PATH.is_file():
+        raise ValueError(
+            f"required sibling experiment config must be a regular, non-symlink file: {CONFIG_PATH}"
+        )
+    try:
+        expected = CONFIG_PATH.expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"required sibling experiment config is unavailable: {CONFIG_PATH}") from exc
+    candidate = CONFIG_PATH if requested is None else requested
+    if candidate.is_symlink():
+        raise ValueError("--config may not be a symlink")
+    try:
+        resolved = candidate.expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"experiment config is unavailable: {candidate}") from exc
+    if resolved != expected:
+        raise ValueError(
+            f"--config must name the config.yaml beside train.py: {CONFIG_PATH}"
+        )
+    return expected
+
+
+def _parse_experiment_profile(
+    payload: Mapping[str, Any], profile: str, source_sha256: str
+) -> ExperimentProfile:
+    top = _config_keys(payload, "document", {"schema_version", "profiles"})
+    schema_version = _config_int(
+        top["schema_version"], "schema_version", minimum=1
+    )
+    if schema_version != CONFIG_SCHEMA_VERSION:
+        raise ValueError(
+            "unsupported config.yaml schema_version "
+            f"{schema_version}; expected {CONFIG_SCHEMA_VERSION}"
+        )
+    profiles = _config_keys(
+        top["profiles"], "profiles", set(_VALID_PROFILES)
+    )
+    selected = _config_keys(
+        profiles[profile],
+        f"profiles.{profile}",
+        {"training", "model", "kernels", "optimizer", "evaluation", "logging"},
+    )
+    training = _config_keys(
+        selected["training"],
+        f"profiles.{profile}.training",
+        {"batch_size", "seq_len", "dtype"},
+        optional={"steps", "train_tokens"},
+    )
+    has_steps = "steps" in training
+    has_train_tokens = "train_tokens" in training
+    if has_steps == has_train_tokens:
+        raise ValueError(
+            f"config.yaml profiles.{profile}.training must define exactly one of "
+            "steps or train_tokens"
+        )
+    model = _config_keys(
+        selected["model"],
+        f"profiles.{profile}.model",
+        {"layers", "heads", "d_model", "mlp_mult", "vocab_size", "semantic_vocab_size"},
+    )
+    kernels = _config_keys(
+        selected["kernels"],
+        f"profiles.{profile}.kernels",
+        {"attention_backend", "loss_backend", "vocab_tile_size"},
+    )
+    optimizer = _config_keys(
+        selected["optimizer"],
+        f"profiles.{profile}.optimizer",
+        {
+            "learning_rate", "min_lr_ratio", "warmup_steps", "weight_decay",
+            "beta1", "beta2", "grad_clip",
+        },
+    )
+    evaluation = _config_keys(
+        selected["evaluation"],
+        f"profiles.{profile}.evaluation",
+        {"eval_batches", "val_every", "val_probe_batches"},
+    )
+    logging = _config_keys(
+        selected["logging"],
+        f"profiles.{profile}.logging",
+        {"diagnostics_every", "log_every"},
+    )
+    prefix = f"profiles.{profile}"
+    learning_rate = _config_float(
+        optimizer["learning_rate"], f"{prefix}.optimizer.learning_rate"
+    )
+    min_lr_ratio = _config_float(
+        optimizer["min_lr_ratio"], f"{prefix}.optimizer.min_lr_ratio"
+    )
+    weight_decay = _config_float(
+        optimizer["weight_decay"], f"{prefix}.optimizer.weight_decay"
+    )
+    beta1 = _config_float(optimizer["beta1"], f"{prefix}.optimizer.beta1")
+    beta2 = _config_float(optimizer["beta2"], f"{prefix}.optimizer.beta2")
+    grad_clip = _config_float(
+        optimizer["grad_clip"], f"{prefix}.optimizer.grad_clip"
+    )
+    if learning_rate <= 0.0:
+        raise ValueError(f"config.yaml {prefix}.optimizer.learning_rate must be positive")
+    if not 0.0 <= min_lr_ratio <= 1.0:
+        raise ValueError(f"config.yaml {prefix}.optimizer.min_lr_ratio must be in [0, 1]")
+    if weight_decay < 0.0:
+        raise ValueError(f"config.yaml {prefix}.optimizer.weight_decay must be nonnegative")
+    if not 0.0 <= beta1 < 1.0 or not 0.0 <= beta2 < 1.0:
+        raise ValueError(f"config.yaml {prefix}.optimizer beta values must be in [0, 1)")
+    if grad_clip <= 0.0:
+        raise ValueError(f"config.yaml {prefix}.optimizer.grad_clip must be positive")
+    result = ExperimentProfile(
+        schema_version=schema_version,
+        source_sha256=source_sha256,
+        name=profile,
+        steps=(
+            _config_int(training["steps"], f"{prefix}.training.steps", minimum=1)
+            if has_steps else None
+        ),
+        train_tokens=(
+            _config_int(
+                training["train_tokens"], f"{prefix}.training.train_tokens", minimum=1
+            ) if has_train_tokens else None
+        ),
+        batch_size=_config_int(
+            training["batch_size"], f"{prefix}.training.batch_size", minimum=1
+        ),
+        seq_len=_config_int(
+            training["seq_len"], f"{prefix}.training.seq_len", minimum=1
+        ),
+        dtype_name=_config_choice(
+            training["dtype"], f"{prefix}.training.dtype", ("bfloat16", "float32")
+        ),
+        layers=_config_int(model["layers"], f"{prefix}.model.layers", minimum=1),
+        heads=_config_int(model["heads"], f"{prefix}.model.heads", minimum=1),
+        d_model=_config_int(model["d_model"], f"{prefix}.model.d_model", minimum=1),
+        mlp_mult=_config_int(model["mlp_mult"], f"{prefix}.model.mlp_mult", minimum=1),
+        vocab_size=_config_int(
+            model["vocab_size"], f"{prefix}.model.vocab_size", minimum=1
+        ),
+        semantic_vocab_size=_config_int(
+            model["semantic_vocab_size"],
+            f"{prefix}.model.semantic_vocab_size",
+            minimum=1,
+        ),
+        attention_backend=_config_choice(
+            kernels["attention_backend"],
+            f"{prefix}.kernels.attention_backend",
+            ("dense", "jax_flash", "tpu_flash"),
+        ),
+        loss_backend=_config_choice(
+            kernels["loss_backend"], f"{prefix}.kernels.loss_backend", ("dense", "tiled")
+        ),
+        vocab_tile_size=_config_int(
+            kernels["vocab_tile_size"], f"{prefix}.kernels.vocab_tile_size", minimum=1
+        ),
+        learning_rate=learning_rate,
+        min_lr_ratio=min_lr_ratio,
+        warmup_steps=_config_int(
+            optimizer["warmup_steps"], f"{prefix}.optimizer.warmup_steps", minimum=0
+        ),
+        weight_decay=weight_decay,
+        beta1=beta1,
+        beta2=beta2,
+        grad_clip=grad_clip,
+        eval_batches=_config_int(
+            evaluation["eval_batches"], f"{prefix}.evaluation.eval_batches", minimum=1
+        ),
+        val_every=_config_int(
+            evaluation["val_every"], f"{prefix}.evaluation.val_every", minimum=0
+        ),
+        val_probe_batches=_config_int(
+            evaluation["val_probe_batches"],
+            f"{prefix}.evaluation.val_probe_batches",
+            minimum=1,
+        ),
+        diagnostics_every=_config_int(
+            logging["diagnostics_every"], f"{prefix}.logging.diagnostics_every", minimum=0
+        ),
+        log_every=_config_int(
+            logging["log_every"], f"{prefix}.logging.log_every", minimum=1
+        ),
+    )
+    if result.semantic_vocab_size > result.vocab_size:
+        raise ValueError(
+            f"config.yaml {prefix}.model.semantic_vocab_size must not exceed vocab_size"
+        )
+    if result.d_model % result.heads:
+        raise ValueError(f"config.yaml {prefix}.model.d_model must be divisible by heads")
+    if result.val_every and result.val_probe_batches > result.eval_batches:
+        raise ValueError(
+            f"config.yaml {prefix}.evaluation.val_probe_batches must not exceed eval_batches"
+        )
+    return result
+
+
+def load_experiment_profile(
+    profile: str, requested_path: Path | None = None
+) -> ExperimentProfile:
+    if profile not in _VALID_PROFILES:
+        raise ValueError(f"unknown experiment profile: {profile!r}")
+    path = resolve_experiment_config_path(requested_path)
+    raw = path.read_bytes()
+    if len(raw) > _MAX_CONFIG_BYTES:
+        raise ValueError(
+            f"config.yaml exceeds the {_MAX_CONFIG_BYTES:,}-byte safety limit"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("config.yaml must be UTF-8") from exc
+    try:
+        forbidden_tokens = (
+            yaml.tokens.AliasToken,
+            yaml.tokens.AnchorToken,
+            yaml.tokens.DirectiveToken,
+            yaml.tokens.TagToken,
+        )
+        for token in yaml.scan(text, Loader=_StrictSafeLoader):
+            if isinstance(token, forbidden_tokens):
+                kind = type(token).__name__.removesuffix("Token").lower()
+                raise ValueError(f"config.yaml may not contain YAML {kind}s")
+        documents = list(yaml.load_all(text, Loader=_StrictSafeLoader))
+    except yaml.YAMLError as exc:
+        raise ValueError(f"invalid config.yaml YAML: {exc}") from exc
+    if len(documents) != 1:
+        raise ValueError("config.yaml must contain exactly one YAML document")
+    mapping = _config_mapping(documents[0], "document")
+    source_sha256 = hashlib.sha256(raw).hexdigest()
+    parsed = {
+        name: _parse_experiment_profile(mapping, name, source_sha256)
+        for name in _VALID_PROFILES
+    }
+    return parsed[profile]
+
+
+def reject_static_cli_overrides(args: argparse.Namespace) -> None:
+    for destination, option in _STATIC_CLI_FIELDS.items():
+        if getattr(args, destination) is not None:
+            raise ValueError(
+                f"{option} is defined by sibling config.yaml; edit the selected "
+                "profile or clone a new submission variant"
+            )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train a decoder-only GPT with JAX on TPU (or run a tiny CPU smoke test).",
@@ -463,6 +867,12 @@ def build_parser() -> argparse.ArgumentParser:
         allow_abbrev=False,
     )
     run = parser.add_argument_group("run")
+    run.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="experiment definition (must resolve to the config.yaml beside train.py)",
+    )
     run.add_argument("--output-dir", type=Path, default=Path("runs/reference"))
     run.add_argument("--seed", type=int, default=1337)
     duration = run.add_mutually_exclusive_group()
@@ -606,15 +1016,15 @@ def build_parser() -> argparse.ArgumentParser:
     model.add_argument("--layers", type=positive_int, default=None)
     model.add_argument("--heads", type=positive_int, default=None)
     model.add_argument("--d-model", type=positive_int, default=None)
-    model.add_argument("--mlp-mult", type=positive_int, default=4)
-    model.add_argument("--dtype", choices=("auto", "bfloat16", "float32"), default="auto")
+    model.add_argument("--mlp-mult", type=positive_int, default=None)
+    model.add_argument("--dtype", choices=("bfloat16", "float32"), default=None)
     model.add_argument(
         "--attention-backend",
         choices=("dense", "jax_flash", "tpu_flash"),
-        default="dense",
+        default=None,
         help=(
-            "dense reference attention, JAX FlashAttention, or the custom "
-            "trainable TPU FlashAttention kernel"
+            "legacy compatibility surface; the backend is authoritative in "
+            "sibling config.yaml and CLI values are rejected"
         ),
     )
     model.add_argument(
@@ -637,7 +1047,7 @@ def build_parser() -> argparse.ArgumentParser:
     model.add_argument(
         "--loss-backend",
         choices=("dense", "tiled"),
-        default="dense",
+        default=None,
         help="dense logits or bounded-memory tiled tied-output cross entropy",
     )
     model.add_argument(
@@ -649,18 +1059,18 @@ def build_parser() -> argparse.ArgumentParser:
     model.add_argument(
         "--vocab-tile-size",
         type=positive_int,
-        default=DEFAULT_VOCAB_TILE_SIZE,
+        default=None,
         help="static vocabulary tile for --loss-backend tiled",
     )
 
     optim = parser.add_argument_group("optimization")
-    optim.add_argument("--learning-rate", type=float, default=3.0e-4)
-    optim.add_argument("--min-lr-ratio", type=float, default=0.1)
+    optim.add_argument("--learning-rate", type=float, default=None)
+    optim.add_argument("--min-lr-ratio", type=float, default=None)
     optim.add_argument("--warmup-steps", type=nonnegative_int, default=None)
-    optim.add_argument("--weight-decay", type=float, default=0.1)
-    optim.add_argument("--beta1", type=float, default=0.9)
-    optim.add_argument("--beta2", type=float, default=0.95)
-    optim.add_argument("--grad-clip", type=float, default=1.0)
+    optim.add_argument("--weight-decay", type=float, default=None)
+    optim.add_argument("--beta1", type=float, default=None)
+    optim.add_argument("--beta2", type=float, default=None)
+    optim.add_argument("--grad-clip", type=float, default=None)
     optim.add_argument(
         "--peak-tflops",
         type=float,
@@ -670,22 +1080,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def validate_args(args: argparse.Namespace) -> None:
+def validate_args(args: argparse.Namespace) -> ExperimentProfile:
     if args.smoke and args.profile not in (None, "smoke"):
         raise ValueError("--smoke cannot be combined with a non-smoke --profile")
+    reject_static_cli_overrides(args)
+    experiment = load_experiment_profile(selected_profile(args), args.config)
     if not 0.0 < args.val_fraction < 1.0:
         raise ValueError("--val-fraction must be between 0 and 1")
-    if args.learning_rate <= 0.0:
-        raise ValueError("--learning-rate must be positive")
-    if not 0.0 <= args.min_lr_ratio <= 1.0:
-        raise ValueError("--min-lr-ratio must be in [0, 1]")
-    if args.weight_decay < 0.0:
-        raise ValueError("--weight-decay must be nonnegative")
-    if not 0.0 <= args.beta1 < 1.0 or not 0.0 <= args.beta2 < 1.0:
-        raise ValueError("--beta1 and --beta2 must be in [0, 1)")
-    if args.grad_clip <= 0.0:
-        raise ValueError("--grad-clip must be positive")
-    if args.peak_tflops is not None and args.peak_tflops <= 0.0:
+    if args.peak_tflops is not None and (
+        not math.isfinite(args.peak_tflops) or args.peak_tflops <= 0.0
+    ):
         raise ValueError("--peak-tflops must be positive")
     if args.autotune_attention and args.attention_tuning_cache is None:
         raise ValueError(
@@ -693,10 +1097,11 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if (
         args.attention_tuning_cache is not None
-        and args.attention_backend == "dense"
+        and experiment.attention_backend == "dense"
     ):
         raise ValueError(
-            "--attention-tuning-cache requires a non-dense --attention-backend"
+            "--attention-tuning-cache requires a non-dense attention_backend "
+            "in config.yaml"
         )
     if args.downstream_root is not None and args.downstream_manifest is None:
         raise ValueError("--downstream-root requires --downstream-manifest")
@@ -728,14 +1133,15 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "--no-final-validation cannot be combined with downstream evaluation data"
         )
-    effective_val_every = args.val_every
-    if effective_val_every is None:
-        effective_val_every = 250 if selected_profile(args) == "official" else 0
+    effective_val_every = (
+        args.val_every if args.val_every is not None else experiment.val_every
+    )
     if args.no_final_validation and effective_val_every:
         raise ValueError(
             "--no-final-validation requires --val-every 0 (the official profile "
             "otherwise enables periodic validation by default)"
         )
+    return experiment
 
 
 def xprof_step_window(
@@ -788,37 +1194,32 @@ def selected_profile(args: argparse.Namespace) -> str:
     return "smoke" if args.smoke else (args.profile or "dev")
 
 
-def resolve_config(args: argparse.Namespace, platform: str, vocab_size: int) -> Config:
-    # Defaults deliberately distinguish a meaningful v4-8 run from a cheap smoke
-    # test. Every field remains directly overridable for competition entries.
+def resolve_config(
+    args: argparse.Namespace,
+    platform: str,
+    vocab_size: int,
+    experiment: ExperimentProfile | None = None,
+) -> Config:
     profile = selected_profile(args)
-    defaults = {
-        # Four keeps this profile valid on both CPU and all four v4-8 devices.
-        "smoke": dict(steps=2, batch=4, sequence=32, layers=2, heads=2, width=64, eval=1),
-        "dev": dict(steps=100, batch=32, sequence=256, layers=6, heads=6, width=384, eval=8),
-        # GPT-2-small model shape. The token budget is a conservative initial
-        # calibration setting, not a claim that this reference reaches 3.28.
-        "official": dict(
-            train_tokens=624_984_064,
-            batch=32,
-            sequence=1024,
-            layers=12,
-            heads=12,
-            width=768,
-            # 320 * 32 * 1024 = the manifest's fixed 10,485,760-token prefix.
-            eval=320,
-        ),
-    }[profile]
-    batch_size = args.batch_size if args.batch_size is not None else defaults["batch"]
-    seq_len = args.seq_len if args.seq_len is not None else defaults["sequence"]
+    reject_static_cli_overrides(args)
+    experiment = experiment or load_experiment_profile(profile, args.config)
+    if experiment.name != profile:
+        raise ValueError(
+            f"resolved config profile {experiment.name!r} does not match {profile!r}"
+        )
+    if vocab_size != experiment.vocab_size:
+        raise ValueError(
+            "loaded dataset vocabulary does not match config.yaml: "
+            f"dataset={vocab_size}, configured={experiment.vocab_size}"
+        )
+    batch_size = experiment.batch_size
+    seq_len = experiment.seq_len
     tokens_per_step = batch_size * seq_len
-    requested_train_tokens = args.train_tokens
-    if (
-        requested_train_tokens is None
-        and args.steps is None
-        and "train_tokens" in defaults
-    ):
-        requested_train_tokens = defaults["train_tokens"]
+    requested_train_tokens = (
+        args.train_tokens
+        if args.train_tokens is not None
+        else (None if args.steps is not None else experiment.train_tokens)
+    )
     if requested_train_tokens is not None:
         if requested_train_tokens % tokens_per_step:
             raise ValueError(
@@ -827,10 +1228,9 @@ def resolve_config(args: argparse.Namespace, platform: str, vocab_size: int) -> 
             )
         steps = requested_train_tokens // tokens_per_step
     else:
-        steps = args.steps if args.steps is not None else defaults["steps"]
-    layers = args.layers if args.layers is not None else defaults["layers"]
-    heads = args.heads if args.heads is not None else defaults["heads"]
-    d_model = args.d_model if args.d_model is not None else defaults["width"]
+        steps = args.steps if args.steps is not None else experiment.steps
+        if steps is None:  # schema validation establishes a duration, defensively retain type.
+            raise AssertionError("experiment duration did not resolve")
     if profile == "official":
         validation_tokens = 10_485_760
         predictions_per_batch = batch_size * seq_len
@@ -840,95 +1240,81 @@ def resolve_config(args: argparse.Namespace, platform: str, vocab_size: int) -> 
                 f"{validation_tokens:,} exactly; got {predictions_per_batch:,}"
             )
         required_eval_batches = validation_tokens // predictions_per_batch
-        if args.eval_batches is not None and args.eval_batches != required_eval_batches:
+        if experiment.eval_batches != required_eval_batches:
             raise ValueError(
-                "official validation must cover exactly 10,485,760 predictions; "
-                f"use --eval-batches {required_eval_batches} for the selected shape"
+                "official config.yaml validation must cover exactly 10,485,760 "
+                f"predictions; set eval_batches to {required_eval_batches}"
             )
         eval_batches = required_eval_batches
-    elif args.eval_batches is not None:
-        eval_batches = args.eval_batches
     else:
-        eval_batches = defaults["eval"]
-    val_every = args.val_every if args.val_every is not None else (
-        250 if profile == "official" else 0
-    )
-    val_probe_batches = args.val_probe_batches if args.val_probe_batches is not None else (
-        min(8, eval_batches) if profile == "official" else eval_batches
-    )
+        eval_batches = experiment.eval_batches
+    val_every = args.val_every if args.val_every is not None else experiment.val_every
+    val_probe_batches = experiment.val_probe_batches
     if val_every > 0 and val_probe_batches > eval_batches:
         raise ValueError(
-            "--val-probe-batches must not exceed the canonical evaluation batch "
+            "config.yaml val_probe_batches must not exceed the canonical evaluation batch "
             f"count ({eval_batches}); got {val_probe_batches}"
         )
-    # Keep the UI lively without forcing a host synchronization on every short
-    # calibration step. Step 1 and the final step are always printed separately.
-    log_every = args.log_every if args.log_every is not None else max(10, steps // 20)
+    log_every = args.log_every if args.log_every is not None else experiment.log_every
     diagnostics_every = (
         args.diagnostics_every
         if args.diagnostics_every is not None
-        else (250 if profile == "official" else 0)
+        else experiment.diagnostics_every
     )
-    warmup_steps = (
-        args.warmup_steps
-        if args.warmup_steps is not None
-        else min(steps, {"smoke": 1, "dev": 10, "official": 715}[profile])
-    )
-
-    dtype_name = args.dtype
-    if dtype_name == "auto":
-        dtype_name = "bfloat16" if platform == "tpu" and profile != "smoke" else "float32"
+    dtype_name = experiment.dtype_name
     compute_dtype = jnp.bfloat16 if dtype_name == "bfloat16" else jnp.float32
-
-    if d_model % heads:
-        raise ValueError(f"d_model ({d_model}) must be divisible by heads ({heads})")
-    semantic_vocab_size = (
-        args.semantic_vocab_size
-        if args.semantic_vocab_size is not None
-        else vocab_size
+    attention_backend = experiment.attention_backend
+    if attention_backend != "dense" and platform != "tpu":
+        raise ValueError(
+            f"config.yaml attention_backend {attention_backend} requires a TPU runtime"
+        )
+    if attention_backend != "dense" and compute_dtype != jnp.bfloat16:
+        raise ValueError(
+            f"config.yaml attention_backend {attention_backend} currently requires "
+            "dtype bfloat16"
+        )
+    overrides = tuple(
+        (name, int(value))
+        for name, value in (
+            ("steps", args.steps),
+            ("train_tokens", args.train_tokens),
+            ("val_every", args.val_every),
+            ("diagnostics_every", args.diagnostics_every),
+            ("log_every", args.log_every),
+        )
+        if value is not None
     )
-    if semantic_vocab_size > vocab_size:
-        raise ValueError(
-            "semantic_vocab_size must not exceed the embedding storage vocabulary; "
-            f"got {semantic_vocab_size} > {vocab_size}"
-        )
-    if args.attention_backend != "dense" and platform != "tpu":
-        raise ValueError(
-            f"--attention-backend {args.attention_backend} requires a TPU runtime"
-        )
-    if args.attention_backend != "dense" and compute_dtype != jnp.bfloat16:
-        raise ValueError(
-            f"--attention-backend {args.attention_backend} currently requires "
-            "--dtype bfloat16"
-        )
-
     return Config(
         steps=steps,
         batch_size=batch_size,
         seq_len=seq_len,
-        layers=layers,
-        heads=heads,
-        d_model=d_model,
-        mlp_mult=args.mlp_mult,
-        learning_rate=args.learning_rate,
-        min_lr_ratio=args.min_lr_ratio,
-        warmup_steps=warmup_steps,
-        weight_decay=args.weight_decay,
-        beta1=args.beta1,
-        beta2=args.beta2,
-        grad_clip=args.grad_clip,
+        layers=experiment.layers,
+        heads=experiment.heads,
+        d_model=experiment.d_model,
+        mlp_mult=experiment.mlp_mult,
+        learning_rate=experiment.learning_rate,
+        min_lr_ratio=experiment.min_lr_ratio,
+        warmup_steps=experiment.warmup_steps,
+        weight_decay=experiment.weight_decay,
+        beta1=experiment.beta1,
+        beta2=experiment.beta2,
+        grad_clip=experiment.grad_clip,
         eval_batches=eval_batches,
         val_every=val_every,
         val_probe_batches=val_probe_batches,
         diagnostics_every=diagnostics_every,
         log_every=log_every,
         vocab_size=vocab_size,
-        semantic_vocab_size=semantic_vocab_size,
-        attention_backend=args.attention_backend,
-        loss_backend=args.loss_backend,
-        vocab_tile_size=args.vocab_tile_size,
+        semantic_vocab_size=experiment.semantic_vocab_size,
+        attention_backend=attention_backend,
+        loss_backend=experiment.loss_backend,
+        vocab_tile_size=experiment.vocab_tile_size,
         compute_dtype=compute_dtype,
         dtype_name=dtype_name,
+        config_schema_version=experiment.schema_version,
+        config_sha256=experiment.source_sha256,
+        config_profile=experiment.name,
+        config_overrides=overrides,
     )
 
 
@@ -1042,11 +1428,16 @@ def split_shards(
     return train, validation
 
 
-def load_dataset(args: argparse.Namespace) -> tuple[TokenDataset, int]:
+def load_dataset(
+    args: argparse.Namespace, experiment: ExperimentProfile | None = None
+) -> tuple[TokenDataset, int]:
+    experiment = experiment or load_experiment_profile(
+        selected_profile(args), args.config
+    )
+    configured_vocab_size = experiment.vocab_size
     if args.data_path is None and not args.train_data and not args.val_data:
         dataset = built_in_dataset(args.seed)
-        vocab_size = args.vocab_size or 256
-        return dataset, vocab_size
+        return dataset, configured_vocab_size
 
     train_paths = [path.expanduser().resolve() for path in args.train_data]
     validation_paths = [path.expanduser().resolve() for path in args.val_data]
@@ -1076,11 +1467,10 @@ def load_dataset(args: argparse.Namespace) -> tuple[TokenDataset, int]:
     else:
         train_shards, validation_shards = split_shards(train_shards, args.val_fraction)
 
-    vocab_size = args.vocab_size or (256 if selected_profile(args) == "smoke" else 50_304)
     source = f"{len(train_shards)} train + {len(validation_shards)} val shard(s)"
     return (
         TokenDataset(ShardedTokens(train_shards), ShardedTokens(validation_shards), source),
-        vocab_size,
+        configured_vocab_size,
     )
 
 
@@ -1361,6 +1751,52 @@ def attention_runtime_metadata(runtime: AttentionRuntime) -> dict[str, Any]:
     }
 
 
+def attention_console_rows(
+    runtime: AttentionRuntime,
+) -> tuple[tuple[str, str], ...]:
+    """Return compact, terminal-safe attention provenance rows."""
+
+    if runtime.tiles is None:
+        return (
+            ("attention tuning", "not applicable (dense)"),
+            ("attention plan", "not applicable"),
+        )
+    digest = runtime.key_digest or "unknown"
+    timing = (
+        f" · {runtime.tune_seconds:.3f}s"
+        if runtime.tune_seconds > 0.0
+        else ""
+    )
+    tiles = runtime.tiles
+    assert tiles.block_q_dkv is not None
+    assert tiles.block_q_dkv_compute is not None
+    assert tiles.block_kv_dkv is not None
+    assert tiles.block_kv_dkv_compute is not None
+    assert tiles.block_q_dq is not None
+    assert tiles.block_kv_dq is not None
+    assert tiles.block_kv_dq_compute is not None
+    return (
+        (
+            "attention tuning",
+            f"{runtime.resolution_source}{timing} · key {digest[:12]}",
+        ),
+        (
+            "attention fwd",
+            f"q{tiles.block_q} · kv{tiles.block_kv}/{tiles.block_kv_compute}",
+        ),
+        (
+            "attention dK/dV",
+            f"q{tiles.block_q_dkv}/{tiles.block_q_dkv_compute} · "
+            f"kv{tiles.block_kv_dkv}/{tiles.block_kv_dkv_compute}",
+        ),
+        (
+            "attention dQ",
+            f"q{tiles.block_q_dq} · "
+            f"kv{tiles.block_kv_dq}/{tiles.block_kv_dq_compute}",
+        ),
+    )
+
+
 def contract_model_metadata(config: Config) -> dict[str, Any]:
     """Return the fixed sample-efficiency architecture contract only."""
 
@@ -1375,6 +1811,51 @@ def contract_model_metadata(config: Config) -> dict[str, Any]:
     }
 
 
+def experiment_config_metadata(config: Config) -> dict[str, Any]:
+    """Return stable source identity and the fully resolved experiment values."""
+
+    return {
+        "schema_version": config.config_schema_version,
+        "path": CONFIG_FILENAME,
+        "sha256": config.config_sha256,
+        "profile": config.config_profile,
+        "overrides": dict(config.config_overrides),
+        "resolved": {
+            "training": {
+                "steps": config.steps,
+                "train_tokens": config.steps * config.batch_size * config.seq_len,
+                "batch_size": config.batch_size,
+                "seq_len": config.seq_len,
+                "dtype": config.dtype_name,
+            },
+            "model": contract_model_metadata(config),
+            "kernels": {
+                "attention_backend": config.attention_backend,
+                "loss_backend": config.loss_backend,
+                "vocab_tile_size": config.vocab_tile_size,
+            },
+            "optimizer": {
+                "learning_rate": config.learning_rate,
+                "min_lr_ratio": config.min_lr_ratio,
+                "warmup_steps": config.warmup_steps,
+                "weight_decay": config.weight_decay,
+                "beta1": config.beta1,
+                "beta2": config.beta2,
+                "grad_clip": config.grad_clip,
+            },
+            "evaluation": {
+                "eval_batches": config.eval_batches,
+                "val_every": config.val_every,
+                "val_probe_batches": config.val_probe_batches,
+            },
+            "logging": {
+                "diagnostics_every": config.diagnostics_every,
+                "log_every": config.log_every,
+            },
+        },
+    }
+
+
 def implementation_metadata(
     config: Config, runtime: AttentionRuntime
 ) -> dict[str, Any]:
@@ -1385,6 +1866,7 @@ def implementation_metadata(
         "attention_tuning": attention_runtime_metadata(runtime),
         "loss_backend": config.loss_backend,
         "vocab_tile_size": config.vocab_tile_size,
+        "configuration": experiment_config_metadata(config),
     }
 
 
@@ -2143,6 +2625,7 @@ def save_checkpoint(
     metadata = {
         "schema_version": SCHEMA_VERSION,
         "seed": seed,
+        "configuration": experiment_config_metadata(config),
         "model": {
             "vocab_size": config.vocab_size,
             "semantic_vocab_size": config.semantic_vocab_size,
@@ -2557,7 +3040,7 @@ def perplexity_from_loss(loss: float) -> float:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any] | None:
-    validate_args(args)
+    experiment = validate_args(args)
     process_index, process_count = initialize_distributed_runtime()
     is_controller = is_controller_process(process_index)
     console = Console(args.color, active=is_controller)
@@ -2576,8 +3059,8 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         # Smoke remains tiny on accelerators too; this is informational only.
         console.phase("Smoke configuration", f"running on {platform.upper()}")
 
-    dataset, vocab_size = load_dataset(args)
-    config = resolve_config(args, platform, vocab_size)
+    dataset, vocab_size = load_dataset(args, experiment)
+    config = resolve_config(args, platform, vocab_size, experiment)
     capture_window = xprof_step_window(args, config.steps)
     downstream_domains = load_downstream_domains(args, config.semantic_vocab_size)
     diagnostic_mode = args.no_final_validation and args.no_checkpoint
@@ -2619,6 +3102,11 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     console.table(
         "run configuration",
         (
+            (
+                "experiment config",
+                f"{CONFIG_FILENAME} · {config.config_profile} · "
+                f"sha256:{config.config_sha256[:12]}",
+            ),
             ("devices", f"{len(devices)} × {device_label(devices)}"),
             ("JAX processes", f"{process_count} (this rank {process_index})"),
             ("mesh", f"data={len(devices)} (replicated model)"),
@@ -2638,30 +3126,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             ("global batch", f"{config.batch_size} × {config.seq_len} tokens"),
             ("compute", config.dtype_name),
             ("attention", config.attention_backend),
-            (
-                "attention tuning",
-                (
-                    "not applicable (dense)"
-                    if attention_runtime.tiles is None
-                    else (
-                        f"{attention_runtime.resolution_source} in "
-                        f"{attention_runtime.tune_seconds:.3f}s; "
-                        f"key {attention_runtime.key_digest}"
-                    )
-                ),
-            ),
-            (
-                "attention tiles",
-                (
-                    "not applicable"
-                    if attention_runtime.tiles is None
-                    else json.dumps(
-                        attention_runtime.tiles.to_dict(),
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    )
-                ),
-            ),
+            *attention_console_rows(attention_runtime),
             (
                 "output loss",
                 (

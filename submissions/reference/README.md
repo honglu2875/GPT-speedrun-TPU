@@ -1,8 +1,10 @@
 # Reference
 
 `train.py` is a readable pure-JAX GPT baseline, not a claimed record. It keeps
-the model, AdamW optimizer, cosine schedule, batching, sharding, timing,
-evaluation, and checkpoint logic in one file.
+the model, AdamW optimizer, batching, sharding, timing, evaluation, and
+checkpoint logic in one entry file. The sibling `config.yaml` is the versioned
+experiment definition: each profile records its model shape, token budget,
+precision, kernel choices, optimizer schedule, and validation cadence.
 
 The checkpoint contains model parameters and versioned model metadata. It is an
 evaluation artifact, not a resumable training snapshot: Adam moments and the
@@ -63,7 +65,7 @@ local devices; model and optimizer state remain replicated. The harness marks
 its controller hostname separately because Cloud TPU's JAX process order need
 not match `-w-N`. Only that controller writes logs and artifacts.
 
-The `official` defaults use the GPT-2-small shape (12 layers, width 768, 12
+The `official` YAML profile uses the GPT-2-small shape (12 layers, width 768, 12
 heads), sequence length 1024, global batch 32, BF16 compute, and an exact
 624,984,064-token budget. This resolves to 19,073 optimizer steps. The full
 v4-8 calibration trained in 1,716.01 synchronized seconds (compilation excluded),
@@ -71,25 +73,32 @@ at about 364k tokens/s and 28.5% analytic MFU, then reached FineWeb loss 3.75788
 and Fresh10 macro loss 3.95959. It is the calibrated systems/reference baseline,
 not yet a claim of reaching the 3.28 target.
 
-## Optional TPU kernels
+## TPU kernel baseline
 
-The calibrated reference remains explicitly `--attention-backend dense
---loss-backend dense`. Two opt-in implementations make systems experiments
-possible without changing that baseline:
+The official YAML profile selects `attention_backend: tpu_flash` and
+`loss_backend: dense`. The top-level `make baseline` reads those settings
+without repeating them as flags. This promotes the
+hardware-validated attention improvement without changing the output objective,
+model, schedule, or token budget. An official TPU invocation with no explicit
+attention flag resolves to the same backend; smoke, CPU, and development
+profiles continue to default to dense. The trainer still exposes three
+attention implementations for controlled comparisons:
 
 - `--attention-backend tpu_flash` selects the trainable custom Pallas causal
   attention forward, dQ, and dK/dV kernels. It currently requires TPU BF16,
   supports head dimensions up to 128 (divisible by 8), and safely right-pads
   arbitrary sequence lengths to 128-wide tiles. `jax_flash` is retained as a
   JAX-provided control.
+- `--attention-backend dense` retains the readable materialized-attention
+  control used for the completed 3.75788 calibration.
 - `--loss-backend tiled` streams the tied output projection and cross entropy
   over vocabulary tiles, with an online FP32 log-sum-exp and a recomputing
   custom VJP. It never constructs the complete token-by-vocabulary logits.
 
-Both loss backends default to the full storage vocabulary, so switching the
-implementation alone preserves the objective. Passing
-`--semantic-vocab-size 50257` is a deliberate model-semantic change available
-in the open track; sample-efficiency pins the calibrated value of 50,304.
+Both loss backends use the full storage vocabulary in the reference config, so
+switching the implementation alone preserves the objective. Changing
+`semantic_vocab_size` to 50,257 in a cloned open-track config is a deliberate
+model-semantic change; sample-efficiency pins the calibrated value of 50,304.
 
 For non-dense attention, the trainer resolves a static ten-field tile plan
 before compiling the real step. Resolution checks an exact runtime-fingerprinted
@@ -111,8 +120,9 @@ For a bounded XProf diagnostic, pass `--xprof-dir`, `--xprof-start-step`, and
 `--xprof-steps`. Combining those with `--no-final-validation --no-checkpoint`
 skips evaluation compilation, all validation, checkpointing, and the competition
 result event; it writes only `training.csv` and the trace. The top-level
-`make profile` target supplies the complete 100-step reference command and
-starts the viewer after capture. That template explicitly passes
+`make profile` target reads the same official YAML and overrides only its
+bounded diagnostic duration/instrumentation before starting the viewer. That
+template explicitly passes
 `--diagnostics-every 0` so sparse reductions do not pollute the XProf window.
 
 Use the harness instead of invoking this file directly so data and results are
@@ -120,5 +130,5 @@ validated and recorded:
 
 ```bash
 uv run --frozen --no-sync speedrun run reference --profile smoke
-uv run --frozen --no-sync speedrun run reference --profile official
+make baseline
 ```

@@ -35,7 +35,13 @@ from .validation import (
 
 _SUBMISSION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-_RESERVED_PASSTHROUGH_FLAGS = ("--output-dir", "--seed", "--track", "--profile")
+_RESERVED_PASSTHROUGH_FLAGS = (
+    "--config",
+    "--output-dir",
+    "--seed",
+    "--track",
+    "--profile",
+)
 
 
 def run_submission(config: RunConfig, *, evaluator: Evaluator | None = None) -> RunOutcome:
@@ -46,9 +52,19 @@ def run_submission(config: RunConfig, *, evaluator: Evaluator | None = None) -> 
     """
 
     checked = _validate_config(config)
-    repo_root, submission_dir, runs_dir, records_path, configured_provenance = checked
+    (
+        repo_root,
+        submission_dir,
+        submission_config,
+        runs_dir,
+        records_path,
+        configured_provenance,
+    ) = checked
     provenance = _collect_provenance(
-        repo_root, submission_dir / "train.py", configured_provenance
+        repo_root,
+        submission_dir / "train.py",
+        submission_config,
+        configured_provenance,
     )
     run_id = _new_run_id(config.submission)
     run_dir = runs_dir / run_id
@@ -60,6 +76,8 @@ def run_submission(config: RunConfig, *, evaluator: Evaluator | None = None) -> 
     trainer_command = [
         config.python_executable or sys.executable,
         str(submission_dir / "train.py"),
+        "--config",
+        str(submission_config),
         "--output-dir",
         str(run_dir),
         "--seed",
@@ -418,7 +436,7 @@ def _validate_official_system(value: Any, *, expected_process_count: int = 1) ->
 
 def _validate_config(
     config: RunConfig,
-) -> tuple[Path, Path, Path, Path, dict[str, Any]]:
+) -> tuple[Path, Path, Path, Path, Path, dict[str, Any]]:
     if not _SUBMISSION_NAME.fullmatch(config.submission):
         raise ConfigurationError(
             "submission must be a simple name containing only letters, digits, '.', '_' or '-'"
@@ -480,6 +498,11 @@ def _validate_config(
     trainer = submission_dir / "train.py"
     if not trainer.is_file() or trainer.is_symlink():
         raise ConfigurationError(f"submission entry script not found: {trainer}")
+    submission_config = submission_dir / "config.yaml"
+    if not submission_config.is_file() or submission_config.is_symlink():
+        raise ConfigurationError(
+            f"submission configuration file not found: {submission_config}"
+        )
 
     runs_dir = _resolve_managed_path(repo_root, config.runs_dir, "runs_dir", directory=True)
     records_path = _resolve_managed_path(repo_root, config.records_path, "records_path")
@@ -520,7 +543,14 @@ def _validate_config(
         reference_contract_dict(config.reference_contract)
     except Exception as exc:
         raise ConfigurationError(str(exc)) from exc
-    return repo_root, submission_dir, runs_dir, records_path, configured_provenance
+    return (
+        repo_root,
+        submission_dir,
+        submission_config,
+        runs_dir,
+        records_path,
+        configured_provenance,
+    )
 
 
 def _copy_finite_mapping(value: Any, label: str) -> dict[str, Any]:
@@ -539,9 +569,12 @@ def _copy_finite_mapping(value: Any, label: str) -> dict[str, Any]:
 
 
 def _collect_provenance(
-    repo_root: Path, trainer: Path, configured: Mapping[str, Any]
+    repo_root: Path,
+    trainer: Path,
+    submission_config: Path,
+    configured: Mapping[str, Any],
 ) -> dict[str, Any]:
-    owned_keys = {"train_py", "shared_python", "uv_lock", "git"}
+    owned_keys = {"train_py", "config_yaml", "shared_python", "uv_lock", "git"}
     collisions = owned_keys.intersection(configured)
     if collisions:
         raise ConfigurationError(
@@ -551,6 +584,7 @@ def _collect_provenance(
     provenance: dict[str, Any] = {
         **dict(configured),
         "train_py": _file_provenance(repo_root, trainer),
+        "config_yaml": _file_provenance(repo_root, submission_config),
         "shared_python": _python_tree_provenance(repo_root),
         "uv_lock": None,
         "git": _git_provenance(repo_root),

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import importlib.util
 from io import StringIO
@@ -32,6 +32,102 @@ class FakeDevice:
 
 
 class TrainerStaticTests(unittest.TestCase):
+    def test_yaml_config_is_authoritative_strict_and_versioned(self) -> None:
+        source = trainer.CONFIG_PATH.read_text(encoding="utf-8")
+        official = trainer.load_experiment_profile("official")
+        self.assertEqual(official.schema_version, 1)
+        self.assertEqual(official.train_tokens, 624_984_064)
+        self.assertEqual(official.attention_backend, "tpu_flash")
+        self.assertEqual(official.dtype_name, "bfloat16")
+        self.assertEqual(
+            official.source_sha256,
+            hashlib.sha256(trainer.CONFIG_PATH.read_bytes()).hexdigest(),
+        )
+
+        invalid = {
+            "duplicate": source.replace(
+                "schema_version: 1", "schema_version: 1\nschema_version: 1", 1
+            ),
+            "unknown": source + "\nunknown: true\n",
+            "anchor": source.replace("schema_version: 1", "schema_version: &v 1", 1),
+            "alias": source.replace(
+                "schema_version: 1", "schema_version: &v 1\nextra: *v", 1
+            ),
+            "tag": source.replace("schema_version: 1", "schema_version: !!int 1", 1),
+            "directive": "%YAML 1.2\n---\n" + source,
+            "multiple documents": source + "\n---\n{}\n",
+            "nonfinite": source.replace(
+                "learning_rate: 0.0003", "learning_rate: .nan", 1
+            ),
+            "invalid unselected profile": source.replace(
+                "warmup_steps: 715", "warmup_steps: -1", 1
+            ),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for label, contents in invalid.items():
+                with self.subTest(label=label):
+                    path = root / "config.yaml"
+                    path.write_text(contents, encoding="utf-8")
+                    with patch.object(trainer, "CONFIG_PATH", path), self.assertRaises(
+                        ValueError
+                    ):
+                        trainer.load_experiment_profile("smoke")
+            path = root / "config.yaml"
+            path.write_bytes(b"#" * (trainer._MAX_CONFIG_BYTES + 1))
+            with patch.object(trainer, "CONFIG_PATH", path), self.assertRaisesRegex(
+                ValueError, "safety limit"
+            ):
+                trainer.load_experiment_profile("smoke")
+
+            target = root / "target.yaml"
+            target.write_text(source, encoding="utf-8")
+            symlink = root / "config-link.yaml"
+            symlink.symlink_to(target)
+            with patch.object(trainer, "CONFIG_PATH", symlink), self.assertRaisesRegex(
+                ValueError, "non-symlink"
+            ):
+                trainer.load_experiment_profile("smoke")
+
+            alternate = root / "alternate.yaml"
+            alternate.write_text(source, encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "beside train.py"):
+                trainer.load_experiment_profile("smoke", alternate)
+
+    def test_static_cli_values_are_rejected_but_diagnostic_overrides_resolve(self) -> None:
+        parser = trainer.build_parser()
+        for option in (
+            ("--layers", "13"),
+            ("--attention-backend", "dense"),
+            ("--learning-rate", "0.001"),
+            ("--eval-batches", "1"),
+        ):
+            with self.subTest(option=option), self.assertRaisesRegex(
+                ValueError, "defined by sibling config.yaml"
+            ):
+                trainer.resolve_config(
+                    parser.parse_args(["--profile", "official", *option]),
+                    "tpu",
+                    50_304,
+                )
+        config = trainer.resolve_config(
+            parser.parse_args(
+                [
+                    "--profile", "official", "--steps", "100",
+                    "--val-every", "0", "--diagnostics-every", "0",
+                    "--log-every", "100",
+                ]
+            ),
+            "tpu",
+            50_304,
+        )
+        self.assertEqual(config.steps, 100)
+        self.assertEqual(config.val_every, 0)
+        self.assertEqual(
+            dict(config.config_overrides),
+            {"steps": 100, "val_every": 0, "diagnostics_every": 0, "log_every": 100},
+        )
+
     def test_train_tokens_derives_exact_steps_and_is_exclusive(self) -> None:
         parser = trainer.build_parser()
         config = trainer.resolve_config(
@@ -39,8 +135,6 @@ class TrainerStaticTests(unittest.TestCase):
                 [
                     "--profile", "official",
                     "--train-tokens", "655360",
-                    "--batch-size", "32",
-                    "--seq-len", "1024",
                 ]
             ),
             "tpu",
@@ -53,8 +147,6 @@ class TrainerStaticTests(unittest.TestCase):
                     [
                         "--profile", "official",
                         "--train-tokens", "655361",
-                        "--batch-size", "32",
-                        "--seq-len", "1024",
                     ]
                 ),
                 "tpu",
@@ -63,22 +155,23 @@ class TrainerStaticTests(unittest.TestCase):
         with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
             parser.parse_args(["--steps", "20", "--train-tokens", "655360"])
 
-    def test_explicit_warmup_may_extend_past_short_profile_run(self) -> None:
+    def test_short_diagnostic_run_preserves_yaml_warmup(self) -> None:
         parser = trainer.build_parser()
-        explicit = trainer.resolve_config(
-            parser.parse_args(
-                ["--profile", "official", "--steps", "100", "--warmup-steps", "715"]
-            ),
-            "tpu",
-            50_304,
-        )
-        defaulted = trainer.resolve_config(
+        config = trainer.resolve_config(
             parser.parse_args(["--profile", "official", "--steps", "100"]),
             "tpu",
             50_304,
         )
-        self.assertEqual(explicit.warmup_steps, 715)
-        self.assertEqual(defaulted.warmup_steps, 100)
+        self.assertEqual(config.steps, 100)
+        self.assertEqual(config.warmup_steps, 715)
+        with self.assertRaisesRegex(ValueError, "defined by sibling config.yaml"):
+            trainer.resolve_config(
+                parser.parse_args(
+                    ["--profile", "official", "--warmup-steps", "100"]
+                ),
+                "tpu",
+                50_304,
+            )
 
     def test_xprof_diagnostic_contract_and_capture_window(self) -> None:
         parser = trainer.build_parser()
@@ -182,13 +275,15 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertEqual(official.eval_batches, 320)
         self.assertEqual(official.diagnostics_every, 250)
 
-        for profile in ("smoke", "dev"):
-            with self.subTest(profile=profile):
-                config = trainer.resolve_config(
-                    parser.parse_args(["--profile", profile]), "cpu", 256
-                )
-                self.assertEqual(config.val_every, 0)
-                self.assertEqual(config.diagnostics_every, 0)
+        smoke = trainer.resolve_config(
+            parser.parse_args(["--profile", "smoke"]), "cpu", 256
+        )
+        development = trainer.resolve_config(
+            parser.parse_args(["--profile", "dev"]), "tpu", 50_304
+        )
+        for config in (smoke, development):
+            self.assertEqual(config.val_every, 0)
+            self.assertEqual(config.diagnostics_every, 0)
 
         overridden = trainer.resolve_config(
             parser.parse_args(
@@ -197,15 +292,13 @@ class TrainerStaticTests(unittest.TestCase):
                     "dev",
                     "--val-every",
                     "5",
-                    "--val-probe-batches",
-                    "3",
                 ]
             ),
-            "cpu",
-            256,
+            "tpu",
+            50_304,
         )
         self.assertEqual(overridden.val_every, 5)
-        self.assertEqual(overridden.val_probe_batches, 3)
+        self.assertEqual(overridden.val_probe_batches, 8)
         disabled = trainer.resolve_config(
             parser.parse_args(
                 [
@@ -213,66 +306,36 @@ class TrainerStaticTests(unittest.TestCase):
                     "official",
                     "--steps",
                     "1",
-                    "--batch-size",
-                    "128",
-                    "--seq-len",
-                    "16384",
                     "--val-every",
                     "0",
-                    "--val-probe-batches",
-                    "99",
                 ]
             ),
             "tpu",
             50_304,
         )
         self.assertEqual(disabled.val_every, 0)
-        self.assertEqual(disabled.eval_batches, 5)
-        self.assertEqual(disabled.val_probe_batches, 99)
-        custom_official = trainer.resolve_config(
-            parser.parse_args(
-                [
-                    "--profile",
-                    "official",
-                    "--steps",
-                    "1",
-                    "--batch-size",
-                    "128",
-                    "--seq-len",
-                    "16384",
-                ]
-            ),
-            "tpu",
-            50_304,
-        )
-        self.assertEqual(custom_official.eval_batches, 5)
-        self.assertEqual(custom_official.val_probe_batches, 5)
-        with self.assertRaisesRegex(ValueError, "training token budget"):
+        self.assertEqual(disabled.eval_batches, 320)
+        self.assertEqual(disabled.val_probe_batches, 8)
+        for option in (
+            ("--batch-size", "128"),
+            ("--seq-len", "16384"),
+            ("--val-probe-batches", "9"),
+        ):
+            with self.subTest(option=option), self.assertRaisesRegex(
+                ValueError, "defined by sibling config.yaml"
+            ):
+                trainer.resolve_config(
+                    parser.parse_args(["--profile", "official", *option]),
+                    "tpu",
+                    50_304,
+                )
+        with self.assertRaisesRegex(ValueError, "must be divisible"):
             trainer.resolve_config(
                 parser.parse_args(
-                    [
-                        "--profile", "official",
-                        "--batch-size", "128",
-                        "--seq-len", "16384",
-                    ]
+                    ["--profile", "official", "--train-tokens", "655361"]
                 ),
                 "tpu",
                 50_304,
-            )
-        with self.assertRaisesRegex(ValueError, "must not exceed"):
-            trainer.resolve_config(
-                parser.parse_args(
-                    [
-                        "--profile",
-                        "dev",
-                        "--val-every",
-                        "1",
-                        "--val-probe-batches",
-                        "9",
-                    ]
-                ),
-                "cpu",
-                256,
             )
 
     def test_tiled_loss_resolves_semantic_vocab_and_counts_recompute_flops(self) -> None:
@@ -280,10 +343,14 @@ class TrainerStaticTests(unittest.TestCase):
         dense = trainer.resolve_config(
             parser.parse_args(["--profile", "official"]), "tpu", 50_304
         )
+        experiment = replace(
+            trainer.load_experiment_profile("official"), loss_backend="tiled"
+        )
         tiled = trainer.resolve_config(
-            parser.parse_args(["--profile", "official", "--loss-backend", "tiled"]),
+            parser.parse_args(["--profile", "official"]),
             "tpu",
             50_304,
+            experiment,
         )
         self.assertEqual(dense.semantic_vocab_size, 50_304)
         # Switching kernels alone preserves the calibrated 50,304-class
@@ -296,34 +363,24 @@ class TrainerStaticTests(unittest.TestCase):
             trainer.estimated_flops_per_token(dense, params_total),
         )
 
-        with self.assertRaisesRegex(ValueError, "must not exceed"):
+        with self.assertRaisesRegex(ValueError, "defined by sibling config.yaml"):
             trainer.resolve_config(
-                parser.parse_args(
-                    [
-                        "--profile",
-                        "official",
-                        "--loss-backend",
-                        "tiled",
-                        "--semantic-vocab-size",
-                        "50305",
-                    ]
-                ),
-                "tpu",
-                50_304,
+                parser.parse_args(["--profile", "official", "--loss-backend", "tiled"]),
+                "tpu", 50_304,
             )
 
     def test_flash_flops_include_right_padding_for_odd_sequences(self) -> None:
         parser = trainer.build_parser()
-        common = ["--profile", "dev", "--seq-len", "129"]
+        common = ["--profile", "dev"]
+        base = trainer.load_experiment_profile("dev")
         dense = trainer.resolve_config(
-            parser.parse_args(common), "tpu", 50_304
+            parser.parse_args(common), "tpu", 50_304, replace(base, seq_len=129)
         )
         flash = trainer.resolve_config(
-            parser.parse_args(
-                [*common, "--attention-backend", "tpu_flash"]
-            ),
+            parser.parse_args(common),
             "tpu",
             50_304,
+            replace(base, seq_len=129, attention_backend="tpu_flash"),
         )
         self.assertGreater(
             trainer.estimated_flops_per_token(flash, 1_000_000),
@@ -345,47 +402,54 @@ class TrainerStaticTests(unittest.TestCase):
 
     def test_trainable_flash_attention_backends_are_tpu_only(self) -> None:
         parser = trainer.build_parser()
+        base = trainer.load_experiment_profile("dev")
         for backend in ("jax_flash", "tpu_flash"):
             with self.subTest(backend=backend):
-                args = parser.parse_args(
-                    ["--profile", "dev", "--attention-backend", backend]
-                )
+                args = parser.parse_args(["--profile", "dev"])
+                experiment = replace(base, attention_backend=backend)
                 with self.assertRaisesRegex(ValueError, "requires a TPU"):
-                    trainer.resolve_config(args, "cpu", 256)
-                config = trainer.resolve_config(args, "tpu", 256)
+                    trainer.resolve_config(args, "cpu", 50_304, experiment)
+                config = trainer.resolve_config(args, "tpu", 50_304, experiment)
                 self.assertEqual(config.attention_backend, backend)
         for backend in ("jax_flash", "tpu_flash"):
             with self.subTest(float32_backend=backend):
-                with self.assertRaisesRegex(ValueError, "requires --dtype bfloat16"):
+                with self.assertRaisesRegex(ValueError, "requires dtype bfloat16"):
                     trainer.resolve_config(
-                        parser.parse_args(
-                            [
-                                "--profile",
-                                "dev",
-                                "--attention-backend",
-                                backend,
-                                "--dtype",
-                                "float32",
-                            ]
-                        ),
+                        parser.parse_args(["--profile", "dev"]),
                         "tpu",
-                        256,
+                        50_304,
+                        replace(
+                            base, attention_backend=backend, dtype_name="float32"
+                        ),
                     )
 
     def test_attention_autotune_cli_requires_cache_and_non_dense_backend(self) -> None:
         parser = trainer.build_parser()
         defaults = parser.parse_args([])
-        self.assertEqual(defaults.attention_backend, "dense")
+        self.assertIsNone(defaults.attention_backend)
         self.assertIsNone(defaults.attention_tuning_cache)
         self.assertFalse(defaults.autotune_attention)
+
+        official = trainer.resolve_config(
+            parser.parse_args(["--profile", "official"]), "tpu", 50_304
+        )
+        smoke = trainer.resolve_config(
+            parser.parse_args(["--profile", "smoke"]), "cpu", 256
+        )
+        development = trainer.resolve_config(
+            parser.parse_args(["--profile", "dev"]), "tpu", 50_304
+        )
+        self.assertEqual(official.attention_backend, "tpu_flash")
+        self.assertEqual(smoke.attention_backend, "dense")
+        self.assertEqual(development.attention_backend, "dense")
 
         with self.assertRaisesRegex(ValueError, "requires --attention-tuning-cache"):
             trainer.validate_args(
                 parser.parse_args(
-                    ["--attention-backend", "tpu_flash", "--autotune-attention"]
+                    ["--profile", "official", "--autotune-attention"]
                 )
             )
-        with self.assertRaisesRegex(ValueError, "requires a non-dense"):
+        with self.assertRaisesRegex(ValueError, "non-dense attention_backend"):
             trainer.validate_args(
                 parser.parse_args(
                     ["--attention-tuning-cache", "attention-tuning.json"]
@@ -394,8 +458,8 @@ class TrainerStaticTests(unittest.TestCase):
 
         valid = parser.parse_args(
             [
-                "--attention-backend",
-                "tpu_flash",
+                "--profile",
+                "official",
                 "--attention-tuning-cache",
                 "attention-tuning.json",
                 "--autotune-attention",
@@ -409,8 +473,6 @@ class TrainerStaticTests(unittest.TestCase):
             [
                 "--profile",
                 "official",
-                "--attention-backend",
-                "tpu_flash",
                 "--attention-tuning-cache",
                 "attention-tuning.json",
             ]
@@ -467,14 +529,16 @@ class TrainerStaticTests(unittest.TestCase):
             [
                 "--profile",
                 "official",
-                "--attention-backend",
-                "jax_flash",
                 "--attention-tuning-cache",
                 "attention-tuning.json",
                 "--autotune-attention",
             ]
         )
-        config = trainer.resolve_config(args, "tpu", 50_304)
+        experiment = replace(
+            trainer.load_experiment_profile("official"),
+            attention_backend="jax_flash",
+        )
+        config = trainer.resolve_config(args, "tpu", 50_304, experiment)
         devices = [FakeDevice("tpu", "TPU v4") for _ in range(4)]
         tiles = trainer.AttentionTiles(
             512, 512, 256, 512, 256, 512, 256, 256, 512, 256
@@ -514,9 +578,7 @@ class TrainerStaticTests(unittest.TestCase):
     def test_mesh_attention_uses_pre_resolved_exact_plan(self) -> None:
         parser = trainer.build_parser()
         config = trainer.resolve_config(
-            parser.parse_args(
-                ["--profile", "official", "--attention-backend", "tpu_flash"]
-            ),
+            parser.parse_args(["--profile", "official"]),
             "tpu",
             50_304,
         )
@@ -571,29 +633,46 @@ class TrainerStaticTests(unittest.TestCase):
             with np.load(output / trainer.CHECKPOINT_NAME) as checkpoint:
                 metadata = json.loads(bytes(checkpoint["metadata.json"]).decode())
         self.assertEqual(metadata["model"]["attention_tuning"], expected)
+        self.assertEqual(metadata["configuration"]["path"], "config.yaml")
+        self.assertEqual(
+            metadata["configuration"]["sha256"], config.config_sha256
+        )
+        self.assertEqual(
+            metadata["configuration"]["resolved"]["model"]["layers"], 2
+        )
 
         implementation = trainer.implementation_metadata(config, runtime)
         self.assertEqual(implementation["attention_tuning"], expected)
+        self.assertEqual(
+            implementation["configuration"],
+            trainer.experiment_config_metadata(config),
+        )
+        rows = trainer.attention_console_rows(runtime)
+        self.assertEqual(
+            rows,
+            (
+                ("attention tuning", "cache · key cccccccccccc"),
+                ("attention fwd", "q512 · kv512/256"),
+                ("attention dK/dV", "q512/256 · kv512/256"),
+                ("attention dQ", "q256 · kv512/256"),
+            ),
+        )
+        self.assertNotIn("c" * 64, repr(rows))
         source = TRAINER_PATH.read_text(encoding="utf-8")
         self.assertIn('"attention_tune_seconds":', source)
 
     def test_kernel_provenance_does_not_change_fixed_model_contract(self) -> None:
         parser = trainer.build_parser()
+        experiment = replace(
+            trainer.load_experiment_profile("official"),
+            loss_backend="tiled",
+            semantic_vocab_size=50_257,
+        )
         config = trainer.resolve_config(
-            parser.parse_args(
-                [
-                    "--profile",
-                    "official",
-                    "--attention-backend",
-                    "tpu_flash",
-                    "--loss-backend",
-                    "tiled",
-                    "--semantic-vocab-size",
-                    "50257",
-                ]
-            ),
+            parser.parse_args(["--profile", "official"]),
             "tpu",
             50_304,
+            experiment,
         )
         tiles = trainer.AttentionTiles(
             512, 512, 256, 512, 256, 512, 256, 256, 512, 256
@@ -939,7 +1018,10 @@ class TrainerStaticTests(unittest.TestCase):
         with redirect_stdout(stdout), redirect_stderr(stderr):
             console = trainer.Console("never")
             console.banner()
-            console.table("test", (("field", "value"),))
+            console.table(
+                "test",
+                (("field", "value"), ("long field", "x" * 512)),
+            )
             console.phase("phase", "detail")
             console.step(1, 1, 1.25, 1.0e-3, 0.5, 1024.0)
             console.success(1.0, 12.5, 0.25)
@@ -948,6 +1030,12 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertIn("synchronized training 12.500s", stderr.getvalue())
         self.assertIn("compilation excluded", stderr.getvalue())
         self.assertIn("validation loss", stderr.getvalue())
+        table_lines = [
+            line for line in stderr.getvalue().splitlines() if "│" in line
+        ]
+        self.assertTrue(table_lines)
+        self.assertLessEqual(max(map(len, table_lines)), 80)
+        self.assertIn("…", stderr.getvalue())
 
     def test_weight_decay_mask_selects_matrices_not_bias_or_norm(self) -> None:
         params = {

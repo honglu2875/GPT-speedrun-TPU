@@ -16,7 +16,6 @@ PROFILE_ID := $(PROFILE_ID)
 PROFILE_OUTPUT ?= $(CURDIR)/profiles/$(PROFILE_ID)-$(SUBMISSION)
 PROFILE_OUTPUT := $(PROFILE_OUTPUT)
 
-BASELINE_TRAIN_TOKENS := 624984064
 UV_BASE = $(UV) --cache-dir "$(UV_CACHE_DIR)"
 UV_RUN = $(UV_BASE) run --frozen --no-sync
 
@@ -45,8 +44,9 @@ preflight:
 	  --require-tpu \
 	  --color always
 
-# Exact open-track reference. The fixed token budget preserves the calibrated
-# 19,073 optimizer steps at global batch 32 x sequence length 1,024.
+# Exact open-track reference. The experiment definition is the immutable
+# submissions/<name>/config.yaml beside the trainer; this target supplies only
+# harness/runtime policy.
 baseline: preflight
 	$(UV_RUN) speedrun run "$(SUBMISSION)" \
 	  --track open \
@@ -56,31 +56,7 @@ baseline: preflight
 	  --target-loss 3.28 \
 	  --timeout 21600 \
 	  --checkpoints qualifying \
-	  --color always \
-	  -- \
-	  --train-tokens $(BASELINE_TRAIN_TOKENS) \
-	  --batch-size 32 \
-	  --seq-len 1024 \
-	  --layers 12 \
-	  --heads 12 \
-	  --d-model 768 \
-	  --mlp-mult 4 \
-	  --dtype bfloat16 \
-	  --attention-backend dense \
-	  --loss-backend dense \
-	  --semantic-vocab-size 50304 \
-	  --learning-rate 0.0003 \
-	  --min-lr-ratio 0.1 \
-	  --warmup-steps 715 \
-	  --weight-decay 0.1 \
-	  --beta1 0.9 \
-	  --beta2 0.95 \
-	  --grad-clip 1.0 \
-	  --eval-batches 320 \
-	  --val-every 250 \
-	  --val-probe-batches 8 \
-	  --diagnostics-every 250 \
-	  --log-every 953
+	  --color always
 
 # Diagnostic, not a leaderboard attempt. Compilation precedes tracing; steps 11-20
 # are captured by default so the trace stays small while the run still exercises 100
@@ -88,31 +64,13 @@ baseline: preflight
 profile: preflight
 	mkdir -p "$(PROFILE_OUTPUT)"
 	$(UV_RUN) submissions/$(SUBMISSION)/train.py \
+	  --config "$(CURDIR)/submissions/$(SUBMISSION)/config.yaml" \
 	  --output-dir "$(PROFILE_OUTPUT)" \
 	  --seed 1337 \
 	  --track open \
 	  --profile official \
 	  --steps 100 \
-	  --batch-size 32 \
-	  --seq-len 1024 \
-	  --layers 12 \
-	  --heads 12 \
-	  --d-model 768 \
-	  --mlp-mult 4 \
-	  --dtype bfloat16 \
-	  --attention-backend dense \
-	  --loss-backend dense \
-	  --semantic-vocab-size 50304 \
-	  --learning-rate 0.0003 \
-	  --min-lr-ratio 0.1 \
-	  --warmup-steps 715 \
-	  --weight-decay 0.1 \
-	  --beta1 0.9 \
-	  --beta2 0.95 \
-	  --grad-clip 1.0 \
-	  --eval-batches 320 \
 	  --val-every 0 \
-	  --val-probe-batches 8 \
 	  --diagnostics-every 0 \
 	  --log-every 100 \
 	  --data-format llmc \

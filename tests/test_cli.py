@@ -31,6 +31,8 @@ class CliTests(unittest.TestCase):
     def test_reserved_trainer_arguments_cannot_override_harness(self) -> None:
         for arguments in (
             ["--seed", "7"],
+            ["--config", "/tmp/other.yaml"],
+            ["--conf=/tmp/other.yaml"],
             ["--profile=smoke"],
             ["--output-dir", "/tmp/elsewhere"],
             ["--train-data", "other.bin"],
@@ -47,6 +49,42 @@ class CliTests(unittest.TestCase):
                 cli._reject_reserved_trainer_args(arguments)
 
         cli._reject_reserved_trainer_args(["--steps", "20", "--batch-size=32"])
+
+    def test_clone_copies_submission_config_byte_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "submissions" / "source"
+            source.mkdir(parents=True)
+            (source / "train.py").write_text("print('train')\n", encoding="utf-8")
+            config_bytes = b"steps: 20\r\nlearning_rate: 3.0e-4\r\n"
+            (source / "config.yaml").write_bytes(config_bytes)
+            (source / "README.md").write_text("# Source\n", encoding="utf-8")
+            args = cli.build_parser().parse_args(["clone", "source", "variant"])
+
+            with patch("speedrun.cli.repo_root", return_value=root):
+                self.assertEqual(cli.command_clone(args), 0)
+
+            destination = root / "submissions" / "variant"
+            self.assertEqual((destination / "config.yaml").read_bytes(), config_bytes)
+            self.assertEqual(
+                (destination / "train.py").read_text(encoding="utf-8"),
+                "print('train')\n",
+            )
+            self.assertTrue((destination / "README.md").is_file())
+
+    def test_clone_requires_config_before_creating_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "submissions" / "source"
+            source.mkdir(parents=True)
+            (source / "train.py").write_text("print('train')\n", encoding="utf-8")
+            args = cli.build_parser().parse_args(["clone", "source", "variant"])
+
+            with patch("speedrun.cli.repo_root", return_value=root):
+                with self.assertRaisesRegex(ConfigError, "configuration does not exist"):
+                    cli.command_clone(args)
+
+            self.assertFalse((root / "submissions" / "variant").exists())
 
     def test_non_run_unknown_arguments_are_rejected(self) -> None:
         with self.assertRaises(SystemExit):
