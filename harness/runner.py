@@ -164,6 +164,11 @@ def run_submission(config: RunConfig, *, evaluator: Evaluator | None = None) -> 
         "timing": {"observed_wall_seconds": observed_seconds},
         "metrics": recorded_metrics,
         "contract": contract,
+        "implementation": (
+            dict(payload["implementation"])
+            if isinstance(payload.get("implementation"), dict)
+            else None
+        ),
         "system": payload.get("system"),
         "reference_contract": reference_contract_dict(config.reference_contract),
         "checkpoint": {
@@ -491,7 +496,7 @@ def _copy_finite_mapping(value: Any, label: str) -> dict[str, Any]:
 def _collect_provenance(
     repo_root: Path, trainer: Path, configured: Mapping[str, Any]
 ) -> dict[str, Any]:
-    owned_keys = {"train_py", "uv_lock", "git"}
+    owned_keys = {"train_py", "shared_python", "uv_lock", "git"}
     collisions = owned_keys.intersection(configured)
     if collisions:
         raise ConfigurationError(
@@ -501,6 +506,7 @@ def _collect_provenance(
     provenance: dict[str, Any] = {
         **dict(configured),
         "train_py": _file_provenance(repo_root, trainer),
+        "shared_python": _python_tree_provenance(repo_root),
         "uv_lock": None,
         "git": _git_provenance(repo_root),
     }
@@ -508,6 +514,34 @@ def _collect_provenance(
     if lockfile.is_file():
         provenance["uv_lock"] = _file_provenance(repo_root, lockfile)
     return provenance
+
+
+def _python_tree_provenance(repo_root: Path) -> dict[str, Any]:
+    """Hash shared Python dependencies, including dirty working-tree bytes."""
+
+    paths: list[Path] = []
+    for package in ("speedrun", "harness"):
+        package_root = repo_root / package
+        if package_root.is_dir():
+            paths.extend(path for path in package_root.rglob("*.py") if path.is_file())
+    paths.sort(key=lambda item: item.relative_to(repo_root).as_posix())
+    digest = hashlib.sha256()
+    entries: list[dict[str, Any]] = []
+    total_bytes = 0
+    for path in paths:
+        item = _file_provenance(repo_root, path)
+        digest.update(str(item["path"]).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(item["sha256"]).encode("ascii"))
+        digest.update(b"\0")
+        entries.append(item)
+        total_bytes += int(item["bytes"])
+    return {
+        "sha256": digest.hexdigest(),
+        "files": len(entries),
+        "bytes": total_bytes,
+        "entries": entries,
+    }
 
 
 def _file_provenance(repo_root: Path, path: Path) -> dict[str, Any]:

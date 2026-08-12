@@ -140,6 +140,37 @@ Fresh10 macro loss **3.95959**. That exact token budget is now fixed for
 official open-track comparisons while we improve the architecture, initialization,
 optimizer, and kernels.
 
+### TPU kernel experiments
+
+The calibrated `make baseline` command keeps dense attention and dense output
+loss explicit. The reference trainer also exposes two opt-in systems paths:
+
+```bash
+# Custom trainable Pallas attention; preserve the baseline output objective.
+uv run --frozen --no-sync speedrun run reference --profile official -- \
+  --attention-backend tpu_flash --loss-backend dense
+
+# Bounded-memory tied output projection + cross entropy.
+uv run --frozen --no-sync speedrun run reference --profile official -- \
+  --attention-backend tpu_flash --loss-backend tiled
+```
+
+The custom attention kernel includes forward, dQ, and dK/dV kernels, uses a
+shape-aware static tile plan, and safely pads non-128-aligned sequence lengths.
+An exact runtime/source lookup table supplies measured seeds; an explicit
+synthetic autotuner can populate a local cache before real compilation. The
+tiled loss streams vocabulary blocks and recomputes them in backward instead of
+materializing full logits. Switching loss implementations keeps all 50,304
+storage classes by default; reducing `--semantic-vocab-size` changes the model
+objective and is not a mere kernel toggle.
+
+The canonical full-step benchmark improved from 93.196 ms to 75.191 ms with
+custom attention and dense loss (435.79k tokens/s, +23.9%). The tiled loss was
+77.048 ms, so it is retained for its memory bound rather than enabled by
+default. These are synchronized short-step measurements, not a new full-run
+score. Details, APIs, numerical checks, and tuning policy are in
+[docs/KERNELS.md](docs/KERNELS.md).
+
 ### Profiling and reports
 
 `make profile` uses the same four-chip data-parallel model shape and the first
@@ -250,7 +281,8 @@ The full timing, qualification, checkpoint, and human-review rules are in
 data/manifests/          pinned datasets and hashes
 harness/                 execution, validation, records, scoring
 speedrun/                CLI, wizard, doctor, and shared data preparation
-submissions/reference/   self-contained JAX baseline
+speedrun/kernels/        shared TPU attention, loss, and autotuning primitives
+submissions/reference/   single-entry JAX reference trainer
 tests/                   CPU-only infrastructure tests
 runs/                    gitignored persistent run artifacts
 ```

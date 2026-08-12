@@ -56,8 +56,9 @@ The sample-efficiency track ranks qualifying runs by the number of predicted
 training tokens consumed by forward/backward passes, lowest first. Synchronized
 training time breaks an exact tie.
 
-This track fixes the reference model contract, tokenizer, selected training
-shards, validation prefix, and sequence length. Optimizer, schedule, precision,
+This track fixes the reference model contract—including the semantic output
+vocabulary—tokenizer, selected training shards, validation prefix, and sequence
+length. Optimizer, schedule, precision,
 batching, sampling order, regularization, and implementation may change. Every
 predicted token participating in a forward/backward training loss counts,
 including repetitions or overlapping sampled windows. Tokens used only for the

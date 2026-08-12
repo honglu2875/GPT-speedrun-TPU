@@ -330,6 +330,9 @@ def validate_result(
         raise ResultValidationError(f"schema_version must be {SCHEMA_VERSION}")
     if payload.get("status") != "ok":
         raise ResultValidationError("result status must be 'ok'")
+    implementation = payload.get("implementation")
+    if implementation is not None and not isinstance(implementation, Mapping):
+        raise ResultValidationError("implementation must be a JSON object")
     metrics = _plain_object(payload.get("metrics"), "metrics")
     declared_time = _finite_number(
         metrics.get("train_seconds"), "metrics.train_seconds", minimum=0.0

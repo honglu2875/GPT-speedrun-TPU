@@ -84,6 +84,10 @@ result = {
         "tokenizer_id": "byte-v1",
         "sequence_length": 8,
     },
+    "implementation": {
+        "attention_backend": "dense",
+        "loss_backend": "dense",
+    },
     "system": {"platform": "test", "devices": 1},
 }
 if args.evaluations_json is not None:
@@ -198,6 +202,10 @@ class HarnessRunTests(unittest.TestCase):
         self.assertEqual(record["metrics"]["compile_seconds"], 0.75)
         self.assertEqual(record["metrics"]["diagnostics"]["gradient_scale"], -2.0)
         self.assertEqual(record["system"], {"platform": "test", "devices": 1})
+        self.assertEqual(
+            record["implementation"],
+            {"attention_backend": "dense", "loss_backend": "dense"},
+        )
         self.assertEqual(record["artifacts"]["training_curve"]["path"], "training.csv")
         self.assertEqual(len(record["artifacts"]["training_curve"]["sha256"]), 64)
         self.assertEqual(len(record["checkpoint"]["sha256"]), 64)
@@ -325,12 +333,33 @@ class HarnessRunTests(unittest.TestCase):
             provenance["uv_lock"]["sha256"],
             hashlib.sha256((self.root / "uv.lock").read_bytes()).hexdigest(),
         )
+        self.assertEqual(provenance["shared_python"]["files"], 0)
+        self.assertEqual(provenance["shared_python"]["bytes"], 0)
+        self.assertEqual(
+            provenance["shared_python"]["sha256"], hashlib.sha256().hexdigest()
+        )
 
         configured["data"]["shards"] = 99
         self.assertEqual(provenance["data"]["shards"], 9)
 
         with self.assertRaisesRegex(ConfigurationError, "harness-owned"):
             run_submission(self.config(provenance={"train_py": {"spoofed": True}}))
+        with self.assertRaisesRegex(ConfigurationError, "harness-owned"):
+            run_submission(self.config(provenance={"shared_python": {"spoofed": True}}))
+
+    def test_shared_python_provenance_changes_with_dependency_bytes(self) -> None:
+        shared = self.root / "speedrun" / "kernels"
+        shared.mkdir(parents=True)
+        dependency = shared / "attention.py"
+        dependency.write_text("PLAN = 128\n", encoding="utf-8")
+        first = run_submission(self.config()).record["provenance"]["shared_python"]
+        dependency.write_text("PLAN = 512\n", encoding="utf-8")
+        second = run_submission(self.config()).record["provenance"]["shared_python"]
+        self.assertEqual(first["files"], 1)
+        self.assertNotEqual(first["sha256"], second["sha256"])
+        self.assertNotEqual(
+            first["entries"][0]["sha256"], second["entries"][0]["sha256"]
+        )
 
     def test_rejects_nonfinite_declared_metrics_and_provenance(self) -> None:
         with self.assertRaisesRegex(ConfigurationError, "finite JSON"):
@@ -595,6 +624,24 @@ class ProtocolAndScoringTests(unittest.TestCase):
             parse_result_line('SPEEDRUN_RESULT={"schema_version":1}\nlate log\n')
         with self.assertRaises(ResultValidationError):
             parse_result_line("SPEEDRUN_RESULT={not json}\n")
+
+    def test_optional_implementation_provenance_must_be_an_object(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            (run_dir / "model.npz").write_bytes(b"checkpoint")
+            payload = {
+                "schema_version": 1,
+                "status": "ok",
+                "checkpoint": "model.npz",
+                "implementation": ["not", "an", "object"],
+                "metrics": {
+                    "train_seconds": 1.0,
+                    "tokens_processed": 1,
+                    "validation_loss": 1.0,
+                },
+            }
+            with self.assertRaisesRegex(ResultValidationError, "implementation"):
+                validate_result(payload, run_dir=run_dir, track="open")
 
     def test_track_rankings_use_canonical_fields(self) -> None:
         def record(name: str, seconds: float, tokens: int) -> dict[str, object]:

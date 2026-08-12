@@ -82,6 +82,7 @@ class TrainerStaticTests(unittest.TestCase):
 
     def test_xprof_diagnostic_contract_and_capture_window(self) -> None:
         parser = trainer.build_parser()
+        defaults = parser.parse_args([])
         valid = parser.parse_args(
             [
                 "--xprof-dir", "trace",
@@ -92,6 +93,23 @@ class TrainerStaticTests(unittest.TestCase):
             ]
         )
         trainer.validate_args(valid)
+
+        with patch.object(trainer, "make_runtime_key") as make_key:
+            runtime = trainer.prepare_attention_runtime(
+                defaults,
+                SimpleNamespace(attention_backend="dense"),
+                (),
+            )
+        make_key.assert_not_called()
+        self.assertEqual(
+            trainer.attention_runtime_metadata(runtime),
+            {
+                "key_digest": None,
+                "resolution_source": "dense",
+                "tune_seconds": 0.0,
+                "tiles": None,
+            },
+        )
         self.assertEqual(trainer.xprof_step_window(valid, 100), (11, 30))
         self.assertFalse(
             trainer.should_compile_evaluation(
@@ -257,6 +275,348 @@ class TrainerStaticTests(unittest.TestCase):
                 256,
             )
 
+    def test_tiled_loss_resolves_semantic_vocab_and_counts_recompute_flops(self) -> None:
+        parser = trainer.build_parser()
+        dense = trainer.resolve_config(
+            parser.parse_args(["--profile", "official"]), "tpu", 50_304
+        )
+        tiled = trainer.resolve_config(
+            parser.parse_args(["--profile", "official", "--loss-backend", "tiled"]),
+            "tpu",
+            50_304,
+        )
+        self.assertEqual(dense.semantic_vocab_size, 50_304)
+        # Switching kernels alone preserves the calibrated 50,304-class
+        # objective. Masking storage-only rows is an explicit algorithm choice.
+        self.assertEqual(tiled.semantic_vocab_size, 50_304)
+        self.assertEqual(tiled.vocab_tile_size, 2_048)
+        params_total = 124_475_904
+        self.assertGreater(
+            trainer.estimated_flops_per_token(tiled, params_total),
+            trainer.estimated_flops_per_token(dense, params_total),
+        )
+
+        with self.assertRaisesRegex(ValueError, "must not exceed"):
+            trainer.resolve_config(
+                parser.parse_args(
+                    [
+                        "--profile",
+                        "official",
+                        "--loss-backend",
+                        "tiled",
+                        "--semantic-vocab-size",
+                        "50305",
+                    ]
+                ),
+                "tpu",
+                50_304,
+            )
+
+    def test_flash_flops_include_right_padding_for_odd_sequences(self) -> None:
+        parser = trainer.build_parser()
+        common = ["--profile", "dev", "--seq-len", "129"]
+        dense = trainer.resolve_config(
+            parser.parse_args(common), "tpu", 50_304
+        )
+        flash = trainer.resolve_config(
+            parser.parse_args(
+                [*common, "--attention-backend", "tpu_flash"]
+            ),
+            "tpu",
+            50_304,
+        )
+        self.assertGreater(
+            trainer.estimated_flops_per_token(flash, 1_000_000),
+            trainer.estimated_flops_per_token(dense, 1_000_000),
+        )
+
+    def test_batches_reject_tokens_outside_semantic_vocabulary(self) -> None:
+        tokens = np.asarray([0, 1, 2, 7, 3, 0, 1, 2], dtype=np.int32)
+        dataset = trainer.TokenDataset(
+            trainer.ShardedTokens((tokens,)),
+            trainer.ShardedTokens((tokens,)),
+            "test",
+        )
+        rng = np.random.default_rng(3)
+        with self.assertRaisesRegex(ValueError, "do not fit"):
+            dataset.batch("train", rng, 1, 7, 7)
+        with self.assertRaisesRegex(ValueError, "do not fit"):
+            dataset.validation_batch(0, 1, 7, 7)
+
+    def test_trainable_flash_attention_backends_are_tpu_only(self) -> None:
+        parser = trainer.build_parser()
+        for backend in ("jax_flash", "tpu_flash"):
+            with self.subTest(backend=backend):
+                args = parser.parse_args(
+                    ["--profile", "dev", "--attention-backend", backend]
+                )
+                with self.assertRaisesRegex(ValueError, "requires a TPU"):
+                    trainer.resolve_config(args, "cpu", 256)
+                config = trainer.resolve_config(args, "tpu", 256)
+                self.assertEqual(config.attention_backend, backend)
+        for backend in ("jax_flash", "tpu_flash"):
+            with self.subTest(float32_backend=backend):
+                with self.assertRaisesRegex(ValueError, "requires --dtype bfloat16"):
+                    trainer.resolve_config(
+                        parser.parse_args(
+                            [
+                                "--profile",
+                                "dev",
+                                "--attention-backend",
+                                backend,
+                                "--dtype",
+                                "float32",
+                            ]
+                        ),
+                        "tpu",
+                        256,
+                    )
+
+    def test_attention_autotune_cli_requires_cache_and_non_dense_backend(self) -> None:
+        parser = trainer.build_parser()
+        defaults = parser.parse_args([])
+        self.assertEqual(defaults.attention_backend, "dense")
+        self.assertIsNone(defaults.attention_tuning_cache)
+        self.assertFalse(defaults.autotune_attention)
+
+        with self.assertRaisesRegex(ValueError, "requires --attention-tuning-cache"):
+            trainer.validate_args(
+                parser.parse_args(
+                    ["--attention-backend", "tpu_flash", "--autotune-attention"]
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "requires a non-dense"):
+            trainer.validate_args(
+                parser.parse_args(
+                    ["--attention-tuning-cache", "attention-tuning.json"]
+                )
+            )
+
+        valid = parser.parse_args(
+            [
+                "--attention-backend",
+                "tpu_flash",
+                "--attention-tuning-cache",
+                "attention-tuning.json",
+                "--autotune-attention",
+            ]
+        )
+        trainer.validate_args(valid)
+
+    def test_ordinary_attention_resolution_uses_exact_local_shape(self) -> None:
+        parser = trainer.build_parser()
+        args = parser.parse_args(
+            [
+                "--profile",
+                "official",
+                "--attention-backend",
+                "tpu_flash",
+                "--attention-tuning-cache",
+                "attention-tuning.json",
+            ]
+        )
+        config = trainer.resolve_config(args, "tpu", 50_304)
+        devices = [FakeDevice("tpu", "TPU v4") for _ in range(4)]
+        tiles = trainer.AttentionTiles(
+            512, 512, 256, 512, 256, 512, 256, 256, 512, 256
+        )
+        key = SimpleNamespace(digest="a" * 64)
+        resolved = SimpleNamespace(source="shipped", tiles=tiles)
+        with (
+            patch.object(trainer, "make_runtime_key", return_value=key) as make_key,
+            patch.object(
+                trainer, "resolve_attention_tile_plan", return_value=resolved
+            ) as resolve,
+            patch.object(trainer, "autotune_attention") as autotune,
+        ):
+            runtime = trainer.prepare_attention_runtime(args, config, devices)
+
+        key_arguments = make_key.call_args.kwargs
+        self.assertEqual(key_arguments["backend"], "tpu_flash")
+        self.assertEqual(key_arguments["batch"], 8)
+        self.assertEqual(key_arguments["heads"], 12)
+        self.assertEqual(key_arguments["sequence"], 1_024)
+        self.assertEqual(key_arguments["head_dim"], 64)
+        self.assertEqual(key_arguments["mode"], "forward_backward")
+        self.assertIs(key_arguments["device"], devices[0])
+        resolve.assert_called_once_with(
+            key, cache_path=Path("attention-tuning.json").resolve()
+        )
+        autotune.assert_not_called()
+        self.assertEqual(runtime.key_digest, "a" * 64)
+        self.assertEqual(runtime.resolution_source, "shipped")
+        self.assertEqual(runtime.tiles, tiles)
+        self.assertEqual(runtime.tune_seconds, 0.0)
+        source = TRAINER_PATH.read_text(encoding="utf-8")
+        self.assertLess(
+            source.index(
+                "attention_runtime = prepare_attention_runtime(args, config, devices)"
+            ),
+            source.index('mesh = Mesh(np.asarray(devices, dtype=object), ("data",))'),
+        )
+        self.assertLess(
+            source.index('mesh = Mesh(np.asarray(devices, dtype=object), ("data",))'),
+            source.index(
+                "attention_fn = make_mesh_attention(config, mesh, attention_runtime.tiles)"
+            ),
+        )
+
+    def test_explicit_attention_autotune_is_synthetic_and_forced(self) -> None:
+        parser = trainer.build_parser()
+        args = parser.parse_args(
+            [
+                "--profile",
+                "official",
+                "--attention-backend",
+                "jax_flash",
+                "--attention-tuning-cache",
+                "attention-tuning.json",
+                "--autotune-attention",
+            ]
+        )
+        config = trainer.resolve_config(args, "tpu", 50_304)
+        devices = [FakeDevice("tpu", "TPU v4") for _ in range(4)]
+        tiles = trainer.AttentionTiles(
+            512, 512, 256, 512, 256, 512, 256, 256, 512, 256
+        )
+        key = SimpleNamespace(digest="b" * 64)
+        record = SimpleNamespace(winner=tiles)
+        sentinel_attention = object()
+        with (
+            patch.object(trainer, "make_runtime_key", return_value=key),
+            patch.object(
+                trainer, "autotune_attention", return_value=record
+            ) as autotune,
+            patch.object(
+                trainer, "make_causal_attention", return_value=sentinel_attention
+            ) as make_attention,
+            patch.object(trainer.time, "perf_counter", side_effect=(10.0, 12.5)),
+        ):
+            runtime = trainer.prepare_attention_runtime(args, config, devices)
+            tune_arguments = autotune.call_args.kwargs
+            built_attention = tune_arguments["attention_factory"](tiles)
+
+        self.assertIs(built_attention, sentinel_attention)
+        attention_config = make_attention.call_args.args[0]
+        self.assertEqual(attention_config.backend, "jax_flash")
+        self.assertEqual(attention_config.tiles, tiles)
+        self.assertEqual(tune_arguments["key"], key)
+        self.assertEqual(
+            tune_arguments["cache_path"], Path("attention-tuning.json").resolve()
+        )
+        self.assertIs(tune_arguments["device"], devices[0])
+        self.assertTrue(tune_arguments["force"])
+        self.assertEqual(runtime.key_digest, "b" * 64)
+        self.assertEqual(runtime.resolution_source, "autotuned")
+        self.assertEqual(runtime.tiles, tiles)
+        self.assertEqual(runtime.tune_seconds, 2.5)
+
+    def test_mesh_attention_uses_pre_resolved_exact_plan(self) -> None:
+        parser = trainer.build_parser()
+        config = trainer.resolve_config(
+            parser.parse_args(
+                ["--profile", "official", "--attention-backend", "tpu_flash"]
+            ),
+            "tpu",
+            50_304,
+        )
+        tiles = trainer.AttentionTiles(
+            512, 512, 256, 512, 256, 512, 256, 256, 512, 256
+        )
+        local_attention = object()
+        with (
+            patch.object(
+                trainer, "make_causal_attention", return_value=local_attention
+            ) as make_attention,
+            patch.object(trainer.jax, "shard_map", return_value="mapped") as shard,
+        ):
+            actual = trainer.make_mesh_attention(config, object(), tiles)
+
+        self.assertEqual(actual, "mapped")
+        attention_config = make_attention.call_args.args[0]
+        self.assertEqual(attention_config.backend, "tpu_flash")
+        self.assertEqual(attention_config.tiles, tiles)
+        self.assertIs(shard.call_args.args[0], local_attention)
+        with self.assertRaisesRegex(ValueError, "resolved tile plan"):
+            trainer.make_mesh_attention(config, object(), None)
+        self.assertIsNone(
+            trainer.make_mesh_attention(
+                SimpleNamespace(attention_backend="dense"), object(), None
+            )
+        )
+
+    def test_attention_tuning_metadata_is_saved_with_exact_plan(self) -> None:
+        parser = trainer.build_parser()
+        config = trainer.resolve_config(
+            parser.parse_args(["--profile", "smoke"]), "cpu", 256
+        )
+        tiles = trainer.AttentionTiles(
+            512, 512, 256, 512, 256, 512, 256, 256, 512, 256
+        )
+        runtime = trainer.AttentionRuntime("c" * 64, "cache", tiles, 0.0)
+        expected = trainer.attention_runtime_metadata(runtime)
+        self.assertEqual(expected["key_digest"], "c" * 64)
+        self.assertEqual(expected["resolution_source"], "cache")
+        self.assertEqual(len(expected["tiles"]), 10)
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            trainer.save_checkpoint(
+                output,
+                {"weight": np.zeros((2, 2), dtype=np.float32)},
+                config,
+                7,
+                runtime,
+            )
+            with np.load(output / trainer.CHECKPOINT_NAME) as checkpoint:
+                metadata = json.loads(bytes(checkpoint["metadata.json"]).decode())
+        self.assertEqual(metadata["model"]["attention_tuning"], expected)
+
+        implementation = trainer.implementation_metadata(config, runtime)
+        self.assertEqual(implementation["attention_tuning"], expected)
+        source = TRAINER_PATH.read_text(encoding="utf-8")
+        self.assertIn('"attention_tune_seconds":', source)
+
+    def test_kernel_provenance_does_not_change_fixed_model_contract(self) -> None:
+        parser = trainer.build_parser()
+        config = trainer.resolve_config(
+            parser.parse_args(
+                [
+                    "--profile",
+                    "official",
+                    "--attention-backend",
+                    "tpu_flash",
+                    "--loss-backend",
+                    "tiled",
+                    "--semantic-vocab-size",
+                    "50257",
+                ]
+            ),
+            "tpu",
+            50_304,
+        )
+        tiles = trainer.AttentionTiles(
+            512, 512, 256, 512, 256, 512, 256, 256, 512, 256
+        )
+        runtime = trainer.AttentionRuntime("d" * 64, "shipped", tiles, 0.0)
+        self.assertEqual(
+            trainer.contract_model_metadata(config),
+            {
+                "layers": 12,
+                "heads": 12,
+                "d_model": 768,
+                "mlp_mult": 4,
+                "vocab_size": 50_304,
+                "semantic_vocab_size": 50_257,
+                "tied_embeddings": True,
+            },
+        )
+        implementation = trainer.implementation_metadata(config, runtime)
+        self.assertEqual(implementation["attention_backend"], "tpu_flash")
+        self.assertEqual(implementation["loss_backend"], "tiled")
+        self.assertNotIn("semantic_vocab_size", implementation)
+        self.assertNotIn("attention_backend", trainer.contract_model_metadata(config))
+
     def test_probe_schedule_excludes_final_step(self) -> None:
         config = SimpleNamespace(val_every=3, steps=9)
         selected = [
@@ -299,7 +659,9 @@ class TrainerStaticTests(unittest.TestCase):
                 return values, values
 
         dataset = Dataset()
-        config = SimpleNamespace(batch_size=2, seq_len=4, vocab_size=16)
+        config = SimpleNamespace(
+            batch_size=2, seq_len=4, vocab_size=16, semantic_vocab_size=16
+        )
 
         def compiled_eval(
             params: object, x: np.ndarray, y: np.ndarray, mask: np.ndarray

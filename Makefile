@@ -66,6 +66,9 @@ baseline: preflight
 	  --d-model 768 \
 	  --mlp-mult 4 \
 	  --dtype bfloat16 \
+	  --attention-backend dense \
+	  --loss-backend dense \
+	  --semantic-vocab-size 50304 \
 	  --learning-rate 0.0003 \
 	  --min-lr-ratio 0.1 \
 	  --warmup-steps 715 \
@@ -98,6 +101,9 @@ profile: preflight
 	  --d-model 768 \
 	  --mlp-mult 4 \
 	  --dtype bfloat16 \
+	  --attention-backend dense \
+	  --loss-backend dense \
+	  --semantic-vocab-size 50304 \
 	  --learning-rate 0.0003 \
 	  --min-lr-ratio 0.1 \
 	  --warmup-steps 715 \

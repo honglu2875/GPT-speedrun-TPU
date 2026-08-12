@@ -18,6 +18,16 @@ class CliTests(unittest.TestCase):
         self.assertEqual(budget // (32 * 1024), 19_073)
         self.assertEqual(budget % (32 * 1024), 0)
 
+    def test_sample_efficiency_contract_pins_semantic_vocabulary(self) -> None:
+        smoke = cli._reference_contract("smoke")
+        self.assertEqual(smoke.dataset_id, "smoke")
+        self.assertEqual(smoke.tokenizer_id, "synthetic-byte-v1")
+        contract = cli._reference_contract("official")
+        self.assertEqual(contract.extra["model"]["vocab_size"], 50_304)
+        self.assertEqual(
+            contract.extra["model"]["semantic_vocab_size"], 50_304
+        )
+
     def test_reserved_trainer_arguments_cannot_override_harness(self) -> None:
         for arguments in (
             ["--seed", "7"],

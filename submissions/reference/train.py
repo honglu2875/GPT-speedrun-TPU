@@ -29,13 +29,29 @@ import re
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
 import jaxlib
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+from speedrun.kernels import (
+    AttentionConfig,
+    AttentionTiles,
+    DEFAULT_VOCAB_TILE_SIZE,
+    make_causal_attention,
+    select_attention_tiles,
+    tiled_tied_cross_entropy,
+    tiled_tied_cross_entropy_losses,
+)
+from speedrun.kernels.autotune import (
+    autotune_attention,
+    make_runtime_key,
+    padded_sequence_length,
+    resolve_attention_tile_plan,
+)
 
 
 RESULT_PREFIX = "SPEEDRUN_RESULT="
@@ -97,8 +113,41 @@ class Config:
     diagnostics_every: int
     log_every: int
     vocab_size: int
+    semantic_vocab_size: int
+    attention_backend: str
+    loss_backend: str
+    vocab_tile_size: int
     compute_dtype: Any
     dtype_name: str
+
+
+@dataclass(frozen=True)
+class AttentionRuntime:
+    """One static attention plan resolved before any real-step compilation."""
+
+    key_digest: str | None
+    resolution_source: str
+    tiles: AttentionTiles | None
+    tune_seconds: float
+
+    def __post_init__(self) -> None:
+        if self.resolution_source not in (
+            "dense",
+            "cache",
+            "shipped",
+            "heuristic",
+            "autotuned",
+        ):
+            raise ValueError(
+                f"invalid attention resolution source: {self.resolution_source!r}"
+            )
+        if not math.isfinite(self.tune_seconds) or self.tune_seconds < 0.0:
+            raise ValueError("attention tune seconds must be finite and nonnegative")
+        if self.resolution_source == "dense":
+            if self.key_digest is not None or self.tiles is not None:
+                raise ValueError("dense attention must not carry a tuning key or tiles")
+        elif self.key_digest is None or self.tiles is None:
+            raise ValueError("non-dense attention requires a tuning key and tile plan")
 
 
 @dataclass(frozen=True)
@@ -539,6 +588,50 @@ def build_parser() -> argparse.ArgumentParser:
     model.add_argument("--d-model", type=positive_int, default=None)
     model.add_argument("--mlp-mult", type=positive_int, default=4)
     model.add_argument("--dtype", choices=("auto", "bfloat16", "float32"), default="auto")
+    model.add_argument(
+        "--attention-backend",
+        choices=("dense", "jax_flash", "tpu_flash"),
+        default="dense",
+        help=(
+            "dense reference attention, JAX FlashAttention, or the custom "
+            "trainable TPU FlashAttention kernel"
+        ),
+    )
+    model.add_argument(
+        "--attention-tuning-cache",
+        type=Path,
+        default=None,
+        help=(
+            "JSON cache for exact runtime-fingerprinted attention tile plans; "
+            "used only by non-dense attention"
+        ),
+    )
+    model.add_argument(
+        "--autotune-attention",
+        action="store_true",
+        help=(
+            "AOT-compile and benchmark synthetic attention candidates before "
+            "the real train-step compilation"
+        ),
+    )
+    model.add_argument(
+        "--loss-backend",
+        choices=("dense", "tiled"),
+        default="dense",
+        help="dense logits or bounded-memory tiled tied-output cross entropy",
+    )
+    model.add_argument(
+        "--semantic-vocab-size",
+        type=positive_int,
+        default=None,
+        help="real output classes when the embedding table has padded storage rows",
+    )
+    model.add_argument(
+        "--vocab-tile-size",
+        type=positive_int,
+        default=DEFAULT_VOCAB_TILE_SIZE,
+        help="static vocabulary tile for --loss-backend tiled",
+    )
 
     optim = parser.add_argument_group("optimization")
     optim.add_argument("--learning-rate", type=float, default=3.0e-4)
@@ -574,6 +667,17 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--grad-clip must be positive")
     if args.peak_tflops is not None and args.peak_tflops <= 0.0:
         raise ValueError("--peak-tflops must be positive")
+    if args.autotune_attention and args.attention_tuning_cache is None:
+        raise ValueError(
+            "--autotune-attention requires --attention-tuning-cache PATH"
+        )
+    if (
+        args.attention_tuning_cache is not None
+        and args.attention_backend == "dense"
+    ):
+        raise ValueError(
+            "--attention-tuning-cache requires a non-dense --attention-backend"
+        )
     if args.downstream_root is not None and args.downstream_manifest is None:
         raise ValueError("--downstream-root requires --downstream-manifest")
     if args.downstream_manifest is not None and args.downstream_data:
@@ -758,6 +862,25 @@ def resolve_config(args: argparse.Namespace, platform: str, vocab_size: int) -> 
 
     if d_model % heads:
         raise ValueError(f"d_model ({d_model}) must be divisible by heads ({heads})")
+    semantic_vocab_size = (
+        args.semantic_vocab_size
+        if args.semantic_vocab_size is not None
+        else vocab_size
+    )
+    if semantic_vocab_size > vocab_size:
+        raise ValueError(
+            "semantic_vocab_size must not exceed the embedding storage vocabulary; "
+            f"got {semantic_vocab_size} > {vocab_size}"
+        )
+    if args.attention_backend != "dense" and platform != "tpu":
+        raise ValueError(
+            f"--attention-backend {args.attention_backend} requires a TPU runtime"
+        )
+    if args.attention_backend != "dense" and compute_dtype != jnp.bfloat16:
+        raise ValueError(
+            f"--attention-backend {args.attention_backend} currently requires "
+            "--dtype bfloat16"
+        )
 
     return Config(
         steps=steps,
@@ -780,6 +903,10 @@ def resolve_config(args: argparse.Namespace, platform: str, vocab_size: int) -> 
         diagnostics_every=diagnostics_every,
         log_every=log_every,
         vocab_size=vocab_size,
+        semantic_vocab_size=semantic_vocab_size,
+        attention_backend=args.attention_backend,
+        loss_backend=args.loss_backend,
+        vocab_tile_size=args.vocab_tile_size,
         compute_dtype=compute_dtype,
         dtype_name=dtype_name,
     )
@@ -1200,14 +1327,185 @@ def linear(x: jax.Array, weight: jax.Array, bias: jax.Array, dtype: Any) -> jax.
     return jnp.einsum("...d,df->...f", x, weight.astype(dtype)) + bias.astype(dtype)
 
 
-def gpt_logits(params: Mapping[str, Any], tokens: jax.Array, config: Config) -> jax.Array:
+AttentionCallable = Callable[[jax.Array, jax.Array, jax.Array], jax.Array]
+
+
+def attention_runtime_metadata(runtime: AttentionRuntime) -> dict[str, Any]:
+    """Return the JSON-safe attention tile provenance shared by all artifacts."""
+
+    return {
+        "key_digest": runtime.key_digest,
+        "resolution_source": runtime.resolution_source,
+        "tune_seconds": float(runtime.tune_seconds),
+        "tiles": None if runtime.tiles is None else runtime.tiles.to_dict(),
+    }
+
+
+def contract_model_metadata(config: Config) -> dict[str, Any]:
+    """Return the fixed sample-efficiency architecture contract only."""
+
+    return {
+        "layers": config.layers,
+        "heads": config.heads,
+        "d_model": config.d_model,
+        "mlp_mult": config.mlp_mult,
+        "vocab_size": config.vocab_size,
+        "semantic_vocab_size": config.semantic_vocab_size,
+        "tied_embeddings": True,
+    }
+
+
+def implementation_metadata(
+    config: Config, runtime: AttentionRuntime
+) -> dict[str, Any]:
+    """Return systems/kernel provenance that may vary in either track."""
+
+    return {
+        "attention_backend": config.attention_backend,
+        "attention_tuning": attention_runtime_metadata(runtime),
+        "loss_backend": config.loss_backend,
+        "vocab_tile_size": config.vocab_tile_size,
+    }
+
+
+def prepare_attention_runtime(
+    args: argparse.Namespace,
+    config: Config,
+    devices: Sequence[jax.Device],
+) -> AttentionRuntime:
+    """Resolve or synthetically tune attention before constructing shard_map.
+
+    Only static model shape, runtime identity, and deterministic synthetic BHSD
+    tensors reach the tuner. No training or validation dataset is accepted by
+    this boundary.
+    """
+
+    if config.attention_backend == "dense":
+        return AttentionRuntime(None, "dense", None, 0.0)
+    if not devices:
+        raise ValueError("attention tile resolution requires at least one device")
+    if config.batch_size % len(devices):
+        raise ValueError(
+            "global batch must divide the device count before attention tuning"
+        )
+    local_batch = config.batch_size // len(devices)
+    head_dim = config.d_model // config.heads
+    key = make_runtime_key(
+        backend=config.attention_backend,
+        dtype=config.compute_dtype,
+        batch=local_batch,
+        heads=config.heads,
+        sequence=config.seq_len,
+        head_dim=head_dim,
+        mode="forward_backward",
+        device=devices[0],
+    )
+    cache_path: Path | None = None
+    if args.attention_tuning_cache is not None:
+        cache_argument = args.attention_tuning_cache.expanduser()
+        if not cache_argument.is_absolute():
+            cache_argument = Path.cwd() / cache_argument
+        # Resolve parent-directory aliases (including the user's shm/ symlink)
+        # without resolving the cache file itself; the cache layer must still
+        # be able to reject a final-component symlink safely.
+        cache_path = cache_argument.parent.resolve() / cache_argument.name
+    if args.autotune_attention:
+        if cache_path is None:  # validate_args establishes this for normal runs.
+            raise ValueError(
+                "--autotune-attention requires --attention-tuning-cache PATH"
+            )
+
+        def factory(tiles: AttentionTiles) -> AttentionCallable:
+            return make_causal_attention(
+                AttentionConfig(backend=config.attention_backend, tiles=tiles)
+            )
+
+        started = time.perf_counter()
+        record = autotune_attention(
+            key=key,
+            attention_factory=factory,
+            cache_path=cache_path,
+            device=devices[0],
+            force=True,
+        )
+        tune_seconds = time.perf_counter() - started
+        return AttentionRuntime(
+            key.digest,
+            "autotuned",
+            record.winner,
+            tune_seconds,
+        )
+
+    resolved = resolve_attention_tile_plan(key, cache_path=cache_path)
+    return AttentionRuntime(key.digest, resolved.source, resolved.tiles, 0.0)
+
+
+def make_mesh_attention(
+    config: Config,
+    mesh: Mesh,
+    tiles: AttentionTiles | None,
+) -> AttentionCallable | None:
+    """Build an explicitly data-sharded Pallas attention boundary.
+
+    Parameters and optimizer state remain replicated, while the leading batch
+    axis is partitioned over ``mesh['data']``.  Pallas/Mosaic calls require this
+    explicit boundary: automatic SPMD partitioning of a custom kernel is not
+    supported by JAX.  Each kernel invocation consequently receives the local
+    per-chip batch and performs no attention collectives.
+    """
+
+    if config.attention_backend == "dense":
+        return None
+    if tiles is None:
+        raise ValueError("non-dense attention requires a resolved tile plan")
+    local_attention = make_causal_attention(
+        AttentionConfig(
+            backend=config.attention_backend,
+            tiles=tiles,
+        )
+    )
+    batch_partition = P("data", None, None, None)
+    return jax.shard_map(
+        local_attention,
+        mesh=mesh,
+        in_specs=(batch_partition, batch_partition, batch_partition),
+        out_specs=batch_partition,
+        check_vma=False,
+    )
+
+
+def gpt_hidden(
+    params: Mapping[str, Any],
+    tokens: jax.Array,
+    config: Config,
+    attention_fn: AttentionCallable | None = None,
+) -> jax.Array:
+    """Return final normalized token representations before the tied head."""
+
     dtype = config.compute_dtype
     batch, length = tokens.shape
     del batch
     x = params["token_embedding"][tokens].astype(dtype)
     x = x + params["position_embedding"][:length].astype(dtype)
     head_dim = config.d_model // config.heads
-    causal = jnp.tril(jnp.ones((length, length), dtype=jnp.bool_))[None, None, :, :]
+    if config.attention_backend != "dense":
+        # Direct construction keeps this function convenient for single-device
+        # tests. Multi-device training supplies an explicit shard_map wrapper;
+        # Mosaic kernels cannot be partitioned automatically by an outer jit.
+        attention = attention_fn or make_causal_attention(
+            AttentionConfig(
+                backend=config.attention_backend,
+                tiles=select_attention_tiles(
+                    sequence=length, head_dim=head_dim, training=True
+                ),
+            )
+        )
+        causal = None
+    else:
+        attention = None
+        causal = jnp.tril(
+            jnp.ones((length, length), dtype=jnp.bool_)
+        )[None, None, :, :]
 
     for block in params["blocks"]:
         residual = x
@@ -1217,11 +1515,19 @@ def gpt_logits(params: Mapping[str, Any], tokens: jax.Array, config: Config) -> 
         query = query.reshape(tokens.shape[0], length, config.heads, head_dim)
         key = key.reshape(tokens.shape[0], length, config.heads, head_dim)
         value = value.reshape(tokens.shape[0], length, config.heads, head_dim)
-        scores = jnp.einsum("bthd,bshd->bhts", query, key)
-        scores = scores.astype(jnp.float32) * (head_dim**-0.5)
-        scores = jnp.where(causal, scores, jnp.finfo(jnp.float32).min)
-        probabilities = jax.nn.softmax(scores, axis=-1).astype(dtype)
-        attended = jnp.einsum("bhts,bshd->bthd", probabilities, value)
+        if attention is not None:
+            attended = attention(
+                jnp.transpose(query, (0, 2, 1, 3)),
+                jnp.transpose(key, (0, 2, 1, 3)),
+                jnp.transpose(value, (0, 2, 1, 3)),
+            )
+            attended = jnp.transpose(attended, (0, 2, 1, 3))
+        else:
+            scores = jnp.einsum("bthd,bshd->bhts", query, key)
+            scores = scores.astype(jnp.float32) * (head_dim**-0.5)
+            scores = jnp.where(causal, scores, jnp.finfo(jnp.float32).min)
+            probabilities = jax.nn.softmax(scores, axis=-1).astype(dtype)
+            attended = jnp.einsum("bhts,bshd->bthd", probabilities, value)
         attended = attended.reshape(tokens.shape[0], length, config.d_model)
         x = residual + linear(attended, block["attn_w"], block["attn_b"], dtype)
 
@@ -1231,15 +1537,42 @@ def gpt_logits(params: Mapping[str, Any], tokens: jax.Array, config: Config) -> 
         hidden = jax.nn.gelu(hidden, approximate=True)
         x = residual + linear(hidden, block["mlp_down_w"], block["mlp_down_b"], dtype)
 
-    x = layer_norm(x, params["final_ln_scale"], params["final_ln_bias"], dtype)
+    return layer_norm(x, params["final_ln_scale"], params["final_ln_bias"], dtype)
+
+
+def gpt_logits(
+    params: Mapping[str, Any],
+    tokens: jax.Array,
+    config: Config,
+    attention_fn: AttentionCallable | None = None,
+) -> jax.Array:
+    x = gpt_hidden(params, tokens, config, attention_fn)
     # Weight tying avoids a second vocabulary-sized parameter matrix.
     return jnp.einsum(
-        "btd,vd->btv", x, params["token_embedding"].astype(dtype)
+        "btd,vd->btv",
+        x,
+        params["token_embedding"].astype(config.compute_dtype),
     ).astype(jnp.float32)
 
 
-def cross_entropy(params: Mapping[str, Any], x: jax.Array, y: jax.Array, config: Config) -> jax.Array:
-    logits = gpt_logits(params, x, config)
+def cross_entropy(
+    params: Mapping[str, Any],
+    x: jax.Array,
+    y: jax.Array,
+    config: Config,
+    attention_fn: AttentionCallable | None = None,
+) -> jax.Array:
+    if config.loss_backend == "tiled":
+        hidden = gpt_hidden(params, x, config, attention_fn)
+        return tiled_tied_cross_entropy(
+            hidden,
+            params["token_embedding"],
+            y,
+            semantic_vocab_size=config.semantic_vocab_size,
+            vocab_tile_size=config.vocab_tile_size,
+            compute_dtype=config.compute_dtype,
+        )
+    logits = gpt_logits(params, x, config, attention_fn)[..., : config.semantic_vocab_size]
     log_probabilities = jax.nn.log_softmax(logits, axis=-1)
     selected = jnp.take_along_axis(log_probabilities, y[..., None], axis=-1)
     return -jnp.mean(selected, dtype=jnp.float32)
@@ -1291,6 +1624,7 @@ def _apply_training_update(
     y: jax.Array,
     config: Config,
     decay_mask: Any | None = None,
+    attention_fn: AttentionCallable | None = None,
 ) -> tuple[Any, dict[str, Any], dict[str, jax.Array], Any]:
     """Apply one ordinary update and also return the raw, pre-clip gradient.
 
@@ -1300,7 +1634,9 @@ def _apply_training_update(
 
     if decay_mask is None:
         decay_mask = weight_decay_mask(params)
-    loss, gradients = jax.value_and_grad(cross_entropy)(params, x, y, config)
+    loss, gradients = jax.value_and_grad(
+        lambda candidate: cross_entropy(candidate, x, y, config, attention_fn)
+    )(params)
     gradients = jax.tree_util.tree_map(lambda grad: grad.astype(jnp.float32), gradients)
     raw_gradients = gradients
     squared_norms = [jnp.sum(jnp.square(grad)) for grad in jax.tree_util.tree_leaves(gradients)]
@@ -1355,9 +1691,10 @@ def train_step(
     y: jax.Array,
     config: Config,
     decay_mask: Any | None = None,
+    attention_fn: AttentionCallable | None = None,
 ) -> tuple[Any, dict[str, Any], dict[str, jax.Array]]:
     params, optimizer, metrics, _ = _apply_training_update(
-        params, optimizer, x, y, config, decay_mask
+        params, optimizer, x, y, config, decay_mask, attention_fn
     )
     return params, optimizer, metrics
 
@@ -1479,12 +1816,13 @@ def diagnostic_train_step(
     y: jax.Array,
     config: Config,
     decay_mask: Any | None = None,
+    attention_fn: AttentionCallable | None = None,
 ) -> tuple[Any, dict[str, Any], dict[str, jax.Array], jax.Array]:
     """Run the same update as :func:`train_step` and emit sparse statistics."""
 
     params_before = params
     params, optimizer, metrics, raw_gradients = _apply_training_update(
-        params, optimizer, x, y, config, decay_mask
+        params, optimizer, x, y, config, decay_mask, attention_fn
     )
     values = diagnostic_values(params_before, raw_gradients, params)
     return params, optimizer, metrics, values
@@ -1496,15 +1834,30 @@ def eval_step(
     y: jax.Array,
     mask: jax.Array,
     config: Config,
+    attention_fn: AttentionCallable | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Return a loss sum and exact target count for fixed-shape masked eval."""
 
-    logits = gpt_logits(params, x, config)
-    log_probabilities = jax.nn.log_softmax(logits, axis=-1)
-    selected = jnp.take_along_axis(log_probabilities, y[..., None], axis=-1)[..., 0]
+    if config.loss_backend == "tiled":
+        hidden = gpt_hidden(params, x, config, attention_fn)
+        losses = tiled_tied_cross_entropy_losses(
+            hidden,
+            params["token_embedding"],
+            y,
+            semantic_vocab_size=config.semantic_vocab_size,
+            vocab_tile_size=config.vocab_tile_size,
+            compute_dtype=config.compute_dtype,
+        )
+    else:
+        logits = gpt_logits(params, x, config, attention_fn)[..., : config.semantic_vocab_size]
+        log_probabilities = jax.nn.log_softmax(logits, axis=-1)
+        selected = jnp.take_along_axis(
+            log_probabilities, y[..., None], axis=-1
+        )[..., 0]
+        losses = -selected
     mask = mask.astype(jnp.float32)
     return (
-        -jnp.sum(selected * mask, dtype=jnp.float32),
+        jnp.sum(losses * mask, dtype=jnp.float32),
         jnp.sum(mask, dtype=jnp.float32),
     )
 
@@ -1548,7 +1901,10 @@ def evaluate_validation_prefix(
     mask = jax.device_put(mask_host, data_sharding)
     for eval_index in range(batches):
         eval_x_host, eval_y_host = dataset.validation_batch(
-            eval_index, config.batch_size, config.seq_len, config.vocab_size
+            eval_index,
+            config.batch_size,
+            config.seq_len,
+            config.semantic_vocab_size,
         )
         eval_x = jax.device_put(eval_x_host, data_sharding)
         eval_y = jax.device_put(eval_y_host, data_sharding)
@@ -1653,6 +2009,40 @@ def parameter_count(params: Any) -> int:
     return sum(int(value.size) for value in jax.tree_util.tree_leaves(params))
 
 
+def estimated_flops_per_token(config: Config, params_total: int) -> int:
+    """Return the analytic training FLOP estimate used by logs and reports.
+
+    The familiar ``6P`` approximation covers the dense forward and two
+    backward matrix products. The tiled output head recomputes vocabulary
+    logits in its custom VJP and pads the storage table to a whole tile, so its
+    additional work must be recorded for honest equi-FLOP comparisons.
+    """
+
+    attention_extent = config.seq_len
+    if config.attention_backend != "dense":
+        # Both TPU Flash paths right-pad q/k/v to native 128-wide tiles.  The
+        # surrounding projections still process only logical tokens, while the
+        # quadratic attention products execute across the padded square.
+        attention_extent = padded_sequence_length(config.seq_len)
+    attention_total_per_sequence = (
+        12 * config.layers * config.d_model * attention_extent * attention_extent
+    )
+    attention_per_logical_token = (
+        attention_total_per_sequence + config.seq_len - 1
+    ) // config.seq_len
+    estimate = 6 * params_total + attention_per_logical_token
+    if config.loss_backend == "tiled":
+        padded_vocab = (
+            (config.vocab_size + config.vocab_tile_size - 1)
+            // config.vocab_tile_size
+            * config.vocab_tile_size
+        )
+        dense_head = 6 * config.vocab_size * config.d_model
+        tiled_head = 8 * padded_vocab * config.d_model
+        estimate += tiled_head - dense_head
+    return int(estimate)
+
+
 def flatten_arrays(tree: Any, prefix: str = "params") -> dict[str, np.ndarray]:
     flat: dict[str, np.ndarray] = {}
 
@@ -1670,7 +2060,13 @@ def flatten_arrays(tree: Any, prefix: str = "params") -> dict[str, np.ndarray]:
     return flat
 
 
-def save_checkpoint(output_dir: Path, params: Any, config: Config, seed: int) -> None:
+def save_checkpoint(
+    output_dir: Path,
+    params: Any,
+    config: Config,
+    seed: int,
+    attention_runtime: AttentionRuntime,
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     host_params = jax.device_get(params)
     arrays = flatten_arrays(host_params)
@@ -1679,12 +2075,17 @@ def save_checkpoint(output_dir: Path, params: Any, config: Config, seed: int) ->
         "seed": seed,
         "model": {
             "vocab_size": config.vocab_size,
+            "semantic_vocab_size": config.semantic_vocab_size,
             "seq_len": config.seq_len,
             "layers": config.layers,
             "heads": config.heads,
             "d_model": config.d_model,
             "mlp_mult": config.mlp_mult,
             "dtype": config.dtype_name,
+            "attention_backend": config.attention_backend,
+            "attention_tuning": attention_runtime_metadata(attention_runtime),
+            "loss_backend": config.loss_backend,
+            "vocab_tile_size": config.vocab_tile_size,
             "tied_embeddings": True,
         },
     }
@@ -2009,7 +2410,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     dataset, vocab_size = load_dataset(args)
     config = resolve_config(args, platform, vocab_size)
     capture_window = xprof_step_window(args, config.steps)
-    downstream_domains = load_downstream_domains(args, vocab_size)
+    downstream_domains = load_downstream_domains(args, config.semantic_vocab_size)
     diagnostic_mode = args.no_final_validation and args.no_checkpoint
     needs_evaluation = should_compile_evaluation(args, config, downstream_domains)
     if config.batch_size % len(devices):
@@ -2017,6 +2418,16 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             f"global batch size {config.batch_size} must be divisible by "
             f"visible device count {len(devices)}"
         )
+    if config.attention_backend != "dense":
+        console.phase(
+            "Attention tile preflight",
+            (
+                "AOT-compiling synthetic forward/backward candidates"
+                if args.autotune_attention
+                else "resolving exact cache, shipped lookup, or shape heuristic"
+            ),
+        )
+    attention_runtime = prepare_attention_runtime(args, config, devices)
     if (
         max(map(len, dataset.train.shards)) < config.seq_len + 1
         or max(map(len, dataset.validation.shards)) < config.seq_len + 1
@@ -2032,9 +2443,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     decay_mask = weight_decay_mask(host_params)
     diagnostic_metadata = diagnostic_scope_metadata(host_params)
     params_total = parameter_count(host_params)
-    flops_per_token = int(
-        6 * params_total + 12 * config.layers * config.d_model * config.seq_len
-    )
+    flops_per_token = estimated_flops_per_token(config, params_total)
     tokens_processed = config.steps * config.batch_size * config.seq_len
 
     console.table(
@@ -2057,6 +2466,40 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             ("parameters", format_count(params_total)),
             ("global batch", f"{config.batch_size} × {config.seq_len} tokens"),
             ("compute", config.dtype_name),
+            ("attention", config.attention_backend),
+            (
+                "attention tuning",
+                (
+                    "not applicable (dense)"
+                    if attention_runtime.tiles is None
+                    else (
+                        f"{attention_runtime.resolution_source} in "
+                        f"{attention_runtime.tune_seconds:.3f}s; "
+                        f"key {attention_runtime.key_digest}"
+                    )
+                ),
+            ),
+            (
+                "attention tiles",
+                (
+                    "not applicable"
+                    if attention_runtime.tiles is None
+                    else json.dumps(
+                        attention_runtime.tiles.to_dict(),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                ),
+            ),
+            (
+                "output loss",
+                (
+                    f"tiled CE (semantic {config.semantic_vocab_size:,}, "
+                    f"tile {config.vocab_tile_size:,})"
+                    if config.loss_backend == "tiled"
+                    else f"dense CE ({config.semantic_vocab_size:,} classes)"
+                ),
+            ),
             (
                 "diagnostics",
                 (
@@ -2082,6 +2525,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     mesh = Mesh(np.asarray(devices, dtype=object), ("data",))
     replicated = NamedSharding(mesh, P())
     data_sharding = NamedSharding(mesh, P("data", None))
+    attention_fn = make_mesh_attention(config, mesh, attention_runtime.tiles)
     params = jax.device_put(host_params, replicated)
     optimizer = jax.device_put(host_optimizer, replicated)
     del host_params, host_optimizer
@@ -2094,7 +2538,9 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     sample_y = jax.device_put(sample_y, data_sharding)
 
     compiled_step = jax.jit(
-        lambda p, o, x, y: train_step(p, o, x, y, config, decay_mask),
+        lambda p, o, x, y: train_step(
+            p, o, x, y, config, decay_mask, attention_fn
+        ),
         in_shardings=(replicated, replicated, data_sharding, data_sharding),
         donate_argnums=(0, 1),
     )
@@ -2113,7 +2559,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         diagnostic_compile_started = time.perf_counter()
         diagnostic_executable = jax.jit(
             lambda p, o, x, y: diagnostic_train_step(
-                p, o, x, y, config, decay_mask
+                p, o, x, y, config, decay_mask, attention_fn
             ),
             in_shardings=(replicated, replicated, data_sharding, data_sharding),
             donate_argnums=(0, 1),
@@ -2136,7 +2582,9 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         console.phase("Compiling evaluation", "reused by probes and final validation")
         eval_compile_started = time.perf_counter()
         compiled_eval = jax.jit(
-            lambda p, x, y, mask: eval_step(p, x, y, mask, config),
+            lambda p, x, y, mask: eval_step(
+                p, x, y, mask, config, attention_fn
+            ),
             in_shardings=(replicated, data_sharding, data_sharding, data_sharding),
         ).lower(params, sample_x, sample_y, sample_mask).compile()
         eval_compile_seconds = time.perf_counter() - eval_compile_started
@@ -2200,7 +2648,11 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                 # synchronization inside the step annotation. This exposes input
                 # gaps alongside TPU execution in the same XProf timeline.
                 batch_x, batch_y = dataset.batch(
-                    "train", train_rng, config.batch_size, config.seq_len, config.vocab_size
+                    "train",
+                    train_rng,
+                    config.batch_size,
+                    config.seq_len,
+                    config.semantic_vocab_size,
                 )
                 batch_x = jax.device_put(batch_x, data_sharding)
                 batch_y = jax.device_put(batch_y, data_sharding)
@@ -2451,7 +2903,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             flops_per_token,
         )
     write_validation_csv(output_dir, validation_rows)
-    save_checkpoint(output_dir, params, config, args.seed)
+    save_checkpoint(output_dir, params, config, args.seed, attention_runtime)
 
     tokens_per_second = finite_metric(
         "tokens_per_second", tokens_processed / train_seconds, positive=True
@@ -2509,15 +2961,12 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             "dataset_id": dataset_id,
             "tokenizer_id": tokenizer_id,
             "sequence_length": config.seq_len,
-            "model": {
-                "layers": config.layers,
-                "heads": config.heads,
-                "d_model": config.d_model,
-                "mlp_mult": config.mlp_mult,
-                "vocab_size": config.vocab_size,
-                "tied_embeddings": True,
-            },
+            "model": contract_model_metadata(config),
         },
+        # Kernel choices are implementation provenance, not part of the fixed
+        # sample-efficiency model contract. Keeping this sibling object separate
+        # preserves exact compatibility with the harness reference contract.
+        "implementation": implementation_metadata(config, attention_runtime),
         "evaluations": evaluations,
         "metrics": {
             "train_seconds": finite_metric("train_seconds", train_seconds, positive=True),
@@ -2544,6 +2993,9 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             "tokens_per_second": tokens_per_second,
             "achieved_tflops": achieved_tflops,
             "mfu_estimate": finite_metric("mfu_estimate", mfu),
+            "attention_tune_seconds": finite_metric(
+                "attention_tune_seconds", attention_runtime.tune_seconds
+            ),
             "train_compile_seconds": finite_metric(
                 "train_compile_seconds", train_compile_seconds
             ),

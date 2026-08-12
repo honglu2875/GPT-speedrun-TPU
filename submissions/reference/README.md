@@ -64,6 +64,42 @@ at about 364k tokens/s and 28.5% analytic MFU, then reached FineWeb loss 3.75788
 and Fresh10 macro loss 3.95959. It is the calibrated systems/reference baseline,
 not yet a claim of reaching the 3.28 target.
 
+## Optional TPU kernels
+
+The calibrated reference remains explicitly `--attention-backend dense
+--loss-backend dense`. Two opt-in implementations make systems experiments
+possible without changing that baseline:
+
+- `--attention-backend tpu_flash` selects the trainable custom Pallas causal
+  attention forward, dQ, and dK/dV kernels. It currently requires TPU BF16,
+  supports head dimensions up to 128 (divisible by 8), and safely right-pads
+  arbitrary sequence lengths to 128-wide tiles. `jax_flash` is retained as a
+  JAX-provided control.
+- `--loss-backend tiled` streams the tied output projection and cross entropy
+  over vocabulary tiles, with an online FP32 log-sum-exp and a recomputing
+  custom VJP. It never constructs the complete token-by-vocabulary logits.
+
+Both loss backends default to the full storage vocabulary, so switching the
+implementation alone preserves the objective. Passing
+`--semantic-vocab-size 50257` is a deliberate model-semantic change available
+in the open track; sample-efficiency pins the calibrated value of 50,304.
+
+For non-dense attention, the trainer resolves a static ten-field tile plan
+before compiling the real step. Resolution checks an exact runtime-fingerprinted
+cache, then a source-pinned shipped entry, then a deterministic shape heuristic.
+Pass `--attention-tuning-cache PATH --autotune-attention` to benchmark bounded
+synthetic candidates explicitly. Tuning never reads the dataset or occurs
+inside `jax.jit`; its time is reported separately from `train_seconds`.
+
+On this v4-8, an identical full-step benchmark measured 93.196 ms for the
+dense reference, 75.191 ms for custom TPU FlashAttention with dense loss, and
+77.048 ms with the tiled loss. The custom-attention/dense-loss variant reached
+435.79k tokens/s, a 23.9% throughput increase in the isolated step benchmark.
+The tiled loss remains optional because its bounded-logit memory behavior cost
+2.47% in that complete-step comparison. See [the kernel design and benchmark
+notes](../../docs/KERNELS.md) for APIs, correctness scope, autotuning policy,
+and microbenchmarks.
+
 For a bounded XProf diagnostic, pass `--xprof-dir`, `--xprof-start-step`, and
 `--xprof-steps`. Combining those with `--no-final-validation --no-checkpoint`
 skips evaluation compilation, all validation, checkpointing, and the competition

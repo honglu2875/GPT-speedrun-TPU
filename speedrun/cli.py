@@ -788,6 +788,7 @@ def _reference_contract(profile: str) -> ReferenceContract:
             "d_model": 64,
             "mlp_mult": 4,
             "vocab_size": 256,
+            "semantic_vocab_size": 256,
             "tied_embeddings": True,
         },
         "dev": {
@@ -796,6 +797,7 @@ def _reference_contract(profile: str) -> ReferenceContract:
             "d_model": 384,
             "mlp_mult": 4,
             "vocab_size": 50_304,
+            "semantic_vocab_size": 50_304,
             "tied_embeddings": True,
         },
         "official": {
@@ -804,6 +806,7 @@ def _reference_contract(profile: str) -> ReferenceContract:
             "d_model": 768,
             "mlp_mult": 4,
             "vocab_size": 50_304,
+            "semantic_vocab_size": 50_304,
             "tied_embeddings": True,
         },
     }
