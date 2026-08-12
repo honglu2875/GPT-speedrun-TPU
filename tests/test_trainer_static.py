@@ -968,7 +968,7 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertFalse(mask["blocks"][0]["ln1_scale"])
         self.assertFalse(mask["final_ln_bias"])
 
-    def test_official_topology_accepts_only_single_process_v4_8(self) -> None:
+    def test_official_topology_accepts_single_or_multi_host_v4(self) -> None:
         v4_devices = [FakeDevice("tpu", "TPU v4") for _ in range(4)]
         with (
             patch.object(trainer.jax, "local_devices", return_value=v4_devices),
@@ -976,6 +976,14 @@ class TrainerStaticTests(unittest.TestCase):
             patch.object(trainer.jax, "device_count", return_value=4),
         ):
             trainer.validate_official_topology("official", v4_devices)
+
+        global_v4_devices = [FakeDevice("tpu", "TPU v4") for _ in range(8)]
+        with (
+            patch.object(trainer.jax, "local_devices", return_value=v4_devices),
+            patch.object(trainer.jax, "process_count", return_value=2),
+            patch.object(trainer.jax, "device_count", return_value=8),
+        ):
+            trainer.validate_official_topology("official", global_v4_devices)
 
         invalid_cases = (
             (v4_devices, v4_devices, 2, 4),
@@ -999,9 +1007,37 @@ class TrainerStaticTests(unittest.TestCase):
                     patch.object(trainer.jax, "local_devices", return_value=local_devices),
                     patch.object(trainer.jax, "process_count", return_value=process_count),
                     patch.object(trainer.jax, "device_count", return_value=device_count),
-                    self.assertRaisesRegex(RuntimeError, "one TPU v4-8"),
+                    self.assertRaisesRegex(RuntimeError, "4 local TPU v4"),
                 ):
                     trainer.validate_official_topology("official", devices)
+
+    def test_rank_local_slice_partitions_global_batch_without_overlap(self) -> None:
+        values = np.arange(24, dtype=np.int32).reshape(8, 3)
+        pieces = [trainer.rank_local_slice(values, rank, 4) for rank in range(4)]
+        np.testing.assert_array_equal(np.concatenate(pieces), values)
+        self.assertTrue(all(piece.flags.c_contiguous for piece in pieces))
+        with self.assertRaisesRegex(ValueError, "divisible"):
+            trainer.rank_local_slice(values[:7], 0, 4)
+
+    def test_controller_hostname_is_independent_of_jax_process_index(self) -> None:
+        with (
+            patch.dict(
+                trainer.os.environ,
+                {"SPEEDRUN_CONTROLLER_HOSTNAME": "slice-w-0"},
+                clear=False,
+            ),
+            patch.object(trainer.socket, "gethostname", return_value="slice-w-0"),
+        ):
+            self.assertTrue(trainer.is_controller_process(3))
+        with (
+            patch.dict(
+                trainer.os.environ,
+                {"SPEEDRUN_CONTROLLER_HOSTNAME": "slice-w-0"},
+                clear=False,
+            ),
+            patch.object(trainer.socket, "gethostname", return_value="slice-w-2"),
+        ):
+            self.assertFalse(trainer.is_controller_process(0))
 
     def test_system_metadata_is_versioned_and_topology_aware(self) -> None:
         devices = [FakeDevice("tpu", "TPU v4") for _ in range(4)]

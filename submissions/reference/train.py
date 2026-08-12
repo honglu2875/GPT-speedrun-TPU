@@ -26,6 +26,7 @@ import os
 from pathlib import Path
 import platform as host_platform
 import re
+import socket
 import sys
 import time
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ import jax
 import jax.numpy as jnp
 import jaxlib
 import numpy as np
+from jax.experimental import multihost_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from speedrun.kernels import (
@@ -72,6 +74,9 @@ _DIAGNOSTIC_STATS = (
     "third_moment",
     "fourth_moment",
 )
+_DISTRIBUTED_ENV = "SPEEDRUN_DISTRIBUTED"
+_PROCESS_COUNT_ENV = "SPEEDRUN_PROCESS_COUNT"
+_CONTROLLER_HOST_ENV = "SPEEDRUN_CONTROLLER_HOSTNAME"
 
 
 # A deliberately small, original corpus for offline and smoke-test use.  The
@@ -208,9 +213,10 @@ class Console:
         "white": "\033[38;5;255m",
     }
 
-    def __init__(self, mode: str) -> None:
+    def __init__(self, mode: str, *, active: bool = True) -> None:
         auto = sys.stderr.isatty() and "NO_COLOR" not in os.environ
         self.enabled = mode == "always" or (mode == "auto" and auto)
+        self.active = active
 
     def paint(self, text: object, *styles: str) -> str:
         raw = str(text)
@@ -220,6 +226,8 @@ class Console:
         return f"{prefix}{raw}{self.COLORS['reset']}"
 
     def banner(self) -> None:
+        if not self.active:
+            return
         mark = self.paint("◆", "magenta", "bold")
         title = self.paint(" GPT TPU SPEEDRUN ", "white", "bold")
         print(
@@ -228,6 +236,8 @@ class Console:
         )
 
     def table(self, title: str, rows: Sequence[tuple[str, object]]) -> None:
+        if not self.active:
+            return
         width = max(
             52, *(max(20, len(str(k))) + len(str(v)) + 7 for k, v in rows)
         )
@@ -262,6 +272,8 @@ class Console:
         )
 
     def phase(self, label: str, detail: str = "") -> None:
+        if not self.active:
+            return
         suffix = f" {self.paint(detail, 'dim')}" if detail else ""
         print(
             f"\n  {self.paint('●', 'magenta')} {self.paint(label, 'white', 'bold')}{suffix}",
@@ -277,6 +289,8 @@ class Console:
         grad_norm: float,
         tokens_per_second: float,
     ) -> None:
+        if not self.active:
+            return
         fraction = step / total
         slots = 18
         filled = min(slots, int(round(fraction * slots)))
@@ -295,6 +309,8 @@ class Console:
         train_seconds: float,
         validation_seconds: float,
     ) -> None:
+        if not self.active:
+            return
         print(
             f"\n  {self.paint('✓', 'green', 'bold')} "
             f"synchronized training "
@@ -308,6 +324,8 @@ class Console:
     def validation_probe(
         self, step: int, loss: float, batches: int, elapsed: float
     ) -> None:
+        if not self.active:
+            return
         print(
             f"  {self.paint('◇', 'cyan')} validation @ {step:,}  "
             f"loss {self.paint(f'{loss:.4f}', 'yellow', 'bold')}  "
@@ -318,6 +336,8 @@ class Console:
     def downstream(
         self, domain: str, loss: float, perplexity: float, tokens: int, elapsed: float
     ) -> None:
+        if not self.active:
+            return
         print(
             f"  {self.paint('◇', 'cyan')} {domain:<14} "
             f"loss {self.paint(f'{loss:.4f}', 'yellow', 'bold')}  "
@@ -1389,6 +1409,14 @@ def prepare_attention_runtime(
             "global batch must divide the device count before attention tuning"
         )
     local_batch = config.batch_size // len(devices)
+    process_index = int(jax.process_index())
+    runtime_devices = tuple(
+        device
+        for device in devices
+        if int(getattr(device, "process_index", process_index)) == process_index
+    )
+    if not runtime_devices:
+        raise RuntimeError("JAX reported no addressable device for this process")
     head_dim = config.d_model // config.heads
     key = make_runtime_key(
         backend=config.attention_backend,
@@ -1398,7 +1426,7 @@ def prepare_attention_runtime(
         sequence=config.seq_len,
         head_dim=head_dim,
         mode="forward_backward",
-        device=devices[0],
+        device=runtime_devices[0],
     )
     cache_path: Path | None = None
     if args.attention_tuning_cache is not None:
@@ -1425,7 +1453,7 @@ def prepare_attention_runtime(
             key=key,
             attention_factory=factory,
             cache_path=cache_path,
-            device=devices[0],
+            device=runtime_devices[0],
             force=True,
         )
         tune_seconds = time.perf_counter() - started
@@ -1889,6 +1917,10 @@ def evaluate_validation_prefix(
     data_sharding: NamedSharding,
     config: Config,
     batches: int,
+    *,
+    mesh: Mesh | None = None,
+    process_index: int = 0,
+    process_count: int = 1,
 ) -> tuple[float, float]:
     """Synchronously evaluate batches ``0..batches-1`` of the fixed prefix."""
 
@@ -1897,8 +1929,16 @@ def evaluate_validation_prefix(
     started = time.perf_counter()
     loss_sum = 0.0
     scored_tokens = 0
-    mask_host = np.ones((config.batch_size, config.seq_len), dtype=np.float32)
-    mask = jax.device_put(mask_host, data_sharding)
+    if process_count > 1 and mesh is None:
+        raise ValueError("a global mesh is required for multi-process evaluation")
+    local_batch = local_batch_size(config.batch_size, process_count)
+    mask_host = np.ones((local_batch, config.seq_len), dtype=np.float32)
+    if mesh is None:
+        mask = jax.device_put(mask_host, data_sharding)
+    else:
+        mask = put_host_local_array(
+            mask_host, mesh, P("data", None), data_sharding, process_count
+        )
     for eval_index in range(batches):
         eval_x_host, eval_y_host = dataset.validation_batch(
             eval_index,
@@ -1906,9 +1946,19 @@ def evaluate_validation_prefix(
             config.seq_len,
             config.semantic_vocab_size,
         )
-        eval_x = jax.device_put(eval_x_host, data_sharding)
-        eval_y = jax.device_put(eval_y_host, data_sharding)
-        batch_loss_sum, batch_scored = jax.device_get(
+        eval_x_host = rank_local_slice(eval_x_host, process_index, process_count)
+        eval_y_host = rank_local_slice(eval_y_host, process_index, process_count)
+        if mesh is None:
+            eval_x = jax.device_put(eval_x_host, data_sharding)
+            eval_y = jax.device_put(eval_y_host, data_sharding)
+        else:
+            eval_x = put_host_local_array(
+                eval_x_host, mesh, P("data", None), data_sharding, process_count
+            )
+            eval_y = put_host_local_array(
+                eval_y_host, mesh, P("data", None), data_sharding, process_count
+            )
+        batch_loss_sum, batch_scored = local_device_get(
             compiled_eval(params, eval_x, eval_y, mask)
         )
         loss_sum += float(batch_loss_sum)
@@ -1971,17 +2021,37 @@ def evaluate_downstream_domain(
     compiled_eval: Any,
     data_sharding: NamedSharding,
     config: Config,
+    *,
+    mesh: Mesh | None = None,
+    process_index: int = 0,
+    process_count: int = 1,
 ) -> dict[str, float | int]:
     """Evaluate one domain with exact masking and the shared eval executable."""
 
     started = time.perf_counter()
     loss_sum = 0.0
     scored_tokens = 0
+    if process_count > 1 and mesh is None:
+        raise ValueError("a global mesh is required for multi-process evaluation")
     for x_host, y_host, mask_host in downstream_batches(domain, config):
-        x = jax.device_put(x_host, data_sharding)
-        y = jax.device_put(y_host, data_sharding)
-        mask = jax.device_put(mask_host, data_sharding)
-        batch_loss_sum, batch_scored = jax.device_get(
+        x_host = rank_local_slice(x_host, process_index, process_count)
+        y_host = rank_local_slice(y_host, process_index, process_count)
+        mask_host = rank_local_slice(mask_host, process_index, process_count)
+        if mesh is None:
+            x = jax.device_put(x_host, data_sharding)
+            y = jax.device_put(y_host, data_sharding)
+            mask = jax.device_put(mask_host, data_sharding)
+        else:
+            x = put_host_local_array(
+                x_host, mesh, P("data", None), data_sharding, process_count
+            )
+            y = put_host_local_array(
+                y_host, mesh, P("data", None), data_sharding, process_count
+            )
+            mask = put_host_local_array(
+                mask_host, mesh, P("data", None), data_sharding, process_count
+            )
+        batch_loss_sum, batch_scored = local_device_get(
             compiled_eval(params, x, y, mask)
         )
         loss_sum += float(batch_loss_sum)
@@ -2068,7 +2138,7 @@ def save_checkpoint(
     attention_runtime: AttentionRuntime,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    host_params = jax.device_get(params)
+    host_params = local_device_get(params)
     arrays = flatten_arrays(host_params)
     metadata = {
         "schema_version": SCHEMA_VERSION,
@@ -2300,7 +2370,7 @@ def device_label(devices: Sequence[jax.Device]) -> str:
 
 
 def validate_official_topology(profile: str, devices: Sequence[jax.Device]) -> None:
-    """Require the competition's exact single-host TPU v4-8 topology."""
+    """Require four TPU v4 chips per process on a coherent global mesh."""
 
     if profile != "official":
         return
@@ -2315,15 +2385,15 @@ def validate_official_topology(profile: str, devices: Sequence[jax.Device]) -> N
         for device in local_devices
     )
     if (
-        process_count != 1
+        process_count < 1
         or len(local_devices) != 4
-        or device_count != 4
-        or len(devices) != 4
+        or device_count != 4 * process_count
+        or len(devices) != device_count
         or not is_tpu_v4
     ):
         raise RuntimeError(
-            "official profile requires one JAX process with exactly 4 local TPU v4 "
-            "devices (one TPU v4-8); detected "
+            "official profile requires exactly 4 local TPU v4 devices per JAX "
+            "process and one coherent global device mesh; detected "
             f"process_count={process_count}, device_count={device_count}, "
             f"local_device_count={len(local_devices)}, platforms={platforms}, "
             f"device_kinds={kinds}"
@@ -2373,6 +2443,103 @@ def sync_tree(tree: Any) -> None:
             value.block_until_ready()
 
 
+def initialize_distributed_runtime() -> tuple[int, int]:
+    """Initialize JAX's Cloud TPU coordinator before the first device query."""
+
+    distributed = os.environ.get(_DISTRIBUTED_ENV) == "1"
+    if distributed:
+        # On Cloud TPU VMs JAX discovers the coordinator, process count, and
+        # process id from TPU metadata. Every host must enter this call.
+        jax.distributed.initialize()
+    process_count = int(jax.process_count())
+    process_index = int(jax.process_index())
+    expected_raw = os.environ.get(_PROCESS_COUNT_ENV)
+    if expected_raw is not None:
+        try:
+            expected = int(expected_raw)
+        except ValueError as exc:
+            raise ValueError(f"{_PROCESS_COUNT_ENV} must be a positive integer") from exc
+        if expected <= 0:
+            raise ValueError(f"{_PROCESS_COUNT_ENV} must be a positive integer")
+        if process_count != expected:
+            raise RuntimeError(
+                f"JAX discovered {process_count} processes, but the launcher expected "
+                f"{expected}"
+            )
+    if not 0 <= process_index < process_count:
+        raise RuntimeError(
+            f"invalid JAX process index {process_index} for {process_count} processes"
+        )
+    return process_index, process_count
+
+
+def is_controller_process(process_index: int) -> bool:
+    """Keep artifacts on the host that owns the harness, regardless of JAX rank."""
+
+    configured = os.environ.get(_CONTROLLER_HOST_ENV)
+    if configured is None:
+        return process_index == 0
+    local = socket.gethostname().strip().split(".", 1)[0]
+    expected = configured.strip().split(".", 1)[0]
+    if not expected:
+        raise ValueError(f"{_CONTROLLER_HOST_ENV} may not be empty")
+    return local == expected
+
+
+def local_batch_size(global_batch_size: int, process_count: int) -> int:
+    if global_batch_size % process_count:
+        raise ValueError(
+            f"global batch size {global_batch_size} must be divisible by JAX "
+            f"process count {process_count}"
+        )
+    return global_batch_size // process_count
+
+
+def rank_local_slice(
+    value: np.ndarray, process_index: int, process_count: int
+) -> np.ndarray:
+    """Return this process's contiguous part of a global leading batch axis."""
+
+    size = local_batch_size(int(value.shape[0]), process_count)
+    start = process_index * size
+    return np.ascontiguousarray(value[start : start + size])
+
+
+def put_host_local_array(
+    value: np.ndarray,
+    mesh: Mesh,
+    partition_spec: P,
+    sharding: NamedSharding,
+    process_count: int,
+) -> jax.Array:
+    """Convert rank-local NumPy data into one globally sharded JAX array."""
+
+    if process_count == 1:
+        return jax.device_put(value, sharding)
+    return multihost_utils.host_local_array_to_global_array(
+        value, mesh, partition_spec
+    )
+
+
+def put_replicated_tree(tree: Any, mesh: Mesh, sharding: NamedSharding, process_count: int) -> Any:
+    """Create identical global replicas from the same host value on every rank."""
+
+    if process_count == 1:
+        return jax.device_put(tree, sharding)
+    return multihost_utils.host_local_array_to_global_array(tree, mesh, P())
+
+
+def local_device_get(tree: Any) -> Any:
+    """Copy replicated values through one addressable shard on multi-host JAX."""
+
+    def fetch(value: Any) -> Any:
+        if isinstance(value, jax.Array) and not value.is_fully_addressable:
+            return jax.device_get(value.addressable_data(0))
+        return jax.device_get(value)
+
+    return jax.tree_util.tree_map(fetch, tree)
+
+
 def finite_metric(name: str, value: float, *, positive: bool = False) -> float:
     value = float(value)
     if not math.isfinite(value) or (positive and value <= 0.0) or (not positive and value < 0.0):
@@ -2391,7 +2558,9 @@ def perplexity_from_loss(loss: float) -> float:
 
 def run(args: argparse.Namespace) -> dict[str, Any] | None:
     validate_args(args)
-    console = Console(args.color)
+    process_index, process_count = initialize_distributed_runtime()
+    is_controller = is_controller_process(process_index)
+    console = Console(args.color, active=is_controller)
     console.banner()
     profile = selected_profile(args)
     using_builtin_data = (
@@ -2418,6 +2587,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             f"global batch size {config.batch_size} must be divisible by "
             f"visible device count {len(devices)}"
         )
+    local_batch = local_batch_size(config.batch_size, process_count)
     if config.attention_backend != "dense":
         console.phase(
             "Attention tile preflight",
@@ -2450,6 +2620,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         "run configuration",
         (
             ("devices", f"{len(devices)} × {device_label(devices)}"),
+            ("JAX processes", f"{process_count} (this rank {process_index})"),
             ("mesh", f"data={len(devices)} (replicated model)"),
             ("dataset", dataset.source),
             ("train / val tokens", f"{len(dataset.train):,} / {len(dataset.validation):,}"),
@@ -2526,16 +2697,22 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     replicated = NamedSharding(mesh, P())
     data_sharding = NamedSharding(mesh, P("data", None))
     attention_fn = make_mesh_attention(config, mesh, attention_runtime.tiles)
-    params = jax.device_put(host_params, replicated)
-    optimizer = jax.device_put(host_optimizer, replicated)
+    params = put_replicated_tree(host_params, mesh, replicated, process_count)
+    optimizer = put_replicated_tree(host_optimizer, mesh, replicated, process_count)
     del host_params, host_optimizer
 
-    train_rng = np.random.default_rng(args.seed + 1)
+    train_rng = np.random.default_rng(
+        args.seed + 1 + process_index * 1_000_003
+    )
     # Compilation may not inspect real data. Shapes and dtypes are sufficient.
-    sample_x = np.zeros((config.batch_size, config.seq_len), dtype=np.int32)
-    sample_y = np.zeros((config.batch_size, config.seq_len), dtype=np.int32)
-    sample_x = jax.device_put(sample_x, data_sharding)
-    sample_y = jax.device_put(sample_y, data_sharding)
+    sample_x_host = np.zeros((local_batch, config.seq_len), dtype=np.int32)
+    sample_y_host = np.zeros((local_batch, config.seq_len), dtype=np.int32)
+    sample_x = put_host_local_array(
+        sample_x_host, mesh, P("data", None), data_sharding, process_count
+    )
+    sample_y = put_host_local_array(
+        sample_y_host, mesh, P("data", None), data_sharding, process_count
+    )
 
     compiled_step = jax.jit(
         lambda p, o, x, y: train_step(
@@ -2576,9 +2753,15 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     eval_compile_seconds = 0.0
     if needs_evaluation:
         sample_mask_host = np.ones(
-            (config.batch_size, config.seq_len), dtype=np.float32
+            (local_batch, config.seq_len), dtype=np.float32
         )
-        sample_mask = jax.device_put(sample_mask_host, data_sharding)
+        sample_mask = put_host_local_array(
+            sample_mask_host,
+            mesh,
+            P("data", None),
+            data_sharding,
+            process_count,
+        )
         console.phase("Compiling evaluation", "reused by probes and final validation")
         eval_compile_started = time.perf_counter()
         compiled_eval = jax.jit(
@@ -2614,6 +2797,8 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     diagnostic_device_points: list[tuple[int, jax.Array]] = []
     validation_rows: list[ValidationRow] = []
     validation_probe_seconds = 0.0
+    if process_count > 1:
+        multihost_utils.sync_global_devices("speedrun-training-start")
     train_started = time.perf_counter()
     xprof_dir = (
         args.xprof_dir.expanduser().resolve() if capture_window is not None else None
@@ -2634,7 +2819,9 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                 )
                 jax.profiler.start_trace(
                     xprof_dir,
-                    profiler_options=profiler_options(platform, len(devices)),
+                    profiler_options=profiler_options(
+                        platform, int(jax.local_device_count())
+                    ),
                 )
                 trace_active = True
 
@@ -2650,12 +2837,16 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                 batch_x, batch_y = dataset.batch(
                     "train",
                     train_rng,
-                    config.batch_size,
+                    local_batch,
                     config.seq_len,
                     config.semantic_vocab_size,
                 )
-                batch_x = jax.device_put(batch_x, data_sharding)
-                batch_y = jax.device_put(batch_y, data_sharding)
+                batch_x = put_host_local_array(
+                    batch_x, mesh, P("data", None), data_sharding, process_count
+                )
+                batch_y = put_host_local_array(
+                    batch_y, mesh, P("data", None), data_sharding, process_count
+                )
                 if should_run_diagnostics(step_index, config):
                     if diagnostic_executable is None:  # defensive invariant
                         raise AssertionError("diagnostic executable was not compiled")
@@ -2682,6 +2873,9 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                         data_sharding,
                         config,
                         config.val_probe_batches,
+                        mesh=mesh,
+                        process_index=process_index,
+                        process_count=process_count,
                     )
                     probe_tokens = (
                         config.val_probe_batches * config.batch_size * config.seq_len
@@ -2711,7 +2905,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                     or step_index % config.log_every == 0
                 )
                 if should_log:
-                    host_metrics = jax.device_get(last_metrics)
+                    host_metrics = local_device_get(last_metrics)
                     elapsed_so_far = max(time.perf_counter() - train_started, 1.0e-12)
                     seen_tokens = step_index * config.batch_size * config.seq_len
                     console.step(
@@ -2743,28 +2937,33 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     # Sparse diagnostic reductions are part of benchmark time even if their
     # result branch is otherwise independent of the next optimizer state.
     sync_tree((params, optimizer, last_metrics, diagnostic_device_points))
+    if process_count > 1:
+        multihost_utils.sync_global_devices("speedrun-training-finished")
     train_seconds = max(time.perf_counter() - train_started, 1.0e-12)
-    final_train = jax.device_get(last_metrics)
-    training_history = np.asarray(jax.device_get(optimizer["history"]), dtype=np.float32)
+    final_train = local_device_get(last_metrics)
+    training_history = np.asarray(
+        local_device_get(optimizer["history"]), dtype=np.float32
+    )
     diagnostic_points = tuple(
-        DiagnosticPoint(step, np.asarray(jax.device_get(values), dtype=np.float32))
+        DiagnosticPoint(step, np.asarray(local_device_get(values), dtype=np.float32))
         for step, values in diagnostic_device_points
     )
     train_loss = finite_metric("train_loss", float(final_train["loss"]))
 
     if diagnostic_mode:
         output_dir = args.output_dir.expanduser().resolve()
-        write_training_csv(
-            output_dir, training_history, config, flops_per_token=flops_per_token
-        )
-        if diagnostic_points:
-            write_diagnostics_csv(
-                output_dir,
-                diagnostic_points,
-                diagnostic_metadata,
-                config,
-                flops_per_token,
+        if is_controller:
+            write_training_csv(
+                output_dir, training_history, config, flops_per_token=flops_per_token
             )
+            if diagnostic_points:
+                write_diagnostics_csv(
+                    output_dir,
+                    diagnostic_points,
+                    diagnostic_metadata,
+                    config,
+                    flops_per_token,
+                )
         diagnostic_rate = finite_metric(
             "tokens_per_second", tokens_processed / train_seconds, positive=True
         )
@@ -2788,6 +2987,8 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                 ("XProf trace", xprof_dir),
             ),
         )
+        if process_count > 1:
+            multihost_utils.sync_global_devices("speedrun-profile-artifacts-written")
         return None
 
     console.phase(
@@ -2803,6 +3004,9 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         data_sharding,
         config,
         config.eval_batches,
+        mesh=mesh,
+        process_index=process_index,
+        process_count=process_count,
     )
     validation_rows.append(
         ValidationRow(
@@ -2826,7 +3030,14 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         )
         for domain in downstream_domains:
             domain_result = evaluate_downstream_domain(
-                params, domain, compiled_eval, data_sharding, config
+                params,
+                domain,
+                compiled_eval,
+                data_sharding,
+                config,
+                mesh=mesh,
+                process_index=process_index,
+                process_count=process_count,
             )
             downstream_results[domain.name] = domain_result
             validation_rows.append(
@@ -2891,19 +3102,20 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         artifact_names.append(DIAGNOSTICS_CSV_NAME)
     artifact_names.append(CHECKPOINT_NAME)
     console.phase("Artifacts", " + ".join(artifact_names))
-    write_training_csv(
-        output_dir, training_history, config, flops_per_token=flops_per_token
-    )
-    if diagnostic_points:
-        write_diagnostics_csv(
-            output_dir,
-            diagnostic_points,
-            diagnostic_metadata,
-            config,
-            flops_per_token,
+    if is_controller:
+        write_training_csv(
+            output_dir, training_history, config, flops_per_token=flops_per_token
         )
-    write_validation_csv(output_dir, validation_rows)
-    save_checkpoint(output_dir, params, config, args.seed, attention_runtime)
+        if diagnostic_points:
+            write_diagnostics_csv(
+                output_dir,
+                diagnostic_points,
+                diagnostic_metadata,
+                config,
+                flops_per_token,
+            )
+        write_validation_csv(output_dir, validation_rows)
+        save_checkpoint(output_dir, params, config, args.seed, attention_runtime)
 
     tokens_per_second = finite_metric(
         "tokens_per_second", tokens_processed / train_seconds, positive=True
@@ -2955,7 +3167,10 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                 else {}
             ),
         },
-        "system": system_metadata(devices),
+        "system": {
+            **system_metadata(devices),
+            "controller_process_index": process_index,
+        },
         "contract": {
             "model_id": "reference-gpt-v1",
             "dataset_id": dataset_id,
@@ -3010,9 +3225,12 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             ),
         },
     }
-    write_result(output_dir, result)
+    if is_controller:
+        write_result(output_dir, result)
     console.success(validation_loss, train_seconds, final_validation_seconds)
-    return result
+    if process_count > 1:
+        multihost_utils.sync_global_devices("speedrun-final-artifacts-written")
+    return result if is_controller else None
 
 
 def main(argv: Iterable[str] | None = None) -> int:

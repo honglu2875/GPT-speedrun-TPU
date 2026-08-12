@@ -210,6 +210,36 @@ class HarnessRunTests(unittest.TestCase):
         self.assertEqual(len(record["artifacts"]["training_curve"]["sha256"]), 64)
         self.assertEqual(len(record["checkpoint"]["sha256"]), 64)
 
+    def test_multi_host_run_builds_controller_owned_distributed_launch(self) -> None:
+        def localize(**arguments: object) -> list[str]:
+            return list(arguments["command"])  # type: ignore[arg-type]
+
+        with (
+            mock.patch(
+                "harness.runner.build_distributed_launch_command",
+                side_effect=localize,
+            ) as build,
+            mock.patch("harness.runner.socket.gethostname", return_value="slice-w-0"),
+        ):
+            outcome = run_submission(
+                self.config(
+                    tpu_vm_count=4,
+                    tpu_vm_hosts="slice-w-[0-3]",
+                )
+            )
+
+        remote_environment = build.call_args.kwargs["environment"]
+        self.assertEqual(remote_environment["SPEEDRUN_DISTRIBUTED"], "1")
+        self.assertEqual(remote_environment["SPEEDRUN_PROCESS_COUNT"], "4")
+        self.assertEqual(
+            remote_environment["SPEEDRUN_CONTROLLER_HOSTNAME"], "slice-w-0"
+        )
+        self.assertEqual(
+            remote_environment["JAX_COMPILATION_CACHE_DIR"],
+            f"/tmp/speedrun-jax-cache-{outcome.run_id}",
+        )
+        self.assertEqual(outcome.record["trainer_command"], outcome.record["command"])
+
     def test_rejects_reserved_passthrough_flags_but_not_prefixes(self) -> None:
         for flag in ("--output-dir", "--seed", "--track", "--profile"):
             for arguments in ((flag, "value"), (f"{flag}=value",), ("--", flag, "value")):
@@ -254,6 +284,29 @@ class HarnessRunTests(unittest.TestCase):
         _validate_payload_identity(payload, config)
         payload["system"]["device_count"] = 8
         with self.assertRaisesRegex(ResultValidationError, "device_count"):
+            _validate_payload_identity(payload, config)
+
+    def test_official_identity_accepts_configured_multi_host_v4_system(self) -> None:
+        payload = {
+            "track": "open",
+            "profile": "official",
+            "seed": 1337,
+            "system": {
+                "platform": "tpu",
+                "device_count": 16,
+                "local_device_count": 4,
+                "process_count": 4,
+                "device_kinds": ["TPU v4"],
+            },
+        }
+        config = self.config(
+            profile="official",
+            tpu_vm_count=4,
+            tpu_vm_hosts="slice-w-[0-3]",
+        )
+        _validate_payload_identity(payload, config)
+        payload["system"]["process_count"] = 3
+        with self.assertRaisesRegex(ResultValidationError, "process_count"):
             _validate_payload_identity(payload, config)
 
     def test_fixed_validation_prefix_count_is_enforced(self) -> None:

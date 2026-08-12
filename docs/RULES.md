@@ -1,8 +1,8 @@
 # GPT Speedrun TPU rules
 
 This benchmark asks a deliberately simple question: how quickly, or with how
-few training tokens, can a single-file JAX trainer reach the target loss on one
-Cloud TPU v4-8?
+few training tokens, can a single-file JAX trainer reach the target loss on a
+declared Cloud TPU v4 slice?
 
 The project is collaborative. Submissions are short enough to review by hand;
 the harness is intended to make honest experiments reproducible, not to be a
@@ -10,12 +10,19 @@ security boundary.
 
 ## Hardware and data
 
-Official runs use one TPU v4-8 (four TPU v4 chips) and the repository's locked
-Python environment. Training and validation consume the GPT-2-tokenized
+Official runs use one Cloud TPU v4 slice with four TPU v4 chips per host and
+the repository's locked Python environment. The supported reference topologies
+range from one v4-8 host upward; the exact global device and process counts are
+part of every result. Timing comparisons are meaningful only among matching
+hardware topologies. Training and validation consume the GPT-2-tokenized
 FineWeb shards named by the official data manifest. Official validation is the
 mean next-token cross-entropy over exactly the first 10,485,760 predictions;
 the result protocol records that coverage. Smoke and development profiles use
 shorter deterministic diagnostic evaluation and never enter this leaderboard.
+
+Here, "multi-host" means one TPU slice whose workers share the TPU ICI fabric
+(for example, a four-host v4-32). Cloud TPU Multislice joins multiple slices
+over DCN and is outside this version of the reference topology contract.
 
 The initial quality target is a validation loss at or below **3.28**. Results
 below lower milestones such as 3.27 and 3.26 are retained in the run record so
@@ -112,8 +119,9 @@ The last non-empty stdout line is `SPEEDRUN_RESULT=<json>`; human output belongs
 on stderr. Version one requires `track`, `profile`, `seed`, a contained relative
 `checkpoint`, and finite `metrics.train_seconds`, `metrics.tokens_processed`,
 and `metrics.validation_loss`. Official results must additionally report
-`metrics.validation_tokens = 10485760` and the exact single-host four-device
-TPU v4 system identity. Extra finite JSON diagnostics are retained verbatim.
+`metrics.validation_tokens = 10485760` and the configured TPU v4 system
+identity: four local devices per JAX process and four times the process count
+globally. Extra finite JSON diagnostics are retained verbatim.
 Optional named artifacts are contained within the run directory and recorded
 with their size and SHA-256; the reference uses this for its per-step CSV curve.
 Its curve records steps, predicted tokens, analytic cumulative estimated FLOPs,

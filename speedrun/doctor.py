@@ -25,6 +25,7 @@ def environment_checks(
     data_path: Path | None = None,
     profile: str | None = None,
     require_tpu: bool = False,
+    expected_process_count: int = 1,
     check_data: bool = True,
     compile_probe: bool = True,
 ) -> list[Callable[[], CheckResult]]:
@@ -32,7 +33,10 @@ def environment_checks(
         check_python,
         check_lockfile,
         check_jax_install,
-        lambda: check_devices(require_tpu=require_tpu),
+        lambda: check_devices(
+            require_tpu=require_tpu,
+            expected_process_count=expected_process_count,
+        ),
     ]
     if compile_probe:
         checks.append(check_compilation)
@@ -96,7 +100,7 @@ def check_jax_install() -> CheckResult:
     )
 
 
-def check_devices(*, require_tpu: bool) -> CheckResult:
+def check_devices(*, require_tpu: bool, expected_process_count: int = 1) -> CheckResult:
     try:
         import jax
 
@@ -109,31 +113,34 @@ def check_devices(*, require_tpu: bool) -> CheckResult:
     kinds = sorted({str(device.device_kind) for device in devices})
     message = f"{len(devices)} device(s), {', '.join(platforms)}; {', '.join(kinds)}"
     tpu_devices = [device for device in devices if device.platform == "tpu"]
-    exact_v4 = len(tpu_devices) == 4 and all(
+    exact_v4 = len(tpu_devices) == 4 * expected_process_count and all(
         str(device.device_kind).strip().lower() == "tpu v4" for device in tpu_devices
     )
-    single_process = True
+    expected_topology = True
     try:
-        single_process = jax.process_count() == 1 and jax.local_device_count() == 4
+        expected_topology = (
+            jax.process_count() == expected_process_count
+            and jax.local_device_count() == 4
+        )
     except Exception:
         pass
-    if require_tpu and (not exact_v4 or not single_process):
+    if require_tpu and (not exact_v4 or not expected_topology):
         return CheckResult(
             "accelerator",
             "error",
             message,
-            "official runs require one process with exactly four TPU v4 chips",
+            "official runs require four local TPU v4 chips on every configured process",
         )
     if not tpu_devices:
         status = "error" if require_tpu else "warning"
         return CheckResult("accelerator", status, message, "CPU is valid only for smoke runs")
-    if exact_v4 and single_process:
+    if exact_v4 and expected_topology:
         return CheckResult("accelerator", "ok", message)
     return CheckResult(
         "accelerator",
         "warning",
         message,
-        "this does not match the official v4-8 topology",
+        "this does not match the configured TPU v4 topology",
     )
 
 
@@ -141,16 +148,42 @@ def check_compilation() -> CheckResult:
     try:
         import jax
         import jax.numpy as jnp
+        import numpy as np
+        from jax.experimental import multihost_utils
+        from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
         started = time.perf_counter()
         value = jnp.ones((128, 128), dtype=jnp.bfloat16)
         output = jax.jit(lambda x: x @ x)(value)
         output.block_until_ready()
-        if len(jax.devices()) > 1:
+        if jax.process_count() > 1:
+            mesh = Mesh(np.asarray(jax.devices(), dtype=object), ("data",))
+            data_sharding = NamedSharding(mesh, P("data"))
+            replicated = NamedSharding(mesh, P())
+            local_values = np.arange(jax.local_device_count(), dtype=np.float32)
+            global_values = multihost_utils.host_local_array_to_global_array(
+                local_values, mesh, P("data")
+            )
+            collective = jax.jit(
+                lambda x: jnp.sum(x),
+                in_shardings=data_sharding,
+                out_shardings=replicated,
+            )
+            result = collective(global_values)
+            result.block_until_ready()
+            observed = float(result.addressable_data(0))
+            expected = float(jax.process_count() * sum(range(jax.local_device_count())))
+            if observed != expected:
+                raise RuntimeError(
+                    f"global collective returned {observed}, expected {expected}"
+                )
+        elif len(jax.devices()) > 1:
             collective = jax.pmap(
                 lambda x: jax.lax.psum(x, "devices"), axis_name="devices"
             )
-            result = collective(jnp.arange(len(jax.devices()), dtype=jnp.float32))
+            result = collective(
+                jnp.arange(jax.local_device_count(), dtype=jnp.float32)
+            )
             result.block_until_ready()
         elapsed = time.perf_counter() - started
     except Exception as exc:
