@@ -9,13 +9,14 @@ requires a download.
 
 Prepared data can be supplied as a directory of llm.c-style FineWeb shards,
 individual NumPy/token/text files, or repeatable explicit shard paths. The
-final stdout line is a machine-readable competition result and is
-intentionally never colorized.
+final stdout line of a competition run is a machine-readable result and is
+intentionally never colorized. Diagnostic XProf runs deliberately omit it.
 """
 
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import csv
 import hashlib
 from importlib import metadata as importlib_metadata
@@ -159,7 +160,9 @@ class Console:
         )
 
     def table(self, title: str, rows: Sequence[tuple[str, object]]) -> None:
-        width = max(52, *(len(str(k)) + len(str(v)) + 7 for k, v in rows))
+        width = max(
+            52, *(max(20, len(str(k))) + len(str(v)) + 7 for k, v in rows)
+        )
         inner = width - 2
         heading = f" {title} "
         top_fill = max(0, inner - len(heading) - 1)
@@ -218,11 +221,19 @@ class Console:
             file=sys.stderr,
         )
 
-    def success(self, validation_loss: float, elapsed: float) -> None:
+    def success(
+        self,
+        validation_loss: float,
+        train_seconds: float,
+        validation_seconds: float,
+    ) -> None:
         print(
             f"\n  {self.paint('✓', 'green', 'bold')} "
-            f"validation loss {self.paint(f'{validation_loss:.4f}', 'green', 'bold')} "
-            f"in {self.paint(f'{elapsed:.3f}s', 'white', 'bold')}\n",
+            f"synchronized training "
+            f"{self.paint(f'{train_seconds:.3f}s', 'white', 'bold')} "
+            f"{self.paint('(compilation excluded)', 'dim')}\n"
+            f"    validation loss {self.paint(f'{validation_loss:.4f}', 'green', 'bold')} "
+            f"in {self.paint(f'{validation_seconds:.3f}s', 'white', 'bold')}\n",
             file=sys.stderr,
         )
 
@@ -366,7 +377,14 @@ def build_parser() -> argparse.ArgumentParser:
     run = parser.add_argument_group("run")
     run.add_argument("--output-dir", type=Path, default=Path("runs/reference"))
     run.add_argument("--seed", type=int, default=1337)
-    run.add_argument("--steps", type=positive_int, default=None)
+    duration = run.add_mutually_exclusive_group()
+    duration.add_argument("--steps", type=positive_int, default=None)
+    duration.add_argument(
+        "--train-tokens",
+        type=positive_int,
+        default=None,
+        help="derive an exact step count from the global batch and sequence length",
+    )
     environment_track = os.environ.get("SPEEDRUN_TRACK", "open")
     if environment_track not in _VALID_TRACKS:
         environment_track = "open"
@@ -395,6 +413,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--log-every", type=positive_int, default=None)
     run.add_argument("--color", choices=("auto", "always", "never"), default="auto")
+
+    profiling = parser.add_argument_group("profiling")
+    profiling.add_argument(
+        "--xprof-dir",
+        type=Path,
+        default=None,
+        help="write an XProf trace for a bounded training-step window",
+    )
+    profiling.add_argument(
+        "--xprof-start-step",
+        type=positive_int,
+        default=None,
+        help="first 1-based step to capture; required with --xprof-dir",
+    )
+    profiling.add_argument(
+        "--xprof-steps",
+        type=positive_int,
+        default=None,
+        help="number of consecutive steps to capture; required with --xprof-dir",
+    )
+    profiling.add_argument(
+        "--no-final-validation",
+        action="store_true",
+        help="diagnostic-only: omit evaluation compilation and final validation",
+    )
+    profiling.add_argument(
+        "--no-checkpoint",
+        action="store_true",
+        help="diagnostic-only: omit the checkpoint and competition result",
+    )
 
     data = parser.add_argument_group("data")
     data.add_argument(
@@ -504,6 +552,84 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "--downstream-manifest and --downstream-data are mutually exclusive"
         )
+    xprof_window_args = (args.xprof_start_step, args.xprof_steps)
+    if args.xprof_dir is None:
+        if any(value is not None for value in xprof_window_args):
+            raise ValueError(
+                "--xprof-start-step and --xprof-steps require --xprof-dir"
+            )
+        if args.no_final_validation or args.no_checkpoint:
+            raise ValueError(
+                "--no-final-validation and --no-checkpoint require --xprof-dir"
+            )
+    elif any(value is None for value in xprof_window_args):
+        raise ValueError(
+            "--xprof-dir requires both --xprof-start-step and --xprof-steps"
+        )
+    if args.no_final_validation != args.no_checkpoint:
+        raise ValueError(
+            "--no-final-validation and --no-checkpoint must be used together"
+        )
+    if args.no_final_validation and (
+        args.downstream_manifest is not None or args.downstream_data
+    ):
+        raise ValueError(
+            "--no-final-validation cannot be combined with downstream evaluation data"
+        )
+    effective_val_every = args.val_every
+    if effective_val_every is None:
+        effective_val_every = 250 if selected_profile(args) == "official" else 0
+    if args.no_final_validation and effective_val_every:
+        raise ValueError(
+            "--no-final-validation requires --val-every 0 (the official profile "
+            "otherwise enables periodic validation by default)"
+        )
+
+
+def xprof_step_window(
+    args: argparse.Namespace, total_steps: int
+) -> tuple[int, int] | None:
+    """Return the inclusive 1-based capture window, validating its bounds."""
+
+    if args.xprof_dir is None:
+        return None
+    # ``validate_args`` establishes that these are both positive integers.
+    start = int(args.xprof_start_step)
+    end = start + int(args.xprof_steps) - 1
+    if start > total_steps or end > total_steps:
+        raise ValueError(
+            "XProf capture window must fit inside the training run; "
+            f"requested steps {start}..{end} with --steps {total_steps}"
+        )
+    return start, end
+
+
+def profiler_options(platform: str, device_count: int) -> Any:
+    """Build an XProf configuration with useful TPU compute and sync events."""
+
+    options = jax.profiler.ProfileOptions()
+    options.python_tracer_level = 0
+    options.host_tracer_level = 2
+    if platform == "tpu":
+        options.advanced_configuration = {
+            "tpu_trace_mode": "TRACE_COMPUTE_AND_SYNC",
+            "tpu_num_chips_to_profile_per_task": device_count,
+        }
+    return options
+
+
+def should_compile_evaluation(
+    args: argparse.Namespace,
+    config: Config,
+    downstream_domains: Sequence[DownstreamDomain],
+) -> bool:
+    """Return whether this invocation can execute any validation workload."""
+
+    return (
+        not args.no_final_validation
+        or config.val_every > 0
+        or bool(downstream_domains)
+    )
 
 
 def selected_profile(args: argparse.Namespace) -> str:
@@ -518,10 +644,10 @@ def resolve_config(args: argparse.Namespace, platform: str, vocab_size: int) -> 
         # Four keeps this profile valid on both CPU and all four v4-8 devices.
         "smoke": dict(steps=2, batch=4, sequence=32, layers=2, heads=2, width=64, eval=1),
         "dev": dict(steps=100, batch=32, sequence=256, layers=6, heads=6, width=384, eval=8),
-        # GPT-2-small model shape. The iteration count is a conservative initial
+        # GPT-2-small model shape. The token budget is a conservative initial
         # calibration setting, not a claim that this reference reaches 3.28.
         "official": dict(
-            steps=19_073,
+            train_tokens=624_984_064,
             batch=32,
             sequence=1024,
             layers=12,
@@ -531,9 +657,25 @@ def resolve_config(args: argparse.Namespace, platform: str, vocab_size: int) -> 
             eval=320,
         ),
     }[profile]
-    steps = args.steps if args.steps is not None else defaults["steps"]
     batch_size = args.batch_size if args.batch_size is not None else defaults["batch"]
     seq_len = args.seq_len if args.seq_len is not None else defaults["sequence"]
+    tokens_per_step = batch_size * seq_len
+    requested_train_tokens = args.train_tokens
+    if (
+        requested_train_tokens is None
+        and args.steps is None
+        and "train_tokens" in defaults
+    ):
+        requested_train_tokens = defaults["train_tokens"]
+    if requested_train_tokens is not None:
+        if requested_train_tokens % tokens_per_step:
+            raise ValueError(
+                "training token budget must be divisible by batch_size * seq_len "
+                f"({tokens_per_step:,}); got {requested_train_tokens:,}"
+            )
+        steps = requested_train_tokens // tokens_per_step
+    else:
+        steps = args.steps if args.steps is not None else defaults["steps"]
     layers = args.layers if args.layers is not None else defaults["layers"]
     heads = args.heads if args.heads is not None else defaults["heads"]
     d_model = args.d_model if args.d_model is not None else defaults["width"]
@@ -575,7 +717,6 @@ def resolve_config(args: argparse.Namespace, platform: str, vocab_size: int) -> 
         if args.warmup_steps is not None
         else min(steps, {"smoke": 1, "dev": 10, "official": 715}[profile])
     )
-    warmup_steps = min(warmup_steps, steps)
 
     dtype_name = args.dtype
     if dtype_name == "auto":
@@ -1372,25 +1513,47 @@ def write_result(output_dir: Path, result: Mapping[str, Any]) -> None:
     os.replace(temporary, destination)
 
 
-def write_training_csv(output_dir: Path, history: np.ndarray, config: Config) -> None:
+def write_training_csv(
+    output_dir: Path,
+    history: np.ndarray,
+    config: Config,
+    flops_per_token: int | None = None,
+) -> None:
     """Atomically persist every optimizer step without timing host transfers."""
 
     if history.shape != (config.steps, 3):
         raise ValueError(
             f"training history has shape {history.shape}; expected {(config.steps, 3)}"
         )
+    if flops_per_token is not None and flops_per_token <= 0:
+        raise ValueError("flops_per_token must be positive when provided")
     output_dir.mkdir(parents=True, exist_ok=True)
     destination = output_dir / TRAINING_CSV_NAME
     temporary = output_dir / f".{TRAINING_CSV_NAME}.tmp"
     tokens_per_step = config.batch_size * config.seq_len
     with temporary.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, lineterminator="\n")
-        writer.writerow(("step", "tokens_processed", "train_loss", "learning_rate", "grad_norm"))
+        writer.writerow(
+            (
+                "step",
+                "tokens_processed",
+                "cumulative_estimated_flops",
+                "train_loss",
+                "learning_rate",
+                "grad_norm",
+            )
+        )
         for index, (loss, learning_rate_value, grad_norm) in enumerate(history, 1):
+            tokens_processed = index * tokens_per_step
             writer.writerow(
                 (
                     index,
-                    index * tokens_per_step,
+                    tokens_processed,
+                    (
+                        tokens_processed * flops_per_token
+                        if flops_per_token is not None
+                        else ""
+                    ),
                     float(loss),
                     float(learning_rate_value),
                     float(grad_norm),
@@ -1550,7 +1713,7 @@ def perplexity_from_loss(loss: float) -> float:
     return finite_metric("perplexity", perplexity, positive=True)
 
 
-def run(args: argparse.Namespace) -> dict[str, Any]:
+def run(args: argparse.Namespace) -> dict[str, Any] | None:
     validate_args(args)
     console = Console(args.color)
     console.banner()
@@ -1570,7 +1733,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     dataset, vocab_size = load_dataset(args)
     config = resolve_config(args, platform, vocab_size)
+    capture_window = xprof_step_window(args, config.steps)
     downstream_domains = load_downstream_domains(args, vocab_size)
+    diagnostic_mode = args.no_final_validation and args.no_checkpoint
+    needs_evaluation = should_compile_evaluation(args, config, downstream_domains)
     if config.batch_size % len(devices):
         raise ValueError(
             f"global batch size {config.batch_size} must be divisible by "
@@ -1617,6 +1783,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ("compute", config.dtype_name),
             ("train tokens", format_count(tokens_processed)),
             ("estimated FLOPs", format_count(flops_per_token * tokens_processed)),
+            (
+                "XProf",
+                (
+                    f"steps {capture_window[0]}..{capture_window[1]} → "
+                    f"{args.xprof_dir.expanduser().resolve()}"
+                    if capture_window is not None
+                    else "disabled"
+                ),
+            ),
         ),
     )
 
@@ -1631,10 +1806,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     # Compilation may not inspect real data. Shapes and dtypes are sufficient.
     sample_x = np.zeros((config.batch_size, config.seq_len), dtype=np.int32)
     sample_y = np.zeros((config.batch_size, config.seq_len), dtype=np.int32)
-    sample_mask = np.ones((config.batch_size, config.seq_len), dtype=np.float32)
     sample_x = jax.device_put(sample_x, data_sharding)
     sample_y = jax.device_put(sample_y, data_sharding)
-    sample_mask = jax.device_put(sample_mask, data_sharding)
 
     compiled_step = jax.jit(
         lambda p, o, x, y: train_step(p, o, x, y, config, decay_mask),
@@ -1646,15 +1819,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     executable = compiled_step.lower(params, optimizer, sample_x, sample_y).compile()
     train_compile_seconds = time.perf_counter() - compile_started
 
-    # Compile evaluation exactly once before the training clock. Periodic probes
-    # and the canonical final validation both reuse this executable.
-    console.phase("Compiling evaluation", "reused by probes and final validation")
-    eval_compile_started = time.perf_counter()
-    compiled_eval = jax.jit(
-        lambda p, x, y, mask: eval_step(p, x, y, mask, config),
-        in_shardings=(replicated, data_sharding, data_sharding, data_sharding),
-    ).lower(params, sample_x, sample_y, sample_mask).compile()
-    eval_compile_seconds = time.perf_counter() - eval_compile_started
+    # Compile evaluation exactly once when it is requested. Diagnostic XProf
+    # runs can skip this executable entirely, keeping their setup focused on the
+    # training step being inspected.
+    compiled_eval: Any | None = None
+    sample_mask: jax.Array | None = None
+    eval_compile_seconds = 0.0
+    if needs_evaluation:
+        sample_mask_host = np.ones(
+            (config.batch_size, config.seq_len), dtype=np.float32
+        )
+        sample_mask = jax.device_put(sample_mask_host, data_sharding)
+        console.phase("Compiling evaluation", "reused by probes and final validation")
+        eval_compile_started = time.perf_counter()
+        compiled_eval = jax.jit(
+            lambda p, x, y, mask: eval_step(p, x, y, mask, config),
+            in_shardings=(replicated, data_sharding, data_sharding, data_sharding),
+        ).lower(params, sample_x, sample_y, sample_mask).compile()
+        eval_compile_seconds = time.perf_counter() - eval_compile_started
     total_compile_seconds = train_compile_seconds + eval_compile_seconds
 
     sync_tree((params, optimizer, sample_x, sample_y, sample_mask))
@@ -1666,67 +1848,125 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     console.phase(
         "Training",
         f"train compiled in {train_compile_seconds:.2f}s, "
-        f"eval in {eval_compile_seconds:.2f}s{probe_detail}",
+        + (
+            f"eval in {eval_compile_seconds:.2f}s{probe_detail}"
+            if needs_evaluation
+            else "evaluation skipped; diagnostic mode"
+        ),
     )
 
     last_metrics: Mapping[str, jax.Array] | None = None
     validation_rows: list[ValidationRow] = []
     validation_probe_seconds = 0.0
     train_started = time.perf_counter()
-    for step_index in range(1, config.steps + 1):
-        batch_x, batch_y = dataset.batch(
-            "train", train_rng, config.batch_size, config.seq_len, config.vocab_size
-        )
-        batch_x = jax.device_put(batch_x, data_sharding)
-        batch_y = jax.device_put(batch_y, data_sharding)
-        params, optimizer, last_metrics = executable(params, optimizer, batch_x, batch_y)
-        if should_run_validation_probe(step_index, config):
-            # Attribute all preceding asynchronous training work to training,
-            # then start the probe's own honest wall clock inside the helper.
-            sync_tree((params, optimizer, last_metrics))
-            probe_loss, probe_seconds = evaluate_validation_prefix(
-                params,
-                dataset,
-                compiled_eval,
-                data_sharding,
-                config,
-                config.val_probe_batches,
-            )
-            probe_tokens = config.val_probe_batches * config.batch_size * config.seq_len
-            validation_probe_seconds += probe_seconds
-            validation_rows.append(
-                ValidationRow(
-                    step=step_index,
-                    tokens_processed=step_index * config.batch_size * config.seq_len,
-                    kind="fineweb_probe",
-                    domain="fineweb",
-                    validation_tokens=probe_tokens,
-                    validation_loss=probe_loss,
-                    perplexity=perplexity_from_loss(probe_loss),
-                    validation_seconds=probe_seconds,
-                    canonical=False,
+    xprof_dir = (
+        args.xprof_dir.expanduser().resolve() if capture_window is not None else None
+    )
+    trace_active = False
+    try:
+        for step_index in range(1, config.steps + 1):
+            if capture_window is not None and step_index == capture_window[0]:
+                # Drain earlier asynchronous work before opening the trace. The
+                # capture therefore begins at the requested steady-state step,
+                # rather than including a backlog dispatched by preceding steps.
+                sync_tree((params, optimizer, last_metrics))
+                assert xprof_dir is not None
+                xprof_dir.mkdir(parents=True, exist_ok=True)
+                console.phase(
+                    "Starting XProf capture",
+                    f"steps {capture_window[0]}..{capture_window[1]} → {xprof_dir}",
                 )
+                jax.profiler.start_trace(
+                    xprof_dir,
+                    profiler_options=profiler_options(platform, len(devices)),
+                )
+                trace_active = True
+
+            annotation = (
+                jax.profiler.StepTraceAnnotation("train", step_num=step_index)
+                if trace_active
+                else nullcontext()
             )
-            console.validation_probe(
-                step_index, probe_loss, config.val_probe_batches, probe_seconds
-            )
-        should_log = (
-            step_index == 1
-            or step_index == config.steps
-            or step_index % config.log_every == 0
-        )
-        if should_log:
-            host_metrics = jax.device_get(last_metrics)
-            elapsed_so_far = max(time.perf_counter() - train_started, 1.0e-12)
-            seen_tokens = step_index * config.batch_size * config.seq_len
-            console.step(
-                step_index,
-                config.steps,
-                float(host_metrics["loss"]),
-                float(host_metrics["learning_rate"]),
-                float(host_metrics["grad_norm"]),
-                seen_tokens / elapsed_so_far,
-            )
+            with annotation:
+                # Keep the host sampling, transfer, dispatch, and any logging
+                # synchronization inside the step annotation. This exposes input
+                # gaps alongside TPU execution in the same XProf timeline.
+                batch_x, batch_y = dataset.batch(
+                    "train", train_rng, config.batch_size, config.seq_len, config.vocab_size
+                )
+                batch_x = jax.device_put(batch_x, data_sharding)
+                batch_y = jax.device_put(batch_y, data_sharding)
+                params, optimizer, last_metrics = executable(
+                    params, optimizer, batch_x, batch_y
+                )
+                if should_run_validation_probe(step_index, config):
+                    # Attribute all preceding asynchronous training work to training,
+                    # then start the probe's own honest wall clock inside the helper.
+                    sync_tree((params, optimizer, last_metrics))
+                    if compiled_eval is None:  # defensive configuration invariant
+                        raise AssertionError("validation executable was not compiled")
+                    probe_loss, probe_seconds = evaluate_validation_prefix(
+                        params,
+                        dataset,
+                        compiled_eval,
+                        data_sharding,
+                        config,
+                        config.val_probe_batches,
+                    )
+                    probe_tokens = (
+                        config.val_probe_batches * config.batch_size * config.seq_len
+                    )
+                    validation_probe_seconds += probe_seconds
+                    validation_rows.append(
+                        ValidationRow(
+                            step=step_index,
+                            tokens_processed=(
+                                step_index * config.batch_size * config.seq_len
+                            ),
+                            kind="fineweb_probe",
+                            domain="fineweb",
+                            validation_tokens=probe_tokens,
+                            validation_loss=probe_loss,
+                            perplexity=perplexity_from_loss(probe_loss),
+                            validation_seconds=probe_seconds,
+                            canonical=False,
+                        )
+                    )
+                    console.validation_probe(
+                        step_index, probe_loss, config.val_probe_batches, probe_seconds
+                    )
+                should_log = (
+                    step_index == 1
+                    or step_index == config.steps
+                    or step_index % config.log_every == 0
+                )
+                if should_log:
+                    host_metrics = jax.device_get(last_metrics)
+                    elapsed_so_far = max(time.perf_counter() - train_started, 1.0e-12)
+                    seen_tokens = step_index * config.batch_size * config.seq_len
+                    console.step(
+                        step_index,
+                        config.steps,
+                        float(host_metrics["loss"]),
+                        float(host_metrics["learning_rate"]),
+                        float(host_metrics["grad_norm"]),
+                        seen_tokens / elapsed_so_far,
+                    )
+
+                if capture_window is not None and step_index == capture_window[1]:
+                    # Include the final synchronization in the trace so all
+                    # captured TPU work is exported before profiling stops.
+                    sync_tree((params, optimizer, last_metrics))
+
+            if capture_window is not None and step_index == capture_window[1]:
+                jax.profiler.stop_trace()
+                trace_active = False
+                console.phase("XProf capture saved", str(xprof_dir))
+    finally:
+        if trace_active:
+            # Avoid leaving process-global profiler state active when a sampled
+            # batch or training step raises midway through the capture window.
+            jax.profiler.stop_trace()
 
     if last_metrics is None:  # defensive: argparse prevents zero steps
         raise AssertionError("training produced no metrics")
@@ -1736,10 +1976,34 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     training_history = np.asarray(jax.device_get(optimizer["history"]), dtype=np.float32)
     train_loss = finite_metric("train_loss", float(final_train["loss"]))
 
+    if diagnostic_mode:
+        output_dir = args.output_dir.expanduser().resolve()
+        write_training_csv(
+            output_dir, training_history, config, flops_per_token=flops_per_token
+        )
+        diagnostic_rate = finite_metric(
+            "tokens_per_second", tokens_processed / train_seconds, positive=True
+        )
+        assert capture_window is not None and xprof_dir is not None
+        console.table(
+            "profile complete",
+            (
+                ("training steps", f"{config.steps:,}"),
+                ("captured steps", f"{capture_window[0]}..{capture_window[1]}"),
+                ("train loss", f"{train_loss:.4f}"),
+                ("diagnostic rate", f"{format_rate(diagnostic_rate)} tok/s"),
+                ("training curve", output_dir / TRAINING_CSV_NAME),
+                ("XProf trace", xprof_dir),
+            ),
+        )
+        return None
+
     console.phase(
         "Canonical validation",
         f"{config.eval_batches} deterministic batches outside train_seconds",
     )
+    if compiled_eval is None:  # defensive configuration invariant
+        raise AssertionError("final validation executable was not compiled")
     validation_loss, final_validation_seconds = evaluate_validation_prefix(
         params,
         dataset,
@@ -1834,7 +2098,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "Artifacts",
         f"{TRAINING_CSV_NAME} + {VALIDATION_CSV_NAME} + {CHECKPOINT_NAME}",
     )
-    write_training_csv(output_dir, training_history, config)
+    write_training_csv(
+        output_dir, training_history, config, flops_per_token=flops_per_token
+    )
     write_validation_csv(output_dir, validation_rows)
     save_checkpoint(output_dir, params, config, args.seed)
 
@@ -1902,6 +2168,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "metrics": {
             "train_seconds": finite_metric("train_seconds", train_seconds, positive=True),
             "tokens_processed": int(tokens_processed),
+            "training_token_budget": int(tokens_processed),
+            "training_steps": int(config.steps),
             "validation_loss": validation_loss,
             "validation_tokens": int(fineweb_tokens),
             "validation_probe_count": sum(
@@ -1932,7 +2200,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         },
     }
     write_result(output_dir, result)
-    console.success(validation_loss, final_validation_seconds)
+    console.success(validation_loss, train_seconds, final_validation_seconds)
     return result
 
 
@@ -1948,7 +2216,13 @@ def main(argv: Iterable[str] | None = None) -> int:
         if os.environ.get("SPEEDRUN_DEBUG") == "1":
             raise
         return 1
-    print(RESULT_PREFIX + json.dumps(result, sort_keys=True, separators=(",", ":"), allow_nan=False))
+    if result is not None:
+        print(
+            RESULT_PREFIX
+            + json.dumps(
+                result, sort_keys=True, separators=(",", ":"), allow_nan=False
+            )
+        )
     return 0
 
 

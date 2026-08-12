@@ -16,16 +16,28 @@ metrics needed to push the target lower after calibrating this hardware.
 
 ## Start here
 
-Install the locked Python 3.12/JAX/libtpu dependency environment once:
+The top-level Makefile is the user interface and a set of copyable command
+templates:
 
 ```bash
-uv sync --frozen
+make prepare
+make baseline
+make profile
+make report
 ```
 
-Then launch the interactive preparation wizard:
+| Target | Purpose |
+|---|---|
+| `make prepare` | synchronize the frozen uv environment, then open the interactive setup wizard |
+| `make baseline` | verify the official data and four-chip TPU, then run the fully explicit reference baseline |
+| `make profile` | run a validation-free 100-step diagnostic, capture XProf steps 11–20, then serve the trace on port 8791 |
+| `make report` | integrity-check completed runs and rebuild the standalone `report.html` dashboard |
+
+`make prepare` runs these two commands:
 
 ```bash
-uv run --frozen --no-sync speedrun prepare
+uv --cache-dir /tmp/uv-cache sync --frozen
+uv --cache-dir /tmp/uv-cache run --frozen --no-sync speedrun prepare
 ```
 
 It asks for the data-cache root, data and run profiles, persistent artifact
@@ -76,6 +88,9 @@ The source is the pinned `kjj0/fineweb10B-gpt2` revision used by
 ## Run an algorithm
 
 ```bash
+# Exact reference workflow, including machine/data preflight
+make baseline
+
 # Fast end-to-end check
 uv run --frozen --no-sync speedrun prepare --non-interactive \
   --path shm/ --profile smoke --run-profile smoke --no-doctor
@@ -98,26 +113,66 @@ live while the machine-readable result remains isolated on stdout.
 
 Every successful reference run also writes `training.csv` inside its run
 directory. It contains one row per optimizer step with step number, cumulative
-training tokens, loss, learning rate, and gradient norm. Scalars accumulate on
-the TPU and transfer only after timed training, so retaining the complete curve
-does not add a synchronization to every step. The harness records its SHA-256
-for later collation across runs.
+training tokens, cumulative analytic estimated FLOPs, loss, learning rate, and
+gradient norm. Scalars accumulate on the TPU and transfer only after timed
+training, so retaining the complete curve does not add a synchronization to
+every step. Token, learning-rate, and FLOP columns are deterministic bookkeeping;
+they require no additional device logging. The harness records the CSV's
+SHA-256 for later collation across runs.
 
 The reference also writes `validation.csv`. On the official profile it probes
 the first eight validation batches every 250 optimizer steps by default, then
-records the exact canonical validation as its final row. Probe synchronization
+records the exact canonical validation as its final FineWeb row. Fresh10 rows
+may follow it. Probe synchronization
 and evaluation are included in `train_seconds`; the final canonical evaluation
 is not. Both training and evaluation executables compile once on synthetic
 zero-valued inputs before timing. Use `--val-every 0` to disable probes, or
 `--val-every N --val-probe-batches M` to change their cadence and prefix size.
 Smoke and development runs do not probe unless explicitly enabled.
 
-The reference is intentionally a readable baseline. A 20-step, official-shape
-calibration on this TPU v4-8 sustained about **351k tokens/s** after compilation
-(roughly 302 estimated TFLOP/s and 27% analytic MFU). Its current 19,073-step
-schedule processes about 625M tokens and is not yet claimed to reach 3.28; use
-it to measure the machine while optimized entries and a target-capable schedule
-are developed.
+The reference is intentionally readable rather than target-capable. The full
+19,073-step calibration on this TPU v4-8 processed exactly **624,984,064**
+training tokens in **1,716.01 synchronized seconds** (28m36s, compilation
+excluded), sustaining about **364k tokens/s**, **313 analytic TFLOP/s**, and
+**28.5% analytic MFU**. It reached FineWeb validation loss **3.75788** and
+Fresh10 macro loss **3.95959**. That exact token budget is now fixed for
+official open-track comparisons while we improve the architecture, initialization,
+optimizer, and kernels.
+
+### Profiling and reports
+
+`make profile` uses the same four-chip data-parallel model shape and the first
+100 updates of the 715-step warmup schedule. Compilation happens before capture;
+canonical validation, Fresh10, checkpointing, and leaderboard recording are
+disabled. The trace includes host sampling, host-to-device transfer, TPU
+execution, synchronization, and collectives for ten steady-state steps. After
+capture it starts an isolated, version-pinned XProf viewer at
+`http://localhost:8791`; Ctrl-C stops the viewer. Override paths or the capture
+window with Make variables such as `DATA_PATH`, `PROFILE_OUTPUT`,
+`XPROF_START_STEP`, and `XPROF_STEPS`.
+
+`make report` scans completed folders beneath `runs/`, checks their recorded
+artifact hashes when an immutable record is available, and writes one
+self-contained static `report.html` with no CDN dependency. A multi-select run
+sidebar controls overlays. Complete official open runs are selected initially
+only when they use the exact 624,984,064-token budget; official
+sample-efficiency runs are also selected. Smoke, development, and partial runs
+remain available but start unchecked and are labeled diagnostic or partial.
+One global selector switches every time-series chart
+between **equi-FLOP** (the default, using analytic cumulative estimated FLOPs)
+and **equi-step**. Existing columns are plotted immediately; future overall or
+per-layer gradient/update/parameter L1/L2 norms, means, standard deviations,
+and third/fourth moments are discovered when their artifacts add numeric fields;
+the report explicitly lists which requested diagnostics were not recorded.
+
+Retained per-layer data uses a documented NPZ naming convention: array keys begin
+with `params/` (also `param/` or `parameters/`), `grads/` (also `grad/` or
+`gradients/`), or `updates/` (also `update/`), followed by a logical layer path
+such as `blocks/0/`, `layers/0/`, or `h/0/`. Arrays sharing a family and layer
+number are aggregated before the report computes L1/L2 norm, mean, standard
+deviation, central third/fourth moments, minimum, and maximum. The current
+reference checkpoint records parameters only; qualifying-only retention may
+remove even that checkpoint, which the report identifies without inventing data.
 
 ### Fresh-domain diagnostic
 
@@ -169,8 +224,9 @@ make entries shorter and easier to compare.
 
 ## Tracks
 
-- **Open:** reach the target in the least synchronized training time. Model,
-  optimizer, batching, precision, kernels, and systems choices may all change.
+- **Open:** reach the target in the least synchronized training time using the
+  fixed 624,984,064-token official budget. Model, optimizer, batching,
+  precision, kernels, and systems choices may all change.
 - **Sample efficiency:** reach the target with the fewest predicted training
   tokens. The reference model/data/sequence contract is fixed; time breaks ties.
 

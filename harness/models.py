@@ -50,6 +50,7 @@ class RunConfig:
     profile: str = "default"
     seed: int = 1337
     target_loss: float = 3.28
+    expected_training_tokens: int | None = None
     expected_validation_tokens: int | None = None
     expected_downstream_tokens: Mapping[str, int] | None = None
     timeout_seconds: float = 900.0

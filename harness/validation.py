@@ -318,6 +318,7 @@ def validate_result(
     run_dir: Path,
     track: str,
     reference_contract: ReferenceContract | Mapping[str, Any] | None = None,
+    expected_training_tokens: int | None = None,
     expected_validation_tokens: int | None = None,
     expected_downstream_tokens: Mapping[str, int] | None = None,
     evaluator: Evaluator | None = None,
@@ -336,6 +337,11 @@ def validate_result(
     if declared_time <= 0:
         raise ResultValidationError("metrics.train_seconds must be greater than zero")
     tokens = _positive_integer(metrics.get("tokens_processed"), "metrics.tokens_processed")
+    if expected_training_tokens is not None and tokens != expected_training_tokens:
+        raise ResultValidationError(
+            "metrics.tokens_processed must match the fixed training-token budget: "
+            f"expected {expected_training_tokens:,}, got {tokens:,}"
+        )
     loss = _finite_number(metrics.get("validation_loss"), "metrics.validation_loss")
     if expected_validation_tokens is not None:
         validation_tokens = _positive_integer(
@@ -437,6 +443,7 @@ def verify_run(
     *,
     track: str = "open",
     reference_contract: ReferenceContract | Mapping[str, Any] | None = None,
+    expected_training_tokens: int | None = None,
     expected_validation_tokens: int | None = None,
     expected_downstream_tokens: Mapping[str, int] | None = None,
     evaluator: Evaluator | None = None,
@@ -452,6 +459,7 @@ def verify_run(
         run_dir=run_dir,
         track=track,
         reference_contract=reference_contract,
+        expected_training_tokens=expected_training_tokens,
         expected_validation_tokens=expected_validation_tokens,
         expected_downstream_tokens=expected_downstream_tokens,
         evaluator=evaluator,

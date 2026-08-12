@@ -32,11 +32,132 @@ class FakeDevice:
 
 
 class TrainerStaticTests(unittest.TestCase):
+    def test_train_tokens_derives_exact_steps_and_is_exclusive(self) -> None:
+        parser = trainer.build_parser()
+        config = trainer.resolve_config(
+            parser.parse_args(
+                [
+                    "--profile", "official",
+                    "--train-tokens", "655360",
+                    "--batch-size", "32",
+                    "--seq-len", "1024",
+                ]
+            ),
+            "tpu",
+            50_304,
+        )
+        self.assertEqual(config.steps, 20)
+        with self.assertRaisesRegex(ValueError, "must be divisible"):
+            trainer.resolve_config(
+                parser.parse_args(
+                    [
+                        "--profile", "official",
+                        "--train-tokens", "655361",
+                        "--batch-size", "32",
+                        "--seq-len", "1024",
+                    ]
+                ),
+                "tpu",
+                50_304,
+            )
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(["--steps", "20", "--train-tokens", "655360"])
+
+    def test_explicit_warmup_may_extend_past_short_profile_run(self) -> None:
+        parser = trainer.build_parser()
+        explicit = trainer.resolve_config(
+            parser.parse_args(
+                ["--profile", "official", "--steps", "100", "--warmup-steps", "715"]
+            ),
+            "tpu",
+            50_304,
+        )
+        defaulted = trainer.resolve_config(
+            parser.parse_args(["--profile", "official", "--steps", "100"]),
+            "tpu",
+            50_304,
+        )
+        self.assertEqual(explicit.warmup_steps, 715)
+        self.assertEqual(defaulted.warmup_steps, 100)
+
+    def test_xprof_diagnostic_contract_and_capture_window(self) -> None:
+        parser = trainer.build_parser()
+        valid = parser.parse_args(
+            [
+                "--xprof-dir", "trace",
+                "--xprof-start-step", "11",
+                "--xprof-steps", "20",
+                "--no-final-validation",
+                "--no-checkpoint",
+            ]
+        )
+        trainer.validate_args(valid)
+        self.assertEqual(trainer.xprof_step_window(valid, 100), (11, 30))
+        self.assertFalse(
+            trainer.should_compile_evaluation(
+                valid, SimpleNamespace(val_every=0), ()
+            )
+        )
+
+        normal = parser.parse_args([])
+        trainer.validate_args(normal)
+        self.assertIsNone(trainer.xprof_step_window(normal, 100))
+        self.assertTrue(
+            trainer.should_compile_evaluation(
+                normal, SimpleNamespace(val_every=0), ()
+            )
+        )
+
+        invalid_commands = (
+            ["--xprof-start-step", "1"],
+            ["--xprof-dir", "trace", "--xprof-start-step", "1"],
+            ["--xprof-dir", "trace", "--xprof-start-step", "1", "--xprof-steps", "1", "--no-checkpoint"],
+            ["--no-final-validation", "--no-checkpoint"],
+            [
+                "--profile", "official",
+                "--xprof-dir", "trace",
+                "--xprof-start-step", "1",
+                "--xprof-steps", "1",
+                "--no-final-validation",
+                "--no-checkpoint",
+            ],
+        )
+        for command in invalid_commands:
+            with self.subTest(command=command), self.assertRaises(ValueError):
+                trainer.validate_args(parser.parse_args(command))
+        with self.assertRaisesRegex(ValueError, "must fit inside"):
+            trainer.xprof_step_window(valid, 25)
+
+        options = trainer.profiler_options("tpu", 4)
+        self.assertEqual(options.python_tracer_level, 0)
+        self.assertEqual(options.host_tracer_level, 2)
+        self.assertEqual(
+            options.advanced_configuration,
+            {
+                "tpu_trace_mode": "TRACE_COMPUTE_AND_SYNC",
+                "tpu_num_chips_to_profile_per_task": 4,
+            },
+        )
+
+    def test_diagnostic_main_omits_competition_result(self) -> None:
+        stdout = StringIO()
+        with (
+            patch.object(trainer, "run", return_value=None),
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(trainer.main([]), 0)
+        self.assertEqual(stdout.getvalue(), "")
+
     def test_periodic_validation_defaults_and_cli_overrides(self) -> None:
         parser = trainer.build_parser()
 
         official = trainer.resolve_config(
             parser.parse_args(["--profile", "official"]), "tpu", 50_304
+        )
+        self.assertEqual(official.steps, 19_073)
+        self.assertEqual(
+            official.steps * official.batch_size * official.seq_len,
+            624_984_064,
         )
         self.assertEqual(official.val_every, 250)
         self.assertEqual(official.val_probe_batches, 8)
@@ -70,6 +191,8 @@ class TrainerStaticTests(unittest.TestCase):
                 [
                     "--profile",
                     "official",
+                    "--steps",
+                    "1",
                     "--batch-size",
                     "128",
                     "--seq-len",
@@ -91,6 +214,8 @@ class TrainerStaticTests(unittest.TestCase):
                 [
                     "--profile",
                     "official",
+                    "--steps",
+                    "1",
                     "--batch-size",
                     "128",
                     "--seq-len",
@@ -102,6 +227,18 @@ class TrainerStaticTests(unittest.TestCase):
         )
         self.assertEqual(custom_official.eval_batches, 5)
         self.assertEqual(custom_official.val_probe_batches, 5)
+        with self.assertRaisesRegex(ValueError, "training token budget"):
+            trainer.resolve_config(
+                parser.parse_args(
+                    [
+                        "--profile", "official",
+                        "--batch-size", "128",
+                        "--seq-len", "16384",
+                    ]
+                ),
+                "tpu",
+                50_304,
+            )
         with self.assertRaisesRegex(ValueError, "must not exceed"):
             trainer.resolve_config(
                 parser.parse_args(
@@ -171,14 +308,18 @@ class TrainerStaticTests(unittest.TestCase):
         )
         config = SimpleNamespace(steps=2, batch_size=4, seq_len=8)
         with tempfile.TemporaryDirectory() as directory:
-            trainer.write_training_csv(Path(directory), history, config)
+            trainer.write_training_csv(
+                Path(directory), history, config, flops_per_token=10
+            )
             rows = (Path(directory) / trainer.TRAINING_CSV_NAME).read_text().splitlines()
         self.assertEqual(
-            rows[0], "step,tokens_processed,train_loss,learning_rate,grad_norm"
+            rows[0],
+            "step,tokens_processed,cumulative_estimated_flops,train_loss,"
+            "learning_rate,grad_norm",
         )
         self.assertEqual(len(rows), 3)
-        self.assertTrue(rows[1].startswith("1,32,2.0,"))
-        self.assertTrue(rows[2].startswith("2,64,1.5,"))
+        self.assertTrue(rows[1].startswith("1,32,320,2.0,"))
+        self.assertTrue(rows[2].startswith("2,64,640,1.5,"))
 
     def test_validation_csv_contains_probes_and_canonical_final_row(self) -> None:
         rows: list[trainer.ValidationRow] = [
@@ -315,9 +456,11 @@ class TrainerStaticTests(unittest.TestCase):
             console.table("test", (("field", "value"),))
             console.phase("phase", "detail")
             console.step(1, 1, 1.25, 1.0e-3, 0.5, 1024.0)
-            console.success(1.0, 0.25)
+            console.success(1.0, 12.5, 0.25)
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn("GPT TPU SPEEDRUN", stderr.getvalue())
+        self.assertIn("synchronized training 12.500s", stderr.getvalue())
+        self.assertIn("compilation excluded", stderr.getvalue())
         self.assertIn("validation loss", stderr.getvalue())
 
     def test_weight_decay_mask_selects_matrices_not_bias_or_norm(self) -> None:

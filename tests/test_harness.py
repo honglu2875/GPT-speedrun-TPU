@@ -450,6 +450,14 @@ class HarnessRunTests(unittest.TestCase):
         self.assertIsNone(outcome.checkpoint_path)
         self.assertFalse(outcome.record["checkpoint"]["retained"])
 
+    def test_fixed_training_token_budget_is_enforced_and_recorded(self) -> None:
+        outcome = run_submission(self.config(expected_training_tokens=96))
+        self.assertEqual(outcome.record["constraints"]["training_tokens"], 96)
+        with self.assertRaisesRegex(ResultValidationError, "training-token budget"):
+            run_submission(self.config(expected_training_tokens=95))
+        with self.assertRaisesRegex(ConfigurationError, "expected_training_tokens"):
+            run_submission(self.config(expected_training_tokens=0))
+
     def test_rejects_submission_and_checkpoint_path_traversal(self) -> None:
         with self.assertRaises(ConfigurationError):
             run_submission(self.config(submission="../tiny"))

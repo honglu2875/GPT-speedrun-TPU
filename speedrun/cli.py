@@ -49,6 +49,7 @@ from .data import (
     verify_fresh10,
 )
 from .doctor import data_selection, environment_checks
+from .report import build_report
 
 
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -57,6 +58,10 @@ _PROFILES = ("smoke", "dev", "official")
 _RETENTION = ("all", "qualifying", "none-after-validation")
 _COLORS = ("auto", "always", "never")
 OFFICIAL_TARGET_LOSS = 3.28
+# The calibrated reference budget: 19,073 × 32 × 1,024 predictions. Alternate
+# global batch/sequence shapes must divide this exactly; a future masked final
+# batch can relax that restriction without changing the comparison budget.
+OFFICIAL_OPEN_TRAINING_TOKENS = 624_984_064
 
 
 class Style:
@@ -175,6 +180,22 @@ def build_parser() -> argparse.ArgumentParser:
     leaderboard.add_argument("--all-submissions", action="store_true")
     leaderboard.add_argument("--color", choices=_COLORS)
 
+    report = commands.add_parser(
+        "report",
+        help="build a self-contained HTML comparison of completed run logs",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    report.add_argument("--runs", type=Path, default=Path("runs"), help="run log directory")
+    report.add_argument(
+        "--output", type=Path, default=Path("report.html"), help="standalone HTML destination"
+    )
+    report.add_argument(
+        "--max-points",
+        type=_positive_int,
+        default=1_400,
+        help="maximum embedded points per run and scalar series",
+    )
+
     clone = commands.add_parser("clone", help="clone one submission into a new algorithm folder")
     clone.add_argument("source", nargs="?", default="reference")
     clone.add_argument("name")
@@ -204,6 +225,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             return command_verify(args)
         if args.command == "leaderboard":
             return command_leaderboard(args)
+        if args.command == "report":
+            return command_report(args)
         if args.command == "clone":
             return command_clone(args)
         if args.command == "settings":
@@ -414,6 +437,11 @@ def command_run(args: argparse.Namespace) -> int:
             seed=args.seed,
             timeout_seconds=timeout,
             target_loss=target_loss,
+            expected_training_tokens=(
+                OFFICIAL_OPEN_TRAINING_TOKENS
+                if profile == "official" and track == "open"
+                else None
+            ),
             expected_validation_tokens=(
                 prepared.validation_prefix_tokens if profile == "official" else None
             ),
@@ -477,6 +505,15 @@ def command_verify(args: argparse.Namespace) -> int:
         run_dir,
         track=track,
         reference_contract=reference,
+        expected_training_tokens=(
+            _recorded_training_tokens(record)
+            if record is not None
+            else (
+                OFFICIAL_OPEN_TRAINING_TOKENS
+                if profile == "official" and track == "open"
+                else None
+            )
+        ),
         expected_validation_tokens=10_485_760 if profile == "official" else None,
         expected_downstream_tokens=expected_downstream,
     )
@@ -522,6 +559,25 @@ def command_leaderboard(args: argparse.Namespace) -> int:
     style = Style(args.color or config.color)
     print(f"target validation loss ≤ {target_loss:.4f}\n")
     print(render_leaderboard(ranked, track=track, color=style.enabled))
+    return 0
+
+
+def command_report(args: argparse.Namespace) -> int:
+    root = repo_root()
+    runs = args.runs if args.runs.is_absolute() else root / args.runs
+    output = args.output if args.output.is_absolute() else root / args.output
+    summary = build_report(runs, output, max_chart_points=args.max_points)
+    relative = (
+        summary.output_path.relative_to(root)
+        if summary.output_path.is_relative_to(root)
+        else summary.output_path
+    )
+    print(
+        f"report {relative}: {len(summary.included)} run(s) plotted, "
+        f"{len(summary.skipped)} skipped"
+    )
+    for run_id, reason in summary.skipped.items():
+        print(f"  skipped {run_id}: {reason}")
     return 0
 
 
@@ -859,6 +915,22 @@ def _recorded_downstream_tokens(record: dict[str, Any]) -> dict[str, int] | None
             raise HarnessError("recorded Fresh10 provenance has an invalid domain row")
         result[name] = count
     return result
+
+
+def _recorded_training_tokens(record: dict[str, Any]) -> int | None:
+    """Recover a token constraint without retroactively invalidating old runs."""
+
+    constraints = record.get("constraints")
+    if constraints is None:
+        return None
+    if not isinstance(constraints, dict):
+        raise HarnessError("recorded run constraints are invalid")
+    value = constraints.get("training_tokens")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise HarnessError("recorded training-token constraint is invalid")
+    return value
 
 
 def _ensure_artifacts_inside_repo(path: Path, root: Path) -> None:

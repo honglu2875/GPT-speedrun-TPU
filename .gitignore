@@ -8,6 +8,7 @@ __pycache__/
 /shm
 /data/cache/
 /runs/
+/report.html
 /.speedrun.toml
 /.env*
 

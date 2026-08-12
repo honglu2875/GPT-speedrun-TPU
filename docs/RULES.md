@@ -23,17 +23,21 @@ the target can become more ambitious after the baseline is calibrated.
 
 Downloading, hashing, and tokenizing data are never part of a timed run.
 Training data may be staged in RAM before timing, but real host-to-device input
-transfer is part of training time. Validation is outside training time.
+transfer is part of training time. Periodic validation probes are also timed;
+only the canonical final validation runs outside the training interval.
 
 ## Tracks
 
 ### Open
 
 The open track ranks qualifying runs by synchronized training seconds, lowest
-first. Architecture, parameter count, optimizer, schedule, precision, batch
-size, sequence length, sharding, kernels, data order, and other systems choices
-may change. A submission must train from its declared initialization during the
-run and may use only the official training split.
+first. Every official open attempt predicts exactly **624,984,064 training
+tokens**, preserving the calibrated `19,073 × 32 × 1,024` reference budget.
+Architecture, parameter count, optimizer, schedule, precision, batch size,
+sequence length, sharding, kernels, data order, and other systems choices may
+change. The selected global batch and sequence length must currently divide the
+fixed budget exactly. A submission must train from its declared initialization
+during the run and may use only the official training split.
 
 The leaderboard displays validation loss and tokens consumed alongside the
 score. Parameter count, throughput, compilation time, and FLOP estimates remain
@@ -77,6 +81,8 @@ qualification threshold or either track's ordering.
 
 Each official run receives a fresh persistent compilation-cache directory.
 Reports include both synchronized training time and cold process wall time.
+XProf captures are separate diagnostic runs: profiling starts only after
+compilation and synchronization, and no profiled timing enters the leaderboard.
 
 ## Submission shape
 
@@ -102,6 +108,9 @@ and `metrics.validation_loss`. Official results must additionally report
 TPU v4 system identity. Extra finite JSON diagnostics are retained verbatim.
 Optional named artifacts are contained within the run directory and recorded
 with their size and SHA-256; the reference uses this for its per-step CSV curve.
+Its curve records steps, predicted tokens, analytic cumulative estimated FLOPs,
+learning rate, loss, and gradient norm. Estimated FLOPs are a versioned analytic
+model diagnostic rather than a hardware-counter score.
 
 ## Qualification and records
 

@@ -9,9 +9,10 @@ evaluation artifact, not a resumable training snapshot: Adam moments and the
 input RNG are deliberately omitted from this compact baseline.
 
 Every optimizer step is retained in `training.csv` with cumulative tokens,
-training loss, learning rate, and gradient norm. The history is accumulated on
-the device and copied after `train_seconds`, so curve capture does not introduce
-a host synchronization on every step.
+analytic cumulative estimated FLOPs, training loss, learning rate, and gradient
+norm. The history is accumulated on the device and copied after `train_seconds`,
+so curve capture does not introduce a host synchronization on every step. The
+token, schedule, and FLOP columns are derived without device-side logging.
 
 `validation.csv` records periodic fixed-prefix probes plus the canonical final
 evaluation. Official runs default to eight batches every 250 optimizer steps;
@@ -37,11 +38,19 @@ provides context but is not scored. Omitting both forms skips downstream
 evaluation while preserving the FineWeb result contract.
 
 The `official` defaults use the GPT-2-small shape (12 layers, width 768, 12
-heads), sequence length 1024, global batch 32, and BF16 compute on TPU. The
-initial 19,073-step schedule is deliberately marked **uncalibrated**: the first
-v4-8 calibration measured about 351k tokens/s at the official shape, but this
-625M-token schedule is not claimed to reach 3.28. The schedule and lower loss
-milestones should be tuned from longer-run evidence.
+heads), sequence length 1024, global batch 32, BF16 compute, and an exact
+624,984,064-token budget. This resolves to 19,073 optimizer steps. The full
+v4-8 calibration trained in 1,716.01 synchronized seconds (compilation excluded),
+at about 364k tokens/s and 28.5% analytic MFU, then reached FineWeb loss 3.75788
+and Fresh10 macro loss 3.95959. It is the calibrated systems/reference baseline,
+not yet a claim of reaching the 3.28 target.
+
+For a bounded XProf diagnostic, pass `--xprof-dir`, `--xprof-start-step`, and
+`--xprof-steps`. Combining those with `--no-final-validation --no-checkpoint`
+skips evaluation compilation, all validation, checkpointing, and the competition
+result event; it writes only `training.csv` and the trace. The top-level
+`make profile` target supplies the complete 100-step reference command and
+starts the viewer after capture.
 
 Use the harness instead of invoking this file directly so data and results are
 validated and recorded:

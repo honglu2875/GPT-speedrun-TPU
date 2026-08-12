@@ -119,6 +119,7 @@ def run_submission(config: RunConfig, *, evaluator: Evaluator | None = None) -> 
         run_dir=run_dir,
         track=config.track,
         reference_contract=config.reference_contract,
+        expected_training_tokens=config.expected_training_tokens,
         expected_validation_tokens=config.expected_validation_tokens,
         expected_downstream_tokens=config.expected_downstream_tokens,
         evaluator=evaluator,
@@ -156,6 +157,10 @@ def run_submission(config: RunConfig, *, evaluator: Evaluator | None = None) -> 
             "finished_at": finished_at.isoformat(),
         },
         "target_loss": float(config.target_loss),
+        "constraints": {
+            "training_tokens": config.expected_training_tokens,
+            "validation_tokens": config.expected_validation_tokens,
+        },
         "timing": {"observed_wall_seconds": observed_seconds},
         "metrics": recorded_metrics,
         "contract": contract,
@@ -438,6 +443,12 @@ def _validate_config(
         or config.expected_validation_tokens <= 0
     ):
         raise ConfigurationError("expected_validation_tokens must be a positive integer")
+    if config.expected_training_tokens is not None and (
+        isinstance(config.expected_training_tokens, bool)
+        or not isinstance(config.expected_training_tokens, int)
+        or config.expected_training_tokens <= 0
+    ):
+        raise ConfigurationError("expected_training_tokens must be a positive integer")
     if config.expected_downstream_tokens is not None:
         if not isinstance(config.expected_downstream_tokens, Mapping):
             raise ConfigurationError("expected_downstream_tokens must be a mapping")

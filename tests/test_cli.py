@@ -11,6 +11,12 @@ from speedrun.data import Fresh10Domain, PreparedDataset, PreparedFresh10
 
 
 class CliTests(unittest.TestCase):
+    def test_official_open_budget_preserves_calibrated_baseline(self) -> None:
+        budget = cli.OFFICIAL_OPEN_TRAINING_TOKENS
+        self.assertEqual(budget, 624_984_064)
+        self.assertEqual(budget // (32 * 1024), 19_073)
+        self.assertEqual(budget % (32 * 1024), 0)
+
     def test_reserved_trainer_arguments_cannot_override_harness(self) -> None:
         for arguments in (
             ["--seed", "7"],
@@ -167,6 +173,24 @@ class CliTests(unittest.TestCase):
         with self.assertRaisesRegex(cli.HarnessError, "invalid domain row"):
             cli._recorded_downstream_tokens(
                 {"provenance": {"fresh10": {"domains": {"science": {"scored_tokens": 0}}}}}
+            )
+
+    def test_verify_recovers_training_budget_without_retroactive_default(self) -> None:
+        self.assertIsNone(cli._recorded_training_tokens({}))
+        self.assertIsNone(
+            cli._recorded_training_tokens(
+                {"constraints": {"training_tokens": None}}
+            )
+        )
+        self.assertEqual(
+            cli._recorded_training_tokens(
+                {"constraints": {"training_tokens": 624_984_064}}
+            ),
+            624_984_064,
+        )
+        with self.assertRaisesRegex(cli.HarnessError, "training-token"):
+            cli._recorded_training_tokens(
+                {"constraints": {"training_tokens": 0}}
             )
 
 
