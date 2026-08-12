@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "name": "smoke",
+  "description": "Deterministic generated tokens for CPU tests; never leaderboard eligible.",
+  "format": {
+    "name": "llm.c-gpt2-v1",
+    "header_bytes": 1024,
+    "header_dtype": "little-endian int32",
+    "magic": 20240520,
+    "version": 1,
+    "token_dtype": "little-endian uint16"
+  },
+  "tokenizer": {
+    "name": "synthetic-byte-v1",
+    "vocab_size": 256
+  },
+  "default_train_shards": 1,
+  "validation_prefix_tokens": 8192,
+  "files": [
+    {
+      "path": "smoke_val_000000.bin",
+      "split": "validation",
+      "tokens": 8192,
+      "bytes": 17408,
+      "sha256": "ff2df081e34adda6fba34ea493ca173b746903698bd2da80b977cda50bbacc80",
+      "generator": {
+        "algorithm": "xorshift32-motif-v1",
+        "seed": 1449690757
+      }
+    },
+    {
+      "path": "smoke_train_000001.bin",
+      "split": "train",
+      "tokens": 32768,
+      "bytes": 66560,
+      "sha256": "bcd6d65542490495682b03cf8563dc8e0db37b6ee246e064aeadf13e70160032",
+      "generator": {
+        "algorithm": "xorshift32-motif-v1",
+        "seed": 1397772884
+      }
+    }
+  ]
+}

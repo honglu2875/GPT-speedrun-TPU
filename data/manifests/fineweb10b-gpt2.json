@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "name": "fineweb10b-gpt2",
+  "description": "The validation shard and first nine 100M-token training shards used by Modded-NanoGPT.",
+  "format": {
+    "name": "llm.c-gpt2-v1",
+    "header_bytes": 1024,
+    "header_dtype": "little-endian int32",
+    "magic": 20240520,
+    "version": 1,
+    "token_dtype": "little-endian uint16"
+  },
+  "source": {
+    "dataset": "HuggingFaceFW/fineweb",
+    "configuration": "sample-10BT",
+    "prepared_repository": "kjj0/fineweb10B-gpt2",
+    "prepared_revision": "889765ea1f903759787add96995d81171b632d0c",
+    "integrity": "SHA-256 values are the Git LFS object IDs reported by the pinned prepared repository revision."
+  },
+  "tokenizer": {
+    "name": "gpt2",
+    "implementation": "tiktoken",
+    "document_prefix_token": 50256,
+    "vocab_size": 50257
+  },
+  "default_train_shards": 9,
+  "validation_prefix_tokens": 10485760,
+  "files": [
+    {
+      "path": "fineweb_val_000000.bin",
+      "split": "validation",
+      "tokens": 100000000,
+      "bytes": 200001024,
+      "sha256": "5b95c8e0966f0861685b307b23dc5ae42b228ef74b28cb499784ae021f201640",
+      "url": "https://huggingface.co/datasets/kjj0/fineweb10B-gpt2/resolve/889765ea1f903759787add96995d81171b632d0c/fineweb_val_000000.bin"
+    },
+    {
+      "path": "fineweb_train_000001.bin",
+      "split": "train",
+      "tokens": 100000000,
+      "bytes": 200001024,
+      "sha256": "771fa4a99b9fe0946ffb6e848b4ba5c6a9b0fe87860ebf03bc2c1c7e45f8178e",
+      "url": "https://huggingface.co/datasets/kjj0/fineweb10B-gpt2/resolve/889765ea1f903759787add96995d81171b632d0c/fineweb_train_000001.bin"
+    },
+    {
+      "path": "fineweb_train_000002.bin",
+      "split": "train",
+      "tokens": 100000000,
+      "bytes": 200001024,
+      "sha256": "d4ba8d2d740905a836a4222d2aff01750560e7d49a51a745a1b3235520aec2cd",
+      "url": "https://huggingface.co/datasets/kjj0/fineweb10B-gpt2/resolve/889765ea1f903759787add96995d81171b632d0c/fineweb_train_000002.bin"
+    },
+    {
+      "path": "fineweb_train_000003.bin",
+      "split": "train",
+      "tokens": 100000000,
+      "bytes": 200001024,
+      "sha256": "f70fa272369730fd9e39f1848bfe4daa3289b6e490c1e7762777f00ea8b66246",
+      "url": "https://huggingface.co/datasets/kjj0/fineweb10B-gpt2/resolve/889765ea1f903759787add96995d81171b632d0c/fineweb_train_000003.bin"
+    },
+    {
+      "path": "fineweb_train_000004.bin",
+      "split": "train",
+      "tokens": 100000000,
+      "bytes": 200001024,
+      "sha256": "d8d88850f89fe2030e866380e90d544167467d407080403b830b903543925835",
+      "url": "https://huggingface.co/datasets/kjj0/fineweb10B-gpt2/resolve/889765ea1f903759787add96995d81171b632d0c/fineweb_train_000004.bin"
+    },
+    {
+      "path": "fineweb_train_000005.bin",
+      "split": "train",
+      "tokens": 100000000,
+      "bytes": 200001024,
+      "sha256": "36cef3fc41863eb6731b41e986edde38e368853ee6deb87b928990bf445a119c",
+      "url": "https://huggingface.co/datasets/kjj0/fineweb10B-gpt2/resolve/889765ea1f903759787add96995d81171b632d0c/fineweb_train_000005.bin"
+    },
+    {
+      "path": "fineweb_train_000006.bin",
+      "split": "train",
+      "tokens": 100000000,
+      "bytes": 200001024,
+      "sha256": "d80e5b209983e636655fc738fdf281f0132f0298bf4c0848f7e7a6bea6ca06f0",
+      "url": "https://huggingface.co/datasets/kjj0/fineweb10B-gpt2/resolve/889765ea1f903759787add96995d81171b632d0c/fineweb_train_000006.bin"
+    },
+    {
+      "path": "fineweb_train_000007.bin",
+      "split": "train",
+      "tokens": 100000000,
+      "bytes": 200001024,
+      "sha256": "fa9f94dce61686b5467bc6cd3078424203db23ac254d804a6d8d5d440afc1e11",
+      "url": "https://huggingface.co/datasets/kjj0/fineweb10B-gpt2/resolve/889765ea1f903759787add96995d81171b632d0c/fineweb_train_000007.bin"
+    },
+    {
+      "path": "fineweb_train_000008.bin",
+      "split": "train",
+      "tokens": 100000000,
+      "bytes": 200001024,
+      "sha256": "308e6937af5d78b7489a8aac3a3951dced5b46103e613f8bc4eb543f5092526c",
+      "url": "https://huggingface.co/datasets/kjj0/fineweb10B-gpt2/resolve/889765ea1f903759787add96995d81171b632d0c/fineweb_train_000008.bin"
+    },
+    {
+      "path": "fineweb_train_000009.bin",
+      "split": "train",
+      "tokens": 100000000,
+      "bytes": 200001024,
+      "sha256": "1635300891634346ecff3a78d6e489a69c647885f0dcd249fe3eb76fac683458",
+      "url": "https://huggingface.co/datasets/kjj0/fineweb10B-gpt2/resolve/889765ea1f903759787add96995d81171b632d0c/fineweb_train_000009.bin"
+    }
+  ]
+}

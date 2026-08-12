@@ -1,0 +1,830 @@
+"""Friendly command-line front end for preparation, runs, and leaderboards."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import sys
+import time
+from typing import Any, Callable, Iterable, Sequence
+
+from harness import (
+    HarnessError,
+    ReferenceContract,
+    RunConfig,
+    doctor_ok,
+    load_records,
+    rank_records,
+    render_doctor,
+    render_leaderboard,
+    run_doctor,
+    run_submission,
+    verify_run,
+)
+
+from .config import (
+    ConfigError,
+    LocalConfig,
+    config_path,
+    load_config,
+    repo_root,
+    resolve_path,
+    save_config,
+    with_overrides,
+)
+from .data import (
+    DataError,
+    PreparedDataset,
+    prepare as prepare_data,
+    sha256_file,
+    verify_dataset,
+)
+from .doctor import data_selection, environment_checks
+
+
+_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_TRACKS = ("open", "sample_efficiency")
+_PROFILES = ("smoke", "dev", "official")
+_RETENTION = ("all", "qualifying", "none-after-validation")
+_COLORS = ("auto", "always", "never")
+OFFICIAL_TARGET_LOSS = 3.28
+
+
+class Style:
+    CODES = {
+        "reset": "\033[0m",
+        "bold": "\033[1m",
+        "dim": "\033[2m",
+        "cyan": "\033[38;5;81m",
+        "blue": "\033[38;5;75m",
+        "green": "\033[38;5;114m",
+        "yellow": "\033[38;5;221m",
+        "magenta": "\033[38;5;176m",
+        "red": "\033[38;5;203m",
+    }
+
+    def __init__(self, mode: str = "auto") -> None:
+        self.enabled = mode == "always" or (
+            mode == "auto" and sys.stdout.isatty() and "NO_COLOR" not in os.environ
+        )
+
+    def text(self, value: object, *styles: str) -> str:
+        raw = str(value)
+        if not self.enabled or not styles:
+            return raw
+        return "".join(self.CODES[item] for item in styles) + raw + self.CODES["reset"]
+
+    def banner(self, subtitle: str) -> None:
+        print(
+            f"\n  {self.text('◆', 'magenta', 'bold')}"
+            f"{self.text(' GPT TPU SPEEDRUN ', 'bold')}"
+            f"{self.text(subtitle, 'cyan')}\n",
+            flush=True,
+        )
+
+    def heading(self, value: str) -> None:
+        print(f"\n  {self.text('●', 'magenta')} {self.text(value, 'bold')}", flush=True)
+
+    def ok(self, value: str) -> None:
+        print(f"  {self.text('✓', 'green', 'bold')} {value}", flush=True)
+
+    def note(self, value: str) -> None:
+        print(f"  {self.text('→', 'cyan')} {value}", flush=True)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="speedrun",
+        description="Prepare, run, and score single-file JAX trainers on TPU v4-8.",
+    )
+    parser.add_argument("--version", action="version", version="%(prog)s 0.1.0")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    prepare = commands.add_parser(
+        "prepare",
+        help="interactive machine, cache, and personal-default setup",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    prepare.add_argument("--path", type=Path, help="exact dataset cache root (for example shm/)")
+    prepare.add_argument("--profile", choices=_PROFILES, help="dataset profile to prepare")
+    prepare.add_argument("--artifacts", type=Path, help="persistent run artifact directory")
+    prepare.add_argument("--track", choices=_TRACKS, help="default competition track")
+    prepare.add_argument("--run-profile", choices=_PROFILES, help="default run profile")
+    prepare.add_argument("--checkpoints", choices=_RETENTION, help="checkpoint retention policy")
+    prepare.add_argument("--color", choices=_COLORS, help="terminal color preference")
+    prepare.add_argument("--target-loss", type=_nonnegative_float, help="qualification target")
+    prepare.add_argument("--train-shards", type=_positive_int, help="override train shard count")
+    prepare.add_argument("--offline", action="store_true", help="forbid network access")
+    prepare.add_argument("--check-only", action="store_true", help="verify without mutation")
+    prepare.add_argument("--force", action="store_true", help="replace invalid cached shards")
+    prepare.add_argument(
+        "--timeout", type=_positive_float, default=60.0, help="per-request network timeout"
+    )
+    prepare.add_argument("--non-interactive", action="store_true", help="use flags/current defaults")
+    prepare.add_argument("--yes", action="store_true", help="accept defaults and run non-interactively")
+    prepare.add_argument("--no-doctor", action="store_true", help="skip environment diagnostics")
+    prepare.add_argument("--no-download", action="store_true", help="save settings without data work")
+    prepare.add_argument("--no-save", action="store_true", help="do not write .speedrun.toml")
+
+    doctor = commands.add_parser(
+        "doctor",
+        help="validate Python, JAX, TPU topology, storage, and cached data",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    doctor.add_argument("--path", type=Path, help="dataset cache root")
+    doctor.add_argument("--profile", choices=_PROFILES, help="data/run profile")
+    doctor.add_argument("--require-tpu", action="store_true", help="require official v4-8 topology")
+    doctor.add_argument("--quick", action="store_true", help="skip compile/collective probe")
+    doctor.add_argument("--skip-data", action="store_true", help="skip dataset integrity scan")
+    doctor.add_argument("--color", choices=_COLORS)
+
+    run = commands.add_parser(
+        "run",
+        help="execute, validate, and record one submission",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    run.add_argument("submission", help="folder name beneath submissions/")
+    run.add_argument("--track", choices=_TRACKS)
+    run.add_argument("--profile", choices=_PROFILES)
+    run.add_argument("--data-path", type=Path)
+    run.add_argument("--seed", type=_nonnegative_int, default=1337)
+    run.add_argument("--target-loss", type=_nonnegative_float)
+    run.add_argument("--timeout", type=_positive_float, help="whole-process timeout in seconds")
+    run.add_argument("--checkpoints", choices=_RETENTION)
+    run.add_argument("--color", choices=_COLORS)
+    run.add_argument("--skip-data-check", action="store_true")
+
+    verify = commands.add_parser("verify", help="re-validate a captured run and checkpoint")
+    verify.add_argument("run", help="run ID or path")
+    verify.add_argument("--track", choices=_TRACKS)
+    verify.add_argument("--profile", choices=_PROFILES)
+
+    leaderboard = commands.add_parser("leaderboard", help="render recorded qualifying scores")
+    leaderboard.add_argument("--track", choices=_TRACKS)
+    leaderboard.add_argument("--profile", choices=_PROFILES, default="official")
+    leaderboard.add_argument("--target-loss", type=_nonnegative_float)
+    leaderboard.add_argument("--all-submissions", action="store_true")
+    leaderboard.add_argument("--color", choices=_COLORS)
+
+    clone = commands.add_parser("clone", help="clone one submission into a new algorithm folder")
+    clone.add_argument("source", nargs="?", default="reference")
+    clone.add_argument("name")
+
+    settings = commands.add_parser("settings", help="show resolved local preferences")
+    settings.add_argument("--json", action="store_true")
+    return parser
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    parser = build_parser()
+    arguments = list(argv) if argv is not None else sys.argv[1:]
+    args, unknown = parser.parse_known_args(arguments)
+    if unknown and args.command != "run":
+        parser.error("unrecognized arguments: " + " ".join(unknown))
+    # Unknown arguments are legal only for `run`; conventionally they follow
+    # `--`, but parse_known_args also makes common direct flags ergonomic.
+    args.trainer_args = unknown if args.command == "run" else []
+    try:
+        if args.command == "prepare":
+            return command_prepare(args)
+        if args.command == "doctor":
+            return command_doctor(args)
+        if args.command == "run":
+            return command_run(args)
+        if args.command == "verify":
+            return command_verify(args)
+        if args.command == "leaderboard":
+            return command_leaderboard(args)
+        if args.command == "clone":
+            return command_clone(args)
+        if args.command == "settings":
+            return command_settings(args)
+        parser.error(f"unknown command {args.command!r}")
+    except (ConfigError, DataError, HarnessError, OSError, ValueError) as exc:
+        style = Style(getattr(args, "color", None) or "auto")
+        print(f"\n  {style.text('error:', 'red', 'bold')} {exc}\n", file=sys.stderr)
+        return 1
+    return 0
+
+
+def command_prepare(args: argparse.Namespace) -> int:
+    root = repo_root()
+    current = load_config(root)
+    proposed = with_overrides(
+        current,
+        {
+            "data_path": str(args.path) if args.path is not None else None,
+            "artifacts_path": str(args.artifacts) if args.artifacts is not None else None,
+            "data_profile": args.profile,
+            "default_profile": args.run_profile,
+            "default_track": args.track,
+            "checkpoint_retention": args.checkpoints,
+            "color": args.color,
+            "target_loss": args.target_loss,
+        },
+    )
+    interactive = not (args.non_interactive or args.yes)
+    if interactive and not sys.stdin.isatty():
+        raise ConfigError(
+            "prepare needs a terminal for its wizard; pass --non-interactive with explicit flags"
+        )
+    run_diagnostics = not args.no_doctor
+    data_work = not args.no_download
+    require_tpu = proposed.default_profile == "official"
+    save = not args.no_save
+    if interactive:
+        proposed, run_diagnostics, require_tpu, data_work, save = _prepare_wizard(
+            proposed,
+            run_diagnostics=run_diagnostics,
+            require_tpu=require_tpu,
+            download=data_work,
+            save=save,
+        )
+
+    style = Style(proposed.color)
+    style.banner("prepare")
+    data_path = resolve_path(proposed.data_path, root)
+    artifacts_path = resolve_path(proposed.artifacts_path, root)
+    _ensure_artifacts_inside_repo(artifacts_path, root)
+    if args.check_only and save:
+        style.note("check-only mode does not write .speedrun.toml")
+        save = False
+    if save:
+        destination = save_config(proposed, root)
+        style.ok(f"saved personal defaults to {destination.relative_to(root)}")
+    else:
+        style.note("settings are temporary (--no-save)")
+
+    if run_diagnostics:
+        style.heading("Machine diagnostics")
+        results = run_doctor(
+            environment_checks(
+                data_path=data_path,
+                profile=proposed.data_profile,
+                require_tpu=require_tpu,
+                check_data=args.check_only,
+                compile_probe=True,
+            )
+        )
+        print(_indent(render_doctor(results, color=style.enabled)))
+        if not doctor_ok(results):
+            raise ConfigError("machine diagnostics failed; resolve the errors above")
+
+    if not data_work:
+        style.note("dataset preparation skipped (--no-download)")
+        return 0
+
+    style.heading("Dataset cache")
+    manifest, default_shards = data_selection(proposed.data_profile)
+    shards = args.train_shards or default_shards
+    if args.check_only:
+        prepared = verify_dataset(manifest, data_path, train_shards=shards)
+    else:
+        progress = _progress_reporter(style)
+        prepared = prepare_data(
+            data_path,
+            manifest,
+            train_shards=shards,
+            offline=args.offline,
+            force=args.force,
+            progress=progress,
+            timeout=args.timeout,
+        )
+    _print_prepared(prepared, style)
+    return 0
+
+
+def command_doctor(args: argparse.Namespace) -> int:
+    config = load_config()
+    profile = args.profile or config.default_profile
+    path = resolve_path(args.path or config.data_path)
+    color = args.color or config.color
+    style = Style(color)
+    style.banner("doctor")
+    results = run_doctor(
+        environment_checks(
+            data_path=path,
+            profile=profile,
+            require_tpu=args.require_tpu or profile == "official",
+            check_data=not args.skip_data,
+            compile_probe=not args.quick,
+        )
+    )
+    print(_indent(render_doctor(results, color=style.enabled)))
+    return 0 if doctor_ok(results) else 1
+
+
+def command_run(args: argparse.Namespace) -> int:
+    config = load_config()
+    root = repo_root()
+    track = args.track or config.default_track
+    profile = args.profile or config.default_profile
+    color = args.color or config.color
+    style = Style(color)
+    trainer_color = "always" if style.enabled else "never"
+    target_loss = _effective_target_loss(
+        profile, requested=args.target_loss, development_default=config.target_loss
+    )
+    data_path = resolve_path(args.data_path or config.data_path, root)
+    artifacts = resolve_path(config.artifacts_path, root)
+    _ensure_artifacts_inside_repo(artifacts, root)
+    if profile == "official" and args.skip_data_check:
+        raise ConfigError("official runs require full dataset SHA-256 verification")
+    manifest, shards = data_selection(profile)
+    style.heading("Verifying cached data")
+    prepared = verify_dataset(
+        manifest,
+        data_path,
+        train_shards=shards,
+        verify_hash=not args.skip_data_check,
+    )
+    if not args.skip_data_check:
+        style.ok(
+            f"{prepared.name}: {prepared.train_tokens:,} train / "
+            f"{prepared.validation_tokens:,} validation tokens"
+        )
+    else:
+        style.note("SHA-256 scan skipped; headers and exact shard selection still checked")
+
+    dataset_id, tokenizer_id = _data_identity(profile)
+    passthrough = [
+        "--data-format",
+        "llmc",
+        "--dataset-id",
+        dataset_id,
+        "--tokenizer-id",
+        tokenizer_id,
+        "--color",
+        trainer_color,
+    ]
+    for train_file in prepared.train_files:
+        passthrough.extend(("--train-data", str(train_file)))
+    for validation_file in prepared.validation_files:
+        passthrough.extend(("--val-data", str(validation_file)))
+    forwarded = list(args.trainer_args)
+    if forwarded and forwarded[0] == "--":
+        forwarded.pop(0)
+    _reject_reserved_trainer_args(forwarded)
+    passthrough.extend(forwarded)
+    timeout = args.timeout or {"smoke": 300.0, "dev": 3600.0, "official": 21600.0}[profile]
+    retention = args.checkpoints or config.checkpoint_retention
+    reference = _reference_contract(profile) if track == "sample_efficiency" else None
+    style.banner(f"run / {track} / {profile}")
+    outcome = run_submission(
+        RunConfig(
+            repo_root=root,
+            submission=args.submission,
+            runs_dir=artifacts,
+            records_path=artifacts / "records.jsonl",
+            track=track,
+            profile=profile,
+            seed=args.seed,
+            timeout_seconds=timeout,
+            target_loss=target_loss,
+            expected_validation_tokens=(
+                prepared.validation_prefix_tokens if profile == "official" else None
+            ),
+            passthrough_args=tuple(passthrough),
+            reference_contract=reference,
+            checkpoint_retention=retention,
+            environment={},
+            provenance=_data_provenance(
+                prepared,
+                profile=profile,
+                integrity="headers+size" if args.skip_data_check else "sha256",
+                repo=root,
+            ),
+        )
+    )
+    metrics = outcome.record["metrics"]
+    qualified = bool(outcome.record["qualified"])
+    marker = style.text("QUALIFIED", "green", "bold") if qualified else style.text("NOT QUALIFIED", "yellow", "bold")
+    style.heading("Recorded result")
+    print(f"  {marker}  loss {metrics['validation_loss']:.4f}  target ≤ {target_loss:.4f}")
+    print(f"  train {metrics['train_seconds']:.3f}s  tokens {metrics['tokens_processed']:,}")
+    print(f"  run {outcome.run_id}\n")
+    return 0
+
+
+def command_verify(args: argparse.Namespace) -> int:
+    config = load_config()
+    root = repo_root()
+    artifacts = resolve_path(config.artifacts_path, root)
+    candidate = Path(args.run).expanduser()
+    run_dir = candidate.resolve() if candidate.exists() else (artifacts / args.run).resolve()
+    records = load_records(artifacts / "records.jsonl")
+    record = next(
+        (item for item in reversed(records) if item.get("run_id") == run_dir.name), None
+    )
+    track = args.track or (str(record["track"]) if record is not None else config.default_track)
+    profile = args.profile or (
+        str(record["profile"]) if record is not None else config.default_profile
+    )
+    reference = _reference_contract(profile) if track == "sample_efficiency" else None
+    result = verify_run(
+        run_dir,
+        track=track,
+        reference_contract=reference,
+        expected_validation_tokens=10_485_760 if profile == "official" else None,
+    )
+    if record is not None:
+        stdout_sha256 = sha256_file(run_dir / "stdout.log")
+        expected_stdout = record.get("logs", {}).get("stdout_sha256")
+        if stdout_sha256 != expected_stdout:
+            raise HarnessError("captured stdout hash no longer matches its immutable record")
+        expected_checkpoint = record.get("checkpoint", {}).get("sha256")
+        if result.checkpoint_sha256 != expected_checkpoint:
+            raise HarnessError("checkpoint hash no longer matches its immutable record")
+        recorded_artifacts = record.get("artifacts", {})
+        if set(result.artifacts) != set(recorded_artifacts):
+            raise HarnessError("run artifacts no longer match their immutable record")
+        for name, path in result.artifacts.items():
+            expected_artifact = recorded_artifacts.get(name, {}).get("sha256")
+            if sha256_file(path) != expected_artifact:
+                raise HarnessError(
+                    f"artifact {name!r} hash no longer matches its immutable record"
+                )
+    print(
+        f"verified {run_dir.name} ({track}/{profile}): loss={result.validation_loss:.4f}, "
+        f"tokens={result.tokens_processed:,}, checkpoint={result.checkpoint_sha256[:12]}"
+    )
+    return 0
+
+
+def command_leaderboard(args: argparse.Namespace) -> int:
+    config = load_config()
+    track = args.track or config.default_track
+    artifacts = resolve_path(config.artifacts_path)
+    records = load_records(artifacts / "records.jsonl")
+    target_loss = _effective_target_loss(
+        args.profile, requested=args.target_loss, development_default=config.target_loss
+    )
+    ranked = rank_records(
+        records,
+        track=track,
+        profile=args.profile,
+        target_loss=target_loss,
+        best_per_submission=not args.all_submissions,
+    )
+    style = Style(args.color or config.color)
+    print(f"target validation loss ≤ {target_loss:.4f}\n")
+    print(render_leaderboard(ranked, track=track, color=style.enabled))
+    return 0
+
+
+def command_clone(args: argparse.Namespace) -> int:
+    if not _NAME.fullmatch(args.source) or not _NAME.fullmatch(args.name):
+        raise ConfigError("submission names may contain only letters, digits, '.', '_' and '-'")
+    root = repo_root()
+    source = root / "submissions" / args.source
+    destination = root / "submissions" / args.name
+    if not (source / "train.py").is_file():
+        raise ConfigError(f"source submission does not exist: {source}")
+    if destination.exists():
+        raise ConfigError(f"destination already exists: {destination}")
+    destination.mkdir(parents=True)
+    shutil.copy2(source / "train.py", destination / "train.py")
+    if (source / "README.md").is_file():
+        shutil.copy2(source / "README.md", destination / "README.md")
+    print(f"cloned {args.source} -> {args.name} ({destination / 'train.py'})")
+    return 0
+
+
+def command_settings(args: argparse.Namespace) -> int:
+    config = load_config()
+    payload = asdict(config)
+    root = repo_root()
+    payload["data_path_resolved"] = str(resolve_path(config.data_path, root))
+    payload["artifacts_path_resolved"] = str(resolve_path(config.artifacts_path, root))
+    payload["config_path"] = str(config_path())
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        width = max(len(key) for key in payload)
+        for key, value in payload.items():
+            print(f"{key:<{width}}  {value}")
+    return 0
+
+
+def _prepare_wizard(
+    config: LocalConfig,
+    *,
+    run_diagnostics: bool,
+    require_tpu: bool,
+    download: bool,
+    save: bool,
+) -> tuple[LocalConfig, bool, bool, bool, bool]:
+    style = Style(config.color)
+    style.banner("interactive preparation")
+    print("  Choose personal defaults. Official data/model rules remain versioned in Git.\n")
+    data_path = _ask("Data cache root", config.data_path, style)
+    data_profile = _choose(
+        "Dataset to prepare",
+        _PROFILES,
+        config.data_profile,
+        style,
+        descriptions={
+            "smoke": "tiny generated CI data",
+            "dev": "one 100M-token FineWeb train shard",
+            "official": "nine train shards and fixed validation shard (~2.0 GB)",
+        },
+    )
+    artifacts = _ask("Persistent run/artifact directory", config.artifacts_path, style)
+    track = _choose("Default track", _TRACKS, config.default_track, style)
+    run_profile = _choose("Default run profile", _PROFILES, data_profile, style)
+    retention = _choose(
+        "Checkpoint retention",
+        _RETENTION,
+        config.checkpoint_retention,
+        style,
+        descriptions={
+            "all": "keep every checkpoint",
+            "qualifying": "keep checkpoints at or below the target",
+            "none-after-validation": "remove after harness validation",
+        },
+    )
+    color = _choose("Terminal colors", _COLORS, config.color, style)
+    target = _ask_float("Qualification loss target", config.target_loss, style)
+    run_diagnostics = _confirm("Run environment diagnostics now", run_diagnostics, style)
+    if run_diagnostics:
+        require_tpu = _confirm("Require a healthy four-chip TPU v4-8", require_tpu, style)
+    download = _confirm("Prepare/verify the selected dataset now", download, style)
+    save = _confirm("Save these personal defaults", save, style)
+    resolved = LocalConfig(
+        data_path=data_path,
+        artifacts_path=artifacts,
+        data_profile=data_profile,
+        default_profile=run_profile,
+        default_track=track,
+        checkpoint_retention=retention,
+        color=color,
+        target_loss=target,
+    ).validate()
+    return resolved, run_diagnostics, require_tpu, download, save
+
+
+def _ask(prompt: str, default: str, style: Style) -> str:
+    while True:
+        rendered = style.text(prompt, "bold")
+        answer = input(f"  {rendered} {style.text(f'[{default}]', 'dim')}: ").strip()
+        value = answer or default
+        if value:
+            return value
+
+
+def _ask_float(prompt: str, default: float, style: Style) -> float:
+    while True:
+        raw = _ask(prompt, str(default), style)
+        try:
+            value = float(raw)
+        except ValueError:
+            print("  Enter a number.")
+            continue
+        if value >= 0 and value < float("inf"):
+            return value
+        print("  Enter a finite non-negative number.")
+
+
+def _choose(
+    prompt: str,
+    choices: Sequence[str],
+    default: str,
+    style: Style,
+    descriptions: dict[str, str] | None = None,
+) -> str:
+    descriptions = descriptions or {}
+    print(f"  {style.text(prompt, 'bold')}")
+    for index, choice in enumerate(choices, 1):
+        selected = style.text("●", "cyan") if choice == default else "○"
+        detail = f" — {descriptions[choice]}" if choice in descriptions else ""
+        print(f"    {selected} {index}. {choice}{style.text(detail, 'dim')}")
+    while True:
+        answer = input(f"    {style.text(f'[{default}]', 'dim')}: ").strip()
+        if not answer:
+            return default
+        if answer.isdigit() and 1 <= int(answer) <= len(choices):
+            return choices[int(answer) - 1]
+        if answer in choices:
+            return answer
+        print(f"    Choose 1-{len(choices)} or enter a listed name.")
+
+
+def _confirm(prompt: str, default: bool, style: Style) -> bool:
+    marker = "Y/n" if default else "y/N"
+    while True:
+        answer = input(f"  {style.text(prompt, 'bold')} {style.text(f'[{marker}]', 'dim')}: ").strip().lower()
+        if not answer:
+            return default
+        if answer in {"y", "yes"}:
+            return True
+        if answer in {"n", "no"}:
+            return False
+        print("  Enter y or n.")
+
+
+def _progress_reporter(style: Style) -> Callable[[str, int, int], None]:
+    last: dict[str, int] = {}
+
+    def report(name: str, completed: int, total: int) -> None:
+        percent = 100 if total <= 0 else min(100, int(completed * 100 / total))
+        bucket = percent // 10
+        previous = last.get(name)
+        if completed != total and previous == bucket:
+            return
+        last[name] = bucket
+        if sys.stdout.isatty():
+            width = 20
+            filled = int(width * percent / 100)
+            bar = style.text("━" * filled, "green") + style.text("─" * (width - filled), "dim")
+            print(
+                f"\r  {name:<30} {bar} {percent:3d}% "
+                f"{completed / 2**20:7.1f}/{total / 2**20:.1f} MiB",
+                end="\n" if completed == total else "",
+                flush=True,
+            )
+        elif completed == total or bucket != previous:
+            print(f"  {name}: {percent}%")
+
+    return report
+
+
+def _print_prepared(prepared: PreparedDataset, style: Style) -> None:
+    style.ok(f"cache ready at {prepared.root}")
+    print(f"  manifest       sha256:{prepared.manifest_sha256[:12]}")
+    print(f"  training       {len(prepared.train_files)} shard(s), {prepared.train_tokens:,} tokens")
+    print(f"  validation     {len(prepared.validation_files)} shard(s), {prepared.validation_tokens:,} tokens")
+    print(f"  fixed prefix   {prepared.validation_prefix_tokens:,} validation predictions")
+
+
+def _reference_contract(profile: str) -> ReferenceContract:
+    dataset_id, tokenizer_id = _data_identity(profile)
+    models: dict[str, dict[str, Any]] = {
+        "smoke": {
+            "layers": 2,
+            "heads": 2,
+            "d_model": 64,
+            "mlp_mult": 4,
+            "vocab_size": 256,
+            "tied_embeddings": True,
+        },
+        "dev": {
+            "layers": 6,
+            "heads": 6,
+            "d_model": 384,
+            "mlp_mult": 4,
+            "vocab_size": 50_304,
+            "tied_embeddings": True,
+        },
+        "official": {
+            "layers": 12,
+            "heads": 12,
+            "d_model": 768,
+            "mlp_mult": 4,
+            "vocab_size": 50_304,
+            "tied_embeddings": True,
+        },
+    }
+    sequence = {"smoke": 32, "dev": 256, "official": 1024}[profile]
+    return ReferenceContract(
+        model_id="reference-gpt-v1",
+        dataset_id=dataset_id,
+        tokenizer_id=tokenizer_id,
+        sequence_length=sequence,
+        extra={"model": models[profile]},
+    )
+
+
+def _data_identity(profile: str) -> tuple[str, str]:
+    if profile == "smoke":
+        return "smoke", "synthetic-byte-v1"
+    return "fineweb10b-gpt2", "gpt2"
+
+
+def _effective_target_loss(
+    profile: str,
+    *,
+    requested: float | None,
+    development_default: float,
+) -> float:
+    if profile == "official":
+        if requested is not None and requested > OFFICIAL_TARGET_LOSS:
+            raise ConfigError(
+                f"official target may not be easier than {OFFICIAL_TARGET_LOSS:.2f}"
+            )
+        return requested if requested is not None else OFFICIAL_TARGET_LOSS
+    return requested if requested is not None else development_default
+
+
+def _data_provenance(
+    prepared: PreparedDataset,
+    *,
+    profile: str,
+    integrity: str,
+    repo: Path,
+) -> dict[str, Any]:
+    try:
+        manifest_path = prepared.manifest_path.resolve().relative_to(repo.resolve()).as_posix()
+    except ValueError:
+        manifest_path = str(prepared.manifest_path.resolve())
+    manifest_file_sha256 = (
+        sha256_file(prepared.manifest_path) if prepared.manifest_path.is_file() else None
+    )
+    return {
+        "dataset": {
+            "name": prepared.name,
+            "profile": profile,
+            "manifest": {
+                "path": manifest_path,
+                "sha256": manifest_file_sha256,
+                "canonical_sha256": prepared.manifest_sha256,
+            },
+            "integrity": integrity,
+            "train_files": [path.name for path in prepared.train_files],
+            "validation_files": [path.name for path in prepared.validation_files],
+            "train_tokens_available": prepared.train_tokens,
+            "validation_tokens_available": prepared.validation_tokens,
+            "validation_prefix_tokens": prepared.validation_prefix_tokens,
+        }
+    }
+
+
+def _ensure_artifacts_inside_repo(path: Path, root: Path) -> None:
+    try:
+        path.relative_to(root.resolve())
+    except ValueError as exc:
+        raise ConfigError(
+            f"artifact directory must stay on persistent storage inside the repository: {path}"
+        ) from exc
+
+
+def _reject_reserved_trainer_args(arguments: Sequence[str]) -> None:
+    reserved = {
+        "--output-dir",
+        "--seed",
+        "--track",
+        "--profile",
+        "--smoke",
+        "--data",
+        "--data-path",
+        "--train-data",
+        "--val-data",
+        "--data-format",
+        "--dataset-id",
+        "--tokenizer-id",
+        "--color",
+    }
+    for argument in arguments:
+        option = argument.split("=", 1)[0]
+        if option in reserved:
+            raise ConfigError(
+                f"{option} is controlled by the harness; set it before `--` "
+                "or choose a trainer-specific option"
+            )
+        if option.startswith("--"):
+            matches = sorted(flag for flag in reserved if flag.startswith(option))
+            if matches:
+                raise ConfigError(
+                    f"abbreviated option {option} could override harness-controlled "
+                    f"{matches[0]}; use the trainer option's complete name"
+                )
+
+
+def _indent(value: str) -> str:
+    return "\n".join("  " + line for line in value.splitlines())
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if not 0.0 < parsed < float("inf"):
+        raise argparse.ArgumentTypeError("must be finite and positive")
+    return parsed
+
+
+def _nonnegative_float(value: str) -> float:
+    parsed = float(value)
+    if not 0.0 <= parsed < float("inf"):
+        raise argparse.ArgumentTypeError("must be finite and non-negative")
+    return parsed
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
