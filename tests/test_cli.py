@@ -114,9 +114,9 @@ class CliTests(unittest.TestCase):
 
     def test_wizard_accepts_defaults_and_returns_complete_config(self) -> None:
         defaults = LocalConfig()
-        # Two path prompts, five menu prompts, one target prompt, and four
-        # confirmations. Empty input accepts every displayed default.
-        with patch("builtins.input", side_effect=[""] * 12):
+        # Two path prompts, one host-count prompt, five menu prompts, one target
+        # prompt, and four confirmations. Empty input accepts every default.
+        with patch("builtins.input", side_effect=[""] * 13):
             result, diagnostics, require_tpu, download, save = cli._prepare_wizard(
                 defaults,
                 run_diagnostics=True,
@@ -129,6 +129,22 @@ class CliTests(unittest.TestCase):
         self.assertTrue(require_tpu)
         self.assertTrue(download)
         self.assertTrue(save)
+
+    def test_wizard_infers_cloud_tpu_host_expression(self) -> None:
+        answers = ["", "", "", "4", "", "", "", "", "", "", "", "", "", ""]
+        with (
+            patch("builtins.input", side_effect=answers),
+            patch("speedrun.cli.infer_host_expression", return_value="slice-w-[0-3]"),
+        ):
+            result, *_ = cli._prepare_wizard(
+                LocalConfig(),
+                run_diagnostics=True,
+                require_tpu=True,
+                download=True,
+                save=True,
+            )
+        self.assertEqual(result.tpu_vm_count, 4)
+        self.assertEqual(result.tpu_vm_hosts, "slice-w-[0-3]")
 
     def test_report_admission_has_no_customization_surface(self) -> None:
         self.assertEqual(REPORT_ADMISSION_QUALIFICATION_LOSS, 3.76)

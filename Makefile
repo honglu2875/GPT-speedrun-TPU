@@ -25,7 +25,7 @@ help:
 	@printf '%s\n' \
 	  'GPT TPU speedrun workflows:' \
 	  '  make prepare   sync the frozen environment and open the setup wizard' \
-	  '  make baseline  validate the node/data and run the exact official baseline' \
+	  '  make baseline  validate configured hosts/data and run the official baseline' \
 	  '  make profile   run a 100-step XProf diagnostic, then serve it on :8791' \
 	  '  make report    rebuild report.html from integrity-checked run logs' \
 	  '' \
@@ -36,7 +36,7 @@ prepare:
 	$(UV_BASE) sync --frozen
 	$(UV_RUN) speedrun prepare
 
-# Full SHA-256 data checks plus a small BF16 matmul and four-chip collective.
+# Full SHA-256 data checks plus a small BF16 matmul and topology-wide collective.
 preflight:
 	$(UV_RUN) speedrun doctor \
 	  --path "$(DATA_PATH)" \

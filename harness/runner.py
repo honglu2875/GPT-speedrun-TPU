@@ -12,6 +12,7 @@ import secrets
 import selectors
 import signal
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -20,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO, TextIO
 
+from .cluster import build_distributed_launch_command, pdsh_environment
 from .errors import ConfigurationError, ResultValidationError, SubmissionError
 from .models import Evaluator, RunConfig, RunOutcome
 from .records import append_record
@@ -71,7 +73,7 @@ def run_submission(config: RunConfig, *, evaluator: Evaluator | None = None) -> 
     stderr_path = run_dir / "stderr.log"
     result_path = run_dir / "result.json"
 
-    command = [
+    trainer_command = [
         config.python_executable or sys.executable,
         str(submission_dir / "train.py"),
         "--config",
@@ -86,22 +88,46 @@ def run_submission(config: RunConfig, *, evaluator: Evaluator | None = None) -> 
         config.profile,
         *[str(argument) for argument in config.passthrough_args],
     ]
+    configured_environment = {
+        str(key): str(value) for key, value in config.environment.items()
+    }
+    managed_environment = {
+        "SPEEDRUN_RUN_ID": run_id,
+        "SPEEDRUN_OUTPUT_DIR": str(run_dir),
+        "SPEEDRUN_TRACK": config.track,
+        "SPEEDRUN_PROFILE": config.profile,
+        # Every attempt receives a fresh persistent cache. This keeps cold
+        # compilation reproducible and prevents run order from advantaging
+        # later submissions.
+        "JAX_COMPILATION_CACHE_DIR": str(run_dir / ".jax_cache"),
+        "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",
+        "PYTHONUNBUFFERED": "1",
+    }
     environment = os.environ.copy()
-    environment.update({str(key): str(value) for key, value in config.environment.items()})
-    environment.update(
-        {
-            "SPEEDRUN_RUN_ID": run_id,
-            "SPEEDRUN_OUTPUT_DIR": str(run_dir),
-            "SPEEDRUN_TRACK": config.track,
-            "SPEEDRUN_PROFILE": config.profile,
-            # Every attempt receives a fresh persistent cache. This keeps cold
-            # compilation reproducible and prevents run order from advantaging
-            # later submissions.
-            "JAX_COMPILATION_CACHE_DIR": str(run_dir / ".jax_cache"),
-            "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",
-            "PYTHONUNBUFFERED": "1",
+    environment.update(configured_environment)
+    environment.update(managed_environment)
+    if config.tpu_vm_count > 1:
+        remote_environment = {
+            **configured_environment,
+            **managed_environment,
+            # Peer filesystems are independent. Keep their fresh compilation
+            # caches ephemeral instead of leaving shadow run directories.
+            "JAX_COMPILATION_CACHE_DIR": f"/tmp/speedrun-jax-cache-{run_id}",
+            "SPEEDRUN_CLUSTER_WORKER": "1",
+            "SPEEDRUN_CONTROLLER_HOSTNAME": socket.gethostname(),
+            "SPEEDRUN_DISTRIBUTED": "1",
+            "SPEEDRUN_PROCESS_COUNT": str(config.tpu_vm_count),
         }
-    )
+        command = build_distributed_launch_command(
+            host_expression=config.tpu_vm_hosts,
+            host_count=config.tpu_vm_count,
+            cwd=submission_dir,
+            command=trainer_command,
+            environment=remote_environment,
+        )
+        environment = pdsh_environment(environment)
+    else:
+        command = trainer_command
     started_at = datetime.now(timezone.utc)
     monotonic_start = time.perf_counter()
     with stdout_path.open("wb") as stdout_handle, stderr_path.open("wb") as stderr_handle:
@@ -210,6 +236,7 @@ def run_submission(config: RunConfig, *, evaluator: Evaluator | None = None) -> 
             "stderr_sha256": _sha256_bytes(stderr_path.read_bytes()),
         },
         "command": command,
+        "trainer_command": trainer_command,
         "provenance": provenance,
     }
     if validated.evaluations is not None:
@@ -380,17 +407,19 @@ def _validate_payload_identity(payload: Mapping[str, Any], config: RunConfig) ->
                 f"expected {expected_value!r}, got {actual!r}"
             )
     if config.profile == "official":
-        _validate_official_system(payload.get("system"))
+        _validate_official_system(
+            payload.get("system"), expected_process_count=config.tpu_vm_count
+        )
 
 
-def _validate_official_system(value: Any) -> None:
+def _validate_official_system(value: Any, *, expected_process_count: int = 1) -> None:
     if not isinstance(value, dict):
         raise ResultValidationError("official result system must be a JSON object")
     expected_scalars = {
         "platform": "tpu",
-        "device_count": 4,
+        "device_count": 4 * expected_process_count,
         "local_device_count": 4,
-        "process_count": 1,
+        "process_count": expected_process_count,
     }
     for name, expected in expected_scalars.items():
         actual = value.get(name)
@@ -418,6 +447,22 @@ def _validate_config(
         raise ConfigurationError("track must be 'open' or 'sample_efficiency'")
     if config.checkpoint_retention not in ("all", "qualifying", "none-after-validation"):
         raise ConfigurationError("invalid checkpoint retention policy")
+    if (
+        isinstance(config.tpu_vm_count, bool)
+        or not isinstance(config.tpu_vm_count, int)
+        or config.tpu_vm_count <= 0
+    ):
+        raise ConfigurationError("tpu_vm_count must be a positive integer")
+    if not isinstance(config.tpu_vm_hosts, str):
+        raise ConfigurationError("tpu_vm_hosts must be a string")
+    if config.tpu_vm_count > 1 and not config.tpu_vm_hosts.strip():
+        raise ConfigurationError(
+            "tpu_vm_hosts is required when tpu_vm_count is greater than 1"
+        )
+    if any(character.isspace() for character in config.tpu_vm_hosts) or any(
+        character in config.tpu_vm_hosts for character in "\x00\r\n"
+    ):
+        raise ConfigurationError("tpu_vm_hosts must be a whitespace-free single line")
     if isinstance(config.seed, bool) or not isinstance(config.seed, int) or config.seed < 0:
         raise ConfigurationError("seed must be a non-negative integer")
     timeout_seconds = _finite_config_number(config.timeout_seconds)

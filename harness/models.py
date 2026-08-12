@@ -60,6 +60,8 @@ class RunConfig:
     python_executable: str | None = None
     environment: Mapping[str, str] = field(default_factory=dict)
     provenance: Mapping[str, Any] = field(default_factory=dict)
+    tpu_vm_count: int = 1
+    tpu_vm_hosts: str = ""
 
 
 @dataclass(frozen=True)

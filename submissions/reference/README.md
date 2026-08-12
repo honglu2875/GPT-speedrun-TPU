@@ -58,6 +58,13 @@ The direct trainer interface is `--downstream-manifest MANIFEST
 provides context but is not scored. Omitting both forms skips downstream
 evaluation while preserving the FineWeb result contract.
 
+On a configured multi-host TPU slice, the same file runs once per VM and calls
+`jax.distributed.initialize()` before device discovery. The global batch is
+partitioned first by `jax.process_index()` and then across each host's four
+local devices; model and optimizer state remain replicated. The harness marks
+its controller hostname separately because Cloud TPU's JAX process order need
+not match `-w-N`. Only that controller writes logs and artifacts.
+
 The `official` YAML profile uses the GPT-2-small shape (12 layers, width 768, 12
 heads), sequence length 1024, global batch 32, BF16 compute, and an exact
 624,984,064-token budget. This resolves to 19,073 optimizer steps. The full

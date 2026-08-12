@@ -1,8 +1,8 @@
 # GPT Speedrun TPU
 
-A collaborative GPT training speedrun for one Cloud TPU v4-8. Every algorithm
-is a polished JAX entry program named `train.py` with a sibling `config.yaml`;
-shared code handles
+A collaborative GPT training speedrun for Cloud TPU v4 slices, from a v4-8 to
+larger multi-host slices. Every algorithm is a polished JAX entry program named
+`train.py` with a sibling `config.yaml`; shared code handles
 reproducible data, machine checks, run capture, protocol validation, and
 leaderboards.
 
@@ -30,7 +30,7 @@ make report
 | Target | Purpose |
 |---|---|
 | `make prepare` | synchronize the frozen uv environment, then open the interactive setup wizard |
-| `make baseline` | verify the official data and four-chip TPU, then run the versioned reference configuration |
+| `make baseline` | verify every configured TPU VM and its data, then run the versioned reference configuration |
 | `make profile` | run a validation-free 100-step diagnostic, capture XProf steps 11–20, then serve the trace on port 8791 |
 | `make report` | integrity-check completed runs and rebuild the standalone `report.html` dashboard |
 
@@ -42,7 +42,7 @@ uv --cache-dir /tmp/uv-cache run --frozen --no-sync speedrun prepare
 ```
 
 It asks for the data-cache root, data and run profiles, persistent artifact
-directory, default track, checkpoint retention, colors, and a
+directory, TPU VM host count, default track, checkpoint retention, colors, and a
 smoke/development loss target. It can then probe JAX/TPU health and prepare the
 selected dataset. Personal choices are stored in the gitignored
 `.speedrun.toml`; official constants remain versioned in Git. The personal
@@ -61,12 +61,51 @@ downloads, free-space checks, and exact header/length/SHA-256 validation. It
 never deletes unrelated files. Because `/dev/shm` is ephemeral, preparation may
 need to restore the data after a reboot.
 
-For automation, bypass the questions:
+### Multi-host TPU slices
+
+A Cloud TPU v4-32 is one slice spread across four TPU VMs, with four TPU v4
+chips attached to each VM. It is not four independent v4-8 slices. Run
+`make prepare` on worker 0, answer `4` for the TPU VM host count, and accept the
+inferred expression when the hostnames follow Cloud TPU's usual convention:
+
+```text
+t1v-n-a09f5679-w-[0-3]
+```
+
+The expression is ordinary `pdsh` host-list syntax; a comma-separated explicit
+list also works. The controller needs `pdsh`, `scp`, and non-interactive SSH to
+itself and every peer. Speedrun tests that access, but it never creates, copies,
+or modifies SSH keys. If the probe fails, add this controller's public key to the
+same user's `~/.ssh/authorized_keys` on the TPU VMs, verify
+`pdsh -R ssh -w HOSTS hostname`, and rerun preparation.
+
+After the SSH probe succeeds, preparation archives the current checkout
+(including dirty and untracked experiment files but excluding Git metadata,
+the virtual environment, caches, and run artifacts), copies it to the same
+absolute path on every peer, installs `uv` there if needed with Astral's
+official installer, synchronizes the frozen environment, and prepares each
+VM's local data cache. `make baseline` repeats the source synchronization and
+automatically launches the trainer on all configured hosts through `pdsh`.
+
+Every trainer process calls `jax.distributed.initialize()` before its first
+device query. JAX's runtime rank is `jax.process_index()`; there is no launcher
+`RANK` variable to trust. Training and evaluation loaders produce a distinct
+rank-local portion of each global batch, while JAX arrays span the whole TPU
+mesh. Cloud TPU's JAX rank order need not match the `-w-N` hostname suffix, so
+the launcher explicitly marks its controller hostname; only that VM emits
+human logs, checkpoints, metrics, and the final result consumed by the harness.
+
+This path targets a single multi-host TPU slice such as v4-32. Cloud TPU
+Multislice (multiple separately provisioned slices connected over DCN) also
+needs a hybrid ICI/DCN mesh and is a distinct scaling mode.
+
+For automation on a four-host v4-32, bypass the questions:
 
 ```bash
 uv run --frozen --no-sync speedrun prepare \
   --non-interactive --path shm/ --profile official \
-  --run-profile official --track open --checkpoints qualifying
+  --run-profile official --track open --checkpoints qualifying \
+  --tpu-vm-count 4 --tpu-vm-hosts 't1v-n-a09f5679-w-[0-3]'
 ```
 
 ## Data profiles
@@ -97,6 +136,10 @@ make baseline
 uv run --frozen --no-sync speedrun prepare --non-interactive \
   --path shm/ --profile smoke --run-profile smoke --no-doctor
 uv run --frozen --no-sync speedrun run reference --profile smoke
+
+# Run the versioned official configuration (compare timings on like hardware)
+uv run --frozen --no-sync speedrun run reference \
+  --track open --profile official
 
 # Short diagnostic overrides follow --; experiment settings stay in config.yaml
 uv run --frozen --no-sync speedrun run reference --profile dev -- \
@@ -137,6 +180,10 @@ excluded), sustaining about **364k tokens/s**, **313 analytic TFLOP/s**, and
 Fresh10 macro loss **3.95959**. That exact token budget is now fixed for
 official open-track comparisons while we improve the architecture, initialization,
 optimizer, and kernels.
+
+That calibration is a v4-8 result. A v4-32 run is validly recorded with its
+16-device/four-process system identity, but its wall-clock score is not a
+like-for-like hardware comparison with the original v4-8 number.
 
 ### TPU kernel baseline
 

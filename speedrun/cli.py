@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import sys
 import time
@@ -25,6 +26,15 @@ from harness import (
     run_doctor,
     run_submission,
     verify_run,
+)
+from harness.cluster import (
+    ClusterError,
+    ClusterInventory,
+    bootstrap_uv,
+    infer_host_expression,
+    probe_cluster,
+    run_pdsh,
+    sync_workspace,
 )
 
 from .config import (
@@ -62,6 +72,10 @@ OFFICIAL_TARGET_LOSS = 3.28
 # global batch/sequence shapes must divide this exactly; a future masked final
 # batch can relax that restriction without changing the comparison budget.
 OFFICIAL_OPEN_TRAINING_TOKENS = 624_984_064
+_CLUSTER_WORKER_ENV = "SPEEDRUN_CLUSTER_WORKER"
+_CONTROLLER_HOST_ENV = "SPEEDRUN_CONTROLLER_HOSTNAME"
+_DISTRIBUTED_ENV = "SPEEDRUN_DISTRIBUTED"
+_PROCESS_COUNT_ENV = "SPEEDRUN_PROCESS_COUNT"
 
 
 class Style:
@@ -109,7 +123,7 @@ class Style:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="speedrun",
-        description="Prepare, run, and score single-entry JAX trainers on TPU v4-8.",
+        description="Prepare, run, and score single-entry JAX trainers on TPU v4 slices.",
     )
     parser.add_argument("--version", action="version", version="%(prog)s 0.1.0")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -122,6 +136,15 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--path", type=Path, help="exact dataset cache root (for example shm/)")
     prepare.add_argument("--profile", choices=_PROFILES, help="dataset profile to prepare")
     prepare.add_argument("--artifacts", type=Path, help="persistent run artifact directory")
+    prepare.add_argument(
+        "--tpu-vm-count",
+        type=_positive_int,
+        help="number of TPU VM hosts participating in one JAX job",
+    )
+    prepare.add_argument(
+        "--tpu-vm-hosts",
+        help="pdsh expression containing every TPU VM host",
+    )
     prepare.add_argument("--track", choices=_TRACKS, help="default competition track")
     prepare.add_argument("--run-profile", choices=_PROFILES, help="default run profile")
     prepare.add_argument("--checkpoints", choices=_RETENTION, help="checkpoint retention policy")
@@ -151,7 +174,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     doctor.add_argument("--path", type=Path, help="dataset cache root")
     doctor.add_argument("--profile", choices=_PROFILES, help="data/run profile")
-    doctor.add_argument("--require-tpu", action="store_true", help="require official v4-8 topology")
+    doctor.add_argument(
+        "--require-tpu",
+        action="store_true",
+        help="require the configured TPU v4 topology",
+    )
     doctor.add_argument("--quick", action="store_true", help="skip compile/collective probe")
     doctor.add_argument("--skip-data", action="store_true", help="skip dataset integrity scan")
     doctor.add_argument("--color", choices=_COLORS)
@@ -236,7 +263,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         if args.command == "settings":
             return command_settings(args)
         parser.error(f"unknown command {args.command!r}")
-    except (ConfigError, DataError, HarnessError, OSError, ValueError) as exc:
+    except (ClusterError, ConfigError, DataError, HarnessError, OSError, ValueError) as exc:
         style = Style(getattr(args, "color", None) or "auto")
         print(f"\n  {style.text('error:', 'red', 'bold')} {exc}\n", file=sys.stderr)
         return 1
@@ -251,6 +278,8 @@ def command_prepare(args: argparse.Namespace) -> int:
         {
             "data_path": str(args.path) if args.path is not None else None,
             "artifacts_path": str(args.artifacts) if args.artifacts is not None else None,
+            "tpu_vm_count": args.tpu_vm_count,
+            "tpu_vm_hosts": args.tpu_vm_hosts,
             "data_profile": args.profile,
             "default_profile": args.run_profile,
             "default_track": args.track,
@@ -291,13 +320,15 @@ def command_prepare(args: argparse.Namespace) -> int:
     else:
         style.note("settings are temporary (--no-save)")
 
-    if run_diagnostics:
+    cluster_controller = proposed.tpu_vm_count > 1 and not _is_cluster_worker()
+    if run_diagnostics and not cluster_controller:
         style.heading("Machine diagnostics")
         results = run_doctor(
             environment_checks(
                 data_path=data_path,
                 profile=proposed.data_profile,
                 require_tpu=require_tpu,
+                expected_process_count=_expected_process_count(proposed),
                 check_data=args.check_only,
                 compile_probe=True,
             )
@@ -308,38 +339,60 @@ def command_prepare(args: argparse.Namespace) -> int:
 
     if not data_work:
         style.note("dataset preparation skipped (--no-download)")
-        return 0
-
-    style.heading("Dataset cache")
-    manifest, default_shards = data_selection(proposed.data_profile)
-    shards = args.train_shards or default_shards
-    if args.check_only:
-        prepared = verify_dataset(manifest, data_path, train_shards=shards)
     else:
-        progress = _progress_reporter(style)
-        prepared = prepare_data(
-            data_path,
-            manifest,
-            train_shards=shards,
-            offline=args.offline,
-            force=args.force,
-            progress=progress,
-            timeout=args.timeout,
-        )
-    _print_prepared(prepared, style)
-    if proposed.data_profile == "official":
-        style.heading("Fresh-domain diagnostic")
+        style.heading("Dataset cache")
+        manifest, default_shards = data_selection(proposed.data_profile)
+        shards = args.train_shards or default_shards
         if args.check_only:
-            fresh10 = verify_fresh10(data_path)
+            prepared = verify_dataset(manifest, data_path, train_shards=shards)
         else:
-            fresh10 = prepare_fresh10(
+            progress = _progress_reporter(style)
+            prepared = prepare_data(
                 data_path,
+                manifest,
+                train_shards=shards,
                 offline=args.offline,
                 force=args.force,
-                progress=_progress_reporter(style),
+                progress=progress,
                 timeout=args.timeout,
             )
-        _print_fresh10(fresh10, style)
+        _print_prepared(prepared, style)
+        if proposed.data_profile == "official":
+            style.heading("Fresh-domain diagnostic")
+            if args.check_only:
+                fresh10 = verify_fresh10(data_path)
+            else:
+                fresh10 = prepare_fresh10(
+                    data_path,
+                    offline=args.offline,
+                    force=args.force,
+                    progress=_progress_reporter(style),
+                    timeout=args.timeout,
+                )
+            _print_fresh10(fresh10, style)
+
+    if cluster_controller:
+        inventory = _prepare_cluster(
+            proposed,
+            args,
+            root=root,
+            artifacts_path=artifacts_path,
+            data_work=data_work,
+            style=style,
+        )
+        if run_diagnostics:
+            style.heading("Distributed machine diagnostics")
+            _run_cluster_doctor(
+                proposed,
+                inventory,
+                profile=proposed.data_profile,
+                data_path=proposed.data_path,
+                require_tpu=require_tpu,
+                check_data=data_work or args.check_only,
+                quick=False,
+                color=proposed.color,
+                root=root,
+            )
     return 0
 
 
@@ -348,19 +401,41 @@ def command_doctor(args: argparse.Namespace) -> int:
     profile = args.profile or config.default_profile
     path = resolve_path(args.path or config.data_path)
     color = args.color or config.color
+    if config.tpu_vm_count > 1 and not _is_cluster_worker():
+        inventory = _probe_configured_cluster(config)
+        return _run_cluster_doctor(
+            config,
+            inventory,
+            profile=profile,
+            data_path=str(args.path or config.data_path),
+            require_tpu=args.require_tpu or profile == "official",
+            check_data=not args.skip_data,
+            quick=args.quick,
+            color=color,
+            root=repo_root(),
+        )
+
+    process_index = _initialize_distributed_worker(config)
+    is_controller = _is_controller_process(process_index)
     style = Style(color)
-    style.banner("doctor")
+    if is_controller:
+        style.banner("doctor")
     results = run_doctor(
         environment_checks(
             data_path=path,
             profile=profile,
             require_tpu=args.require_tpu or profile == "official",
+            expected_process_count=_expected_process_count(config),
             check_data=not args.skip_data,
             compile_probe=not args.quick,
         )
     )
-    print(_indent(render_doctor(results, color=style.enabled)))
-    return 0 if doctor_ok(results) else 1
+    healthy = doctor_ok(results)
+    if is_controller:
+        print(_indent(render_doctor(results, color=style.enabled)))
+    elif not healthy:
+        print(render_doctor(results, color=False), file=sys.stderr)
+    return 0 if healthy else 1
 
 
 def command_run(args: argparse.Namespace) -> int:
@@ -402,6 +477,17 @@ def command_run(args: argparse.Namespace) -> int:
             f"{fresh10.name}: {len(fresh10.domains)} domains / "
             f"{fresh10.scored_tokens:,} scored tokens"
         )
+
+    if config.tpu_vm_count > 1:
+        style.heading("Synchronizing TPU VM cluster")
+        inventory = _probe_configured_cluster(config)
+        sync_workspace(
+            root,
+            inventory,
+            artifacts_path=artifacts,
+            data_path=data_path,
+        )
+        style.ok(f"current source synchronized to {len(inventory.remote_hosts)} peer VMs")
 
     dataset_id, tokenizer_id = _data_identity(profile)
     passthrough = [
@@ -458,13 +544,21 @@ def command_run(args: argparse.Namespace) -> int:
             reference_contract=reference,
             checkpoint_retention=retention,
             environment={},
-            provenance=_data_provenance(
-                prepared,
-                profile=profile,
-                integrity="headers+size" if args.skip_data_check else "sha256",
-                repo=root,
-                fresh10=fresh10,
-            ),
+            provenance={
+                **_data_provenance(
+                    prepared,
+                    profile=profile,
+                    integrity="headers+size" if args.skip_data_check else "sha256",
+                    repo=root,
+                    fresh10=fresh10,
+                ),
+                "cluster": {
+                    "tpu_vm_count": config.tpu_vm_count,
+                    "tpu_vm_hosts": config.tpu_vm_hosts,
+                },
+            },
+            tpu_vm_count=config.tpu_vm_count,
+            tpu_vm_hosts=config.tpu_vm_hosts,
         )
     )
     metrics = outcome.record["metrics"]
@@ -624,6 +718,195 @@ def command_settings(args: argparse.Namespace) -> int:
     return 0
 
 
+def _prepare_cluster(
+    config: LocalConfig,
+    args: argparse.Namespace,
+    *,
+    root: Path,
+    artifacts_path: Path,
+    data_work: bool,
+    style: Style,
+) -> ClusterInventory:
+    style.heading("TPU VM cluster")
+    inventory = probe_cluster(config.tpu_vm_hosts, config.tpu_vm_count)
+    style.ok(
+        f"passwordless SSH ready on {len(inventory.hosts)} hosts "
+        f"({len(inventory.remote_hosts)} peer VMs)"
+    )
+    if args.check_only:
+        style.note("check-only mode does not synchronize source or environments")
+    else:
+        style.note("synchronizing current source and personal settings to peer VMs")
+        sync_workspace(
+            root,
+            inventory,
+            artifacts_path=artifacts_path,
+            data_path=resolve_path(config.data_path, root),
+        )
+        style.note("synchronizing the frozen uv environment on peer VMs")
+        bootstrap_uv(root, inventory.remote_hosts, offline=args.offline)
+
+    if data_work:
+        style.note("preparing the selected dataset independently on peer VMs")
+        _run_remote_prepare(config, args, inventory, root=root)
+    return inventory
+
+
+def _run_remote_prepare(
+    config: LocalConfig,
+    args: argparse.Namespace,
+    inventory: ClusterInventory,
+    *,
+    root: Path,
+) -> None:
+    if not inventory.remote_hosts:
+        return
+    command = [
+        str(root / ".venv" / "bin" / "python"),
+        "-m",
+        "speedrun",
+        "prepare",
+        "--non-interactive",
+        "--no-save",
+        "--no-doctor",
+        "--path",
+        config.data_path,
+        "--profile",
+        config.data_profile,
+        "--artifacts",
+        config.artifacts_path,
+        "--tpu-vm-count",
+        str(config.tpu_vm_count),
+        "--tpu-vm-hosts",
+        config.tpu_vm_hosts,
+        "--track",
+        config.default_track,
+        "--run-profile",
+        config.default_profile,
+        "--checkpoints",
+        config.checkpoint_retention,
+        "--color",
+        "never",
+        "--target-loss",
+        str(config.target_loss),
+        "--timeout",
+        str(args.timeout),
+    ]
+    if args.train_shards is not None:
+        command.extend(("--train-shards", str(args.train_shards)))
+    if args.offline:
+        command.append("--offline")
+    if args.check_only:
+        command.append("--check-only")
+    if args.force:
+        command.append("--force")
+    remote = (
+        f"cd {shlex.quote(str(root.resolve()))} && "
+        f"env {_CLUSTER_WORKER_ENV}=1 {shlex.join(command)}"
+    )
+    run_pdsh(
+        inventory.remote_hosts,
+        remote,
+        labels=True,
+        timeout=max(900.0, float(args.timeout) * 20.0),
+    )
+
+
+def _probe_configured_cluster(config: LocalConfig) -> ClusterInventory:
+    if config.tpu_vm_count <= 1:
+        raise ConfigError("multi-host operation requires tpu_vm_count greater than 1")
+    return probe_cluster(config.tpu_vm_hosts, config.tpu_vm_count)
+
+
+def _run_cluster_doctor(
+    config: LocalConfig,
+    inventory: ClusterInventory,
+    *,
+    profile: str,
+    data_path: str,
+    require_tpu: bool,
+    check_data: bool,
+    quick: bool,
+    color: str,
+    root: Path,
+) -> int:
+    command = [
+        str(root / ".venv" / "bin" / "python"),
+        "-m",
+        "speedrun",
+        "doctor",
+        "--path",
+        data_path,
+        "--profile",
+        profile,
+        "--color",
+        color,
+    ]
+    if require_tpu:
+        command.append("--require-tpu")
+    if not check_data:
+        command.append("--skip-data")
+    if quick:
+        command.append("--quick")
+    remote = (
+        f"cd {shlex.quote(str(root.resolve()))} && env "
+        f"{_CLUSTER_WORKER_ENV}=1 "
+        f"{_CONTROLLER_HOST_ENV}={shlex.quote(inventory.reported_hostnames[inventory.local_host])} "
+        f"{_DISTRIBUTED_ENV}=1 "
+        f"{_PROCESS_COUNT_ENV}={config.tpu_vm_count} {shlex.join(command)}"
+    )
+    run_pdsh(
+        inventory.hosts,
+        remote,
+        labels=True,
+        timeout=900.0,
+    )
+    return 0
+
+
+def _is_cluster_worker() -> bool:
+    return os.environ.get(_CLUSTER_WORKER_ENV) == "1"
+
+
+def _expected_process_count(config: LocalConfig) -> int:
+    raw = os.environ.get(_PROCESS_COUNT_ENV)
+    if raw is None:
+        return config.tpu_vm_count
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{_PROCESS_COUNT_ENV} must be a positive integer") from exc
+    if value <= 0:
+        raise ConfigError(f"{_PROCESS_COUNT_ENV} must be a positive integer")
+    return value
+
+
+def _is_controller_process(process_index: int) -> bool:
+    configured = os.environ.get(_CONTROLLER_HOST_ENV)
+    if configured is None:
+        return process_index == 0
+    local = os.uname().nodename.strip().split(".", 1)[0]
+    expected = configured.strip().split(".", 1)[0]
+    if not expected:
+        raise ConfigError(f"{_CONTROLLER_HOST_ENV} may not be empty")
+    return local == expected
+
+
+def _initialize_distributed_worker(config: LocalConfig) -> int:
+    expected = _expected_process_count(config)
+    if not _is_cluster_worker() or expected <= 1:
+        return 0
+    import jax
+
+    jax.distributed.initialize()
+    actual = int(jax.process_count())
+    if actual != expected:
+        raise ConfigError(
+            f"JAX discovered {actual} processes, but prepare configured {expected} TPU VM hosts"
+        )
+    return int(jax.process_index())
+
+
 def _prepare_wizard(
     config: LocalConfig,
     *,
@@ -648,6 +931,15 @@ def _prepare_wizard(
         },
     )
     artifacts = _ask("Persistent run/artifact directory", config.artifacts_path, style)
+    tpu_vm_count = _ask_int("TPU VM hosts in this JAX job", config.tpu_vm_count, style)
+    if tpu_vm_count > 1:
+        inferred_hosts = infer_host_expression(tpu_vm_count)
+        default_hosts = config.tpu_vm_hosts if config.tpu_vm_hosts else inferred_hosts
+        if not default_hosts:
+            default_hosts = f"tpu-worker-[0-{tpu_vm_count - 1}]"
+        tpu_vm_hosts = _ask("pdsh host expression", default_hosts, style)
+    else:
+        tpu_vm_hosts = ""
     track = _choose("Default track", _TRACKS, config.default_track, style)
     run_profile = _choose("Default run profile", _PROFILES, data_profile, style)
     retention = _choose(
@@ -667,12 +959,18 @@ def _prepare_wizard(
     )
     run_diagnostics = _confirm("Run environment diagnostics now", run_diagnostics, style)
     if run_diagnostics:
-        require_tpu = _confirm("Require a healthy four-chip TPU v4-8", require_tpu, style)
+        require_tpu = _confirm(
+            "Require four healthy TPU v4 chips per configured VM",
+            require_tpu,
+            style,
+        )
     download = _confirm("Prepare/verify the selected dataset now", download, style)
     save = _confirm("Save these personal defaults", save, style)
     resolved = LocalConfig(
         data_path=data_path,
         artifacts_path=artifacts,
+        tpu_vm_count=tpu_vm_count,
+        tpu_vm_hosts=tpu_vm_hosts,
         data_profile=data_profile,
         default_profile=run_profile,
         default_track=track,
@@ -703,6 +1001,19 @@ def _ask_float(prompt: str, default: float, style: Style) -> float:
         if value >= 0 and value < float("inf"):
             return value
         print("  Enter a finite non-negative number.")
+
+
+def _ask_int(prompt: str, default: int, style: Style) -> int:
+    while True:
+        raw = _ask(prompt, str(default), style)
+        try:
+            value = int(raw)
+        except ValueError:
+            print("  Enter a positive integer.")
+            continue
+        if value > 0:
+            return value
+        print("  Enter a positive integer.")
 
 
 def _choose(

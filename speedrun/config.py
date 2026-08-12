@@ -20,6 +20,8 @@ class ConfigError(ValueError):
 class LocalConfig:
     data_path: str = "shm"
     artifacts_path: str = "runs"
+    tpu_vm_count: int = 1
+    tpu_vm_hosts: str = ""
     data_profile: str = "official"
     default_profile: str = "official"
     default_track: str = "open"
@@ -28,6 +30,18 @@ class LocalConfig:
     target_loss: float = 3.28
 
     def validate(self) -> "LocalConfig":
+        if isinstance(self.tpu_vm_count, bool) or not isinstance(self.tpu_vm_count, int):
+            raise ConfigError("tpu_vm_count must be a positive integer")
+        if self.tpu_vm_count <= 0:
+            raise ConfigError("tpu_vm_count must be a positive integer")
+        if not isinstance(self.tpu_vm_hosts, str):
+            raise ConfigError("tpu_vm_hosts must be a string")
+        if any(character in self.tpu_vm_hosts for character in "\x00\r\n"):
+            raise ConfigError("tpu_vm_hosts must be a single-line pdsh expression")
+        if self.tpu_vm_count > 1 and not self.tpu_vm_hosts.strip():
+            raise ConfigError("tpu_vm_hosts is required when tpu_vm_count is greater than 1")
+        if any(character.isspace() for character in self.tpu_vm_hosts):
+            raise ConfigError("tpu_vm_hosts may not contain whitespace")
         if self.data_profile not in {"smoke", "dev", "official"}:
             raise ConfigError("data_profile must be smoke, dev, or official")
         if self.default_profile not in {"smoke", "dev", "official"}:
@@ -95,6 +109,8 @@ def save_config(config: LocalConfig, root: Path | None = None) -> Path:
             encoded = _toml_string(value)
         elif isinstance(value, float):
             encoded = repr(value)
+        elif isinstance(value, int) and not isinstance(value, bool):
+            encoded = str(value)
         else:  # defensive for future scalar settings
             raise ConfigError(f"cannot encode setting {key}")
         lines.append(f"{key} = {encoded}")
@@ -134,4 +150,3 @@ __all__ = [
     "save_config",
     "with_overrides",
 ]
-
