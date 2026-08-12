@@ -1,12 +1,13 @@
 [project]
 name = "gpt-speedrun-tpu"
 version = "0.1.0"
-description = "A single-file GPT training speedrun and competition harness for TPU v4-8"
+description = "A single-entry GPT training speedrun and competition harness for TPU v4-8"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 license = "Apache-2.0"
 dependencies = [
     "jax[tpu]==0.11.0",
+    "pyyaml==6.0.3",
 ]
 
 [project.scripts]

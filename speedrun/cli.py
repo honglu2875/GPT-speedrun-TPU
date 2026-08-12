@@ -594,10 +594,14 @@ def command_clone(args: argparse.Namespace) -> int:
     destination = root / "submissions" / args.name
     if not (source / "train.py").is_file():
         raise ConfigError(f"source submission does not exist: {source}")
+    source_config = source / "config.yaml"
+    if not source_config.is_file() or source_config.is_symlink():
+        raise ConfigError(f"source submission configuration does not exist: {source_config}")
     if destination.exists():
         raise ConfigError(f"destination already exists: {destination}")
     destination.mkdir(parents=True)
     shutil.copy2(source / "train.py", destination / "train.py")
+    shutil.copy2(source_config, destination / "config.yaml")
     if (source / "README.md").is_file():
         shutil.copy2(source / "README.md", destination / "README.md")
     print(f"cloned {args.source} -> {args.name} ({destination / 'train.py'})")
@@ -954,6 +958,7 @@ def _ensure_artifacts_inside_repo(path: Path, root: Path) -> None:
 
 def _reject_reserved_trainer_args(arguments: Sequence[str]) -> None:
     reserved = {
+        "--config",
         "--output-dir",
         "--seed",
         "--track",

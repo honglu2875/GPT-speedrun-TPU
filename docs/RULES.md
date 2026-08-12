@@ -1,7 +1,7 @@
 # GPT Speedrun TPU rules
 
 This benchmark asks a deliberately simple question: how quickly, or with how
-few training tokens, can a single-file JAX trainer reach the target loss on one
+few training tokens, can a single-entry JAX trainer reach the target loss on one
 Cloud TPU v4-8?
 
 The project is collaborative. Submissions are short enough to review by hand;
@@ -94,16 +94,22 @@ compilation and synchronization, and no profiled timing enters the leaderboard.
 
 ## Submission shape
 
-Each algorithm is a directory containing the same entry filename:
+Each algorithm is a directory containing the same entry and configuration
+filenames:
 
 ```text
 submissions/<algorithm>/train.py
+submissions/<algorithm>/config.yaml
 ```
 
 Fundamental repository utilities—data validation, result protocol, terminal
 presentation, and run recording—may be imported. The model, optimizer, schedule,
-and novel training logic should remain visible in `train.py`. Avoid vendored
-frameworks, generated code, or hidden algorithm-specific modules.
+and novel training logic should remain visible in `train.py`; static experiment
+choices belong in the strict, versioned sibling YAML. The harness owns the
+configuration path, records its hash, and clones it with the entry script.
+Runtime paths, seed, track/profile identity, and profiling destinations may stay
+as arguments. Avoid vendored frameworks, generated code, or hidden
+algorithm-specific modules.
 
 A completed run emits the versioned machine-readable result required by the
 harness and writes a portable parameter checkpoint beneath its assigned output
@@ -139,7 +145,7 @@ The version-one harness validates result structure, identities, finite metrics,
 artifact containment, and hashes. It does not yet reload arbitrary submission
 checkpoints or independently recompute loss; qualification is therefore
 provisional and based on the submission's deterministic evaluation. Human
-review checks the one-file evaluator and can rerun the captured command before
+review checks the entry-file evaluator and can rerun the captured command before
 accepting a record. A future checkpoint-evaluator protocol can promote this to
 automatic independent validation without changing the two scores.
 
@@ -154,4 +160,5 @@ is planned once the reference schedule has been calibrated.
 Reviewers may reject results that violate the spirit of training from scratch,
 use validation information for optimization, miscount tokens, exploit numerical
 errors, or make the submitted result impractical to reproduce. New techniques
-are welcome when their behavior is clear in the one-file implementation.
+are welcome when their behavior is clear in the entry-file implementation and
+its sibling experiment config.

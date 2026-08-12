@@ -1,7 +1,8 @@
 # GPT Speedrun TPU
 
 A collaborative GPT training speedrun for one Cloud TPU v4-8. Every algorithm
-is a polished single-file JAX program named `train.py`; shared code handles
+is a polished JAX entry program named `train.py` with a sibling `config.yaml`;
+shared code handles
 reproducible data, machine checks, run capture, protocol validation, and
 leaderboards.
 
@@ -29,7 +30,7 @@ make report
 | Target | Purpose |
 |---|---|
 | `make prepare` | synchronize the frozen uv environment, then open the interactive setup wizard |
-| `make baseline` | verify the official data and four-chip TPU, then run the fully explicit reference baseline |
+| `make baseline` | verify the official data and four-chip TPU, then run the versioned reference configuration |
 | `make profile` | run a validation-free 100-step diagnostic, capture XProf steps 11–20, then serve the trace on port 8791 |
 | `make report` | integrity-check completed runs and rebuild the standalone `report.html` dashboard |
 
@@ -97,13 +98,9 @@ uv run --frozen --no-sync speedrun prepare --non-interactive \
   --path shm/ --profile smoke --run-profile smoke --no-doctor
 uv run --frozen --no-sync speedrun run reference --profile smoke
 
-# Initial v4-8 calibration
-uv run --frozen --no-sync speedrun run reference \
-  --track open --profile official
-
-# Trainer-specific overrides follow --
+# Short diagnostic overrides follow --; experiment settings stay in config.yaml
 uv run --frozen --no-sync speedrun run reference --profile dev -- \
-  --steps 100 --batch-size 32
+  --steps 100
 ```
 
 The harness creates a unique persistent run directory, captures stdout/stderr,
@@ -140,19 +137,20 @@ Fresh10 macro loss **3.95959**. That exact token budget is now fixed for
 official open-track comparisons while we improve the architecture, initialization,
 optimizer, and kernels.
 
-### TPU kernel experiments
+### TPU kernel baseline
 
-The calibrated `make baseline` command keeps dense attention and dense output
-loss explicit. The reference trainer also exposes two opt-in systems paths:
+The reference [`config.yaml`](submissions/reference/config.yaml) pins the custom
+trainable Pallas attention with the dense output loss. It also preserves the
+model, objective, schedule, validation cadence, and exact token budget beside
+the entry script. `make baseline` supplies only machine/run policy and lets the
+trainer read that versioned file. To create a dense control, clone the reference
+and change the clone's `attention_backend` field instead of hiding an algorithm
+change in a long launch command:
 
 ```bash
-# Custom trainable Pallas attention; preserve the baseline output objective.
-uv run --frozen --no-sync speedrun run reference --profile official -- \
-  --attention-backend tpu_flash --loss-backend dense
-
-# Bounded-memory tied output projection + cross entropy.
-uv run --frozen --no-sync speedrun run reference --profile official -- \
-  --attention-backend tpu_flash --loss-backend tiled
+uv run --frozen --no-sync speedrun clone reference dense_control
+# edit submissions/dense_control/config.yaml
+uv run --frozen --no-sync speedrun run dense_control --profile official
 ```
 
 The custom attention kernel includes forward, dQ, and dK/dV kernels, uses a
@@ -167,8 +165,9 @@ objective and is not a mere kernel toggle.
 The canonical full-step benchmark improved from 93.196 ms to 75.191 ms with
 custom attention and dense loss (435.79k tokens/s, +23.9%). The tiled loss was
 77.048 ms, so it is retained for its memory bound rather than enabled by
-default. These are synchronized short-step measurements, not a new full-run
-score. Details, APIs, numerical checks, and tuning policy are in
+default. Dense attention's completed 3.75788 run remains the historical quality
+control until the promoted baseline has completed its full validation. Details,
+APIs, numerical checks, and tuning policy are in
 [docs/KERNELS.md](docs/KERNELS.md).
 
 ### Profiling and reports
@@ -225,7 +224,7 @@ a versioned deterministic recipe, and frozen by URL/revision plus SHA-256.
 `fresh10` reports each domain independently and a macro-average beside FineWeb.
 It does not change qualification, and “fresh” means a strong temporal contamination
 control rather than a proof that no equivalent passage ever appeared online.
-The one-file trainer accepts the frozen set with
+The entry trainer accepts the frozen set with
 `--downstream-manifest data/manifests/fresh10.json --downstream-root PATH`.
 It reuses one fixed-shape masked evaluation executable, excludes padding and
 cross-document targets, and writes the domain rows plus `fresh10_macro` to
@@ -244,10 +243,11 @@ uv run --frozen --no-sync speedrun leaderboard --track sample_efficiency
 
 ## Create an algorithm
 
-Every entry has the same path contract:
+Every entry has the same two-file path contract:
 
 ```text
 submissions/<algorithm>/train.py
+submissions/<algorithm>/config.yaml
 ```
 
 Clone the current reference without overwriting anything:
@@ -256,9 +256,20 @@ Clone the current reference without overwriting anything:
 uv run --frozen --no-sync speedrun clone reference my_experiment
 ```
 
-Keep the interesting model, optimizer, schedule, and training logic visible in
-that file. Fundamental shared data/protocol/UI utilities are welcome when they
-make entries shorter and easier to compare.
+The clone copies both files byte-for-byte. Keep the implementation visible in
+`train.py` and the experiment-defining model, optimizer, schedule, objective,
+kernel, and validation settings in `config.yaml`. Runtime locations, run
+identity, seed, and profiling destinations remain command-line concerns.
+Fundamental shared data/protocol/UI utilities are welcome when they make entries
+shorter and easier to compare.
+
+The YAML is schema-versioned and contains complete `smoke`, `dev`, and
+`official` profiles. The trainer resolves it relative to its own file—not the
+caller's working directory—and rejects duplicate/unknown keys, unsafe YAML
+features, type/range errors, symlinks, and attempts to replace static settings
+with hidden launch flags. The harness records both the source SHA-256 and the
+fully resolved profile. Short XProf diagnostics may override only their bounded
+duration and instrumentation cadence; those overrides are recorded explicitly.
 
 ## Tracks
 
@@ -282,7 +293,7 @@ data/manifests/          pinned datasets and hashes
 harness/                 execution, validation, records, scoring
 speedrun/                CLI, wizard, doctor, and shared data preparation
 speedrun/kernels/        shared TPU attention, loss, and autotuning primitives
-submissions/reference/   single-entry JAX reference trainer
+submissions/reference/   JAX entry trainer + versioned experiment config
 tests/                   CPU-only infrastructure tests
 runs/                    gitignored persistent run artifacts
 ```

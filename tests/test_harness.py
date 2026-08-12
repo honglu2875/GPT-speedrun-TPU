@@ -36,6 +36,7 @@ import time
 from pathlib import Path
 
 parser = argparse.ArgumentParser()
+parser.add_argument("--config", required=True)
 parser.add_argument("--output-dir", required=True)
 parser.add_argument("--seed", required=True, type=int)
 parser.add_argument("--track", required=True)
@@ -61,7 +62,7 @@ if args.make_cache:
     (output / ".jax_cache" / "compiled.bin").write_bytes(b"temporary")
 (output / "model.npz").write_bytes(b"tiny checkpoint")
 (output / "training.csv").write_text("step,train_loss\n1,2.5\n")
-(output / "seen.json").write_text(json.dumps({"seed": args.seed, "track": args.track, "profile": args.profile, "tag": args.tag, "seeded": args.seeded}))
+(output / "seen.json").write_text(json.dumps({"config": args.config, "seed": args.seed, "track": args.track, "profile": args.profile, "tag": args.tag, "seeded": args.seeded}))
 result = {
     "schema_version": 1,
     "status": "ok",
@@ -104,6 +105,7 @@ class HarnessRunTests(unittest.TestCase):
         submission = self.root / "submissions" / "tiny"
         submission.mkdir(parents=True)
         (submission / "train.py").write_text(FAKE_TRAINER, encoding="utf-8")
+        (submission / "config.yaml").write_text("steps: 1\n", encoding="utf-8")
         (self.root / "uv.lock").write_bytes(b"version = 1\n")
 
     def tearDown(self) -> None:
@@ -180,6 +182,7 @@ class HarnessRunTests(unittest.TestCase):
         outcome = run_submission(self.config(target_loss=2.48), evaluator=evaluator)
 
         self.assertEqual(json.loads((outcome.run_dir / "seen.json").read_text()), {
+            "config": str(self.root / "submissions" / "tiny" / "config.yaml"),
             "seed": 1337,
             "track": "open",
             "profile": "default",
@@ -211,7 +214,7 @@ class HarnessRunTests(unittest.TestCase):
         self.assertEqual(len(record["checkpoint"]["sha256"]), 64)
 
     def test_rejects_reserved_passthrough_flags_but_not_prefixes(self) -> None:
-        for flag in ("--output-dir", "--seed", "--track", "--profile"):
+        for flag in ("--config", "--output-dir", "--seed", "--track", "--profile"):
             for arguments in ((flag, "value"), (f"{flag}=value",), ("--", flag, "value")):
                 with self.subTest(arguments=arguments):
                     with self.assertRaisesRegex(ConfigurationError, "reserved flag"):
@@ -319,6 +322,7 @@ class HarnessRunTests(unittest.TestCase):
 
     def test_provenance_hashes_inputs_and_copies_configured_values(self) -> None:
         trainer = self.root / "submissions" / "tiny" / "train.py"
+        submission_config = self.root / "submissions" / "tiny" / "config.yaml"
         configured = {"data": {"manifest": "fineweb-α", "shards": 9}}
         outcome = run_submission(self.config(provenance=configured))
         provenance = outcome.record["provenance"]
@@ -328,6 +332,14 @@ class HarnessRunTests(unittest.TestCase):
         self.assertEqual(provenance["train_py"]["bytes"], trainer.stat().st_size)
         self.assertEqual(
             provenance["train_py"]["sha256"], hashlib.sha256(trainer.read_bytes()).hexdigest()
+        )
+        self.assertEqual(
+            provenance["config_yaml"],
+            {
+                "path": "submissions/tiny/config.yaml",
+                "sha256": hashlib.sha256(submission_config.read_bytes()).hexdigest(),
+                "bytes": submission_config.stat().st_size,
+            },
         )
         self.assertEqual(
             provenance["uv_lock"]["sha256"],
@@ -346,6 +358,21 @@ class HarnessRunTests(unittest.TestCase):
             run_submission(self.config(provenance={"train_py": {"spoofed": True}}))
         with self.assertRaisesRegex(ConfigurationError, "harness-owned"):
             run_submission(self.config(provenance={"shared_python": {"spoofed": True}}))
+        with self.assertRaisesRegex(ConfigurationError, "harness-owned"):
+            run_submission(self.config(provenance={"config_yaml": {"spoofed": True}}))
+
+    def test_submission_config_must_be_a_regular_sibling_file(self) -> None:
+        submission = self.root / "submissions" / "tiny"
+        submission_config = submission / "config.yaml"
+        submission_config.unlink()
+        with self.assertRaisesRegex(ConfigurationError, "configuration file not found"):
+            run_submission(self.config())
+
+        target = submission / "elsewhere.yaml"
+        target.write_text("steps: 1\n", encoding="utf-8")
+        submission_config.symlink_to(target.name)
+        with self.assertRaisesRegex(ConfigurationError, "configuration file not found"):
+            run_submission(self.config())
 
     def test_shared_python_provenance_changes_with_dependency_bytes(self) -> None:
         shared = self.root / "speedrun" / "kernels"
