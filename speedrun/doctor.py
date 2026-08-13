@@ -219,7 +219,7 @@ def check_prepared_data(path: Path, profile: str) -> CheckResult:
     try:
         prepared = verify_dataset(manifest, path, train_shards=shards, verify_hash=True)
     except (DataError, OSError) as exc:
-        return CheckResult("dataset", "warning", str(exc), "run `speedrun prepare`")
+        return CheckResult("dataset", "error", str(exc), "run `make prepare`")
     fresh_detail = ""
     if profile == "official":
         try:
@@ -227,9 +227,9 @@ def check_prepared_data(path: Path, profile: str) -> CheckResult:
         except (DataError, OSError) as exc:
             return CheckResult(
                 "dataset",
-                "warning",
+                "error",
                 f"FineWeb is ready, but Fresh10 is not: {exc}",
-                "run `speedrun prepare --profile official`",
+                "run `make prepare` with the official data profile",
             )
         fresh_detail = (
             f" + Fresh10 {len(downstream.domains)} domains / "

@@ -250,6 +250,15 @@ class TrainerStaticTests(unittest.TestCase):
             },
         )
 
+    def test_multihost_xprof_capture_is_owned_by_controller(self) -> None:
+        source = TRAINER_PATH.read_text(encoding="utf-8")
+        start_trace = source.index("jax.profiler.start_trace(")
+        controller_guard = source.rfind("if is_controller:", 0, start_trace)
+        self.assertGreater(controller_guard, 0)
+        self.assertLess(start_trace - controller_guard, 1_000)
+        self.assertIn("speedrun-xprof-capture-started", source)
+        self.assertIn("speedrun-xprof-capture-finished", source)
+
     def test_diagnostic_main_omits_competition_result(self) -> None:
         stdout = StringIO()
         with (

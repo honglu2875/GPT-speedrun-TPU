@@ -7,14 +7,21 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness.cluster import (
+    RAM_CACHE_ROOT,
+    RAM_CACHE_SETUP_GUIDANCE,
     SSH_SETUP_GUIDANCE,
     ClusterAccessError,
+    ClusterError,
+    ClusterInventory,
+    bootstrap_rsync,
     build_distributed_launch_command,
     expand_host_expression,
     infer_host_expression,
+    prepare_ram_cache,
     probe_cluster,
+    seal_ram_cache_command,
 )
-from harness.cluster import _copy_to_hosts
+from harness.cluster import _rsync_to_hosts
 from speedrun.config import ConfigError, LocalConfig, load_config, save_config
 
 
@@ -84,25 +91,87 @@ class ClusterTests(unittest.TestCase):
         self.assertIn("SAFE_VALUE='value with space'", command[-1])
         self.assertIn("'/repo with space/.venv/bin/python'", command[-1])
 
-    def test_workspace_copy_uses_parallel_scp_without_peer_pdcp(self) -> None:
+    def test_workspace_copy_uses_parallel_incremental_rsync_without_delete(self) -> None:
         completed = subprocess.CompletedProcess([], 0, "", "")
         with (
-            patch("harness.cluster.shutil.which", return_value="/usr/bin/scp"),
+            patch("harness.cluster.shutil.which", return_value="/usr/bin/rsync"),
             patch("harness.cluster.subprocess.run", return_value=completed) as run,
         ):
-            _copy_to_hosts(
-                Path("/tmp/archive.tar.gz"),
-                "/tmp/remote.tar.gz",
+            _rsync_to_hosts(
+                Path("/repo"),
                 ("slice-w-1", "slice-w-2"),
+                (".git/", "/runs/"),
                 environment={},
             )
         self.assertEqual(run.call_count, 2)
         commands = [call.args[0] for call in run.call_args_list]
-        self.assertTrue(all(command[0] == "scp" for command in commands))
+        self.assertTrue(all(command[0] == "rsync" for command in commands))
+        self.assertTrue(all("--delete" not in command for command in commands))
+        self.assertTrue(all(".git/" in command and "/runs/" in command for command in commands))
         self.assertEqual(
             {command[-1] for command in commands},
-            {"slice-w-1:/tmp/remote.tar.gz", "slice-w-2:/tmp/remote.tar.gz"},
+            {"slice-w-1:/repo/", "slice-w-2:/repo/"},
         )
+
+    def test_ram_cache_preflight_checks_mount_then_creates_link_on_all_hosts(self) -> None:
+        inventory = ClusterInventory(
+            host_expression="slice-w-[0-1]",
+            hosts=("slice-w-0", "slice-w-1"),
+            remote_hosts=("slice-w-1",),
+            local_host="slice-w-0",
+            reported_hostnames={"slice-w-0": "slice-w-0", "slice-w-1": "slice-w-1"},
+        )
+        with patch("harness.cluster.run_pdsh") as run:
+            prepare_ram_cache(Path("/repo"), inventory)
+
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args_list[0].args[0], inventory.hosts)
+        self.assertIn("tmpfs|ramfs", run.call_args_list[0].args[1])
+        setup = run.call_args_list[1].args[1]
+        self.assertIn(str(RAM_CACHE_ROOT), setup)
+        self.assertIn("sudo -n install", setup)
+        self.assertIn(f"ln -s {RAM_CACHE_ROOT} /repo/shm", setup)
+        self.assertIn("readlink -f /repo/shm", setup)
+
+    def test_ram_cache_seal_protects_only_the_dedicated_cache(self) -> None:
+        command = seal_ram_cache_command()
+        self.assertIn(f"chown -R root:", command)
+        self.assertIn(str(RAM_CACHE_ROOT), command)
+        self.assertIn("sudo -n chown", command)
+        self.assertIn("find /dev/shm/.speedrun-cache -type d", command)
+        self.assertNotIn("chown -R root:\"$group\" -- /dev/shm ", command)
+
+    def test_ram_cache_preflight_reports_mount_instruction(self) -> None:
+        inventory = ClusterInventory(
+            host_expression="slice-w-[0-1]",
+            hosts=("slice-w-0", "slice-w-1"),
+            remote_hosts=("slice-w-1",),
+            local_host="slice-w-0",
+            reported_hostnames={"slice-w-0": "slice-w-0", "slice-w-1": "slice-w-1"},
+        )
+        with (
+            patch("harness.cluster.run_pdsh", side_effect=ClusterError("mount failed")),
+            self.assertRaisesRegex(ClusterError, "mount.*make prepare") as raised,
+        ):
+            prepare_ram_cache(Path("/repo"), inventory)
+        self.assertEqual(str(raised.exception), RAM_CACHE_SETUP_GUIDANCE)
+
+    def test_rsync_bootstrap_attempts_noninteractive_apt_get_on_every_host(self) -> None:
+        inventory = ClusterInventory(
+            host_expression="slice-w-[0-1]",
+            hosts=("slice-w-0", "slice-w-1"),
+            remote_hosts=("slice-w-1",),
+            local_host="slice-w-0",
+            reported_hostnames={"slice-w-0": "slice-w-0", "slice-w-1": "slice-w-1"},
+        )
+        with (
+            patch("harness.cluster.run_pdsh") as run,
+            patch("harness.cluster.shutil.which", return_value="/usr/bin/rsync"),
+        ):
+            bootstrap_rsync(inventory)
+        self.assertEqual(run.call_args.args[0], inventory.hosts)
+        self.assertIn("apt-get install -y rsync", run.call_args.args[1])
+        self.assertIn("DEBIAN_FRONTEND=noninteractive", run.call_args.args[1])
 
 
 class ClusterConfigTests(unittest.TestCase):
