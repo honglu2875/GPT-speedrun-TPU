@@ -107,5 +107,30 @@ winner. Once a common interior neighborhood appears, it should be rerun with at
 least three seeds. Only then should batch size vary, using the SDE rules above
 and keeping the selected normalized base LR fixed.
 
+The initial 60M and 125M curves were still descending at the `3.2e-3` upper
+boundary. Before resuming the expensive tiers, the separate
+`complete_d_p_lr_60m_extension_v1` suite continues the same √2 grid at
+`4.525e-3`, `6.4e-3`, and `9.051e-3`. Keeping this extension separate preserves
+the original suite hash and accepted results. If the 60M minimum is still on the
+right edge, another extension is required; larger-tier sweeps should not infer
+an optimum from a censored curve.
+
+That extension bracketed the best observed 60M region: validation loss was
+`4.0621` at `3.2e-3`, `4.0539` at `4.525e-3`, and `4.2817` at `6.4e-3`.
+The `complete_d_p_lr_60m_refine_v1` suite interleaves four new rates inside
+that bracket. Together with the existing points, this gives local `2^(1/8)`
+log spacing without paying to repeat deterministic runs.
+
+After the refinement, `complete_d_p_lr_local_transfer_v1` applies the same
+seven-point local grid, including both bracket endpoints, independently and in
+sequence to 125M, 250M, and 500M. A transferred optimum must be interior for
+each tier; matching only the best tested boundary does not count as evidence.
+
 The suite lives in [`studies/complete_d_p_lr_v1/suite.yaml`](../studies/complete_d_p_lr_v1/suite.yaml).
 Its SHA-256 is attached to each immutable run record and every CSV row.
+The 60M bracketing extension lives in
+[`studies/complete_d_p_lr_60m_extension_v1/suite.yaml`](../studies/complete_d_p_lr_60m_extension_v1/suite.yaml).
+The local refinement lives in
+[`studies/complete_d_p_lr_60m_refine_v1/suite.yaml`](../studies/complete_d_p_lr_60m_refine_v1/suite.yaml).
+The sequential larger-tier reproduction lives in
+[`studies/complete_d_p_lr_local_transfer_v1/suite.yaml`](../studies/complete_d_p_lr_local_transfer_v1/suite.yaml).
