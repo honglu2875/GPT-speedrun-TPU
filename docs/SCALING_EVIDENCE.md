@@ -27,10 +27,14 @@ per-slice learning-rate selections, and exactly these 15 files for every run:
 
 An extra file, an empty extra directory, any interior symbolic/hard link, a
 missing selection, or a changed source during copying fails the build. A
-user-selected bundle or runs root may itself be a symlink; it is resolved once
-before credential access, and the resolved root identity must remain stable.
-Files are copied
-through one read-and-hash stream; they are never hard-linked into the archive.
+user-selected bundle or runs root may itself be a symlink. Standalone publish
+resolves its bundle root once before credential access. Combined build+publish
+resolves and recursively inventories its runs root once before building, then
+requires that exact canonical path and every file/directory identity through
+the pre-credential publication gate; retargeting the original alias cannot
+select a second tree.
+Files are copied through one read-and-hash stream; they are never hard-linked
+into the archive.
 The archive also contains a deterministic `git archive` of the launch commit and
 a standalone `verify.py`. Every completed run must be part of the exact minimal
 prospective staged state: the `c100_n124_control` is unconditional, each initial
@@ -40,9 +44,8 @@ initial suffix or an unnecessary post-bracket trial fails publication.
 
 Each recomputed run is also bound to the exact checked-in public 4B manifest
 (`99ac90a5...c2c14` raw; `92b21722...8dc1` canonical): both manifest hashes,
-the prepared immutable revision,
-production identity, and all 40 shard paths, sizes, token counts, and SHA-256s
-must agree.
+the prepared immutable revision, production identity, and all 40 shard paths,
+sizes, token counts, and SHA-256s must agree.
 
 ## Local release gate
 
@@ -63,8 +66,12 @@ verifier again with:
 uv run --script /tmp/current_budget_isoflop_v4-evidence/verify.py verify --bundle /tmp/current_budget_isoflop_v4-evidence
 ```
 
-The output directory must not already exist. This prevents an earlier archive
-from being silently mixed with a new build.
+The output directory must not already exist. Before creating even a missing
+output parent, the builder rejects lexical or already-resolvable containment
+and aliasing with either the runs tree or repository source. Final installation
+is an atomic no-replace operation. These rules prevent staging artifacts from
+polluting source evidence and prevent an earlier archive from being silently
+mixed with a new build.
 
 ## Publication
 
@@ -85,8 +92,8 @@ retained mode-read-only private snapshot and an explicit operation for each path
 in its manifest-derived allowlist. Every upload object is opened once with
 no-follow semantics, rehashed through that retained descriptor, kept open
 through the commit, and checked for descriptor mutation afterward. It records
-the current immutable parent
-commit and refuses a competing parent update. If the content-derived remote
+the current immutable parent commit and refuses a competing parent update. If
+the content-derived remote
 prefix already exists, publication becomes a safe resume: no overwrite is
 attempted and the existing immutable prefix must pass the same complete remote
 verification.
@@ -102,8 +109,11 @@ The bundle is snapshotted once and fully revalidated before the token is opened.
 The token path must have no linked component and must name one current-user,
 single-link regular file of at most 4096 bytes with exact mode `0600`. Bundle,
 evidence, token, and receipt paths must be disjoint and non-aliased. The receipt
-writer refuses symlink components and replaces only an unchanged current-user
-regular target.
+writer refuses symlink components and never replaces an existing object. An
+already-existing byte-identical current-user receipt is accepted as an
+idempotent success; any different existing receipt is a hard failure and must
+be reviewed and moved explicitly. Archive installation likewise uses an atomic
+no-replace operation, so a concurrent creator cannot be clobbered.
 
 After upload (or safe resume), the publisher uses an anonymous client and
 unauthenticated, size-bounded streaming downloads at the exact 40-hex commit.

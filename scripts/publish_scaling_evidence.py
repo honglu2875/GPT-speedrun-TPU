@@ -19,6 +19,9 @@ from __future__ import annotations
 
 import argparse
 from contextlib import ExitStack, contextmanager
+import ctypes
+from dataclasses import dataclass
+import errno
 import hashlib
 import importlib
 import json
@@ -309,11 +312,23 @@ def _directory_entry_signature(
     return _stat_signature(metadata)
 
 
-def read_token_file(path: Path) -> str:
+def read_token_file(
+    path: Path,
+    *,
+    expected_signature: tuple[int, ...] | None = None,
+    expected_parent_identity: tuple[int, int] | None = None,
+) -> str:
     """Read one bounded mode-0600 token through a pinned no-follow descriptor."""
 
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     with open_parent_directory(path, create=False) as (_absolute, parent, leaf):
+        parent_metadata = os.fstat(parent)
+        parent_identity = (parent_metadata.st_dev, parent_metadata.st_ino)
+        if (
+            expected_parent_identity is not None
+            and parent_identity != expected_parent_identity
+        ):
+            raise EvidenceError("Hugging Face token parent changed after preflight")
         try:
             descriptor = os.open(leaf, flags, dir_fd=parent)
         except OSError as exc:
@@ -322,6 +337,11 @@ def read_token_file(path: Path) -> str:
             ) from exc
         try:
             before = os.fstat(descriptor)
+            if (
+                expected_signature is not None
+                and _stat_signature(before) != expected_signature
+            ):
+                raise EvidenceError("Hugging Face token changed after preflight")
             if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
                 raise EvidenceError(
                     "Hugging Face token path must be one regular, non-hard-linked file"
@@ -759,15 +779,32 @@ def _inventory_index(manifest: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     }
 
 
-def snapshot_bundle(bundle: Path, destination: Path) -> dict[str, Any]:
+def snapshot_bundle(
+    bundle: Path,
+    destination: Path,
+    *,
+    pinned_files: Mapping[str, tuple[int, ...]] | None = None,
+    pinned_directories: Mapping[str, tuple[int, ...]] | None = None,
+) -> dict[str, Any]:
     """Read each bundle object once into a private verified snapshot."""
 
-    bundle = bundle.expanduser().resolve(strict=True)
+    # Publication passes a symlink-free resolved path plus its complete pinned
+    # inventory. Standalone verification resolves its user-selected root once.
+    if pinned_files is None and pinned_directories is None:
+        bundle = bundle.expanduser().resolve(strict=True)
+    elif pinned_files is None or pinned_directories is None:
+        raise EvidenceError("pinned bundle files/directories must be supplied together")
+    else:
+        bundle = lexical_absolute(bundle)
     if destination.exists() or destination.is_symlink():
         raise EvidenceError(f"snapshot destination already exists: {destination}")
     destination.mkdir(parents=True)
     source_directories: dict[str, tuple[int, ...]] = {}
     source_inventory = scan_regular_tree(bundle, directories=source_directories)
+    if pinned_files is not None and (
+        source_inventory != pinned_files or source_directories != pinned_directories
+    ):
+        raise EvidenceError("pinned bundle changed between preflight and snapshot")
     if MANIFEST_NAME not in source_inventory:
         raise EvidenceError(f"bundle lacks {MANIFEST_NAME}")
     manifest_bytes = read_regular_once(
@@ -1393,7 +1430,11 @@ def set_snapshot_permissions(snapshot: Path, *, sealed: bool) -> None:
 def deterministic_git_archive(repository: Path, commit: str, destination: Path) -> tuple[int, str]:
     """Write the exact deterministic ``git archive`` byte stream for a commit."""
 
-    repository = repository.expanduser().resolve(strict=True)
+    # build_archive has already resolved this input root exactly once.  Do not
+    # re-resolve a user-controlled alias between the build preflight and Git.
+    repository = lexical_absolute(repository)
+    descriptor = open_directory_chain(repository, create=False)
+    os.close(descriptor)
     resolved = subprocess.run(
         ["git", "rev-parse", "--verify", f"{commit}^{{commit}}"],
         cwd=repository,
@@ -1518,7 +1559,10 @@ def _load_suite_from_source_archive(source_archive: Path) -> dict[str, Any]:
 def discover_runs_source(runs: Path, declared_points: set[str]) -> tuple[list[str], list[str], dict[str, tuple[int, ...]]]:
     """Validate the source run tree against the exact run/derived allowlist."""
 
-    runs = runs.expanduser().resolve(strict=True)
+    # The caller supplies the one canonical root chosen at workflow preflight.
+    # A later symlink substitution must be rejected by scan_regular_tree rather
+    # than silently followed to a different evidence tree.
+    runs = lexical_absolute(runs)
     directories: dict[str, tuple[int, ...]] = {}
     inventory = scan_regular_tree(runs, directories=directories)
     required_derived = {
@@ -1676,6 +1720,83 @@ def cleanup_owned_temporary_directory(
         raise EvidenceError(f"cannot clean owned temporary archive directory: {exc}") from exc
 
 
+def rename_directory_noreplace(
+    source_parent: int,
+    source: str,
+    destination_parent: int,
+    destination: str,
+) -> None:
+    """Atomically install a directory without replacing any existing object."""
+
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as exc:  # pragma: no cover - Linux release environment
+        raise EvidenceError("atomic renameat2(RENAME_NOREPLACE) is unavailable") from exc
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        source_parent,
+        os.fsencode(source),
+        destination_parent,
+        os.fsencode(destination),
+        1,  # RENAME_NOREPLACE
+    )
+    if result == 0:
+        return
+    error = ctypes.get_errno()
+    if error in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise EvidenceError(
+            "archive output appeared concurrently; refusing to replace it"
+        )
+    raise EvidenceError(
+        "atomic no-replace archive installation failed: "
+        f"{os.strerror(error) if error else 'unknown renameat2 error'}"
+    )
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    """Return whether either absolute path contains the other."""
+
+    try:
+        left.relative_to(right)
+        return True
+    except ValueError:
+        pass
+    try:
+        right.relative_to(left)
+        return True
+    except ValueError:
+        return False
+
+
+def preflight_build_output(
+    *, repository_root: Path, runs: Path, output: Path
+) -> Path:
+    """Reject output/source overlap without creating any filesystem object."""
+
+    output_path = lexical_absolute(output)
+    try:
+        # strict=False follows only already-existing aliases and appends a
+        # missing suffix.  This is read-only and catches a parent symlink into a
+        # source tree before open_directory_chain could create below it.
+        canonical_projection = output_path.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise EvidenceError("cannot safely project archive output path") from exc
+    for label, source in (("repository", repository_root), ("runs", runs)):
+        for spelling in (output_path, canonical_projection):
+            if _paths_overlap(spelling, source):
+                raise EvidenceError(
+                    f"archive output must be disjoint from the {label} source tree"
+                )
+    return output_path
+
+
 def build_archive(
     *,
     repository_root: Path,
@@ -1684,13 +1805,34 @@ def build_archive(
     repo_id: str,
     prefix: str,
     launch_commit: str = LAUNCH_COMMIT,
+    _pinned_runs: PinnedEvidenceRoot | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     """Build atomically from a stable source tree, then fully reverify it."""
 
     if launch_commit != LAUNCH_COMMIT:
         raise EvidenceError(f"v4 publication pins launch commit {LAUNCH_COMMIT}")
     repository_root = repository_root.expanduser().resolve(strict=True)
-    runs = runs.expanduser().resolve(strict=True)
+    repository_descriptor = open_directory_chain(repository_root, create=False)
+    os.close(repository_descriptor)
+    if _pinned_runs is None:
+        runs = runs.expanduser().resolve(strict=True)
+        pinned_runs = pin_evidence_root(runs, resolve_once=False)
+    else:
+        runs = lexical_absolute(runs)
+        if runs != _pinned_runs.path:
+            raise EvidenceError("pinned runs root differs from the build input")
+        current_runs = pin_evidence_root(runs, resolve_once=False)
+        if (
+            current_runs.files != _pinned_runs.files
+            or current_runs.directories != _pinned_runs.directories
+        ):
+            raise EvidenceError("run source changed after workflow preflight")
+        pinned_runs = _pinned_runs
+    output = preflight_build_output(
+        repository_root=repository_root,
+        runs=runs,
+        output=output,
+    )
     with open_parent_directory(output, create=True) as (output, output_parent, output_leaf):
         if _directory_entry_signature(output_parent, output_leaf) is not None:
             raise EvidenceError(
@@ -1717,9 +1859,15 @@ def build_archive(
             checked_before_inventory = scan_regular_tree(
                 runs, directories=before_directories
             )
-            if checked_before_inventory != before_inventory:
+            if (
+                checked_before_inventory != before_inventory
+                or (
+                    checked_before_inventory != pinned_runs.files
+                    or before_directories != pinned_runs.directories
+                )
+            ):
                 raise EvidenceError(
-                    "run source changed during initial inventory validation"
+                    "run source changed after workflow preflight"
                 )
 
             copied: list[dict[str, Any]] = []
@@ -1745,6 +1893,10 @@ def build_archive(
             if (
                 before_inventory != after_inventory
                 or before_directories != after_directories
+                or (
+                    after_inventory != pinned_runs.files
+                    or after_directories != pinned_runs.directories
+                )
             ):
                 raise EvidenceError(
                     "run source tree changed while the archive was copied"
@@ -1839,16 +1991,39 @@ def build_archive(
             validate_manifest(manifest)
             write_new(temporary / MANIFEST_NAME, canonical_json_bytes(manifest))
             verify_bundle(temporary)
+            final_directories: dict[str, tuple[int, ...]] = {}
+            final_inventory = scan_regular_tree(
+                runs, directories=final_directories
+            )
+            if (
+                final_inventory != pinned_runs.files
+                or final_directories != pinned_runs.directories
+            ):
+                raise EvidenceError(
+                    "run source changed before atomic archive installation"
+                )
             if _directory_entry_signature(output_parent, output_leaf) is not None:
                 raise EvidenceError(
                     "archive output appeared while the bundle was being built"
                 )
-            os.rename(
+            rename_directory_noreplace(
+                output_parent,
                 temporary_name,
+                output_parent,
                 output_leaf,
-                src_dir_fd=output_parent,
-                dst_dir_fd=output_parent,
             )
+            installed_signature = _directory_entry_signature(
+                output_parent, output_leaf
+            )
+            if (
+                installed_signature is None
+                or installed_signature[:2] != temporary_signature[:2]
+                or not stat.S_ISDIR(installed_signature[2])
+                or installed_signature[4] != temporary_signature[4]
+            ):
+                raise EvidenceError(
+                    "atomically installed archive is not the owned temporary root"
+                )
             os.fsync(output_parent)
             completed = True
             return output, manifest
@@ -2120,21 +2295,91 @@ def publication_receipt(
     }
 
 
-def write_atomic(path: Path, payload: bytes) -> None:
-    """Atomically replace only an unchanged regular target below real directories."""
+def _read_directory_entry_once(
+    parent: int,
+    leaf: str,
+    signature: tuple[int, ...],
+    *,
+    maximum_bytes: int,
+) -> bytes:
+    """Read one already-lstat'd leaf and prove its identity stayed fixed."""
 
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(leaf, flags, dir_fd=parent)
+    except OSError as exc:
+        raise EvidenceError(f"cannot safely open existing receipt {leaf!r}") from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            _stat_signature(before) != signature
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.getuid()
+            or before.st_size > maximum_bytes
+        ):
+            raise EvidenceError("existing receipt is not one bounded current-user file")
+        remaining = before.st_size
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = os.read(descriptor, min(READ_CHUNK, remaining))
+            if not chunk:
+                raise EvidenceError("existing receipt was truncated while reading")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise EvidenceError("existing receipt grew while reading")
+        after = os.fstat(descriptor)
+        if (
+            _stat_signature(after) != signature
+            or _directory_entry_signature(parent, leaf) != signature
+        ):
+            raise EvidenceError("existing receipt changed while reading")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _existing_receipt_is_identical(parent: int, leaf: str, payload: bytes) -> bool:
+    signature = _directory_entry_signature(parent, leaf)
+    if signature is None:
+        return False
+    if (
+        not stat.S_ISREG(signature[2])
+        or signature[3] != 1
+        or signature[4] != os.getuid()
+    ):
+        raise EvidenceError("receipt output exists but is not one current-user file")
+    existing = _read_directory_entry_once(
+        parent, leaf, signature, maximum_bytes=MAX_MANIFEST_BYTES
+    )
+    if existing != payload:
+        raise EvidenceError(
+            "existing receipt differs; refusing to overwrite immutable evidence"
+        )
+    return True
+
+
+def write_atomic(
+    path: Path,
+    payload: bytes,
+    *,
+    expected_parent_identity: tuple[int, int] | None = None,
+) -> None:
+    """Install one immutable receipt, or accept an identical existing receipt."""
+
+    if len(payload) > MAX_MANIFEST_BYTES:
+        raise EvidenceError("receipt payload exceeds the bounded receipt size")
     with open_parent_directory(path, create=True) as (_absolute, parent, leaf):
-        prior = _directory_entry_signature(parent, leaf)
-        if prior is not None:
-            mode = prior[2]
-            if (
-                not stat.S_ISREG(mode)
-                or prior[3] != 1
-                or prior[4] != os.getuid()
-            ):
-                raise EvidenceError(
-                    "receipt output may replace only one current-user regular file"
-                )
+        parent_metadata = os.fstat(parent)
+        parent_identity = (parent_metadata.st_dev, parent_metadata.st_ino)
+        if (
+            expected_parent_identity is not None
+            and parent_identity != expected_parent_identity
+        ):
+            raise EvidenceError("receipt parent changed after publication preflight")
+        if _existing_receipt_is_identical(parent, leaf, payload):
+            return
         temporary = f".{leaf}.tmp-{secrets.token_hex(16)}"
         flags = (
             os.O_WRONLY
@@ -2144,6 +2389,24 @@ def write_atomic(path: Path, payload: bytes) -> None:
             | getattr(os, "O_NOFOLLOW", 0)
         )
         descriptor: int | None = None
+        temporary_signature: tuple[int, ...] | None = None
+
+        def clean_owned_temporary() -> None:
+            if temporary_signature is None:
+                return
+            current = _directory_entry_signature(parent, temporary)
+            if current is None:
+                return
+            if (
+                current[:2] != temporary_signature[:2]
+                or not stat.S_ISREG(current[2])
+                or current[4] != temporary_signature[4]
+            ):
+                raise EvidenceError(
+                    "refusing to clean a receipt temporary whose identity changed"
+                )
+            os.unlink(temporary, dir_fd=parent)
+
         try:
             descriptor = os.open(temporary, flags, 0o600, dir_fd=parent)
             view = memoryview(payload)
@@ -2154,30 +2417,45 @@ def write_atomic(path: Path, payload: bytes) -> None:
                     raise EvidenceError("receipt temporary file made no write progress")
                 written += count
             os.fsync(descriptor)
+            temporary_signature = _stat_signature(os.fstat(descriptor))
             os.close(descriptor)
             descriptor = None
-            if _directory_entry_signature(parent, leaf) != prior:
-                raise EvidenceError("receipt output changed during atomic replacement")
-            os.replace(
-                temporary,
-                leaf,
-                src_dir_fd=parent,
-                dst_dir_fd=parent,
-            )
+            if _directory_entry_signature(parent, temporary) != temporary_signature:
+                raise EvidenceError("receipt temporary changed before installation")
+            try:
+                # link(2) has atomic no-replace semantics for the destination.
+                os.link(
+                    temporary,
+                    leaf,
+                    src_dir_fd=parent,
+                    dst_dir_fd=parent,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                if not _existing_receipt_is_identical(parent, leaf, payload):
+                    raise EvidenceError("receipt appeared without an identical payload")
+            else:
+                installed = _directory_entry_signature(parent, leaf)
+                if (
+                    installed is None
+                    or installed[:2] != temporary_signature[:2]
+                    or not stat.S_ISREG(installed[2])
+                    or installed[4] != os.getuid()
+                ):
+                    raise EvidenceError("installed receipt identity differs from temporary")
+            clean_owned_temporary()
+            temporary_signature = None
             os.fsync(parent)
         except (EvidenceError, OSError) as exc:
             if descriptor is not None:
                 os.close(descriptor)
             try:
-                os.unlink(temporary, dir_fd=parent)
-            except FileNotFoundError:
-                pass
-            except OSError as cleanup_exc:
-                if isinstance(exc, EvidenceError):
-                    exc.add_note(f"temporary receipt cleanup also failed: {cleanup_exc}")
+                clean_owned_temporary()
+            except (EvidenceError, OSError) as cleanup_exc:
+                exc.add_note(f"temporary receipt cleanup also failed: {cleanup_exc}")
             if isinstance(exc, EvidenceError):
                 raise
-            raise EvidenceError(f"cannot atomically write receipt output: {exc}") from exc
+            raise EvidenceError(f"cannot atomically install receipt output: {exc}") from exc
 
 
 def _path_is_within(path: Path, root: Path) -> bool:
@@ -2188,41 +2466,84 @@ def _path_is_within(path: Path, root: Path) -> bool:
         return False
 
 
-def validate_publication_paths(
-    *,
-    bundle: Path,
-    token_file: Path,
-    receipt_output: Path,
-    evidence_roots: Sequence[Path] = (),
-) -> None:
-    """Reject linked or aliased credential/output paths before token or network use."""
+@dataclass(frozen=True)
+class PinnedEvidenceRoot:
+    path: Path
+    files: Mapping[str, tuple[int, ...]]
+    directories: Mapping[str, tuple[int, ...]]
 
-    try:
-        bundle_path = bundle.expanduser().resolve(strict=True)
-        resolved_evidence_roots = [
-            path.expanduser().resolve(strict=True) for path in evidence_roots
-        ]
-    except OSError as exc:
-        raise EvidenceError(
-            "bundle/evidence input root cannot be resolved once to a directory"
-        ) from exc
-    token_path = lexical_absolute(token_file)
-    receipt_path = lexical_absolute(receipt_output)
-    roots = [bundle_path, *resolved_evidence_roots]
-    root_file_inodes: set[tuple[int, int]] = set()
-    root_directory_inodes: set[tuple[int, int]] = set()
+
+@dataclass(frozen=True)
+class PublicationPathState:
+    bundle: PinnedEvidenceRoot
+    evidence_roots: tuple[PinnedEvidenceRoot, ...]
+    token_file: Path
+    token_signature: tuple[int, ...]
+    token_parent_identity: tuple[int, int]
+    receipt_output: Path
+    receipt_parent_identity: tuple[int, int]
+
+
+def pin_evidence_root(path: Path, *, resolve_once: bool = True) -> PinnedEvidenceRoot:
+    """Capture one closed source-tree identity for later exact revalidation."""
+
+    root = (
+        path.expanduser().resolve(strict=True)
+        if resolve_once
+        else lexical_absolute(path)
+    )
+    descriptor = open_directory_chain(root, create=False)
+    os.close(descriptor)
+    directories: dict[str, tuple[int, ...]] = {}
+    files = scan_regular_tree(root, directories=directories)
+    return PinnedEvidenceRoot(
+        path=root,
+        files=dict(files),
+        directories=dict(directories),
+    )
+
+
+def _require_disjoint_roots(roots: Sequence[PinnedEvidenceRoot]) -> None:
+    """Reject containment or inode aliasing among bundle/evidence trees."""
+
+    for index, left in enumerate(roots):
+        left_inodes = {
+            (signature[0], signature[1])
+            for signature in (*left.files.values(), *left.directories.values())
+        }
+        for right in roots[index + 1 :]:
+            if _paths_overlap(left.path, right.path):
+                raise EvidenceError("bundle/evidence roots must be disjoint")
+            right_inodes = {
+                (signature[0], signature[1])
+                for signature in (*right.files.values(), *right.directories.values())
+            }
+            if left_inodes & right_inodes:
+                raise EvidenceError("bundle/evidence roots must not contain inode aliases")
+
+
+def _inspect_publication_aliases(
+    *,
+    roots: Sequence[PinnedEvidenceRoot],
+    token_path: Path,
+    receipt_path: Path,
+) -> tuple[tuple[int, ...], tuple[int, int], tuple[int, int]]:
+    """Recheck leaf safety and cross-tree inode aliases using pinned roots."""
+
+    root_file_inodes = {
+        (signature[0], signature[1])
+        for root in roots
+        for signature in root.files.values()
+    }
+    root_directory_inodes = {
+        (signature[0], signature[1])
+        for root in roots
+        for signature in root.directories.values()
+    }
     for root in roots:
-        descriptor = open_directory_chain(root, create=False)
-        os.close(descriptor)
-        directories: dict[str, tuple[int, ...]] = {}
-        files = scan_regular_tree(root, directories=directories)
-        root_file_inodes.update((value[0], value[1]) for value in files.values())
-        root_directory_inodes.update(
-            (value[0], value[1]) for value in directories.values()
-        )
-        if _path_is_within(token_path, root):
+        if _path_is_within(token_path, root.path):
             raise EvidenceError("token path must be disjoint from bundle/evidence roots")
-        if _path_is_within(receipt_path, root):
+        if _path_is_within(receipt_path, root.path):
             raise EvidenceError("receipt path must be disjoint from bundle/evidence roots")
     if token_path == receipt_path:
         raise EvidenceError("receipt path must not alias the token path")
@@ -2235,12 +2556,25 @@ def validate_publication_paths(
             parent,
             leaf,
         ):
-            parent_meta = os.fstat(parent)
-            parent_identities[label] = (parent_meta.st_dev, parent_meta.st_ino)
+            parent_metadata = os.fstat(parent)
+            parent_identities[label] = (
+                parent_metadata.st_dev,
+                parent_metadata.st_ino,
+            )
             identities[label] = _directory_entry_signature(parent, leaf)
     token_identity = identities["token"]
     if token_identity is None or not stat.S_ISREG(token_identity[2]):
         raise EvidenceError("token path must name an existing regular file")
+    if (
+        token_identity[3] != 1
+        or token_identity[4] != os.getuid()
+        or stat.S_IMODE(token_identity[2]) != 0o600
+        or token_identity[6] > MAX_TOKEN_BYTES
+    ):
+        raise EvidenceError(
+            "token preflight requires one current-user regular file with exact "
+            f"mode 0600 and at most {MAX_TOKEN_BYTES} bytes"
+        )
     receipt_identity = identities["receipt"]
     if receipt_identity is not None and (
         not stat.S_ISREG(receipt_identity[2])
@@ -2262,6 +2596,97 @@ def validate_publication_paths(
         raise EvidenceError("receipt file aliases the token file")
     if parent_identities["receipt"] in root_directory_inodes:
         raise EvidenceError("receipt parent aliases a bundle/evidence directory")
+    return (
+        token_identity,
+        parent_identities["token"],
+        parent_identities["receipt"],
+    )
+
+
+def validate_publication_paths(
+    *,
+    bundle: Path,
+    token_file: Path,
+    receipt_output: Path,
+    evidence_roots: Sequence[Path] = (),
+    pinned_evidence_roots: Sequence[PinnedEvidenceRoot] = (),
+) -> PublicationPathState:
+    """Resolve inputs once and pin every tree/token identity before credentials."""
+
+    try:
+        bundle_path = bundle.expanduser().resolve(strict=True)
+        resolved_evidence_roots = [
+            path.expanduser().resolve(strict=True) for path in evidence_roots
+        ]
+    except OSError as exc:
+        raise EvidenceError(
+            "bundle/evidence input root cannot be resolved once to a directory"
+        ) from exc
+    token_path = lexical_absolute(token_file)
+    receipt_path = lexical_absolute(receipt_output)
+    pinned_roots: list[PinnedEvidenceRoot] = [
+        pin_evidence_root(bundle_path, resolve_once=False),
+        *(pin_evidence_root(path, resolve_once=False) for path in resolved_evidence_roots),
+    ]
+    for expected in pinned_evidence_roots:
+        fixed_path = lexical_absolute(expected.path)
+        current = pin_evidence_root(fixed_path, resolve_once=False)
+        if (
+            current.files != expected.files
+            or current.directories != expected.directories
+        ):
+            raise EvidenceError(
+                f"pinned evidence root changed after workflow preflight: {fixed_path}"
+            )
+        pinned_roots.append(expected)
+    _require_disjoint_roots(pinned_roots)
+    (
+        token_signature,
+        token_parent_identity,
+        receipt_parent_identity,
+    ) = _inspect_publication_aliases(
+        roots=pinned_roots,
+        token_path=token_path,
+        receipt_path=receipt_path,
+    )
+    return PublicationPathState(
+        bundle=pinned_roots[0],
+        evidence_roots=tuple(pinned_roots[1:]),
+        token_file=token_path,
+        token_signature=token_signature,
+        token_parent_identity=token_parent_identity,
+        receipt_output=receipt_path,
+        receipt_parent_identity=receipt_parent_identity,
+    )
+
+
+def revalidate_publication_paths(state: PublicationPathState) -> None:
+    """Require pinned source trees/token to remain exact; recheck receipt aliases."""
+
+    roots = (state.bundle, *state.evidence_roots)
+    for root in roots:
+        directories: dict[str, tuple[int, ...]] = {}
+        files = scan_regular_tree(root.path, directories=directories)
+        if files != root.files or directories != root.directories:
+            raise EvidenceError(
+                f"pinned publication input changed after preflight: {root.path}"
+            )
+    (
+        token_signature,
+        token_parent_identity,
+        receipt_parent_identity,
+    ) = _inspect_publication_aliases(
+        roots=roots,
+        token_path=state.token_file,
+        receipt_path=state.receipt_output,
+    )
+    if (
+        token_signature != state.token_signature
+        or token_parent_identity != state.token_parent_identity
+    ):
+        raise EvidenceError("token identity changed after publication preflight")
+    if receipt_parent_identity != state.receipt_parent_identity:
+        raise EvidenceError("receipt parent identity changed after publication preflight")
 
 
 def exact_snapshot_inventory(
@@ -2352,18 +2777,25 @@ def publish_archive(
     receipt_output: Path,
     expected_manifest: Mapping[str, Any] | None = None,
     evidence_roots: Sequence[Path] = (),
+    pinned_evidence_roots: Sequence[PinnedEvidenceRoot] = (),
 ) -> dict[str, Any]:
     """Verify one retained snapshot before token access and upload exactly it."""
 
-    validate_publication_paths(
+    path_state = validate_publication_paths(
         bundle=bundle,
         token_file=token_file,
         receipt_output=receipt_output,
         evidence_roots=evidence_roots,
+        pinned_evidence_roots=pinned_evidence_roots,
     )
     with tempfile.TemporaryDirectory(prefix="scaling-evidence-upload-") as name:
         upload_snapshot = Path(name) / "archive"
-        manifest = snapshot_bundle(bundle, upload_snapshot)
+        manifest = snapshot_bundle(
+            path_state.bundle.path,
+            upload_snapshot,
+            pinned_files=path_state.bundle.files,
+            pinned_directories=path_state.bundle.directories,
+        )
         verify_frozen_snapshot(
             upload_snapshot,
             manifest,
@@ -2376,7 +2808,12 @@ def publish_archive(
         # Credential access is deliberately after the sole retained upload
         # snapshot has passed byte, identity, source-stability, and semantic gates.
         try:
-            token = read_token_file(token_file)
+            revalidate_publication_paths(path_state)
+            token = read_token_file(
+                path_state.token_file,
+                expected_signature=path_state.token_signature,
+                expected_parent_identity=path_state.token_parent_identity,
+            )
             try:
                 from huggingface_hub import CommitOperationAdd, HfApi
             except ImportError as exc:
@@ -2502,13 +2939,12 @@ def publish_archive(
     receipt = publication_receipt(
         manifest=manifest, revision=revision, verification=verification
     )
-    validate_publication_paths(
-        bundle=bundle,
-        token_file=token_file,
-        receipt_output=receipt_output,
-        evidence_roots=evidence_roots,
+    revalidate_publication_paths(path_state)
+    write_atomic(
+        path_state.receipt_output,
+        canonical_json_bytes(receipt),
+        expected_parent_identity=path_state.receipt_parent_identity,
     )
-    write_atomic(receipt_output, canonical_json_bytes(receipt))
     return receipt
 
 
@@ -2557,13 +2993,22 @@ def main(argv: Iterable[str] | None = None) -> int:
             )
             print(json.dumps(receipt, indent=2, sort_keys=True))
             return 0
+        # A combined build+publish resolves and inventories the runs root once
+        # before building.  The same canonical identity is required by both the
+        # builder and the pre-credential publication gate; retargeting the
+        # original CLI symlink can never select a second tree.
+        workflow_runs = (
+            None if args.dry_run else pin_evidence_root(args.runs)
+        )
+        build_runs = args.runs if workflow_runs is None else workflow_runs.path
         bundle, manifest = build_archive(
             repository_root=args.repository_root,
-            runs=args.runs,
+            runs=build_runs,
             output=args.output,
             repo_id=args.repo_id,
             prefix=args.prefix,
             launch_commit=args.launch_commit,
+            _pinned_runs=workflow_runs,
         )
         plan = {
             "archive": str(bundle),
@@ -2585,7 +3030,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             token_file=args.token_file,
             receipt_output=args.receipt_output,
             expected_manifest=manifest,
-            evidence_roots=(args.runs,),
+            pinned_evidence_roots=(workflow_runs,),
         )
         print(json.dumps(receipt, indent=2, sort_keys=True))
         return 0

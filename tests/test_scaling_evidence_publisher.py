@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from contextlib import contextmanager
+import errno
 import io
 import os
 from pathlib import Path
@@ -29,9 +30,12 @@ from scripts.publish_scaling_evidence import (
     discover_runs_source,
     hash_regular_file,
     publication_receipt,
+    pin_evidence_root,
     prospective_selection_groups,
     publish_archive,
     read_token_file,
+    rename_directory_noreplace,
+    revalidate_publication_paths,
     scan_regular_tree,
     semantic_verify,
     sha256_bytes,
@@ -422,7 +426,7 @@ class ScalingEvidencePublisherTests(unittest.TestCase):
             verified_snapshot.append(snapshot)
             return {flag: True for flag in SEMANTIC_FLAGS}
 
-        def token(_path):
+        def token(_path, **_kwargs):
             events.append("token")
             return "hf_" + "A" * 24
 
@@ -597,7 +601,7 @@ class ScalingEvidencePublisherTests(unittest.TestCase):
             victim.write_bytes(b"unchanged")
             linked_output = root / "receipt"
             linked_output.symlink_to(victim)
-            with self.assertRaisesRegex(EvidenceError, "regular file"):
+            with self.assertRaisesRegex(EvidenceError, "current-user file"):
                 write_atomic(linked_output, b"malicious")
             self.assertEqual(victim.read_bytes(), b"unchanged")
 
@@ -611,9 +615,16 @@ class ScalingEvidencePublisherTests(unittest.TestCase):
 
             regular = root / "regular"
             regular.write_bytes(b"old")
-            write_atomic(regular, b"new")
-            self.assertEqual(regular.read_bytes(), b"new")
-            self.assertEqual(regular.stat().st_mode & 0o777, 0o600)
+            with self.assertRaisesRegex(EvidenceError, "differs; refusing to overwrite"):
+                write_atomic(regular, b"new")
+            self.assertEqual(regular.read_bytes(), b"old")
+            write_atomic(regular, b"old")
+            self.assertEqual(regular.read_bytes(), b"old")
+
+            fresh = root / "fresh"
+            write_atomic(fresh, b"new")
+            self.assertEqual(fresh.read_bytes(), b"new")
+            self.assertEqual(fresh.stat().st_mode & 0o777, 0o600)
 
     def test_publication_paths_reject_receipt_and_token_aliases(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -657,11 +668,82 @@ class ScalingEvidencePublisherTests(unittest.TestCase):
             token = root / "token"
             token.write_text("HF_TOKEN=hf_" + "A" * 24 + "\n", encoding="utf-8")
             token.chmod(0o600)
-            validate_publication_paths(
+            state = validate_publication_paths(
                 bundle=alias,
                 token_file=token,
                 receipt_output=root / "receipt.json",
             )
+            self.assertEqual(state.bundle.path, bundle.resolve())
+            alias.unlink()
+            replacement = root / "replacement"
+            replacement.mkdir()
+            alias.symlink_to(replacement, target_is_directory=True)
+            # Revalidation is against the one resolved/pinned tree, never the
+            # mutable user-selected alias.
+            revalidate_publication_paths(state)
+
+    def test_publication_rejects_token_and_bundle_identity_swaps_after_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "bundle"
+            bundle.mkdir()
+            _write_bundle(bundle)
+            token = root / "token"
+            token_payload = "HF_TOKEN=hf_" + "A" * 24 + "\n"
+            token.write_text(token_payload, encoding="utf-8")
+            token.chmod(0o600)
+            receipts = root / "receipts"
+            receipts.mkdir()
+            state = validate_publication_paths(
+                bundle=bundle,
+                token_file=token,
+                receipt_output=receipts / "receipt.json",
+            )
+
+            moved_receipts = root / "moved-receipts"
+            receipts.rename(moved_receipts)
+            receipts.mkdir()
+            with self.assertRaisesRegex(EvidenceError, "receipt parent identity"):
+                revalidate_publication_paths(state)
+            with self.assertRaisesRegex(EvidenceError, "receipt parent changed"):
+                write_atomic(
+                    receipts / "receipt.json",
+                    b"receipt",
+                    expected_parent_identity=state.receipt_parent_identity,
+                )
+            receipts.rmdir()
+            moved_receipts.rename(receipts)
+
+            replacement_token = root / "replacement-token"
+            replacement_token.write_text(token_payload, encoding="utf-8")
+            replacement_token.chmod(0o600)
+            os.replace(replacement_token, token)
+            with self.assertRaisesRegex(EvidenceError, "token identity changed"):
+                revalidate_publication_paths(state)
+            with self.assertRaisesRegex(EvidenceError, "changed after preflight"):
+                read_token_file(
+                    token,
+                    expected_signature=state.token_signature,
+                    expected_parent_identity=state.token_parent_identity,
+                )
+
+            # Restore the exact token inode, then swap the resolved bundle root
+            # for a byte-identical directory with different identities.
+            token.unlink()
+            original_token = root / "original-token"
+            original_token.write_text(token_payload, encoding="utf-8")
+            original_token.chmod(0o600)
+            state = validate_publication_paths(
+                bundle=bundle,
+                token_file=original_token,
+                receipt_output=root / "receipt.json",
+            )
+            moved = root / "moved"
+            bundle.rename(moved)
+            bundle.mkdir()
+            _write_bundle(bundle)
+            with self.assertRaisesRegex(EvidenceError, "input changed"):
+                revalidate_publication_paths(state)
 
     def test_disjoint_failure_happens_before_token_or_hub_access(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1054,6 +1136,131 @@ class ScalingEvidencePublisherTests(unittest.TestCase):
                 )
             self.assertFalse((real_parent / "output").exists())
 
+    def test_build_preflights_source_overlap_before_creating_output_parents(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            repository.mkdir()
+            runs = root / "runs"
+            runs.mkdir()
+
+            nested_runs_parent = runs / "new-parent"
+            with self.assertRaisesRegex(EvidenceError, "disjoint from the runs"):
+                build_archive(
+                    repository_root=repository,
+                    runs=runs,
+                    output=nested_runs_parent / "archive",
+                    repo_id="quintic/gpt-tpu-speedrun-scaling-evidence",
+                    prefix="current_budget_isoflop_v4",
+                )
+            self.assertFalse(nested_runs_parent.exists())
+
+            nested_repository_parent = repository / "new-parent"
+            with self.assertRaisesRegex(EvidenceError, "disjoint from the repository"):
+                build_archive(
+                    repository_root=repository,
+                    runs=runs,
+                    output=nested_repository_parent / "archive",
+                    repo_id="quintic/gpt-tpu-speedrun-scaling-evidence",
+                    prefix="current_budget_isoflop_v4",
+                )
+            self.assertFalse(nested_repository_parent.exists())
+
+            alias = root / "runs-alias"
+            alias.symlink_to(runs, target_is_directory=True)
+            aliased_parent = alias / "new-parent"
+            with self.assertRaisesRegex(EvidenceError, "disjoint from the runs"):
+                build_archive(
+                    repository_root=repository,
+                    runs=runs,
+                    output=aliased_parent / "archive",
+                    repo_id="quintic/gpt-tpu-speedrun-scaling-evidence",
+                    prefix="current_budget_isoflop_v4",
+                )
+            self.assertFalse((runs / "new-parent").exists())
+
+    def test_pinned_runs_root_rejects_retarget_and_identity_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first"
+            second = root / "second"
+            first.mkdir()
+            second.mkdir()
+            (first / "marker").write_bytes(b"first")
+            (second / "marker").write_bytes(b"second")
+            alias = root / "runs"
+            alias.symlink_to(first, target_is_directory=True)
+            pinned = pin_evidence_root(alias)
+
+            alias.unlink()
+            alias.symlink_to(second, target_is_directory=True)
+            self.assertEqual(pinned.path, first.resolve())
+
+            moved = root / "moved-first"
+            first.rename(moved)
+            first.mkdir()
+            (first / "marker").write_bytes(b"first")
+            token = root / "token"
+            token.write_text("HF_TOKEN=hf_" + "A" * 24 + "\n", encoding="utf-8")
+            token.chmod(0o600)
+            bundle = root / "bundle"
+            bundle.mkdir()
+            _write_bundle(bundle)
+            with self.assertRaisesRegex(EvidenceError, "changed after workflow preflight"):
+                validate_publication_paths(
+                    bundle=bundle,
+                    token_file=token,
+                    receipt_output=root / "receipt.json",
+                    pinned_evidence_roots=(pinned,),
+                )
+
+    def test_directory_install_is_atomic_noreplace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            (source / "owned").write_bytes(b"source")
+            destination = root / "destination"
+            destination.mkdir()
+            (destination / "concurrent").write_bytes(b"destination")
+            parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with self.assertRaisesRegex(EvidenceError, "refusing to replace"):
+                    rename_directory_noreplace(
+                        parent, "source", parent, "destination"
+                    )
+                self.assertEqual((source / "owned").read_bytes(), b"source")
+                self.assertEqual(
+                    (destination / "concurrent").read_bytes(), b"destination"
+                )
+                (destination / "concurrent").unlink()
+                destination.rmdir()
+                rename_directory_noreplace(parent, "source", parent, "destination")
+            finally:
+                os.close(parent)
+            self.assertFalse(source.exists())
+            self.assertEqual((destination / "owned").read_bytes(), b"source")
+
+    def test_receipt_concurrent_creation_accepts_only_identical_bytes(self) -> None:
+        for existing, should_pass in ((b"receipt", True), (b"different", False)):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                receipt = root / "receipt.json"
+                def racing_link(*args, **kwargs):
+                    receipt.write_bytes(existing)
+                    raise FileExistsError(errno.EEXIST, "simulated race")
+
+                with patch("scripts.publish_scaling_evidence.os.link", side_effect=racing_link):
+                    if should_pass:
+                        write_atomic(receipt, b"receipt")
+                    else:
+                        with self.assertRaisesRegex(EvidenceError, "differs"):
+                            write_atomic(receipt, b"receipt")
+                self.assertEqual(receipt.read_bytes(), existing)
+                self.assertEqual(
+                    [path.name for path in root.iterdir()], ["receipt.json"]
+                )
+
     def test_upload_detects_mutation_of_open_snapshot_descriptor(self) -> None:
         class Add:
             def __init__(self, *, path_in_repo, path_or_fileobj):
@@ -1135,6 +1342,60 @@ class ScalingEvidencePublisherTests(unittest.TestCase):
         self.assertEqual(result, 0)
         publish.assert_called_once()
         build.assert_not_called()
+
+    def test_combined_cli_carries_one_pinned_runs_root_through_publication(self) -> None:
+        from scripts.publish_scaling_evidence import main
+
+        manifest = _manifest()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "runs"
+            runs.mkdir()
+            (runs / "marker").write_bytes(b"evidence")
+            alias = root / "runs-alias"
+            alias.symlink_to(runs, target_is_directory=True)
+            pinned = pin_evidence_root(alias)
+            bundle = root / "bundle"
+            token = root / "token"
+            receipt = root / "receipt"
+
+            def build_once(**kwargs):
+                self.assertEqual(kwargs["runs"], pinned.path)
+                self.assertIs(kwargs["_pinned_runs"], pinned)
+                alias.unlink()
+                replacement = root / "replacement"
+                replacement.mkdir()
+                alias.symlink_to(replacement, target_is_directory=True)
+                return bundle, manifest
+
+            with patch(
+                "scripts.publish_scaling_evidence.pin_evidence_root",
+                return_value=pinned,
+            ), patch(
+                "scripts.publish_scaling_evidence.build_archive",
+                side_effect=build_once,
+            ), patch(
+                "scripts.publish_scaling_evidence.publish_archive",
+                return_value={"published": True},
+            ) as publish:
+                result = main(
+                    [
+                        "build",
+                        "--runs",
+                        str(alias),
+                        "--output",
+                        str(bundle),
+                        "--token-file",
+                        str(token),
+                        "--receipt-output",
+                        str(receipt),
+                    ]
+                )
+
+            self.assertEqual(result, 0)
+            call = publish.call_args.kwargs
+            self.assertEqual(call["pinned_evidence_roots"], (pinned,))
+            self.assertNotIn("evidence_roots", call)
 
     def test_dry_run_cli_never_reads_token_or_publishes(self) -> None:
         from scripts.publish_scaling_evidence import main
