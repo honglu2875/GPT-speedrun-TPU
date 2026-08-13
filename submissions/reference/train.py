@@ -3509,18 +3509,26 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                 # rather than including a backlog dispatched by preceding steps.
                 sync_tree((params, optimizer, last_metrics))
                 assert xprof_dir is not None
-                xprof_dir.mkdir(parents=True, exist_ok=True)
-                console.phase(
-                    "Starting XProf capture",
-                    f"steps {capture_window[0]}..{capture_window[1]} → {xprof_dir}",
-                )
-                jax.profiler.start_trace(
-                    xprof_dir,
-                    profiler_options=profiler_options(
-                        platform, int(jax.local_device_count())
-                    ),
-                )
-                trace_active = True
+                if is_controller:
+                    # TPU VM filesystems are independent. Capture the controller's
+                    # local chips while every process still runs the distributed
+                    # step; this gives worker 0 a self-contained trace to serve.
+                    xprof_dir.mkdir(parents=True, exist_ok=True)
+                    console.phase(
+                        "Starting XProf capture",
+                        f"steps {capture_window[0]}..{capture_window[1]} → {xprof_dir}",
+                    )
+                    jax.profiler.start_trace(
+                        xprof_dir,
+                        profiler_options=profiler_options(
+                            platform, int(jax.local_device_count())
+                        ),
+                    )
+                    trace_active = True
+                if process_count > 1:
+                    multihost_utils.sync_global_devices(
+                        "speedrun-xprof-capture-started"
+                    )
 
             annotation = (
                 jax.profiler.StepTraceAnnotation("train", step_num=step_index)
@@ -3623,9 +3631,18 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                     sync_tree((params, optimizer, last_metrics))
 
             if capture_window is not None and step_index == capture_window[1]:
-                jax.profiler.stop_trace()
-                trace_active = False
-                console.phase("XProf capture saved", str(xprof_dir))
+                if process_count > 1:
+                    multihost_utils.sync_global_devices(
+                        "speedrun-xprof-capture-finished"
+                    )
+                if trace_active:
+                    jax.profiler.stop_trace()
+                    trace_active = False
+                    console.phase("XProf capture saved", str(xprof_dir))
+                if process_count > 1:
+                    multihost_utils.sync_global_devices(
+                        "speedrun-xprof-capture-stopped"
+                    )
     finally:
         if trace_active:
             # Avoid leaving process-global profiler state active when a sampled

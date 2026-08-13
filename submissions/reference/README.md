@@ -82,7 +82,7 @@ not yet a claim of reaching the 3.28 target.
 ## TPU kernel baseline
 
 The official YAML profile selects `attention_backend: tpu_flash` and
-`loss_backend: dense`. The top-level `make baseline` reads those settings
+`loss_backend: dense`. The top-level `make run` reads those settings
 without repeating them as flags. This promotes the
 hardware-validated attention improvement without changing the output objective,
 model, schedule, or token budget. The smoke and development YAML profiles stay
@@ -130,7 +130,7 @@ For a bounded XProf diagnostic, pass `--xprof-dir`, `--xprof-start-step`, and
 `--xprof-steps`. Combining those with `--no-final-validation --no-checkpoint`
 skips evaluation compilation, all validation, checkpointing, and the competition
 result event; it writes only `training.csv` and the trace. The top-level
-`make profile` target reads the same official YAML and overrides only its
+`make profile` target reads the saved YAML profile and overrides only its
 bounded diagnostic duration/instrumentation before starting the viewer. That
 template explicitly passes
 `--diagnostics-every 0` so sparse reductions do not pollute the XProf window.
@@ -140,5 +140,5 @@ validated and recorded:
 
 ```bash
 uv run --frozen --no-sync speedrun run reference --profile smoke
-make baseline
+make run
 ```

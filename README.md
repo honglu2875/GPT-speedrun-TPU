@@ -2,7 +2,7 @@
 
 A collaborative GPT training speedrun for Cloud TPU v4 slices, from a v4-8 to
 larger multi-host slices. Every algorithm is a polished JAX entry program named
-`train.py` with a sibling `config.yaml`; shared code handles
+`train.py`, with a sibling `config.yaml`; shared code handles
 reproducible data, machine checks, run capture, protocol validation, and
 leaderboards.
 
@@ -22,6 +22,7 @@ templates:
 
 ```bash
 make prepare
+make run
 make baseline
 make profile
 make report
@@ -30,8 +31,10 @@ make report
 | Target | Purpose |
 |---|---|
 | `make prepare` | synchronize the frozen uv environment, then open the interactive setup wizard |
-| `make baseline` | verify every configured TPU VM and its data, then run the versioned reference configuration |
-| `make profile` | run a validation-free 100-step diagnostic, capture XProf steps 11–20, then serve the trace on port 8791 |
+| `make run` | verify every configured TPU VM and its data, then run the reference using the saved profile |
+| `make baseline` | compatibility alias for `make run` |
+| `make run TARGET=name` | run `submissions/name/train.py` with its sibling `config.yaml` under the same policy |
+| `make profile` | run a distributed, validation-free 100-step diagnostic, capture worker 0 steps 11–20, then serve XProf on port 8791 |
 | `make report` | integrity-check completed runs and rebuild the standalone `report.html` dashboard |
 
 `make prepare` runs these two commands:
@@ -43,17 +46,31 @@ uv --cache-dir /tmp/uv-cache run --frozen --no-sync speedrun prepare \
 ```
 
 It asks for the data-cache root, data and run profiles, persistent artifact
-directory, TPU VM host count, default track, checkpoint retention, colors, and a
-smoke/development loss target. The training-token answer sizes only the corpus
-prepared for the `official` profile; it does not change trainer steps, the
-leaderboard budget, or the official run contract. The wizard can then probe
-JAX/TPU health and prepare the selected dataset. Personal choices are stored in
-the gitignored `.speedrun.toml`; official constants remain versioned in Git.
-The personal target applies only to smoke/development work; the official target
-is fixed at 3.28 and may only be tightened explicitly.
+directory, TPU VM host count, default track, checkpoint retention, colors, a
+smoke/development loss target, and a corpus-preparation token budget. The token
+answer sizes only the corpus prepared for the `official` profile; it does not
+change trainer steps, the leaderboard budget, or the official run contract.
+The wizard can then probe JAX/TPU health and prepare the selected dataset;
+only the explicit CLI flag `--no-download` skips data preparation. Personal
+choices are stored in the gitignored `.speedrun.toml`; official constants
+remain versioned in Git. The personal loss target applies only to
+smoke/development work; the official target is fixed at 3.28 and may only be
+tightened explicitly.
 
-On this node, `shm/` is a symlink to the 201 GiB RAM filesystem and is an ideal
-ephemeral data cache:
+`make run` requires that saved file to contain a default profile; otherwise it
+stops and asks for `make prepare`. `TARGET` defaults to `reference`. A custom
+target must be a folder beneath `submissions/` containing regular, non-symlink
+`train.py` and `config.yaml` files.
+
+For a multi-host run using the conventional `shm` cache, preparation requires
+`/dev/shm` to be a writable `tmpfs` or `ramfs` on every VM and creates
+`shm -> /dev/shm/.speedrun-cache` in each checkout. It uses `sudo -n` to make
+that dedicated directory and completed entries root-owned but writable by the
+caller's primary group. This is necessary because systemd-logind defaults to
+`RemoveIPC=yes` and recursively removes user-owned `/dev/shm` entries after the
+last SSH session for that user ends. Speedrun does not alter that host-wide
+policy. If any VM lacks the mount or non-interactive cache ownership access,
+preparation stops with a short instruction before downloading data:
 
 ```bash
 uv run --frozen --no-sync speedrun prepare --path shm/ --profile official
@@ -76,19 +93,23 @@ t1v-n-a09f5679-w-[0-3]
 ```
 
 The expression is ordinary `pdsh` host-list syntax; a comma-separated explicit
-list also works. The controller needs `pdsh`, `scp`, and non-interactive SSH to
+list also works. The controller needs `pdsh`, `rsync`, and non-interactive SSH to
 itself and every peer. Speedrun tests that access, but it never creates, copies,
 or modifies SSH keys. If the probe fails, add this controller's public key to the
 same user's `~/.ssh/authorized_keys` on the TPU VMs, verify
 `pdsh -R ssh -w HOSTS hostname`, and rerun preparation.
 
-After the SSH probe succeeds, preparation archives the current checkout
-(including dirty and untracked experiment files but excluding Git metadata,
-the virtual environment, caches, and run artifacts), copies it to the same
-absolute path on every peer, installs `uv` there if needed with Astral's
-official installer, synchronizes the frozen environment, and prepares each
-VM's local data cache. `make baseline` repeats the source synchronization and
-automatically launches the trainer on all configured hosts through `pdsh`.
+After the SSH and RAM-cache probes succeed, preparation attempts a
+non-interactive `apt-get` installation wherever `rsync` is missing. It then
+incrementally copies the current checkout—including dirty and untracked
+experiment files, but excluding Git metadata, the virtual environment,
+`shm/`, data, caches, profiles, and run artifacts—to the same absolute path on
+every peer. It installs `uv` there if needed, synchronizes the frozen
+environment, then uses one `pdsh` launch to prepare the selected dataset and
+validations concurrently in every VM's local protected RAM cache. Before each
+worker's SSH command exits, it protects the completed entries from logout
+cleanup. `make run` repeats the source synchronization and launches the trainer
+on all configured hosts.
 
 Every trainer process calls `jax.distributed.initialize()` before its first
 device query. JAX's runtime rank is `jax.process_index()`; there is no launcher
@@ -133,8 +154,9 @@ nominal training capacity fits the requested budget:
 | 3.9B+1 through 7.9B | scaled `8B` | 7.9B | `<data-path>/fineweb-scaled/8B/` |
 | 7.9B+1 through 74.9B | scaled `hero` | 74.9B | `<data-path>/fineweb-scaled/hero/` |
 
-The route is preparation-only: `speedrun run --profile official`, standalone
-doctor checks, and `make baseline` retain the fixed classic dataset and
+The route is preparation-only: `training_tokens` is never consulted by
+standalone doctor or `speedrun run`, and therefore not by `make run` or
+`make baseline`. Official runs continue to use the fixed classic dataset and
 624,984,064-token competition contract. Scaled preparation is fail-closed and
 starts working only after the corresponding immutable, URL-bearing publication
 manifest is checked into `data/manifests/fineweb-scaled-gpt2/`; no placeholder
@@ -152,8 +174,11 @@ The source is the pinned `kjj0/fineweb10B-gpt2` revision used by
 ## Run an algorithm
 
 ```bash
-# Exact reference workflow, including machine/data preflight
-make baseline
+# Reference workflow using the profile and policy saved by make prepare
+make run
+
+# Run a variant from submissions/dense_control/train.py
+make run TARGET=dense_control
 
 # Fast end-to-end check
 uv run --frozen --no-sync speedrun prepare --non-interactive \
@@ -213,7 +238,7 @@ like-for-like hardware comparison with the original v4-8 number.
 The reference [`config.yaml`](submissions/reference/config.yaml) pins the custom
 trainable Pallas attention with the dense output loss. It also preserves the
 model, objective, schedule, validation cadence, and exact token budget beside
-the entry script. `make baseline` supplies only machine/run policy and lets the
+the entry script. `make run` supplies only saved machine/run policy and lets the
 trainer read that versioned file. To create a dense control, clone the reference
 and change the clone's `attention_backend` field instead of hiding an algorithm
 change in a long launch command:
@@ -243,15 +268,16 @@ APIs, numerical checks, and tuning policy are in
 
 ### Profiling and reports
 
-`make profile` uses the same four-chip data-parallel model shape and the first
-100 updates of the 715-step warmup schedule. Compilation happens before capture;
-canonical validation, Fresh10, checkpointing, and leaderboard recording are
-disabled. The trace includes host sampling, host-to-device transfer, TPU
-execution, synchronization, and collectives for ten steady-state steps. After
-capture it starts an isolated, version-pinned XProf viewer at
-`http://localhost:8791`; Ctrl-C stops the viewer. Override paths or the capture
-window with Make variables such as `DATA_PATH`, `PROFILE_OUTPUT`,
-`XPROF_START_STEP`, and `XPROF_STEPS`.
+`make profile` uses the profile saved by `make prepare` and launches the trainer
+on every configured TPU VM, so the measured computation and collectives use the
+real global topology. Compilation happens before capture; canonical validation,
+Fresh10, checkpointing, and leaderboard recording are disabled. Worker 0 alone
+records its host activity and four local TPU chips, including their participation
+in global collectives. This avoids trying to merge independent local trace
+sessions from four VM filesystems. After capture, worker 0 starts an isolated,
+version-pinned XProf viewer at `http://localhost:8791`; Ctrl-C stops it. Override
+the output or capture window with `PROFILE_OUTPUT`, `XPROF_START_STEP`, and
+`XPROF_STEPS`.
 
 `make report` scans completed folders beneath `runs/`, checks their recorded
 artifact hashes when an immutable record is available, and writes one

@@ -8,10 +8,20 @@ from unittest.mock import patch
 from speedrun import cli
 from speedrun.config import ConfigError, LocalConfig
 from speedrun.data import DataError, Fresh10Domain, PreparedDataset, PreparedFresh10
+from speedrun.doctor import check_prepared_data
 from speedrun.report import REPORT_ADMISSION_QUALIFICATION_LOSS
 
 
 class CliTests(unittest.TestCase):
+    def test_requested_data_diagnostics_fail_when_cache_is_missing(self) -> None:
+        with patch(
+            "speedrun.doctor.verify_dataset",
+            side_effect=DataError("missing dataset shard"),
+        ):
+            result = check_prepared_data(Path("/dev/shm"), "official")
+        self.assertEqual(result.status, "error")
+        self.assertIn("make prepare", result.hint or "")
+
     def test_official_open_budget_preserves_calibrated_baseline(self) -> None:
         budget = cli.OFFICIAL_OPEN_TRAINING_TOKENS
         self.assertEqual(budget, 624_984_064)
@@ -115,10 +125,10 @@ class CliTests(unittest.TestCase):
 
     def test_wizard_accepts_defaults_and_returns_complete_config(self) -> None:
         defaults = LocalConfig()
-        # Two path prompts, one host-count prompt, five menu prompts, one target
-        # prompt, one token-budget prompt, and four confirmations. Empty input
-        # accepts every default.
-        with patch("builtins.input", side_effect=[""] * 14):
+        # Two path prompts, one host-count prompt, five menu prompts, one loss
+        # target, one token budget, and three confirmations. Dataset
+        # preparation is automatic.
+        with patch("builtins.input", side_effect=[""] * 13) as prompt:
             result, diagnostics, require_tpu, download, save = cli._prepare_wizard(
                 defaults,
                 run_diagnostics=True,
@@ -131,6 +141,7 @@ class CliTests(unittest.TestCase):
         self.assertTrue(require_tpu)
         self.assertTrue(download)
         self.assertTrue(save)
+        self.assertEqual(prompt.call_count, 13)
 
     def test_prepare_training_budget_is_explicit_and_positive(self) -> None:
         parser = cli.build_parser()
@@ -222,7 +233,7 @@ class CliTests(unittest.TestCase):
         )
         args = cli.build_parser().parse_args(["prepare", "--non-interactive"])
         with patch("speedrun.cli.run_pdsh") as run:
-            cli._run_remote_prepare(config, args, inventory, root=Path("/repo"))
+            cli._run_cluster_prepare(config, args, inventory, root=Path("/repo"))
         remote = run.call_args.args[1]
         self.assertIn("--training-tokens 3900000000", remote)
         self.assertIn("--profile official", remote)
@@ -292,7 +303,7 @@ class CliTests(unittest.TestCase):
                     cli.command_prepare(args)
 
     def test_wizard_infers_cloud_tpu_host_expression(self) -> None:
-        answers = ["", "", "", "4", "", "", "", "", "", "", "", "", "", "", ""]
+        answers = ["", "", "", "4"] + [""] * 10
         with (
             patch("builtins.input", side_effect=answers),
             patch("speedrun.cli.infer_host_expression", return_value="slice-w-[0-3]"),
@@ -306,6 +317,103 @@ class CliTests(unittest.TestCase):
             )
         self.assertEqual(result.tpu_vm_count, 4)
         self.assertEqual(result.tpu_vm_hosts, "slice-w-[0-3]")
+
+    def test_cluster_prepare_downloads_on_controller_and_every_peer(self) -> None:
+        args = cli.build_parser().parse_args(["prepare", "--non-interactive"])
+        config = LocalConfig(
+            tpu_vm_count=4,
+            tpu_vm_hosts="slice-w-[0-3]",
+        )
+        inventory = cli.ClusterInventory(
+            host_expression=config.tpu_vm_hosts,
+            hosts=tuple(f"slice-w-{index}" for index in range(4)),
+            remote_hosts=tuple(f"slice-w-{index}" for index in range(1, 4)),
+            local_host="slice-w-0",
+            reported_hostnames={
+                f"slice-w-{index}": f"slice-w-{index}" for index in range(4)
+            },
+        )
+        with patch("speedrun.cli.run_pdsh") as run:
+            cli._run_cluster_prepare(config, args, inventory, root=Path("/repo"))
+
+        self.assertEqual(run.call_args.args[0], inventory.hosts)
+        remote = run.call_args.args[1]
+        self.assertIn("SPEEDRUN_CLUSTER_WORKER=1", remote)
+        self.assertIn("--profile official", remote)
+        self.assertIn("--path /repo/shm", remote)
+        self.assertIn("sudo -n chown -R", remote)
+        self.assertIn("/dev/shm/.speedrun-cache", remote)
+
+    def test_ram_cache_path_detection_does_not_follow_existing_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "shm").symlink_to("/dev/shm")
+            self.assertTrue(cli._uses_repo_shm_cache("shm", root))
+            self.assertTrue(cli._uses_repo_shm_cache("/dev/shm", root))
+            self.assertFalse(cli._uses_repo_shm_cache("data", root))
+
+    def test_profile_launches_every_configured_host_with_controller_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            submission = root / "submissions" / "variant"
+            submission.mkdir(parents=True)
+            (submission / "train.py").write_text("pass\n", encoding="utf-8")
+            (submission / "config.yaml").write_text("schema_version: 1\n", encoding="utf-8")
+            (root / ".speedrun.toml").write_text("[speedrun]\n", encoding="utf-8")
+            config = LocalConfig(
+                data_path="shm",
+                default_profile="dev",
+                tpu_vm_count=4,
+                tpu_vm_hosts="slice-w-[0-3]",
+            )
+            inventory = cli.ClusterInventory(
+                host_expression=config.tpu_vm_hosts,
+                hosts=tuple(f"slice-w-{index}" for index in range(4)),
+                remote_hosts=tuple(f"slice-w-{index}" for index in range(1, 4)),
+                local_host="slice-w-0",
+                reported_hostnames={
+                    f"slice-w-{index}": f"slice-w-{index}" for index in range(4)
+                },
+            )
+            prepared = PreparedDataset(
+                name="dev",
+                root=Path("/dev/shm"),
+                manifest_path=root / "manifest.json",
+                manifest_sha256="a" * 64,
+                train_files=(Path("/dev/shm/train.bin"),),
+                validation_files=(Path("/dev/shm/val.bin"),),
+                train_tokens=100,
+                validation_tokens=20,
+            )
+            args = cli.build_parser().parse_args(
+                [
+                    "profile",
+                    "variant",
+                    "--output-dir",
+                    "profiles/test",
+                    "--steps",
+                    "20",
+                ]
+            )
+            with (
+                patch("speedrun.cli.repo_root", return_value=root),
+                patch("speedrun.cli.load_config", return_value=config),
+                patch("speedrun.cli.data_selection", return_value=("dev", 1)),
+                patch("speedrun.cli.verify_dataset", return_value=prepared),
+                patch("speedrun.cli._probe_configured_cluster", return_value=inventory),
+                patch("speedrun.cli.sync_workspace") as sync,
+                patch("speedrun.cli.run_pdsh") as run,
+            ):
+                self.assertEqual(cli.command_profile(args), 0)
+
+            self.assertEqual(run.call_args.args[0], inventory.hosts)
+            remote = run.call_args.args[1]
+            self.assertIn("SPEEDRUN_DISTRIBUTED=1", remote)
+            self.assertIn("SPEEDRUN_CONTROLLER_HOSTNAME=slice-w-0", remote)
+            self.assertIn("--profile dev", remote)
+            self.assertIn("--xprof-dir", remote)
+            self.assertIn("profiles/test/xprof", remote)
+            sync.assert_called_once()
 
     def test_report_admission_has_no_customization_surface(self) -> None:
         self.assertEqual(REPORT_ADMISSION_QUALIFICATION_LOSS, 3.76)

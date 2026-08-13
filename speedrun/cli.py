@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 from typing import Any, Callable, Iterable, Sequence
 
@@ -31,8 +32,10 @@ from harness.cluster import (
     ClusterInventory,
     bootstrap_uv,
     infer_host_expression,
+    prepare_ram_cache,
     probe_cluster,
     run_pdsh,
+    seal_ram_cache_command,
     sync_workspace,
 )
 
@@ -208,6 +211,24 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--color", choices=_COLORS)
     run.add_argument("--skip-data-check", action="store_true")
 
+    profile = commands.add_parser(
+        "profile",
+        help="capture a bounded XProf trace from a distributed submission",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    profile.add_argument(
+        "submission", nargs="?", default="reference", help="folder name beneath submissions/"
+    )
+    profile.add_argument("--profile", choices=_PROFILES, help="saved profile override")
+    profile.add_argument("--data-path", type=Path, help="dataset cache root override")
+    profile.add_argument("--output-dir", type=Path, required=True)
+    profile.add_argument("--steps", type=_positive_int, default=100)
+    profile.add_argument("--xprof-start-step", type=_positive_int, default=11)
+    profile.add_argument("--xprof-steps", type=_positive_int, default=10)
+    profile.add_argument("--seed", type=_nonnegative_int, default=1337)
+    profile.add_argument("--timeout", type=_positive_float, default=7200.0)
+    profile.add_argument("--color", choices=_COLORS)
+
     verify = commands.add_parser("verify", help="re-validate a captured run and checkpoint")
     verify.add_argument("run", help="run ID or path")
     verify.add_argument("--track", choices=_TRACKS)
@@ -261,6 +282,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             return command_doctor(args)
         if args.command == "run":
             return command_run(args)
+        if args.command == "profile":
+            return command_profile(args)
         if args.command == "verify":
             return command_verify(args)
         if args.command == "leaderboard":
@@ -344,6 +367,16 @@ def command_prepare(args: argparse.Namespace) -> int:
         style.note("settings are temporary (--no-save)")
 
     cluster_controller = proposed.tpu_vm_count > 1 and not _is_cluster_worker()
+    inventory: ClusterInventory | None = None
+    if cluster_controller:
+        inventory = _prepare_cluster(
+            proposed,
+            args,
+            root=root,
+            artifacts_path=artifacts_path,
+            style=style,
+        )
+
     if run_diagnostics and not cluster_controller:
         style.heading("Machine diagnostics")
         results = run_doctor(
@@ -361,7 +394,14 @@ def command_prepare(args: argparse.Namespace) -> int:
             raise ConfigError("machine diagnostics failed; resolve the errors above")
 
     if not data_work:
-        style.note("dataset preparation skipped (--no-download)")
+        style.note("dataset preparation explicitly skipped (--no-download)")
+    elif inventory is not None:
+        style.heading("Dataset caches")
+        style.note(
+            f"preparing datasets and validations concurrently on "
+            f"{len(inventory.hosts)} TPU VMs"
+        )
+        _run_cluster_prepare(proposed, args, inventory, root=root)
     else:
         style.heading("Dataset cache")
         shards = args.train_shards or route.train_shards
@@ -393,15 +433,7 @@ def command_prepare(args: argparse.Namespace) -> int:
                 )
             _print_fresh10(fresh10, style)
 
-    if cluster_controller:
-        inventory = _prepare_cluster(
-            proposed,
-            args,
-            root=root,
-            artifacts_path=artifacts_path,
-            data_work=data_work,
-            style=style,
-        )
+    if inventory is not None:
         if run_diagnostics:
             style.heading("Distributed machine diagnostics")
             _run_cluster_doctor(
@@ -474,7 +506,10 @@ def command_run(args: argparse.Namespace) -> int:
     target_loss = _effective_target_loss(
         profile, requested=args.target_loss, development_default=config.target_loss
     )
-    data_path = resolve_path(args.data_path or config.data_path, root)
+    configured_data_path = str(args.data_path or config.data_path)
+    if config.tpu_vm_count > 1:
+        configured_data_path = _cluster_data_argument(configured_data_path, root)
+    data_path = resolve_path(configured_data_path, root)
     artifacts = resolve_path(config.artifacts_path, root)
     _ensure_artifacts_inside_repo(artifacts, root)
     if profile == "official" and args.skip_data_check:
@@ -601,6 +636,152 @@ def command_run(args: argparse.Namespace) -> int:
                 f"ppl {float(fresh['macro_perplexity']):.2f}"
             )
     print(f"  run {outcome.run_id}\n")
+    return 0
+
+
+def command_profile(args: argparse.Namespace) -> int:
+    """Run one bounded diagnostic on the configured JAX process topology."""
+
+    root = repo_root()
+    if not config_path(root).is_file():
+        raise ConfigError("no saved default profile found; run `make prepare` first")
+    config = load_config(root)
+    profile = args.profile or config.default_profile
+    color = args.color or config.color
+    style = Style(color)
+    if args.xprof_start_step + args.xprof_steps - 1 > args.steps:
+        raise ConfigError("the XProf capture window must fit inside --steps")
+
+    if not _NAME.fullmatch(args.submission):
+        raise ConfigError(
+            "submission names may contain only letters, digits, '.', '_' and '-'"
+        )
+    submissions_root = (root / "submissions").resolve()
+    submission_dir = (submissions_root / args.submission).resolve()
+    try:
+        submission_dir.relative_to(submissions_root)
+    except ValueError as exc:
+        raise ConfigError("submission path escapes submissions directory") from exc
+    trainer = submission_dir / "train.py"
+    experiment_config = submission_dir / "config.yaml"
+    if not trainer.is_file() or trainer.is_symlink():
+        raise ConfigError(f"submission entry script not found: {trainer}")
+    if not experiment_config.is_file() or experiment_config.is_symlink():
+        raise ConfigError(f"submission configuration file not found: {experiment_config}")
+
+    configured_data_path = str(args.data_path or config.data_path)
+    if config.tpu_vm_count > 1:
+        configured_data_path = _cluster_data_argument(configured_data_path, root)
+    data_path = resolve_path(configured_data_path, root)
+    manifest, shards = data_selection(profile)
+    style.heading("Verifying cached profile data")
+    prepared = verify_dataset(manifest, data_path, train_shards=shards)
+    style.ok(
+        f"{prepared.name}: {prepared.train_tokens:,} train / "
+        f"{prepared.validation_tokens:,} validation tokens"
+    )
+
+    output_dir = resolve_path(args.output_dir, root)
+    xprof_dir = output_dir / "xprof"
+    dataset_id, tokenizer_id = _data_identity(profile)
+    trainer_color = "always" if style.enabled else "never"
+    trainer_command = [
+        str(root / ".venv" / "bin" / "python"),
+        str(trainer),
+        "--config",
+        str(experiment_config),
+        "--output-dir",
+        str(output_dir),
+        "--seed",
+        str(args.seed),
+        "--track",
+        config.default_track,
+        "--profile",
+        profile,
+        "--steps",
+        str(args.steps),
+        "--val-every",
+        "0",
+        "--diagnostics-every",
+        "0",
+        "--log-every",
+        str(args.steps),
+        "--data-format",
+        "llmc",
+        "--dataset-id",
+        dataset_id,
+        "--tokenizer-id",
+        tokenizer_id,
+    ]
+    for train_file in prepared.train_files:
+        trainer_command.extend(("--train-data", str(train_file)))
+    for validation_file in prepared.validation_files:
+        trainer_command.extend(("--val-data", str(validation_file)))
+    trainer_command.extend(
+        (
+            "--xprof-dir",
+            str(xprof_dir),
+            "--xprof-start-step",
+            str(args.xprof_start_step),
+            "--xprof-steps",
+            str(args.xprof_steps),
+            "--no-final-validation",
+            "--no-checkpoint",
+            "--color",
+            trainer_color,
+        )
+    )
+
+    style.banner(f"profile / {args.submission} / {profile}")
+    if config.tpu_vm_count > 1:
+        inventory = _probe_configured_cluster(config)
+        style.note(
+            f"synchronizing source and launching all {len(inventory.hosts)} TPU VMs"
+        )
+        sync_workspace(
+            root,
+            inventory,
+            artifacts_path=output_dir,
+            data_path=data_path,
+        )
+        remote_environment = {
+            _CLUSTER_WORKER_ENV: "1",
+            _CONTROLLER_HOST_ENV: inventory.reported_hostnames[inventory.local_host],
+            _DISTRIBUTED_ENV: "1",
+            _PROCESS_COUNT_ENV: str(config.tpu_vm_count),
+            "JAX_COMPILATION_CACHE_DIR": f"/tmp/speedrun-profile-cache-{os.getpid()}",
+            "PYTHONUNBUFFERED": "1",
+        }
+        assignments = " ".join(
+            f"{key}={shlex.quote(value)}" for key, value in remote_environment.items()
+        )
+        remote = (
+            f"cd {shlex.quote(str(submission_dir))} && "
+            f"env {assignments} {shlex.join(trainer_command)}"
+        )
+        run_pdsh(
+            inventory.hosts,
+            remote,
+            labels=True,
+            timeout=float(args.timeout),
+        )
+    else:
+        try:
+            completed = subprocess.run(
+                trainer_command,
+                cwd=submission_dir,
+                check=False,
+                timeout=float(args.timeout),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ConfigError(
+                f"profile trainer timed out after {float(args.timeout):g}s"
+            ) from exc
+        if completed.returncode != 0:
+            raise ConfigError(
+                f"profile trainer exited with status {completed.returncode}"
+            )
+    style.ok(f"worker 0 XProf trace saved to {xprof_dir}")
     return 0
 
 
@@ -749,7 +930,6 @@ def _prepare_cluster(
     *,
     root: Path,
     artifacts_path: Path,
-    data_work: bool,
     style: Style,
 ) -> ClusterInventory:
     style.heading("TPU VM cluster")
@@ -758,10 +938,14 @@ def _prepare_cluster(
         f"passwordless SSH ready on {len(inventory.hosts)} hosts "
         f"({len(inventory.remote_hosts)} peer VMs)"
     )
+    if _uses_repo_shm_cache(config.data_path, root):
+        style.note("checking RAM-backed /dev/shm and configuring the shm cache link")
+        prepare_ram_cache(root, inventory, create_link=not args.check_only)
+        style.ok("shm points to writable RAM-backed storage on every TPU VM")
     if args.check_only:
         style.note("check-only mode does not synchronize source or environments")
     else:
-        style.note("synchronizing current source and personal settings to peer VMs")
+        style.note("incrementally synchronizing source and personal settings to peer VMs")
         sync_workspace(
             root,
             inventory,
@@ -770,22 +954,19 @@ def _prepare_cluster(
         )
         style.note("synchronizing the frozen uv environment on peer VMs")
         bootstrap_uv(root, inventory.remote_hosts, offline=args.offline)
-
-    if data_work:
-        style.note("preparing the selected dataset independently on peer VMs")
-        _run_remote_prepare(config, args, inventory, root=root)
     return inventory
 
 
-def _run_remote_prepare(
+def _run_cluster_prepare(
     config: LocalConfig,
     args: argparse.Namespace,
     inventory: ClusterInventory,
     *,
     root: Path,
 ) -> None:
-    if not inventory.remote_hosts:
+    if not inventory.hosts:
         return
+    data_argument = _cluster_data_argument(config.data_path, root)
     command = [
         str(root / ".venv" / "bin" / "python"),
         "-m",
@@ -795,7 +976,7 @@ def _run_remote_prepare(
         "--no-save",
         "--no-doctor",
         "--path",
-        config.data_path,
+        data_argument,
         "--profile",
         config.data_profile,
         "--artifacts",
@@ -827,12 +1008,12 @@ def _run_remote_prepare(
         command.append("--check-only")
     if args.force:
         command.append("--force")
-    remote = (
-        f"cd {shlex.quote(str(root.resolve()))} && "
-        f"env {_CLUSTER_WORKER_ENV}=1 {shlex.join(command)}"
-    )
+    worker_command = f"env {_CLUSTER_WORKER_ENV}=1 {shlex.join(command)}"
+    if _uses_repo_shm_cache(config.data_path, root) and not args.check_only:
+        worker_command = f"{worker_command} && {seal_ram_cache_command()}"
+    remote = f"cd {shlex.quote(str(root.resolve()))} && {worker_command}"
     run_pdsh(
-        inventory.remote_hosts,
+        inventory.hosts,
         remote,
         labels=True,
         timeout=_remote_prepare_timeout(config, args),
@@ -860,6 +1041,24 @@ def _remote_prepare_timeout(config: LocalConfig, args: argparse.Namespace) -> fl
     return max(900.0, float(args.timeout) * 20.0, route_deadline)
 
 
+def _uses_repo_shm_cache(value: str, root: Path) -> bool:
+    """Recognize the conventional checkout ``shm`` path without following links."""
+
+    configured = Path(value).expanduser()
+    if not configured.is_absolute():
+        configured = root / configured
+    lexical = Path(os.path.abspath(configured))
+    return lexical in {root.resolve() / "shm", Path("/dev/shm")}
+
+
+def _cluster_data_argument(value: str, root: Path) -> str:
+    """Route conventional multi-host shm use through the protected cache link."""
+
+    if _uses_repo_shm_cache(value, root):
+        return str(root.resolve() / "shm")
+    return value
+
+
 def _probe_configured_cluster(config: LocalConfig) -> ClusterInventory:
     if config.tpu_vm_count <= 1:
         raise ConfigError("multi-host operation requires tpu_vm_count greater than 1")
@@ -878,6 +1077,7 @@ def _run_cluster_doctor(
     color: str,
     root: Path,
 ) -> int:
+    data_path = _cluster_data_argument(data_path, root)
     command = [
         str(root / ".venv" / "bin" / "python"),
         "-m",
@@ -1016,11 +1216,10 @@ def _prepare_wizard(
     run_diagnostics = _confirm("Run environment diagnostics now", run_diagnostics, style)
     if run_diagnostics:
         require_tpu = _confirm(
-            "Require four healthy TPU v4 chips per configured VM",
+            "Require a healthy Cloud TPU v4 topology on every configured VM",
             require_tpu,
             style,
         )
-    download = _confirm("Prepare/verify the selected dataset now", download, style)
     save = _confirm("Save these personal defaults", save, style)
     resolved = LocalConfig(
         data_path=data_path,

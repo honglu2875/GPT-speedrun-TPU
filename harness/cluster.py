@@ -11,13 +11,11 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import shlex
 import shutil
 import socket
 import subprocess
-import tarfile
-import tempfile
 from typing import Mapping, Sequence
 
 
@@ -27,6 +25,26 @@ SSH_SETUP_GUIDANCE = (
     "TPU VM, verify that `pdsh -R ssh -w HOSTS hostname` succeeds, and rerun "
     "`make prepare`; speedrun never creates or distributes SSH keys."
 )
+RAM_CACHE_SETUP_GUIDANCE = (
+    "/dev/shm must be a writable tmpfs or ramfs on every configured TPU VM. "
+    "On each host reported above, mount it there (for example, "
+    "`sudo install -d -m 1777 /dev/shm && sudo mount -t tmpfs -o "
+    "rw,nosuid,nodev,mode=1777 tmpfs /dev/shm`) or remount it writable, then "
+    "rerun `make prepare`."
+)
+RAM_CACHE_PROTECTION_GUIDANCE = (
+    "The multi-host RAM cache needs non-interactive root privilege on every "
+    "configured TPU VM. `make prepare` uses `sudo -n` only to create and protect "
+    "its dedicated /dev/shm/.speedrun-cache directory, so systemd-logind "
+    "RemoveIPC cannot erase the dataset when a pdsh SSH session ends. Configure "
+    "passwordless sudo for those cache ownership commands, then rerun "
+    "`make prepare`; speedrun does not change the host-wide RemoveIPC policy."
+)
+RSYNC_SETUP_GUIDANCE = (
+    "rsync is required on every configured TPU VM. Automatic installation with "
+    "non-interactive apt-get failed; install the `rsync` package on the hosts "
+    "reported above, then rerun `make prepare`."
+)
 
 _SSH_OPTIONS = (
     "BatchMode=yes",
@@ -34,16 +52,19 @@ _SSH_OPTIONS = (
     "StrictHostKeyChecking=accept-new",
 )
 _DEFAULT_SSH_ARGS = " ".join(f"-o {option}" for option in _SSH_OPTIONS)
-_COMMON_ARCHIVE_EXCLUDES = {
-    ".git",
-    ".venv",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-    "__pycache__",
-    "profiles",
+RAM_CACHE_ROOT = Path("/dev/shm/.speedrun-cache")
+_COMMON_RSYNC_EXCLUDES = (
+    ".git/",
+    ".venv/",
+    ".mypy_cache/",
+    ".pytest_cache/",
+    ".ruff_cache/",
+    "__pycache__/",
+    "shm",
+    "runs/",
+    "profiles/",
     "report.html",
-}
+)
 
 
 class ClusterError(RuntimeError):
@@ -187,46 +208,186 @@ def sync_workspace(
     data_path: Path | None = None,
     environment: Mapping[str, str] | None = None,
 ) -> None:
-    """Copy current source/config bytes to peers without caches or run artifacts."""
+    """Incrementally copy source/config bytes without deleting peer-only files."""
 
     if not inventory.remote_hosts:
         return
     root = root.resolve()
-    excluded: set[PurePosixPath] = set()
+    bootstrap_rsync(inventory, environment=environment)
+    excluded = set(_COMMON_RSYNC_EXCLUDES)
     for ignored_path in (artifacts_path, data_path):
         if ignored_path is None:
             continue
         try:
-            excluded.add(
-                PurePosixPath(ignored_path.resolve().relative_to(root).as_posix())
-            )
+            relative = ignored_path.resolve().relative_to(root).as_posix()
         except ValueError:
-            pass
+            continue
+        excluded.add(f"/{relative}/")
 
-    with tempfile.TemporaryDirectory(prefix="speedrun-cluster-", dir="/tmp") as temporary:
-        archive_path = Path(temporary) / "workspace.tar.gz"
-        _create_workspace_archive(root, archive_path, excluded)
-        remote_archive = f"/tmp/speedrun-workspace-{os.getpid()}.tar.gz"
-        _copy_to_hosts(
-            archive_path,
-            remote_archive,
-            inventory.remote_hosts,
-            environment=environment,
-        )
-        quoted_root = shlex.quote(str(root))
-        quoted_archive = shlex.quote(remote_archive)
-        command = (
-            f"install -d -m 755 {quoted_root} && "
-            f"tar -xzf {quoted_archive} -C {quoted_root} && "
-            f"rm -f {quoted_archive}"
-        )
+    run_pdsh(
+        inventory.remote_hosts,
+        f"install -d -m 755 {shlex.quote(str(root))}",
+        environment=environment,
+        labels=True,
+        timeout=60.0,
+    )
+    _rsync_to_hosts(
+        root,
+        inventory.remote_hosts,
+        tuple(sorted(excluded)),
+        environment=environment,
+    )
+
+
+def prepare_ram_cache(
+    root: Path,
+    inventory: ClusterInventory,
+    *,
+    create_link: bool = True,
+    environment: Mapping[str, str] | None = None,
+) -> None:
+    """Configure a logout-safe cache within RAM-backed ``/dev/shm``.
+
+    systemd-logind's default ``RemoveIPC=yes`` recursively removes ordinary
+    user-owned files from ``/dev/shm`` when the user's final SSH session ends.
+    The dedicated cache directory and completed entries are therefore owned by
+    root while remaining writable through the caller's primary group.
+    """
+
+    mount_check = (
+        'target="$(findmnt -n -T /dev/shm -o TARGET 2>/dev/null || true)"; '
+        'fstype="$(findmnt -n -T /dev/shm -o FSTYPE 2>/dev/null || true)"; '
+        'if [ "$target" = /dev/shm ] && [ -w /dev/shm ]; then '
+        'case "$fstype" in tmpfs|ramfs) exit 0;; esac; fi; '
+        'echo "ERROR: /dev/shm is not a writable tmpfs or ramfs "'
+        '"(target=${target:-missing}, type=${fstype:-missing})" >&2; exit 3'
+    )
+    try:
         run_pdsh(
-            inventory.remote_hosts,
+            inventory.hosts,
+            mount_check,
+            environment=environment,
+            labels=True,
+            timeout=60.0,
+        )
+    except ClusterError as exc:
+        raise ClusterError(RAM_CACHE_SETUP_GUIDANCE) from exc
+
+    root = root.resolve()
+    link = root / "shm"
+    cache = RAM_CACHE_ROOT
+    quoted_root = shlex.quote(str(root))
+    quoted_link = shlex.quote(str(link))
+    quoted_cache = shlex.quote(str(cache))
+    replace_error = shlex.quote(
+        f"ERROR: refusing to replace existing {link}; move it aside"
+    )
+    missing_error = shlex.quote(
+        f"ERROR: {link} is not a symlink to {cache}; "
+        "rerun make prepare without --check-only"
+    )
+    valid_link = (
+        f"[ -d {quoted_cache} ] && [ -L {quoted_link} ] && "
+        f"[ \"$(readlink -f {quoted_link} 2>/dev/null || true)\" = {quoted_cache} ]"
+    )
+    if create_link:
+        cache_setup = (
+            'group="$(id -g)"; '
+            'if [ "$(id -u)" -eq 0 ]; then '
+            f"install -d -o root -g \"$group\" -m 0775 {quoted_cache} || exit 5; "
+            "elif command -v sudo >/dev/null 2>&1 && "
+            "sudo -n true >/dev/null 2>&1; then "
+            f"sudo -n install -d -o root -g \"$group\" -m 0775 {quoted_cache} "
+            "|| exit 5; else "
+            "echo 'ERROR: passwordless sudo is required to protect the RAM cache' "
+            ">&2; exit 5; fi; "
+        )
+        legacy_link = (
+            f"[ -L {quoted_link} ] && "
+            f"[ \"$(readlink -f {quoted_link} 2>/dev/null || true)\" = /dev/shm ]"
+        )
+        link_command = (
+            f"{cache_setup}if {valid_link}; then exit 0; "
+            f"elif {legacy_link}; then unlink {quoted_link} && "
+            f"ln -s {quoted_cache} {quoted_link}; "
+            f"elif [ -e {quoted_link} ] || [ -L {quoted_link} ]; then "
+            f"echo {replace_error} >&2; "
+            "exit 4; fi; "
+            f"install -d -m 755 {quoted_root} && "
+            f"ln -s {quoted_cache} {quoted_link}"
+        )
+    else:
+        link_command = (
+            f"if {valid_link}; then exit 0; fi; "
+            f"echo {missing_error} >&2; exit 4"
+        )
+    try:
+        run_pdsh(
+            inventory.hosts,
+            link_command,
+            environment=environment,
+            labels=True,
+            timeout=60.0,
+        )
+    except ClusterError as exc:
+        raise ClusterError(RAM_CACHE_PROTECTION_GUIDANCE) from exc
+
+
+def seal_ram_cache_command() -> str:
+    """Return a shell fragment that protects completed cache files at logout."""
+
+    cache = shlex.quote(str(RAM_CACHE_ROOT))
+    protect_direct = (
+        f"chown -R root:\"$group\" -- {cache} && "
+        f"find {cache} -type d -exec chmod 0775 {{}} +"
+    )
+    protect_sudo = (
+        f"sudo -n chown -R root:\"$group\" -- {cache} && "
+        f"sudo -n find {cache} -type d -exec chmod 0775 {{}} +"
+    )
+    return (
+        'group="$(id -g)"; '
+        'if [ "$(id -u)" -eq 0 ]; then '
+        f"{protect_direct}; "
+        "elif command -v sudo >/dev/null 2>&1 && "
+        "sudo -n true >/dev/null 2>&1; then "
+        f"{protect_sudo}; "
+        "else echo 'ERROR: passwordless sudo is required to protect the RAM cache' "
+        ">&2; exit 5; fi"
+    )
+
+
+def bootstrap_rsync(
+    inventory: ClusterInventory,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> None:
+    """Install rsync with apt-get when absent, then require it on every host."""
+
+    command = (
+        "if command -v rsync >/dev/null 2>&1; then exit 0; fi; "
+        "if ! command -v apt-get >/dev/null 2>&1; then "
+        "echo 'ERROR: rsync is missing and apt-get is unavailable' >&2; exit 5; fi; "
+        "if [ \"$(id -u)\" -eq 0 ]; then privilege=''; "
+        "elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; "
+        "then privilege='sudo -n'; else "
+        "echo 'ERROR: rsync is missing and passwordless sudo is unavailable' >&2; "
+        "exit 5; fi; "
+        "$privilege env DEBIAN_FRONTEND=noninteractive apt-get update && "
+        "$privilege env DEBIAN_FRONTEND=noninteractive apt-get install -y rsync && "
+        "command -v rsync >/dev/null 2>&1"
+    )
+    try:
+        run_pdsh(
+            inventory.hosts,
             command,
             environment=environment,
             labels=True,
-            timeout=180.0,
+            timeout=900.0,
         )
+    except ClusterError as exc:
+        raise ClusterError(RSYNC_SETUP_GUIDANCE) from exc
+    _require_program("rsync")
 
 
 def bootstrap_uv(
@@ -351,29 +512,41 @@ def _pdsh_command(
     return command
 
 
-def _copy_to_hosts(
-    source: Path,
-    destination: str,
+def _rsync_to_hosts(
+    root: Path,
     hosts: Sequence[str],
+    exclusions: Sequence[str],
     *,
     environment: Mapping[str, str] | None,
 ) -> None:
-    _require_program("scp")
-    copy_environment = pdsh_environment(environment)
+    _require_program("rsync")
+    sync_environment = pdsh_environment(environment)
+    ssh_arguments = ["ssh"]
+    for option in _SSH_OPTIONS:
+        ssh_arguments.extend(("-o", option))
+    ssh_command = shlex.join(ssh_arguments)
 
     def copy(host: str) -> tuple[str, subprocess.CompletedProcess[str]]:
-        command = ["scp", "-q"]
-        for option in _SSH_OPTIONS:
-            command.extend(("-o", option))
-        command.extend((str(source), f"{host}:{destination}"))
+        command = ["rsync", "-az", "--protect-args", "--quiet"]
+        for exclusion in exclusions:
+            command.extend(("--exclude", exclusion))
+        command.extend(
+            (
+                "-e",
+                ssh_command,
+                "--",
+                f"{root}/",
+                f"{host}:{root}/",
+            )
+        )
         completed = subprocess.run(
             command,
-            env=copy_environment,
+            env=sync_environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             check=False,
-            timeout=180.0,
+            timeout=300.0,
         )
         return host, completed
 
@@ -381,32 +554,12 @@ def _copy_to_hosts(
         with ThreadPoolExecutor(max_workers=len(hosts)) as executor:
             results = tuple(executor.map(copy, hosts))
     except subprocess.TimeoutExpired as exc:
-        raise ClusterError("workspace copy timed out") from exc
+        raise ClusterError("workspace rsync timed out") from exc
     for host, completed in results:
         if completed.returncode != 0:
             raise ClusterError(
-                _command_failure(f"workspace copy to {host} failed", completed)
+                _command_failure(f"workspace rsync to {host} failed", completed)
             )
-
-
-def _create_workspace_archive(
-    root: Path,
-    destination: Path,
-    excluded_roots: set[PurePosixPath],
-) -> None:
-    def archive_filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
-        relative = PurePosixPath(info.name)
-        if any(part in _COMMON_ARCHIVE_EXCLUDES for part in relative.parts):
-            return None
-        if any(relative == item or item in relative.parents for item in excluded_roots):
-            return None
-        return info
-
-    with tarfile.open(destination, mode="w:gz", dereference=False) as archive:
-        for child in sorted(root.iterdir(), key=lambda item: item.name):
-            if child.name in _COMMON_ARCHIVE_EXCLUDES:
-                continue
-            archive.add(child, arcname=child.name, recursive=True, filter=archive_filter)
 
 
 def _parse_labeled_output(output: str) -> dict[str, str]:
@@ -456,13 +609,20 @@ __all__ = [
     "ClusterAccessError",
     "ClusterError",
     "ClusterInventory",
+    "RAM_CACHE_PROTECTION_GUIDANCE",
+    "RAM_CACHE_ROOT",
+    "RAM_CACHE_SETUP_GUIDANCE",
+    "RSYNC_SETUP_GUIDANCE",
     "SSH_SETUP_GUIDANCE",
+    "bootstrap_rsync",
     "bootstrap_uv",
     "build_distributed_launch_command",
     "expand_host_expression",
     "infer_host_expression",
     "pdsh_environment",
+    "prepare_ram_cache",
     "probe_cluster",
     "run_pdsh",
+    "seal_ram_cache_command",
     "sync_workspace",
 ]
