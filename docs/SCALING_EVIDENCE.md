@@ -25,11 +25,24 @@ per-slice learning-rate selections, and exactly these 15 files for every run:
 14. `artifacts/result.json`
 15. `artifacts/stability-admission.json`
 
-An extra file, an empty extra directory, any symbolic/hard link, a missing
-selection, or a changed source during copying fails the build. Files are copied
+An extra file, an empty extra directory, any interior symbolic/hard link, a
+missing selection, or a changed source during copying fails the build. A
+user-selected bundle or runs root may itself be a symlink; it is resolved once
+before credential access, and the resolved root identity must remain stable.
+Files are copied
 through one read-and-hash stream; they are never hard-linked into the archive.
 The archive also contains a deterministic `git archive` of the launch commit and
-a standalone `verify.py`.
+a standalone `verify.py`. Every completed run must be part of the exact minimal
+prospective staged state: the `c100_n124_control` is unconditional, each initial
+LR grid is a contiguous low-to-high prefix through its first ineligible trial,
+and geometric adaptation stops at the first valid bracket. A missing stable
+initial suffix or an unnecessary post-bracket trial fails publication.
+
+Each recomputed run is also bound to the exact checked-in public 4B manifest
+(`99ac90a5...c2c14` raw; `92b21722...8dc1` canonical): both manifest hashes,
+the prepared immutable revision,
+production identity, and all 40 shard paths, sizes, token counts, and SHA-256s
+must agree.
 
 ## Local release gate
 
@@ -68,9 +81,34 @@ uv run --script scripts/publish_scaling_evidence.py build --runs runs/scaling/cu
 ```
 
 The token is read only after local verification succeeds. Upload uses a single
-folder commit beneath a content-derived archive directory. The publisher then
-uses an anonymous client and unauthenticated streaming downloads at that exact
-immutable commit to:
+retained mode-read-only private snapshot and an explicit operation for each path
+in its manifest-derived allowlist. Every upload object is opened once with
+no-follow semantics, rehashed through that retained descriptor, kept open
+through the commit, and checked for descriptor mutation afterward. It records
+the current immutable parent
+commit and refuses a competing parent update. If the content-derived remote
+prefix already exists, publication becomes a safe resume: no overwrite is
+attempted and the existing immutable prefix must pass the same complete remote
+verification.
+
+To resume from an already-built bundle without rebuilding or mixing content,
+run:
+
+```bash
+uv run --script scripts/publish_scaling_evidence.py publish --bundle /tmp/current_budget_isoflop_v4-release --token-file /absolute/private/path/hf-token --receipt-output data/manifests/scaling/current_budget_isoflop_v4.json
+```
+
+The bundle is snapshotted once and fully revalidated before the token is opened.
+The token path must have no linked component and must name one current-user,
+single-link regular file of at most 4096 bytes with exact mode `0600`. Bundle,
+evidence, token, and receipt paths must be disjoint and non-aliased. The receipt
+writer refuses symlink components and replaces only an unchanged current-user
+regular target.
+
+After upload (or safe resume), the publisher uses an anonymous client and
+unauthenticated, size-bounded streaming downloads at the exact 40-hex commit.
+Anonymous repository resolution must return that same full OID; no branch,
+fallback head, or mutable hex-looking reference is accepted. It then:
 
 - require the exact closed remote tree;
 - SHA-256 every remote object in full;
