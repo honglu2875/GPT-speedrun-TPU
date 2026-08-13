@@ -1,0 +1,26 @@
+# Phase 1d: independently reproduce the refined 60M LR bracket at larger widths.
+# Tiers execute in this order; every tier receives the identical normalized grid.
+schema_version: 1
+study_id: complete-d-p-lr-local-transfer-v1
+kind: learning_rate_transfer
+submission: reference
+profile: dev
+tiers:
+  - 125m
+  - 250m
+  - 500m
+admission_tiers:
+  - 125m
+  - 250m
+tokens_per_parameter: 5.0
+batch_size: 128
+learning_rates:
+  - 0.0032
+  - 0.003805462768009
+  - 0.004149886574883
+  - 0.004525483399594
+  - 0.004935074641305
+  - 0.005381737057624
+  - 0.0064
+seeds:
+  - 1337

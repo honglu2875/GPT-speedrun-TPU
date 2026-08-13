@@ -26,7 +26,7 @@ TARGET_ENTRY := $(TARGET_DIR)/train.py
 UV_BASE = $(UV) --cache-dir "$(UV_CACHE_DIR)"
 UV_RUN = $(UV_BASE) run --frozen --no-sync
 
-.PHONY: help prepare require-prepare validate-target preflight run baseline profile sweep-lr sweep-lr-60m-extend report
+.PHONY: help prepare require-prepare validate-target preflight run baseline profile sweep-lr sweep-lr-60m-extend sweep-lr-60m-refine sweep-lr-local-transfer report
 
 help:
 	@printf '%s\n' \
@@ -38,6 +38,8 @@ help:
 	  '  make profile   run a distributed XProf diagnostic, then serve it on :8791' \
 	  '  make sweep-lr  run/resume the CSV-first 60m-500m 0.25-OT LR study' \
 	  '  make sweep-lr-60m-extend  bracket the 60m optimum above the first grid' \
+	  '  make sweep-lr-60m-refine  refine the bracket around the 60m optimum' \
+	  '  make sweep-lr-local-transfer  apply that local grid to 125m, 250m, 500m' \
 	  '  make report    rebuild report.html from integrity-checked run logs' \
 	  '' \
 	  'Useful overrides: TIER=125m TRAIN_TOKENS=2600000000 TARGET=reference PROFILE_OUTPUT=... REPORT=report.html' \
@@ -99,6 +101,14 @@ sweep-lr: validate-target preflight
 sweep-lr-60m-extend: LR_SUITE := studies/complete_d_p_lr_60m_extension_v1/suite.yaml
 sweep-lr-60m-extend: LR_RESULTS := runs/studies/complete_d_p_lr_60m_extension_v1/results.csv
 sweep-lr-60m-extend: sweep-lr
+
+sweep-lr-60m-refine: LR_SUITE := studies/complete_d_p_lr_60m_refine_v1/suite.yaml
+sweep-lr-60m-refine: LR_RESULTS := runs/studies/complete_d_p_lr_60m_refine_v1/results.csv
+sweep-lr-60m-refine: sweep-lr
+
+sweep-lr-local-transfer: LR_SUITE := studies/complete_d_p_lr_local_transfer_v1/suite.yaml
+sweep-lr-local-transfer: LR_RESULTS := runs/studies/complete_d_p_lr_local_transfer_v1/results.csv
+sweep-lr-local-transfer: sweep-lr
 
 # Diagnostic, not a leaderboard attempt. Compilation precedes tracing; steps 11-20
 # are captured by default so the trace stays small while the run still exercises 100
