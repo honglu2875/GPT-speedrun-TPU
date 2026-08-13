@@ -16,6 +16,11 @@ faster and 0.0018 better on the official metric, while Fresh10 regresses by
 The recorded run is
 `20260813T052208.157345Z-modern_rope_gelu_b128_vocab50257_lr12e3_min025-24cb5599`.
 
+A seed-1338 replication trained in 384.080 seconds and reached canonical loss
+3.6161 plus Fresh10 3.6985, confirming the throughput result while bounding
+the small quality differences between neighboring candidates. Its run is
+`20260813T053346.958152Z-modern_rope_gelu_b128_vocab50257_lr12e3_min025-1fba6aca`.
+
 ```bash
 make run TARGET=modern_rope_gelu_b128_vocab50257_lr12e3_min025
 ```
