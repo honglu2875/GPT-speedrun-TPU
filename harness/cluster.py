@@ -55,6 +55,14 @@ _SSH_OPTIONS = (
     # contacted together. Give OpenSSH several chances without weakening
     # authentication; idempotent orchestration commands also retry status 255.
     "ConnectionAttempts=4",
+    # Warmed by probe_cluster one host at a time. Subsequent pdsh/rsync
+    # commands multiplex over these sockets instead of bursting simultaneous
+    # key exchanges at the TPU VM sshd.
+    "ControlMaster=auto",
+    "ControlPersist=600",
+    f"ControlPath=/tmp/speedrun-ssh-{os.getuid()}-%C",
+    "ServerAliveInterval=15",
+    "ServerAliveCountMax=3",
     "StrictHostKeyChecking=accept-new",
 )
 _DEFAULT_SSH_ARGS = " ".join(f"-o {option}" for option in _SSH_OPTIONS)
@@ -170,32 +178,33 @@ def probe_cluster(
             f"TPU VM host expression expands to {len(hosts)} host(s), expected {host_count}"
         )
     reported: dict[str, str] = {}
-    last_error: Exception | None = None
-    for attempt in range(_PROBE_ATTEMPTS):
-        try:
-            completed = subprocess.run(
-                _pdsh_command(host_expression, host_count, "hostname", labels=True),
-                env=pdsh_environment(environment),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-                timeout=max(20.0, host_count * 2.0),
-            )
-        except subprocess.TimeoutExpired as exc:
-            last_error = exc
-        else:
-            if completed.returncode == 0:
-                reported = _parse_labeled_output(completed.stdout)
-                if set(reported) == set(hosts):
+    for host in hosts:
+        last_error: Exception | None = None
+        for attempt in range(_PROBE_ATTEMPTS):
+            try:
+                completed = subprocess.run(
+                    _ssh_command(host, "hostname"),
+                    env=pdsh_environment(environment),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                    timeout=20.0,
+                )
+            except subprocess.TimeoutExpired as exc:
+                last_error = exc
+            else:
+                remote_name = completed.stdout.strip()
+                if completed.returncode == 0 and remote_name:
+                    reported[host] = remote_name
                     break
-            last_error = ClusterAccessError(SSH_SETUP_GUIDANCE)
-        if attempt + 1 < _PROBE_ATTEMPTS:
-            # TPU VM sshd can close a connection during simultaneous key
-            # exchange. Retrying this read-only probe is always safe.
-            time.sleep(1.0)
-    else:
-        raise ClusterAccessError(SSH_SETUP_GUIDANCE) from last_error
+                last_error = ClusterAccessError(SSH_SETUP_GUIDANCE)
+            if attempt + 1 < _PROBE_ATTEMPTS:
+                # TPU VM sshd can close a connection during key exchange.
+                # Retrying this read-only probe is always safe.
+                time.sleep(1.0)
+        else:
+            raise ClusterAccessError(SSH_SETUP_GUIDANCE) from last_error
 
     local_name = _short_hostname(socket.gethostname())
     matches = [
@@ -596,6 +605,16 @@ def _pdsh_command(
     return command
 
 
+def _ssh_command(host: str, remote_command: str) -> list[str]:
+    """Build one direct SSH command using the same options as pdsh and rsync."""
+
+    command = ["ssh"]
+    for option in _SSH_OPTIONS:
+        command.extend(("-o", option))
+    command.extend((host, remote_command))
+    return command
+
+
 def _rsync_to_hosts(
     root: Path,
     hosts: Sequence[str],
@@ -650,15 +669,6 @@ def _rsync_to_hosts(
             raise ClusterError(
                 _command_failure(f"workspace rsync to {host} failed", completed)
             )
-
-
-def _parse_labeled_output(output: str) -> dict[str, str]:
-    result: dict[str, str] = {}
-    for line in output.splitlines():
-        target, separator, value = line.partition(": ")
-        if separator and target.strip() and value.strip():
-            result[target.strip()] = value.strip()
-    return result
 
 
 def _short_hostname(value: str) -> str:

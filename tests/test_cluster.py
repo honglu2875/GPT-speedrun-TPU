@@ -53,11 +53,12 @@ class ClusterTests(unittest.TestCase):
 
     def test_probe_resolves_controller_and_peer_hosts(self) -> None:
         hosts = tuple(f"slice-w-{index}" for index in range(4))
-        output = "".join(f"{host}: {host}\n" for host in hosts)
-        completed = subprocess.CompletedProcess([], 0, output, "")
+        completed = tuple(
+            subprocess.CompletedProcess([], 0, f"{host}\n", "") for host in hosts
+        )
         with (
             patch("harness.cluster.expand_host_expression", return_value=hosts),
-            patch("harness.cluster.subprocess.run", return_value=completed),
+            patch("harness.cluster.subprocess.run", side_effect=completed) as run,
             patch("harness.cluster.socket.gethostname", return_value="slice-w-0"),
         ):
             inventory = probe_cluster("slice-w-[0-3]", 4)
@@ -65,10 +66,18 @@ class ClusterTests(unittest.TestCase):
         self.assertEqual(inventory.local_host, "slice-w-0")
         self.assertEqual(inventory.remote_hosts, hosts[1:])
         self.assertEqual(inventory.reported_hostnames["slice-w-3"], "slice-w-3")
+        self.assertEqual(run.call_count, 4)
+        self.assertTrue(all(call.args[0][0] == "ssh" for call in run.call_args_list))
+        self.assertTrue(
+            all(
+                any("ControlMaster=auto" in part for part in call.args[0])
+                for call in run.call_args_list
+            )
+        )
 
     def test_probe_reports_short_ssh_key_guidance(self) -> None:
         hosts = ("slice-w-0", "slice-w-1")
-        completed = subprocess.CompletedProcess([], 1, "", "permission denied")
+        completed = subprocess.CompletedProcess([], 255, "", "permission denied")
         with (
             patch("harness.cluster.expand_host_expression", return_value=hosts),
             patch("harness.cluster.subprocess.run", return_value=completed),
@@ -81,13 +90,13 @@ class ClusterTests(unittest.TestCase):
     def test_probe_retries_transient_ssh_failure(self) -> None:
         hosts = ("slice-w-0", "slice-w-1")
         failed = subprocess.CompletedProcess([], 255, "", "key exchange failed")
-        output = "".join(f"{host}: {host}\n" for host in hosts)
-        succeeded = subprocess.CompletedProcess([], 0, output, "")
+        first = subprocess.CompletedProcess([], 0, "slice-w-0\n", "")
+        second = subprocess.CompletedProcess([], 0, "slice-w-1\n", "")
         with (
             patch("harness.cluster.expand_host_expression", return_value=hosts),
             patch(
                 "harness.cluster.subprocess.run",
-                side_effect=(failed, succeeded),
+                side_effect=(failed, first, second),
             ) as run,
             patch("harness.cluster.socket.gethostname", return_value="slice-w-0"),
             patch("harness.cluster.time.sleep") as sleep,
@@ -95,7 +104,7 @@ class ClusterTests(unittest.TestCase):
             inventory = probe_cluster("slice-w-[0-1]", 2)
 
         self.assertEqual(inventory.local_host, "slice-w-0")
-        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_count, 3)
         sleep.assert_called_once_with(1.0)
 
     def test_pdsh_retries_only_transport_status(self) -> None:
