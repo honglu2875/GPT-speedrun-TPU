@@ -71,13 +71,17 @@ local devices; model and optimizer state remain replicated. The harness marks
 its controller hostname separately because Cloud TPU's JAX process order need
 not match `-w-N`. Only that controller writes logs and artifacts.
 
-The `official` YAML profile uses the GPT-2-small shape (12 layers, width 768, 12
-heads), sequence length 1024, global batch 32, BF16 compute, and an exact
-624,984,064-token budget. This resolves to 19,073 optimizer steps. The full
-v4-8 calibration trained in 1,716.01 synchronized seconds (compilation excluded),
-at about 364k tokens/s and 28.5% analytic MFU, then reached FineWeb loss 3.75788
-and Fresh10 macro loss 3.95959. It is the calibrated systems/reference baseline,
-not yet a claim of reaching the 3.28 target.
+The `official` YAML profile uses 12 layers, width 768, 12 heads, base-10,000
+RoPE, pre-RMSNorm, a 4× GELU MLP, tied embeddings, sequence length 1024,
+global batch 32, BF16 compute, and an exact 624,984,064-token budget. This is
+123.67M parameters and resolves to 19,073 optimizer steps. The architecture is
+identified as `reference-gpt-v2`; the earlier learned-position/LayerNorm
+`reference-gpt-v1` remains only as historical run provenance.
+
+The historical v1 v4-8 calibration trained in 1,716.01 synchronized seconds
+(compilation excluded), at about 364k tokens/s and 28.5% analytic MFU, then
+reached FineWeb loss 3.75788 and Fresh10 macro loss 3.95959. Those measurements
+are not relabeled as v2 results.
 
 ## TPU kernel baseline
 

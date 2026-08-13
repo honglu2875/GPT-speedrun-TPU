@@ -110,6 +110,9 @@ class Config:
     heads: int
     d_model: int
     mlp_mult: int
+    normalization: str
+    position_encoding: str
+    mlp_activation: str
     learning_rate: float
     min_lr_ratio: float
     warmup_steps: int
@@ -152,6 +155,9 @@ class ExperimentProfile:
     heads: int
     d_model: int
     mlp_mult: int
+    normalization: str
+    position_encoding: str
+    mlp_activation: str
     vocab_size: int
     semantic_vocab_size: int
     attention_backend: str
@@ -834,7 +840,11 @@ def _parse_experiment_profile(
     model = _config_keys(
         selected["model"],
         f"profiles.{profile}.model",
-        {"layers", "heads", "d_model", "mlp_mult", "vocab_size", "semantic_vocab_size"},
+        {
+            "layers", "heads", "d_model", "mlp_mult", "normalization",
+            "position_encoding", "mlp_activation", "vocab_size",
+            "semantic_vocab_size",
+        },
     )
     kernels = _config_keys(
         selected["kernels"],
@@ -915,6 +925,17 @@ def _parse_experiment_profile(
         heads=_config_int(model["heads"], f"{prefix}.model.heads", minimum=1),
         d_model=_config_int(model["d_model"], f"{prefix}.model.d_model", minimum=1),
         mlp_mult=_config_int(model["mlp_mult"], f"{prefix}.model.mlp_mult", minimum=1),
+        normalization=_config_choice(
+            model["normalization"], f"{prefix}.model.normalization", ("rms_norm",)
+        ),
+        position_encoding=_config_choice(
+            model["position_encoding"],
+            f"{prefix}.model.position_encoding",
+            ("rope_base_10000",),
+        ),
+        mlp_activation=_config_choice(
+            model["mlp_activation"], f"{prefix}.model.mlp_activation", ("gelu",)
+        ),
         vocab_size=_config_int(
             model["vocab_size"], f"{prefix}.model.vocab_size", minimum=1
         ),
@@ -967,6 +988,10 @@ def _parse_experiment_profile(
         )
     if result.d_model % result.heads:
         raise ValueError(f"config.yaml {prefix}.model.d_model must be divisible by heads")
+    if (result.d_model // result.heads) % 2:
+        raise ValueError(
+            f"config.yaml {prefix}.model head dimension must be even for RoPE"
+        )
     if result.attention_backend != "dense" and result.dtype_name != "bfloat16":
         raise ValueError(
             f"config.yaml {prefix}.kernels.attention_backend "
@@ -1501,6 +1526,9 @@ def resolve_config(
         heads=experiment.heads,
         d_model=experiment.d_model,
         mlp_mult=experiment.mlp_mult,
+        normalization=experiment.normalization,
+        position_encoding=experiment.position_encoding,
+        mlp_activation=experiment.mlp_activation,
         learning_rate=experiment.learning_rate,
         min_lr_ratio=experiment.min_lr_ratio,
         warmup_steps=experiment.warmup_steps,
@@ -1912,13 +1940,11 @@ def init_params(config: Config, seed: int) -> dict[str, Any]:
         blocks.append(
             {
                 "ln1_scale": np.ones((d_model,), dtype=np.float32),
-                "ln1_bias": np.zeros((d_model,), dtype=np.float32),
                 "qkv_w": normal(rng, (d_model, 3 * d_model), 0.02),
                 "qkv_b": np.zeros((3 * d_model,), dtype=np.float32),
                 "attn_w": normal(rng, (d_model, d_model), residual_scale),
                 "attn_b": np.zeros((d_model,), dtype=np.float32),
                 "ln2_scale": np.ones((d_model,), dtype=np.float32),
-                "ln2_bias": np.zeros((d_model,), dtype=np.float32),
                 "mlp_up_w": normal(rng, (d_model, hidden), 0.02),
                 "mlp_up_b": np.zeros((hidden,), dtype=np.float32),
                 "mlp_down_w": normal(rng, (hidden, d_model), residual_scale),
@@ -1927,19 +1953,38 @@ def init_params(config: Config, seed: int) -> dict[str, Any]:
         )
     return {
         "token_embedding": normal(rng, (config.vocab_size, d_model), 0.02),
-        "position_embedding": normal(rng, (config.seq_len, d_model), 0.01),
         "blocks": blocks,
         "final_ln_scale": np.ones((d_model,), dtype=np.float32),
-        "final_ln_bias": np.zeros((d_model,), dtype=np.float32),
     }
 
 
-def layer_norm(x: jax.Array, scale: jax.Array, bias: jax.Array, dtype: Any) -> jax.Array:
+def rms_norm(x: jax.Array, scale: jax.Array, dtype: Any) -> jax.Array:
+    """Apply pre-normalization without mean centering in FP32."""
+
     x32 = x.astype(jnp.float32)
-    mean = jnp.mean(x32, axis=-1, keepdims=True)
-    variance = jnp.mean(jnp.square(x32 - mean), axis=-1, keepdims=True)
-    normalized = ((x32 - mean) * jax.lax.rsqrt(variance + 1.0e-5)).astype(dtype)
-    return normalized * scale.astype(dtype) + bias.astype(dtype)
+    normalized = x32 * jax.lax.rsqrt(
+        jnp.mean(jnp.square(x32), axis=-1, keepdims=True) + 1.0e-5
+    )
+    return normalized.astype(dtype) * scale.astype(dtype)
+
+
+def apply_rotary(x: jax.Array) -> jax.Array:
+    """Apply interleaved base-10,000 rotary positions to one BTHD tensor."""
+
+    length = x.shape[1]
+    head_dim = x.shape[-1]
+    if head_dim % 2:
+        raise ValueError("rotary attention requires an even head dimension")
+    fraction = jnp.arange(0, head_dim, 2, dtype=jnp.float32) / float(head_dim)
+    inverse_frequency = jnp.power(10000.0, -fraction)
+    angle = jnp.arange(length, dtype=jnp.float32)[:, None] * inverse_frequency[None, :]
+    cosine = jnp.cos(angle)[None, :, None, :].astype(x.dtype)
+    sine = jnp.sin(angle)[None, :, None, :].astype(x.dtype)
+    even = x[..., 0::2]
+    odd = x[..., 1::2]
+    return jnp.stack(
+        (even * cosine - odd * sine, even * sine + odd * cosine), axis=-1
+    ).reshape(x.shape)
 
 
 def linear(x: jax.Array, weight: jax.Array, bias: jax.Array, dtype: Any) -> jax.Array:
@@ -2014,6 +2059,9 @@ def contract_model_metadata(config: Config) -> dict[str, Any]:
         "heads": config.heads,
         "d_model": config.d_model,
         "mlp_mult": config.mlp_mult,
+        "normalization": config.normalization,
+        "position_encoding": config.position_encoding,
+        "mlp_activation": config.mlp_activation,
         "vocab_size": config.vocab_size,
         "semantic_vocab_size": config.semantic_vocab_size,
         "tied_embeddings": True,
@@ -2206,7 +2254,6 @@ def gpt_hidden(
     batch, length = tokens.shape
     del batch
     x = params["token_embedding"][tokens].astype(dtype)
-    x = x + params["position_embedding"][:length].astype(dtype)
     head_dim = config.d_model // config.heads
     if config.attention_backend != "dense":
         # Direct construction keeps this function convenient for single-device
@@ -2229,12 +2276,14 @@ def gpt_hidden(
 
     for block in params["blocks"]:
         residual = x
-        x_norm = layer_norm(x, block["ln1_scale"], block["ln1_bias"], dtype)
+        x_norm = rms_norm(x, block["ln1_scale"], dtype)
         qkv = linear(x_norm, block["qkv_w"], block["qkv_b"], dtype)
         query, key, value = jnp.split(qkv, 3, axis=-1)
         query = query.reshape(tokens.shape[0], length, config.heads, head_dim)
         key = key.reshape(tokens.shape[0], length, config.heads, head_dim)
         value = value.reshape(tokens.shape[0], length, config.heads, head_dim)
+        query = apply_rotary(query)
+        key = apply_rotary(key)
         if attention is not None:
             attended = attention(
                 jnp.transpose(query, (0, 2, 1, 3)),
@@ -2252,12 +2301,12 @@ def gpt_hidden(
         x = residual + linear(attended, block["attn_w"], block["attn_b"], dtype)
 
         residual = x
-        x_norm = layer_norm(x, block["ln2_scale"], block["ln2_bias"], dtype)
+        x_norm = rms_norm(x, block["ln2_scale"], dtype)
         hidden = linear(x_norm, block["mlp_up_w"], block["mlp_up_b"], dtype)
         hidden = jax.nn.gelu(hidden, approximate=True)
         x = residual + linear(hidden, block["mlp_down_w"], block["mlp_down_b"], dtype)
 
-    return layer_norm(x, params["final_ln_scale"], params["final_ln_bias"], dtype)
+    return rms_norm(x, params["final_ln_scale"], dtype)
 
 
 def gpt_logits(
@@ -2330,7 +2379,7 @@ def weight_decay_mask(params: Any) -> Any:
     """Match the parameter tree, selecting only matrices for AdamW decay.
 
     Every learned projection and embedding in this model is rank two. Biases
-    and layer-normalization scales are rank one, so they intentionally remain
+    and normalization scales are rank one, so they intentionally remain
     outside the decoupled weight-decay update.
     """
 
@@ -2422,11 +2471,7 @@ def train_step(
 def diagnostic_scopes(tree: Mapping[str, Any]) -> tuple[tuple[str, int | None, tuple[Any, ...]], ...]:
     """Group a parameter-shaped tree into stable logical report scopes."""
 
-    embeddings = tuple(
-        jax.tree_util.tree_leaves(
-            (tree["token_embedding"], tree["position_embedding"])
-        )
-    )
+    embeddings = tuple(jax.tree_util.tree_leaves(tree["token_embedding"]))
     blocks = tuple(
         (
             "block",
@@ -2435,11 +2480,7 @@ def diagnostic_scopes(tree: Mapping[str, Any]) -> tuple[tuple[str, int | None, t
         )
         for layer, block in enumerate(tree["blocks"])
     )
-    final_norm = tuple(
-        jax.tree_util.tree_leaves(
-            (tree["final_ln_scale"], tree["final_ln_bias"])
-        )
-    )
+    final_norm = tuple(jax.tree_util.tree_leaves(tree["final_ln_scale"]))
     return (
         ("overall", None, tuple(jax.tree_util.tree_leaves(tree))),
         ("embeddings", None, embeddings),
@@ -2844,6 +2885,9 @@ def save_checkpoint(
             "heads": config.heads,
             "d_model": config.d_model,
             "mlp_mult": config.mlp_mult,
+            "normalization": config.normalization,
+            "position_encoding": config.position_encoding,
+            "mlp_activation": config.mlp_activation,
             "dtype": config.dtype_name,
             "attention_backend": config.attention_backend,
             "attention_tuning": attention_runtime_metadata(attention_runtime),
@@ -3344,7 +3388,11 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                     else "not requested"
                 ),
             ),
-            ("model", f"L{config.layers} D{config.d_model} H{config.heads} MLP×{config.mlp_mult}"),
+            (
+                "model",
+                f"L{config.layers} D{config.d_model} H{config.heads} "
+                f"RoPE RMSNorm GELU MLP×{config.mlp_mult}",
+            ),
             ("parameters", format_count(params_total)),
             ("global batch", f"{config.batch_size} × {config.seq_len} tokens"),
             (
@@ -3891,7 +3939,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             "controller_process_index": process_index,
         },
         "contract": {
-            "model_id": "reference-gpt-v1",
+            "model_id": "reference-gpt-v2",
             "dataset_id": dataset_id,
             "tokenizer_id": tokenizer_id,
             "sequence_length": config.seq_len,

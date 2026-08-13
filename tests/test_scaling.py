@@ -117,6 +117,7 @@ class ScalingTests(unittest.TestCase):
         self.assertIsNotNone(lineage)
         self.assertEqual(lineage["allowlisted_artifact_count"], 24)
         self.assertEqual(lineage["origin_suite_id"], "current_budget_isoflop_v2")
+        self.assertFalse(suite["lineage"]["trainer_compatible"])
         upper = suite["learning_rate_search"]["upper"]
         self.assertEqual(upper[-2]["id"], "lr3417")
         self.assertEqual(upper[-2]["value"], 0.0034171875)
@@ -412,13 +413,35 @@ class ScalingTests(unittest.TestCase):
             )
 
         current_snapshot = dict(self.lineage_suite["source_snapshot"])
-        current_snapshot["submissions/reference/train.py"] = "0" * 64
+        current_snapshot["speedrun/data.py"] = "0" * 64
         with patch("speedrun.scaling._source_snapshot", return_value=current_snapshot):
             with self.assertRaisesRegex(ScalingError, "execution source differs"):
                 _load_lineage_contract(
                     self.lineage_suite,
                     declaration=suite_payload["lineage"],
                     suite_directory=suite_path.parent,
+                )
+
+    def test_v3_rejects_new_runs_after_reference_promotion(self) -> None:
+        point = next(
+            item
+            for item in self.lineage_suite["calibrations"]
+            if _lineage_entry_for_point(self.lineage_suite, item) is None
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ScalingError, "read-only"):
+                run_variants(
+                    self.lineage_suite,
+                    names=[point["id"]],
+                    data_path=Path("/does/not/matter"),
+                    runs_path=Path(directory),
+                    seed=1337,
+                    color="never",
+                    downstream_manifest=Path("/does/not/matter"),
+                    downstream_root=Path("/does/not/matter"),
+                    attention_tuning_cache=None,
+                    autotune_attention=False,
+                    resume=False,
                 )
 
     def test_exact_builder_manifest_contract_rejects_inventory_drift(self) -> None:

@@ -32,6 +32,37 @@ class FakeDevice:
 
 
 class TrainerStaticTests(unittest.TestCase):
+    def test_reference_block_is_rope_rmsnorm_gelu(self) -> None:
+        parser = trainer.build_parser()
+        config = trainer.resolve_config(
+            parser.parse_args(["--profile", "smoke"]), "cpu", 256
+        )
+        params = trainer.init_params(config, 7)
+        self.assertNotIn("position_embedding", params)
+        self.assertNotIn("final_ln_bias", params)
+        self.assertNotIn("ln1_bias", params["blocks"][0])
+        self.assertEqual(trainer.parameter_count(params), 116_160)
+        self.assertEqual(
+            trainer.contract_model_metadata(config)["position_encoding"],
+            "rope_base_10000",
+        )
+        self.assertEqual(
+            trainer.contract_model_metadata(config)["normalization"], "rms_norm"
+        )
+        self.assertEqual(
+            trainer.contract_model_metadata(config)["mlp_activation"], "gelu"
+        )
+
+        values = np.arange(24, dtype=np.float32).reshape(1, 3, 2, 4)
+        rotated = np.asarray(trainer.apply_rotary(trainer.jnp.asarray(values)))
+        np.testing.assert_allclose(rotated[:, 0], values[:, 0], rtol=0, atol=1e-6)
+        np.testing.assert_allclose(
+            np.sum(rotated * rotated, axis=-1),
+            np.sum(values * values, axis=-1),
+            rtol=1e-6,
+            atol=1e-5,
+        )
+
     def test_yaml_config_is_authoritative_strict_and_versioned(self) -> None:
         source = trainer.CONFIG_PATH.read_text(encoding="utf-8")
         official = trainer.load_experiment_profile("official")
@@ -410,7 +441,7 @@ class TrainerStaticTests(unittest.TestCase):
         # objective. Masking storage-only rows is an explicit algorithm choice.
         self.assertEqual(tiled.semantic_vocab_size, 50_304)
         self.assertEqual(tiled.vocab_tile_size, 2_048)
-        params_total = 124_475_904
+        params_total = 123_670_272
         self.assertGreater(
             trainer.estimated_flops_per_token(tiled, params_total),
             trainer.estimated_flops_per_token(dense, params_total),
@@ -778,6 +809,9 @@ class TrainerStaticTests(unittest.TestCase):
                 "heads": 12,
                 "d_model": 768,
                 "mlp_mult": 4,
+                "normalization": "rms_norm",
+                "position_encoding": "rope_base_10000",
+                "mlp_activation": "gelu",
                 "vocab_size": 50_304,
                 "semantic_vocab_size": 50_257,
                 "tied_embeddings": True,
@@ -898,12 +932,10 @@ class TrainerStaticTests(unittest.TestCase):
     def test_diagnostic_statistics_use_postupdate_param_raw_gradient_and_signed_delta(self) -> None:
         params = {
             "token_embedding": np.asarray([[1.0, 2.0]], dtype=np.float32),
-            "position_embedding": np.asarray([[3.0, 4.0]], dtype=np.float32),
             "blocks": [
                 {"weight": np.asarray([-1.0, 1.0], dtype=np.float32)}
             ],
             "final_ln_scale": np.asarray([2.0], dtype=np.float32),
-            "final_ln_bias": np.asarray([0.0], dtype=np.float32),
         }
         gradients = trainer.jax.tree_util.tree_map(
             lambda value: np.full_like(value, 2.0), params
@@ -915,8 +947,8 @@ class TrainerStaticTests(unittest.TestCase):
         metadata = trainer.diagnostic_scope_metadata(params)
         self.assertEqual(
             metadata,
-            (("overall", None, 8), ("embeddings", None, 4),
-             ("block", 0, 2), ("final_norm", None, 2)),
+            (("overall", None, 5), ("embeddings", None, 2),
+             ("block", 0, 2), ("final_norm", None, 1)),
         )
         flattened = np.concatenate(
             [np.ravel(value) for value in trainer.jax.tree_util.tree_leaves(after)]

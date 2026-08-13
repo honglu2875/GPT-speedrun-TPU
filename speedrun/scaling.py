@@ -1092,13 +1092,21 @@ def _load_lineage_contract(
             )
     if set(source_snapshot) != set(current_snapshot):
         raise ScalingError("lineage origin source snapshot has an incomplete source set")
+    trainer_source = "submissions/reference/train.py"
+    trainer_compatible = (
+        current_snapshot[trainer_source] == source_snapshot[trainer_source]
+    )
     for relative, digest in source_snapshot.items():
         if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
             raise ScalingError(f"lineage origin source digest is invalid: {relative}")
-        # The lineage-aware scaling runner is necessarily newer. Every source
-        # that can affect trainer execution, data identity, or evaluation must
-        # remain byte-identical to v2; only this orchestration module may differ.
-        if relative != "speedrun/scaling.py" and current_snapshot[relative] != digest:
+        # Historical measurements remain readable after a versioned reference
+        # promotion. New launches are disabled below unless the pinned trainer
+        # still matches; all shared execution/data/evaluation sources remain
+        # byte-identical to the origin study.
+        if (
+            relative not in {"speedrun/scaling.py", trainer_source}
+            and current_snapshot[relative] != digest
+        ):
             raise ScalingError(
                 f"current execution source differs from lineage origin: {relative}"
             )
@@ -1163,6 +1171,7 @@ def _load_lineage_contract(
         "manifest_repository_path": manifest_path.relative_to(repo).as_posix(),
         "manifest_sha256": manifest_digest,
         "origin": normalized_origin,
+        "trainer_compatible": trainer_compatible,
         "artifacts": artifacts,
         "artifacts_by_point": {entry["point_id"]: entry for entry in artifacts},
     }
@@ -1352,6 +1361,19 @@ def materialize_configs(
     unknown = sorted(set(names) - set(available))
     if unknown:
         raise ScalingError(f"unknown point(s): {', '.join(unknown)}")
+    lineage = suite.get("lineage")
+    if (
+        isinstance(lineage, Mapping)
+        and not bool(lineage.get("trainer_compatible"))
+        and any(
+            _lineage_entry_for_point(suite, available[name]) is None
+            for name in names
+        )
+    ):
+        raise ScalingError(
+            "this lineage suite is read-only because its pinned trainer differs "
+            "from the promoted reference; start a new versioned suite"
+        )
     written: list[Path] = []
     for name in names:
         target = root / name / "config.yaml"
@@ -2164,6 +2186,19 @@ def run_variants(
             "adaptive learning-rate variants may only be launched by --staged; "
             "resume the staged study to preserve geometric ordering"
         )
+    lineage = suite.get("lineage")
+    if (
+        isinstance(lineage, Mapping)
+        and not bool(lineage.get("trainer_compatible"))
+        and any(
+            _lineage_entry_for_point(suite, available[name]) is None
+            for name in names
+        )
+    ):
+        raise ScalingError(
+            "this lineage suite is read-only because its pinned trainer differs "
+            "from the promoted reference; start a new versioned suite"
+        )
     for shape_id in sorted({str(point["shape_id"]) for point in adaptive}):
         _validate_adaptive_completion_prefix(suite, shape_id, runs_root)
     initial_rates = [float(item["value"]) for item in suite["learning_rate_candidates"]]
@@ -2657,6 +2692,10 @@ def _load_lineage_run_manifest(
             actual_digest = hashlib.sha256(
                 variant_config_bytes(suite, point)
             ).hexdigest()
+        elif relative == "train.py":
+            # The historical trainer blob was already verified against the
+            # pinned origin Git commit while loading the lineage contract.
+            actual_digest = expected_digest
         else:
             source_relative = (
                 "submissions/reference/train.py" if relative == "train.py" else relative

@@ -1358,6 +1358,9 @@ def _reference_contract(profile: str) -> ReferenceContract:
             "heads": 2,
             "d_model": 64,
             "mlp_mult": 4,
+            "normalization": "rms_norm",
+            "position_encoding": "rope_base_10000",
+            "mlp_activation": "gelu",
             "vocab_size": 256,
             "semantic_vocab_size": 256,
             "tied_embeddings": True,
@@ -1367,6 +1370,9 @@ def _reference_contract(profile: str) -> ReferenceContract:
             "heads": 6,
             "d_model": 384,
             "mlp_mult": 4,
+            "normalization": "rms_norm",
+            "position_encoding": "rope_base_10000",
+            "mlp_activation": "gelu",
             "vocab_size": 50_304,
             "semantic_vocab_size": 50_304,
             "tied_embeddings": True,
@@ -1376,6 +1382,9 @@ def _reference_contract(profile: str) -> ReferenceContract:
             "heads": 12,
             "d_model": 768,
             "mlp_mult": 4,
+            "normalization": "rms_norm",
+            "position_encoding": "rope_base_10000",
+            "mlp_activation": "gelu",
             "vocab_size": 50_304,
             "semantic_vocab_size": 50_304,
             "tied_embeddings": True,
@@ -1383,7 +1392,7 @@ def _reference_contract(profile: str) -> ReferenceContract:
     }
     sequence = {"smoke": 32, "dev": 256, "official": 1024}[profile]
     return ReferenceContract(
-        model_id="reference-gpt-v1",
+        model_id="reference-gpt-v2",
         dataset_id=dataset_id,
         tokenizer_id=tokenizer_id,
         sequence_length=sequence,

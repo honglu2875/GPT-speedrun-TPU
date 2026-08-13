@@ -220,12 +220,14 @@ cadence override; change `val_probe_batches` in a cloned YAML profile when the
 prefix size is part of the experiment. Smoke and development runs do not probe
 unless explicitly enabled.
 
-The reference is intentionally readable rather than target-capable. The full
-19,073-step calibration on this TPU v4-8 processed exactly **624,984,064**
+The reference is intentionally readable rather than target-capable. Its v2
+architecture uses RoPE, pre-RMSNorm, and a 4× GELU MLP. The historical v1
+19,073-step calibration on a TPU v4-8 processed exactly **624,984,064**
 training tokens in **1,716.01 synchronized seconds** (28m36s, compilation
 excluded), sustaining about **364k tokens/s**, **313 analytic TFLOP/s**, and
 **28.5% analytic MFU**. It reached FineWeb validation loss **3.75788** and
-Fresh10 macro loss **3.95959**. That exact token budget is now fixed for
+Fresh10 macro loss **3.95959**. Those measurements remain labeled as v1 rather
+than being attributed to the promoted architecture. The exact token budget is fixed for
 official open-track comparisons while we improve the architecture, initialization,
 optimizer, and kernels.
 

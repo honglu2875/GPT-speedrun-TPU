@@ -6,7 +6,7 @@ suite_id: current_budget_isoflop_v3
 config_template: template.yaml
 lineage:
   manifest: lineage-v2.json
-  sha256: ebdaaf461d290de941bb4a52f960c20d745618126e3049745a97fc83a56a197d
+  sha256: ad69215482e89797cec49e78ef0b3fcf6c3b63e9abf5a97a77cecd5c328b4fc2
 sequence_length: 1024
 batch_size: 32
 vocab_size: 50304
