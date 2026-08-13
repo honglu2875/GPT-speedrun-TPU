@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from contextlib import contextmanager
-import errno
 import io
 import os
 from pathlib import Path
@@ -1246,11 +1245,14 @@ class ScalingEvidencePublisherTests(unittest.TestCase):
             with self.subTest(existing=existing), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 receipt = root / "receipt.json"
-                def racing_link(*args, **kwargs):
+                def racing_rename(*_args, **_kwargs):
                     receipt.write_bytes(existing)
-                    raise FileExistsError(errno.EEXIST, "simulated race")
+                    return False
 
-                with patch("scripts.publish_scaling_evidence.os.link", side_effect=racing_link):
+                with patch(
+                    "scripts.publish_scaling_evidence.rename_entry_noreplace",
+                    side_effect=racing_rename,
+                ):
                     if should_pass:
                         write_atomic(receipt, b"receipt")
                     else:
@@ -1260,6 +1262,35 @@ class ScalingEvidencePublisherTests(unittest.TestCase):
                 self.assertEqual(
                     [path.name for path in root.iterdir()], ["receipt.json"]
                 )
+
+    def test_receipt_interruption_after_noreplace_rename_is_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            receipt = root / "receipt.json"
+
+            def interrupt_after_rename(
+                source_parent, source, destination_parent, destination
+            ):
+                os.rename(
+                    source,
+                    destination,
+                    src_dir_fd=source_parent,
+                    dst_dir_fd=destination_parent,
+                )
+                raise KeyboardInterrupt("simulated process interruption")
+
+            with patch(
+                "scripts.publish_scaling_evidence.rename_entry_noreplace",
+                side_effect=interrupt_after_rename,
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    write_atomic(receipt, b"receipt")
+
+            self.assertEqual(receipt.read_bytes(), b"receipt")
+            self.assertEqual(receipt.stat().st_nlink, 1)
+            self.assertEqual([path.name for path in root.iterdir()], ["receipt.json"])
+            write_atomic(receipt, b"receipt")
+            self.assertEqual(receipt.read_bytes(), b"receipt")
 
     def test_upload_detects_mutation_of_open_snapshot_descriptor(self) -> None:
         class Add:

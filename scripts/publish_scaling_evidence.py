@@ -1720,13 +1720,13 @@ def cleanup_owned_temporary_directory(
         raise EvidenceError(f"cannot clean owned temporary archive directory: {exc}") from exc
 
 
-def rename_directory_noreplace(
+def rename_entry_noreplace(
     source_parent: int,
     source: str,
     destination_parent: int,
     destination: str,
-) -> None:
-    """Atomically install a directory without replacing any existing object."""
+) -> bool:
+    """Atomically rename one entry; return false if the destination exists."""
 
     try:
         renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
@@ -1748,16 +1748,30 @@ def rename_directory_noreplace(
         1,  # RENAME_NOREPLACE
     )
     if result == 0:
-        return
+        return True
     error = ctypes.get_errno()
     if error in {errno.EEXIST, errno.ENOTEMPTY}:
+        return False
+    raise EvidenceError(
+        "atomic no-replace entry installation failed: "
+        f"{os.strerror(error) if error else 'unknown renameat2 error'}"
+    )
+
+
+def rename_directory_noreplace(
+    source_parent: int,
+    source: str,
+    destination_parent: int,
+    destination: str,
+) -> None:
+    """Atomically install a directory without replacing any existing object."""
+
+    if not rename_entry_noreplace(
+        source_parent, source, destination_parent, destination
+    ):
         raise EvidenceError(
             "archive output appeared concurrently; refusing to replace it"
         )
-    raise EvidenceError(
-        "atomic no-replace archive installation failed: "
-        f"{os.strerror(error) if error else 'unknown renameat2 error'}"
-    )
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:
@@ -2422,16 +2436,10 @@ def write_atomic(
             descriptor = None
             if _directory_entry_signature(parent, temporary) != temporary_signature:
                 raise EvidenceError("receipt temporary changed before installation")
-            try:
-                # link(2) has atomic no-replace semantics for the destination.
-                os.link(
-                    temporary,
-                    leaf,
-                    src_dir_fd=parent,
-                    dst_dir_fd=parent,
-                    follow_symlinks=False,
-                )
-            except FileExistsError:
+            installed_new = rename_entry_noreplace(
+                parent, temporary, parent, leaf
+            )
+            if not installed_new:
                 if not _existing_receipt_is_identical(parent, leaf, payload):
                     raise EvidenceError("receipt appeared without an identical payload")
             else:
@@ -2443,6 +2451,8 @@ def write_atomic(
                     or installed[4] != os.getuid()
                 ):
                     raise EvidenceError("installed receipt identity differs from temporary")
+                if _directory_entry_signature(parent, temporary) is not None:
+                    raise EvidenceError("receipt temporary remained after atomic rename")
             clean_owned_temporary()
             temporary_signature = None
             os.fsync(parent)
