@@ -20,6 +20,7 @@ from harness.cluster import (
     prepare_ram_cache,
     probe_cluster,
     seal_ram_cache_command,
+    terminate_distributed_workers,
 )
 from harness.cluster import _rsync_to_hosts
 from speedrun.config import ConfigError, LocalConfig, load_config, save_config
@@ -90,6 +91,30 @@ class ClusterTests(unittest.TestCase):
         self.assertIn("cd '/repo with space/submissions/reference'", command[-1])
         self.assertIn("SAFE_VALUE='value with space'", command[-1])
         self.assertIn("'/repo with space/.venv/bin/python'", command[-1])
+
+    def test_distributed_teardown_matches_one_exact_run(self) -> None:
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with (
+            patch("harness.cluster.shutil.which", return_value="/usr/bin/pdsh"),
+            patch("harness.cluster.subprocess.run", return_value=completed) as run,
+        ):
+            cleaned = terminate_distributed_workers(
+                host_expression="slice-w-[0-3]",
+                host_count=4,
+                executable=Path("/repo/.venv/bin/python3"),
+                script=Path("/repo/submissions/candidate/train.py"),
+                output_dir=Path("/repo/runs/run-123"),
+            )
+
+        self.assertTrue(cleaned)
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command[:8],
+            ["pdsh", "-S", "-R", "ssh", "-f", "4", "-w", "slice-w-[0-3]"],
+        )
+        self.assertIn("pkill -KILL -f --", command[-1])
+        self.assertIn("candidate/train\\.py", command[-1])
+        self.assertIn("run\\-123", command[-1])
 
     def test_workspace_copy_uses_parallel_incremental_rsync_without_delete(self) -> None:
         completed = subprocess.CompletedProcess([], 0, "", "")
