@@ -107,5 +107,15 @@ winner. Once a common interior neighborhood appears, it should be rerun with at
 least three seeds. Only then should batch size vary, using the SDE rules above
 and keeping the selected normalized base LR fixed.
 
+The initial 60M and 125M curves were still descending at the `3.2e-3` upper
+boundary. Before resuming the expensive tiers, the separate
+`complete_d_p_lr_60m_extension_v1` suite continues the same √2 grid at
+`4.525e-3`, `6.4e-3`, and `9.051e-3`. Keeping this extension separate preserves
+the original suite hash and accepted results. If the 60M minimum is still on the
+right edge, another extension is required; larger-tier sweeps should not infer
+an optimum from a censored curve.
+
 The suite lives in [`studies/complete_d_p_lr_v1/suite.yaml`](../studies/complete_d_p_lr_v1/suite.yaml).
 Its SHA-256 is attached to each immutable run record and every CSV row.
+The 60M bracketing extension lives in
+[`studies/complete_d_p_lr_60m_extension_v1/suite.yaml`](../studies/complete_d_p_lr_60m_extension_v1/suite.yaml).
