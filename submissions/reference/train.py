@@ -62,12 +62,13 @@ TRAINING_CSV_NAME = "training.csv"
 VALIDATION_CSV_NAME = "validation.csv"
 DIAGNOSTICS_CSV_NAME = "diagnostics.csv"
 SCHEMA_VERSION = 1
-CONFIG_SCHEMA_VERSION = 1
+CONFIG_SCHEMA_VERSION = 2
 CONFIG_FILENAME = "config.yaml"
 CONFIG_PATH = Path(__file__).resolve().with_name(CONFIG_FILENAME)
 _MAX_CONFIG_BYTES = 256 * 1024
 _VALID_TRACKS = ("open", "sample_efficiency")
 _VALID_PROFILES = ("smoke", "dev", "official")
+_VALID_TIERS = ("60m", "125m", "250m", "500m", "1b")
 _DOMAIN_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _DIAGNOSTIC_FAMILIES = ("param", "grad", "update")
 _DIAGNOSTIC_STATS = (
@@ -110,10 +111,29 @@ class Config:
     heads: int
     d_model: int
     mlp_mult: int
+    normalization: str
+    position_encoding: str
+    mlp_activation: str
+    tier: str
+    declared_parameters: int | None
+    base_parameters: int
+    parameterization: str
+    base_width: int
+    base_depth: int
+    depth_alpha: float
+    init_std: float
+    attention_scale: str
+    embeddings: str
+    width_multiplier: float
+    depth_multiplier: float
+    data_multiplier: float
+    batch_multiplier: float
+    tokens_per_parameter: float | None
     learning_rate: float
     min_lr_ratio: float
     warmup_steps: int
     weight_decay: float
+    adam_epsilon: float
     beta1: float
     beta2: float
     grad_clip: float
@@ -144,6 +164,7 @@ class ExperimentProfile:
     name: str
     steps: int | None
     train_tokens: int | None
+    tokens_per_parameter: float | None
     batch_size: int
     seq_len: int
     sampling: str
@@ -152,6 +173,19 @@ class ExperimentProfile:
     heads: int
     d_model: int
     mlp_mult: int
+    normalization: str
+    position_encoding: str
+    mlp_activation: str
+    tier: str
+    declared_parameters: int | None
+    base_parameters: int
+    parameterization: str
+    base_width: int
+    base_depth: int
+    depth_alpha: float
+    init_std: float
+    attention_scale: str
+    embeddings: str
     vocab_size: int
     semantic_vocab_size: int
     attention_backend: str
@@ -159,8 +193,9 @@ class ExperimentProfile:
     vocab_tile_size: int
     learning_rate: float
     min_lr_ratio: float
-    warmup_steps: int
+    warmup_ratio: float
     weight_decay: float
+    adam_epsilon: float
     beta1: float
     beta2: float
     grad_clip: float
@@ -798,10 +833,71 @@ def resolve_experiment_config_path(requested: Path | None) -> Path:
     return expected
 
 
+def _parse_model(value: Any, label: str) -> dict[str, Any]:
+    model = _config_keys(
+        value,
+        label,
+        {
+            "layers", "heads", "d_model", "mlp_mult", "normalization",
+            "position_encoding", "mlp_activation", "vocab_size",
+            "semantic_vocab_size",
+        },
+    )
+    parsed = {
+        "layers": _config_int(model["layers"], f"{label}.layers", minimum=1),
+        "heads": _config_int(model["heads"], f"{label}.heads", minimum=1),
+        "d_model": _config_int(model["d_model"], f"{label}.d_model", minimum=1),
+        "mlp_mult": _config_int(model["mlp_mult"], f"{label}.mlp_mult", minimum=1),
+        "normalization": _config_choice(
+            model["normalization"], f"{label}.normalization", ("rms_norm",)
+        ),
+        "position_encoding": _config_choice(
+            model["position_encoding"],
+            f"{label}.position_encoding",
+            ("rope_base_10000",),
+        ),
+        "mlp_activation": _config_choice(
+            model["mlp_activation"], f"{label}.mlp_activation", ("gelu",)
+        ),
+        "vocab_size": _config_int(
+            model["vocab_size"], f"{label}.vocab_size", minimum=1
+        ),
+        "semantic_vocab_size": _config_int(
+            model["semantic_vocab_size"],
+            f"{label}.semantic_vocab_size",
+            minimum=1,
+        ),
+    }
+    if parsed["semantic_vocab_size"] > parsed["vocab_size"]:
+        raise ValueError(
+            f"config.yaml {label}.semantic_vocab_size must not exceed vocab_size"
+        )
+    if parsed["d_model"] % parsed["heads"]:
+        raise ValueError(f"config.yaml {label}.d_model must be divisible by heads")
+    if (parsed["d_model"] // parsed["heads"]) % 2:
+        raise ValueError(
+            f"config.yaml {label} head dimension must be even for RoPE"
+        )
+    return parsed
+
+
+def _declared_family_parameter_count(model: Mapping[str, Any]) -> int:
+    """Count this trainer's untied, position-free RMSNorm transformer exactly."""
+
+    width = int(model["d_model"])
+    return (
+        2 * int(model["vocab_size"]) * width
+        + int(model["layers"]) * (12 * width * width + 11 * width)
+        + width
+    )
+
+
 def _parse_experiment_profile(
-    payload: Mapping[str, Any], profile: str, source_sha256: str
+    payload: Mapping[str, Any], profile: str, source_sha256: str, tier: str
 ) -> ExperimentProfile:
-    top = _config_keys(payload, "document", {"schema_version", "profiles"})
+    top = _config_keys(
+        payload, "document", {"schema_version", "family", "profiles"}
+    )
     schema_version = _config_int(
         top["schema_version"], "schema_version", minimum=1
     )
@@ -810,9 +906,101 @@ def _parse_experiment_profile(
             "unsupported config.yaml schema_version "
             f"{schema_version}; expected {CONFIG_SCHEMA_VERSION}"
         )
-    profiles = _config_keys(
-        top["profiles"], "profiles", set(_VALID_PROFILES)
+    family = _config_keys(
+        top["family"],
+        "family",
+        {"default_tier", "parameterization", "tiers"},
     )
+    default_tier = _config_choice(
+        family["default_tier"], "family.default_tier", _VALID_TIERS
+    )
+    if tier not in _VALID_TIERS:
+        raise ValueError(
+            f"unknown model tier {tier!r}; expected {', '.join(_VALID_TIERS)}"
+        )
+    parameterization = _config_keys(
+        family["parameterization"],
+        "family.parameterization",
+        {
+            "name", "base_width", "base_depth", "depth_alpha", "init_std",
+            "attention_scale", "embeddings",
+        },
+    )
+    parameterization_name = _config_choice(
+        parameterization["name"],
+        "family.parameterization.name",
+        ("complete_d_p",),
+    )
+    base_width = _config_int(
+        parameterization["base_width"],
+        "family.parameterization.base_width",
+        minimum=1,
+    )
+    base_depth = _config_int(
+        parameterization["base_depth"],
+        "family.parameterization.base_depth",
+        minimum=1,
+    )
+    depth_alpha = _config_float(
+        parameterization["depth_alpha"], "family.parameterization.depth_alpha"
+    )
+    init_std = _config_float(
+        parameterization["init_std"], "family.parameterization.init_std"
+    )
+    if not 0.5 <= depth_alpha <= 1.0:
+        raise ValueError(
+            "config.yaml family.parameterization.depth_alpha must be in [0.5, 1]"
+        )
+    if init_std <= 0.0:
+        raise ValueError(
+            "config.yaml family.parameterization.init_std must be positive"
+        )
+    attention_scale = _config_choice(
+        parameterization["attention_scale"],
+        "family.parameterization.attention_scale",
+        ("inverse_model_width",),
+    )
+    embeddings = _config_choice(
+        parameterization["embeddings"],
+        "family.parameterization.embeddings",
+        ("untied",),
+    )
+    raw_tiers = _config_keys(family["tiers"], "family.tiers", set(_VALID_TIERS))
+    parsed_tiers: dict[str, tuple[int, dict[str, Any]]] = {}
+    for tier_name in _VALID_TIERS:
+        tier_value = _config_keys(
+            raw_tiers[tier_name],
+            f"family.tiers.{tier_name}",
+            {"parameters", "model"},
+        )
+        declared = _config_int(
+            tier_value["parameters"],
+            f"family.tiers.{tier_name}.parameters",
+            minimum=1,
+        )
+        tier_model = _parse_model(
+            tier_value["model"], f"family.tiers.{tier_name}.model"
+        )
+        if tier_model["d_model"] // tier_model["heads"] != 64:
+            raise ValueError(
+                f"config.yaml family.tiers.{tier_name} must use 64-wide heads"
+            )
+        counted = _declared_family_parameter_count(tier_model)
+        if declared != counted:
+            raise ValueError(
+                f"config.yaml family.tiers.{tier_name}.parameters is {declared:,}, "
+                f"but this trainer counts {counted:,}"
+            )
+        parsed_tiers[tier_name] = (declared, tier_model)
+    # Scaling multipliers are anchored to the smallest declared tier; the
+    # independently validated default controls selection, not parameterization.
+    base_model = parsed_tiers["60m"][1]
+    if base_width != base_model["d_model"] or base_depth != base_model["layers"]:
+        raise ValueError(
+            "config.yaml Complete(d)P base_width/base_depth must match the 60m tier"
+        )
+
+    profiles = _config_keys(top["profiles"], "profiles", set(_VALID_PROFILES))
     selected = _config_keys(
         profiles[profile],
         f"profiles.{profile}",
@@ -822,20 +1010,43 @@ def _parse_experiment_profile(
         selected["training"],
         f"profiles.{profile}.training",
         {"batch_size", "seq_len", "sampling", "dtype"},
-        optional={"steps", "train_tokens"},
+        optional={"steps", "train_tokens", "tokens_per_parameter"},
     )
-    has_steps = "steps" in training
-    has_train_tokens = "train_tokens" in training
-    if has_steps == has_train_tokens:
+    duration_fields = tuple(
+        name
+        for name in ("steps", "train_tokens", "tokens_per_parameter")
+        if name in training
+    )
+    if len(duration_fields) != 1:
         raise ValueError(
             f"config.yaml profiles.{profile}.training must define exactly one of "
-            "steps or train_tokens"
+            "steps, train_tokens, or tokens_per_parameter"
         )
-    model = _config_keys(
-        selected["model"],
-        f"profiles.{profile}.model",
-        {"layers", "heads", "d_model", "mlp_mult", "vocab_size", "semantic_vocab_size"},
-    )
+    if profile == "smoke":
+        model = _parse_model(selected["model"], f"profiles.{profile}.model")
+        selected_tier = "smoke"
+        declared_parameters = None
+        selected_parameterization = "standard"
+        selected_base_width = model["d_model"]
+        selected_base_depth = model["layers"]
+        selected_depth_alpha = 0.0
+        selected_init_std = 0.02
+        selected_attention_scale = "inverse_sqrt_head_dim"
+        selected_embeddings = "tied"
+    else:
+        if selected["model"] != "family_tier":
+            raise ValueError(
+                f"config.yaml profiles.{profile}.model must be 'family_tier'"
+            )
+        declared_parameters, model = parsed_tiers[tier]
+        selected_tier = tier
+        selected_parameterization = parameterization_name
+        selected_base_width = base_width
+        selected_base_depth = base_depth
+        selected_depth_alpha = depth_alpha
+        selected_init_std = init_std
+        selected_attention_scale = attention_scale
+        selected_embeddings = embeddings
     kernels = _config_keys(
         selected["kernels"],
         f"profiles.{profile}.kernels",
@@ -845,8 +1056,8 @@ def _parse_experiment_profile(
         selected["optimizer"],
         f"profiles.{profile}.optimizer",
         {
-            "learning_rate", "min_lr_ratio", "warmup_steps", "weight_decay",
-            "beta1", "beta2", "grad_clip",
+            "learning_rate", "min_lr_ratio", "warmup_ratio", "weight_decay",
+            "adam_epsilon", "beta1", "beta2", "grad_clip",
         },
     )
     evaluation = _config_keys(
@@ -869,6 +1080,12 @@ def _parse_experiment_profile(
     weight_decay = _config_float(
         optimizer["weight_decay"], f"{prefix}.optimizer.weight_decay"
     )
+    adam_epsilon = _config_float(
+        optimizer["adam_epsilon"], f"{prefix}.optimizer.adam_epsilon"
+    )
+    warmup_ratio = _config_float(
+        optimizer["warmup_ratio"], f"{prefix}.optimizer.warmup_ratio"
+    )
     beta1 = _config_float(optimizer["beta1"], f"{prefix}.optimizer.beta1")
     beta2 = _config_float(optimizer["beta2"], f"{prefix}.optimizer.beta2")
     grad_clip = _config_float(
@@ -880,22 +1097,34 @@ def _parse_experiment_profile(
         raise ValueError(f"config.yaml {prefix}.optimizer.min_lr_ratio must be in [0, 1]")
     if weight_decay < 0.0:
         raise ValueError(f"config.yaml {prefix}.optimizer.weight_decay must be nonnegative")
+    if adam_epsilon <= 0.0:
+        raise ValueError(f"config.yaml {prefix}.optimizer.adam_epsilon must be positive")
+    if not 0.0 <= warmup_ratio < 1.0:
+        raise ValueError(f"config.yaml {prefix}.optimizer.warmup_ratio must be in [0, 1)")
     if not 0.0 <= beta1 < 1.0 or not 0.0 <= beta2 < 1.0:
         raise ValueError(f"config.yaml {prefix}.optimizer beta values must be in [0, 1)")
-    if grad_clip <= 0.0:
-        raise ValueError(f"config.yaml {prefix}.optimizer.grad_clip must be positive")
+    if grad_clip < 0.0:
+        raise ValueError(f"config.yaml {prefix}.optimizer.grad_clip must be nonnegative")
     result = ExperimentProfile(
         schema_version=schema_version,
         source_sha256=source_sha256,
         name=profile,
         steps=(
             _config_int(training["steps"], f"{prefix}.training.steps", minimum=1)
-            if has_steps else None
+            if "steps" in training else None
         ),
         train_tokens=(
             _config_int(
                 training["train_tokens"], f"{prefix}.training.train_tokens", minimum=1
-            ) if has_train_tokens else None
+            ) if "train_tokens" in training else None
+        ),
+        tokens_per_parameter=(
+            _config_float(
+                training["tokens_per_parameter"],
+                f"{prefix}.training.tokens_per_parameter",
+            )
+            if "tokens_per_parameter" in training
+            else None
         ),
         batch_size=_config_int(
             training["batch_size"], f"{prefix}.training.batch_size", minimum=1
@@ -911,18 +1140,25 @@ def _parse_experiment_profile(
         dtype_name=_config_choice(
             training["dtype"], f"{prefix}.training.dtype", ("bfloat16", "float32")
         ),
-        layers=_config_int(model["layers"], f"{prefix}.model.layers", minimum=1),
-        heads=_config_int(model["heads"], f"{prefix}.model.heads", minimum=1),
-        d_model=_config_int(model["d_model"], f"{prefix}.model.d_model", minimum=1),
-        mlp_mult=_config_int(model["mlp_mult"], f"{prefix}.model.mlp_mult", minimum=1),
-        vocab_size=_config_int(
-            model["vocab_size"], f"{prefix}.model.vocab_size", minimum=1
-        ),
-        semantic_vocab_size=_config_int(
-            model["semantic_vocab_size"],
-            f"{prefix}.model.semantic_vocab_size",
-            minimum=1,
-        ),
+        layers=int(model["layers"]),
+        heads=int(model["heads"]),
+        d_model=int(model["d_model"]),
+        mlp_mult=int(model["mlp_mult"]),
+        normalization=str(model["normalization"]),
+        position_encoding=str(model["position_encoding"]),
+        mlp_activation=str(model["mlp_activation"]),
+        tier=selected_tier,
+        declared_parameters=declared_parameters,
+        base_parameters=parsed_tiers["60m"][0],
+        parameterization=selected_parameterization,
+        base_width=selected_base_width,
+        base_depth=selected_base_depth,
+        depth_alpha=selected_depth_alpha,
+        init_std=selected_init_std,
+        attention_scale=selected_attention_scale,
+        embeddings=selected_embeddings,
+        vocab_size=int(model["vocab_size"]),
+        semantic_vocab_size=int(model["semantic_vocab_size"]),
         attention_backend=_config_choice(
             kernels["attention_backend"],
             f"{prefix}.kernels.attention_backend",
@@ -936,10 +1172,9 @@ def _parse_experiment_profile(
         ),
         learning_rate=learning_rate,
         min_lr_ratio=min_lr_ratio,
-        warmup_steps=_config_int(
-            optimizer["warmup_steps"], f"{prefix}.optimizer.warmup_steps", minimum=0
-        ),
+        warmup_ratio=warmup_ratio,
         weight_decay=weight_decay,
+        adam_epsilon=adam_epsilon,
         beta1=beta1,
         beta2=beta2,
         grad_clip=grad_clip,
@@ -961,12 +1196,10 @@ def _parse_experiment_profile(
             logging["log_every"], f"{prefix}.logging.log_every", minimum=1
         ),
     )
-    if result.semantic_vocab_size > result.vocab_size:
+    if result.tokens_per_parameter is not None and result.tokens_per_parameter <= 0.0:
         raise ValueError(
-            f"config.yaml {prefix}.model.semantic_vocab_size must not exceed vocab_size"
+            f"config.yaml {prefix}.training.tokens_per_parameter must be positive"
         )
-    if result.d_model % result.heads:
-        raise ValueError(f"config.yaml {prefix}.model.d_model must be divisible by heads")
     if result.attention_backend != "dense" and result.dtype_name != "bfloat16":
         raise ValueError(
             f"config.yaml {prefix}.kernels.attention_backend "
@@ -999,7 +1232,7 @@ def _parse_experiment_profile(
 
 
 def load_experiment_profile(
-    profile: str, requested_path: Path | None = None
+    profile: str, requested_path: Path | None = None, *, tier: str = "125m"
 ) -> ExperimentProfile:
     if profile not in _VALID_PROFILES:
         raise ValueError(f"unknown experiment profile: {profile!r}")
@@ -1032,7 +1265,7 @@ def load_experiment_profile(
     mapping = _config_mapping(documents[0], "document")
     source_sha256 = hashlib.sha256(raw).hexdigest()
     parsed = {
-        name: _parse_experiment_profile(mapping, name, source_sha256)
+        name: _parse_experiment_profile(mapping, name, source_sha256, tier)
         for name in _VALID_PROFILES
     }
     return parsed[profile]
@@ -1065,6 +1298,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--output-dir", type=Path, default=Path("runs/reference"))
     run.add_argument("--seed", type=int, default=1337)
+    environment_tier = os.environ.get("SPEEDRUN_TIER", "125m")
+    if environment_tier not in _VALID_TIERS:
+        environment_tier = "125m"
+    run.add_argument(
+        "--tier",
+        choices=_VALID_TIERS,
+        default=environment_tier,
+        help="model-family size tier (smoke keeps its tiny inline model)",
+    )
     duration = run.add_mutually_exclusive_group()
     duration.add_argument("--steps", type=positive_int, default=None)
     duration.add_argument(
@@ -1072,6 +1314,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=positive_int,
         default=None,
         help="derive an exact step count from the global batch and sequence length",
+    )
+    duration.add_argument(
+        "--tokens-per-parameter",
+        type=float,
+        default=None,
+        help="research budget rounded to the nearest complete global step",
     )
     environment_track = os.environ.get("SPEEDRUN_TRACK", "open")
     if environment_track not in _VALID_TRACKS:
@@ -1274,6 +1522,18 @@ def build_parser() -> argparse.ArgumentParser:
     optim.add_argument("--beta2", type=float, default=None, help=argparse.SUPPRESS)
     optim.add_argument("--grad-clip", type=float, default=None, help=argparse.SUPPRESS)
     optim.add_argument(
+        "--base-learning-rate",
+        type=float,
+        default=None,
+        help="research override for the transferable base learning rate",
+    )
+    optim.add_argument(
+        "--study-batch-size",
+        type=positive_int,
+        default=None,
+        help="research-only global batch override for a staged batch study",
+    )
+    optim.add_argument(
         "--peak-tflops",
         type=float,
         default=None,
@@ -1286,7 +1546,19 @@ def validate_args(args: argparse.Namespace) -> ExperimentProfile:
     if args.smoke and args.profile not in (None, "smoke"):
         raise ValueError("--smoke cannot be combined with a non-smoke --profile")
     reject_static_cli_overrides(args)
-    experiment = load_experiment_profile(selected_profile(args), args.config)
+    experiment = load_experiment_profile(
+        selected_profile(args), args.config, tier=args.tier
+    )
+    if args.tokens_per_parameter is not None and (
+        not math.isfinite(args.tokens_per_parameter)
+        or args.tokens_per_parameter <= 0.0
+    ):
+        raise ValueError("--tokens-per-parameter must be finite and positive")
+    if args.base_learning_rate is not None and (
+        not math.isfinite(args.base_learning_rate)
+        or args.base_learning_rate <= 0.0
+    ):
+        raise ValueError("--base-learning-rate must be finite and positive")
     if not 0.0 < args.val_fraction < 1.0:
         raise ValueError("--val-fraction must be between 0 and 1")
     if args.peak_tflops is not None and (
@@ -1410,7 +1682,9 @@ def resolve_config(
 ) -> Config:
     profile = selected_profile(args)
     reject_static_cli_overrides(args)
-    experiment = experiment or load_experiment_profile(profile, args.config)
+    experiment = experiment or load_experiment_profile(
+        profile, args.config, tier=args.tier
+    )
     if experiment.name != profile:
         raise ValueError(
             f"resolved config profile {experiment.name!r} does not match {profile!r}"
@@ -1420,13 +1694,25 @@ def resolve_config(
             "loaded dataset vocabulary does not match config.yaml: "
             f"dataset={vocab_size}, configured={experiment.vocab_size}"
         )
-    batch_size = experiment.batch_size
+    batch_size = args.study_batch_size or experiment.batch_size
     seq_len = experiment.seq_len
     tokens_per_step = batch_size * seq_len
     requested_train_tokens = (
         args.train_tokens
-        if args.train_tokens is not None
-        else (None if args.steps is not None else experiment.train_tokens)
+        if args.train_tokens is not None else (
+            None
+            if args.steps is not None or args.tokens_per_parameter is not None
+            else experiment.train_tokens
+        )
+    )
+    requested_tpp = (
+        args.tokens_per_parameter
+        if args.tokens_per_parameter is not None
+        else (
+            None
+            if args.steps is not None or args.train_tokens is not None
+            else experiment.tokens_per_parameter
+        )
     )
     if requested_train_tokens is not None:
         if requested_train_tokens % tokens_per_step:
@@ -1435,6 +1721,13 @@ def resolve_config(
                 f"({tokens_per_step:,}); got {requested_train_tokens:,}"
             )
         steps = requested_train_tokens // tokens_per_step
+    elif requested_tpp is not None:
+        if experiment.declared_parameters is None:
+            raise ValueError(
+                "tokens-per-parameter requires a non-smoke family tier"
+            )
+        ideal_tokens = float(experiment.declared_parameters) * requested_tpp
+        steps = max(1, int(math.floor(ideal_tokens / tokens_per_step + 0.5)))
     else:
         steps = args.steps if args.steps is not None else experiment.steps
         if steps is None:  # schema validation establishes a duration, defensively retain type.
@@ -1486,12 +1779,44 @@ def resolve_config(
         for name, value in (
             ("steps", args.steps),
             ("train_tokens", args.train_tokens),
+            ("tokens_per_parameter_micros", (
+                round(args.tokens_per_parameter * 1_000_000)
+                if args.tokens_per_parameter is not None else None
+            )),
+            ("study_batch_size", args.study_batch_size),
             ("val_every", args.val_every),
             ("diagnostics_every", args.diagnostics_every),
             ("log_every", args.log_every),
         )
         if value is not None
     )
+    width_multiplier = experiment.d_model / float(experiment.base_width)
+    depth_multiplier = experiment.layers / float(experiment.base_depth)
+    batch_multiplier = batch_size / float(experiment.batch_size)
+    achieved_tpp = (
+        steps * tokens_per_step / float(experiment.declared_parameters)
+        if experiment.declared_parameters is not None
+        else None
+    )
+    # In a fixed-TPP ladder, the data horizon grows in proportion to model
+    # parameters. This is the Complete(d)P m_D axis, normalized to the 60m base.
+    # A step- or token-bounded diagnostic instead holds its data horizon fixed
+    # across tiers, so it must not accidentally inherit the ladder correction.
+    data_multiplier = (
+        experiment.declared_parameters / float(experiment.base_parameters)
+        if experiment.declared_parameters is not None and requested_tpp is not None
+        else 1.0
+    )
+    base_learning_rate = (
+        args.base_learning_rate
+        if args.base_learning_rate is not None
+        else experiment.learning_rate
+    )
+    warmup_steps = int(math.floor(steps * experiment.warmup_ratio + 0.5))
+    if steps > 1:
+        warmup_steps = min(warmup_steps, steps - 1)
+    else:
+        warmup_steps = 0
     return Config(
         steps=steps,
         batch_size=batch_size,
@@ -1501,10 +1826,29 @@ def resolve_config(
         heads=experiment.heads,
         d_model=experiment.d_model,
         mlp_mult=experiment.mlp_mult,
-        learning_rate=experiment.learning_rate,
+        normalization=experiment.normalization,
+        position_encoding=experiment.position_encoding,
+        mlp_activation=experiment.mlp_activation,
+        tier=experiment.tier,
+        declared_parameters=experiment.declared_parameters,
+        base_parameters=experiment.base_parameters,
+        parameterization=experiment.parameterization,
+        base_width=experiment.base_width,
+        base_depth=experiment.base_depth,
+        depth_alpha=experiment.depth_alpha,
+        init_std=experiment.init_std,
+        attention_scale=experiment.attention_scale,
+        embeddings=experiment.embeddings,
+        width_multiplier=width_multiplier,
+        depth_multiplier=depth_multiplier,
+        data_multiplier=data_multiplier,
+        batch_multiplier=batch_multiplier,
+        tokens_per_parameter=achieved_tpp,
+        learning_rate=base_learning_rate,
         min_lr_ratio=experiment.min_lr_ratio,
-        warmup_steps=experiment.warmup_steps,
+        warmup_steps=warmup_steps,
         weight_decay=experiment.weight_decay,
+        adam_epsilon=experiment.adam_epsilon,
         beta1=experiment.beta1,
         beta2=experiment.beta2,
         grad_clip=experiment.grad_clip,
@@ -1641,7 +1985,7 @@ def load_dataset(
     args: argparse.Namespace, experiment: ExperimentProfile | None = None
 ) -> tuple[TokenDataset, int]:
     experiment = experiment or load_experiment_profile(
-        selected_profile(args), args.config
+        selected_profile(args), args.config, tier=args.tier
     )
     configured_vocab_size = experiment.vocab_size
     if args.data_path is None and not args.train_data and not args.val_data:
@@ -1906,40 +2250,70 @@ def init_params(config: Config, seed: int) -> dict[str, Any]:
     rng = np.random.default_rng(seed)
     d_model = config.d_model
     hidden = config.mlp_mult * d_model
-    residual_scale = 0.02 / math.sqrt(2.0 * config.layers)
+    hidden_scale = (
+        config.init_std / math.sqrt(config.width_multiplier)
+        if config.parameterization == "complete_d_p"
+        else 0.02
+    )
     blocks: list[dict[str, np.ndarray]] = []
     for _ in range(config.layers):
         blocks.append(
             {
                 "ln1_scale": np.ones((d_model,), dtype=np.float32),
-                "ln1_bias": np.zeros((d_model,), dtype=np.float32),
-                "qkv_w": normal(rng, (d_model, 3 * d_model), 0.02),
+                "qkv_w": normal(rng, (d_model, 3 * d_model), hidden_scale),
                 "qkv_b": np.zeros((3 * d_model,), dtype=np.float32),
-                "attn_w": normal(rng, (d_model, d_model), residual_scale),
+                "attn_w": normal(rng, (d_model, d_model), hidden_scale),
                 "attn_b": np.zeros((d_model,), dtype=np.float32),
                 "ln2_scale": np.ones((d_model,), dtype=np.float32),
-                "ln2_bias": np.zeros((d_model,), dtype=np.float32),
-                "mlp_up_w": normal(rng, (d_model, hidden), 0.02),
+                "mlp_up_w": normal(rng, (d_model, hidden), hidden_scale),
                 "mlp_up_b": np.zeros((hidden,), dtype=np.float32),
-                "mlp_down_w": normal(rng, (hidden, d_model), residual_scale),
+                "mlp_down_w": normal(rng, (hidden, d_model), hidden_scale),
                 "mlp_down_b": np.zeros((d_model,), dtype=np.float32),
             }
         )
-    return {
-        "token_embedding": normal(rng, (config.vocab_size, d_model), 0.02),
-        "position_embedding": normal(rng, (config.seq_len, d_model), 0.01),
+    result = {
+        "token_embedding": normal(
+            rng, (config.vocab_size, d_model), config.init_std
+        ),
         "blocks": blocks,
         "final_ln_scale": np.ones((d_model,), dtype=np.float32),
-        "final_ln_bias": np.zeros((d_model,), dtype=np.float32),
     }
+    if config.embeddings == "untied":
+        result["output_embedding"] = normal(
+            rng,
+            (config.vocab_size, d_model),
+            config.init_std / config.width_multiplier,
+        )
+    return result
 
 
-def layer_norm(x: jax.Array, scale: jax.Array, bias: jax.Array, dtype: Any) -> jax.Array:
+def rms_norm(x: jax.Array, scale: jax.Array, dtype: Any) -> jax.Array:
+    """Apply pre-normalization without mean centering in FP32."""
+
     x32 = x.astype(jnp.float32)
-    mean = jnp.mean(x32, axis=-1, keepdims=True)
-    variance = jnp.mean(jnp.square(x32 - mean), axis=-1, keepdims=True)
-    normalized = ((x32 - mean) * jax.lax.rsqrt(variance + 1.0e-5)).astype(dtype)
-    return normalized * scale.astype(dtype) + bias.astype(dtype)
+    normalized = x32 * jax.lax.rsqrt(
+        jnp.mean(jnp.square(x32), axis=-1, keepdims=True) + 1.0e-5
+    )
+    return normalized.astype(dtype) * scale.astype(dtype)
+
+
+def apply_rotary(x: jax.Array) -> jax.Array:
+    """Apply interleaved base-10,000 rotary positions to one BTHD tensor."""
+
+    length = x.shape[1]
+    head_dim = x.shape[-1]
+    if head_dim % 2:
+        raise ValueError("rotary attention requires an even head dimension")
+    fraction = jnp.arange(0, head_dim, 2, dtype=jnp.float32) / float(head_dim)
+    inverse_frequency = jnp.power(10000.0, -fraction)
+    angle = jnp.arange(length, dtype=jnp.float32)[:, None] * inverse_frequency[None, :]
+    cosine = jnp.cos(angle)[None, :, None, :].astype(x.dtype)
+    sine = jnp.sin(angle)[None, :, None, :].astype(x.dtype)
+    even = x[..., 0::2]
+    odd = x[..., 1::2]
+    return jnp.stack(
+        (even * cosine - odd * sine, even * sine + odd * cosine), axis=-1
+    ).reshape(x.shape)
 
 
 def linear(x: jax.Array, weight: jax.Array, bias: jax.Array, dtype: Any) -> jax.Array:
@@ -1947,6 +2321,14 @@ def linear(x: jax.Array, weight: jax.Array, bias: jax.Array, dtype: Any) -> jax.
 
 
 AttentionCallable = Callable[[jax.Array, jax.Array, jax.Array], jax.Array]
+
+
+def attention_softmax_scale(config: Config) -> float:
+    if config.attention_scale == "inverse_model_width":
+        return 1.0 / float(config.d_model)
+    if config.attention_scale == "inverse_sqrt_head_dim":
+        return (config.d_model // config.heads) ** -0.5
+    raise ValueError(f"unsupported attention scale {config.attention_scale!r}")
 
 
 def attention_runtime_metadata(runtime: AttentionRuntime) -> dict[str, Any]:
@@ -2014,9 +2396,14 @@ def contract_model_metadata(config: Config) -> dict[str, Any]:
         "heads": config.heads,
         "d_model": config.d_model,
         "mlp_mult": config.mlp_mult,
+        "normalization": config.normalization,
+        "position_encoding": config.position_encoding,
+        "mlp_activation": config.mlp_activation,
         "vocab_size": config.vocab_size,
         "semantic_vocab_size": config.semantic_vocab_size,
-        "tied_embeddings": True,
+        "tied_embeddings": config.embeddings == "tied",
+        "tier": config.tier,
+        "parameterization": config.parameterization,
     }
 
 
@@ -2037,6 +2424,7 @@ def experiment_config_metadata(config: Config) -> dict[str, Any]:
                 "seq_len": config.seq_len,
                 "sampling": config.sampling,
                 "dtype": config.dtype_name,
+                "tokens_per_parameter": config.tokens_per_parameter,
             },
             "model": contract_model_metadata(config),
             "kernels": {
@@ -2046,12 +2434,27 @@ def experiment_config_metadata(config: Config) -> dict[str, Any]:
             },
             "optimizer": {
                 "learning_rate": config.learning_rate,
+                "effective": effective_optimizer_metadata(config),
                 "min_lr_ratio": config.min_lr_ratio,
                 "warmup_steps": config.warmup_steps,
                 "weight_decay": config.weight_decay,
+                "adam_epsilon": config.adam_epsilon,
                 "beta1": config.beta1,
                 "beta2": config.beta2,
                 "grad_clip": config.grad_clip,
+            },
+            "parameterization": {
+                "name": config.parameterization,
+                "base_width": config.base_width,
+                "base_depth": config.base_depth,
+                "width_multiplier": config.width_multiplier,
+                "depth_multiplier": config.depth_multiplier,
+                "data_multiplier": config.data_multiplier,
+                "batch_multiplier": config.batch_multiplier,
+                "depth_alpha": config.depth_alpha,
+                "init_std": config.init_std,
+                "attention_scale": config.attention_scale,
+                "embeddings": config.embeddings,
             },
             "evaluation": {
                 "eval_batches": config.eval_batches,
@@ -2137,7 +2540,11 @@ def prepare_attention_runtime(
 
         def factory(tiles: AttentionTiles) -> AttentionCallable:
             return make_causal_attention(
-                AttentionConfig(backend=config.attention_backend, tiles=tiles)
+                AttentionConfig(
+                    backend=config.attention_backend,
+                    tiles=tiles,
+                    softmax_scale=attention_softmax_scale(config),
+                )
             )
 
         started = time.perf_counter()
@@ -2182,6 +2589,7 @@ def make_mesh_attention(
         AttentionConfig(
             backend=config.attention_backend,
             tiles=tiles,
+            softmax_scale=attention_softmax_scale(config),
         )
     )
     batch_partition = P("data", None, None, None)
@@ -2206,7 +2614,6 @@ def gpt_hidden(
     batch, length = tokens.shape
     del batch
     x = params["token_embedding"][tokens].astype(dtype)
-    x = x + params["position_embedding"][:length].astype(dtype)
     head_dim = config.d_model // config.heads
     if config.attention_backend != "dense":
         # Direct construction keeps this function convenient for single-device
@@ -2218,6 +2625,7 @@ def gpt_hidden(
                 tiles=select_attention_tiles(
                     sequence=length, head_dim=head_dim, training=True
                 ),
+                softmax_scale=attention_softmax_scale(config),
             )
         )
         causal = None
@@ -2229,12 +2637,14 @@ def gpt_hidden(
 
     for block in params["blocks"]:
         residual = x
-        x_norm = layer_norm(x, block["ln1_scale"], block["ln1_bias"], dtype)
+        x_norm = rms_norm(x, block["ln1_scale"], dtype)
         qkv = linear(x_norm, block["qkv_w"], block["qkv_b"], dtype)
         query, key, value = jnp.split(qkv, 3, axis=-1)
         query = query.reshape(tokens.shape[0], length, config.heads, head_dim)
         key = key.reshape(tokens.shape[0], length, config.heads, head_dim)
         value = value.reshape(tokens.shape[0], length, config.heads, head_dim)
+        query = apply_rotary(query)
+        key = apply_rotary(key)
         if attention is not None:
             attended = attention(
                 jnp.transpose(query, (0, 2, 1, 3)),
@@ -2244,20 +2654,24 @@ def gpt_hidden(
             attended = jnp.transpose(attended, (0, 2, 1, 3))
         else:
             scores = jnp.einsum("bthd,bshd->bhts", query, key)
-            scores = scores.astype(jnp.float32) * (head_dim**-0.5)
+            scores = scores.astype(jnp.float32) * attention_softmax_scale(config)
             scores = jnp.where(causal, scores, jnp.finfo(jnp.float32).min)
             probabilities = jax.nn.softmax(scores, axis=-1).astype(dtype)
             attended = jnp.einsum("bhts,bshd->bthd", probabilities, value)
         attended = attended.reshape(tokens.shape[0], length, config.d_model)
-        x = residual + linear(attended, block["attn_w"], block["attn_b"], dtype)
+        x = residual + (
+            config.depth_multiplier ** (-config.depth_alpha)
+        ) * linear(attended, block["attn_w"], block["attn_b"], dtype)
 
         residual = x
-        x_norm = layer_norm(x, block["ln2_scale"], block["ln2_bias"], dtype)
+        x_norm = rms_norm(x, block["ln2_scale"], dtype)
         hidden = linear(x_norm, block["mlp_up_w"], block["mlp_up_b"], dtype)
         hidden = jax.nn.gelu(hidden, approximate=True)
-        x = residual + linear(hidden, block["mlp_down_w"], block["mlp_down_b"], dtype)
+        x = residual + (
+            config.depth_multiplier ** (-config.depth_alpha)
+        ) * linear(hidden, block["mlp_down_w"], block["mlp_down_b"], dtype)
 
-    return layer_norm(x, params["final_ln_scale"], params["final_ln_bias"], dtype)
+    return rms_norm(x, params["final_ln_scale"], dtype)
 
 
 def gpt_logits(
@@ -2267,11 +2681,11 @@ def gpt_logits(
     attention_fn: AttentionCallable | None = None,
 ) -> jax.Array:
     x = gpt_hidden(params, tokens, config, attention_fn)
-    # Weight tying avoids a second vocabulary-sized parameter matrix.
+    output_embedding = params.get("output_embedding", params["token_embedding"])
     return jnp.einsum(
         "btd,vd->btv",
         x,
-        params["token_embedding"].astype(config.compute_dtype),
+        output_embedding.astype(config.compute_dtype),
     ).astype(jnp.float32)
 
 
@@ -2286,7 +2700,7 @@ def cross_entropy(
         hidden = gpt_hidden(params, x, config, attention_fn)
         return tiled_tied_cross_entropy(
             hidden,
-            params["token_embedding"],
+            params.get("output_embedding", params["token_embedding"]),
             y,
             semantic_vocab_size=config.semantic_vocab_size,
             vocab_tile_size=config.vocab_tile_size,
@@ -2310,7 +2724,12 @@ def learning_rate(step: jax.Array, config: Config) -> jax.Array:
     )
     cosine = 0.5 * (1.0 + jnp.cos(jnp.pi * progress))
     multiplier = config.min_lr_ratio + (1.0 - config.min_lr_ratio) * cosine
-    return jnp.asarray(config.learning_rate, jnp.float32) * warmup * multiplier
+    horizon_scale = math.sqrt(config.batch_multiplier / config.data_multiplier)
+    return (
+        jnp.asarray(config.learning_rate * horizon_scale, jnp.float32)
+        * warmup
+        * multiplier
+    )
 
 
 def init_optimizer(params: Any, steps: int) -> dict[str, Any]:
@@ -2330,11 +2749,99 @@ def weight_decay_mask(params: Any) -> Any:
     """Match the parameter tree, selecting only matrices for AdamW decay.
 
     Every learned projection and embedding in this model is rank two. Biases
-    and layer-normalization scales are rank one, so they intentionally remain
+    and normalization scales are rank one, so they intentionally remain
     outside the decoupled weight-decay update.
     """
 
     return jax.tree_util.tree_map(lambda value: bool(value.ndim >= 2), params)
+
+
+def optimizer_hyperparameter_trees(
+    params: Mapping[str, Any], config: Config
+) -> tuple[Any, Any, Any]:
+    """Return Complete(d)P LR, epsilon, and decay multipliers per tensor.
+
+    Input/output layers and the residual backbone are intentionally distinct.
+    Complete(d)P corrects CompleteP's input-embedding epsilon to ``1 / m_N``;
+    the unembedding epsilon remains unscaled after its forward multiplier is
+    absorbed into initialization and learning rate.
+    """
+
+    if config.parameterization != "complete_d_p":
+        ones = jax.tree_util.tree_map(lambda _: 1.0, params)
+        return ones, ones, ones
+
+    width = config.width_multiplier
+    depth = config.depth_multiplier
+    alpha = config.depth_alpha
+    hidden_lr = width**-1 * depth ** (alpha - 1.0)
+    hidden_vector_lr = depth ** (alpha - 1.0)
+    hidden_epsilon = width**-1 * depth**-alpha
+
+    lr_blocks: list[dict[str, float]] = []
+    epsilon_blocks: list[dict[str, float]] = []
+    decay_blocks: list[dict[str, float]] = []
+    for block in params["blocks"]:
+        lr_blocks.append(
+            {
+                name: (hidden_lr if name.endswith("_w") else hidden_vector_lr)
+                for name in block
+            }
+        )
+        epsilon_blocks.append({name: hidden_epsilon for name in block})
+        decay_blocks.append(
+            {name: (width if name.endswith("_w") else 1.0) for name in block}
+        )
+
+    lr_tree: dict[str, Any] = {
+        "token_embedding": 1.0,
+        "blocks": lr_blocks,
+        "final_ln_scale": 1.0,
+    }
+    epsilon_tree: dict[str, Any] = {
+        "token_embedding": width**-1,
+        "blocks": epsilon_blocks,
+        "final_ln_scale": 1.0,
+    }
+    decay_tree: dict[str, Any] = {
+        "token_embedding": 1.0,
+        "blocks": decay_blocks,
+        "final_ln_scale": 1.0,
+    }
+    if "output_embedding" in params:
+        # Complete(d)P absorbs the old 1/m_N output multiplier into output
+        # initialization and learning rate. Its width-scaled decay keeps the
+        # actual AdamW shrink invariant.
+        lr_tree["output_embedding"] = width**-1
+        epsilon_tree["output_embedding"] = 1.0
+        decay_tree["output_embedding"] = width
+    return lr_tree, epsilon_tree, decay_tree
+
+
+def effective_adam_betas(config: Config) -> tuple[float, float]:
+    ratio = config.batch_multiplier / config.data_multiplier
+    beta1 = 1.0 - (1.0 - config.beta1) * ratio
+    beta2 = 1.0 - (1.0 - config.beta2) * ratio
+    if not 0.0 <= beta1 < 1.0 or not 0.0 <= beta2 < 1.0:
+        raise ValueError(
+            "Complete(d)P batch/data scaling produced invalid Adam momenta; "
+            "use a closer transfer base"
+        )
+    return beta1, beta2
+
+
+def effective_optimizer_metadata(config: Config) -> dict[str, float]:
+    """Return the global Complete(d)P horizon/batch scalars used at runtime."""
+
+    beta1, beta2 = effective_adam_betas(config)
+    ratio = config.batch_multiplier / config.data_multiplier
+    return {
+        "global_peak_learning_rate": config.learning_rate * math.sqrt(ratio),
+        "adam_epsilon_horizon_multiplier": math.sqrt(1.0 / ratio),
+        "weight_decay_horizon_multiplier": math.sqrt(ratio),
+        "beta1": beta1,
+        "beta2": beta2,
+    }
 
 
 def _apply_training_update(
@@ -2354,6 +2861,10 @@ def _apply_training_update(
 
     if decay_mask is None:
         decay_mask = weight_decay_mask(params)
+    lr_multipliers, epsilon_multipliers, decay_multipliers = (
+        optimizer_hyperparameter_trees(params, config)
+    )
+    beta1, beta2 = effective_adam_betas(config)
     loss, gradients = jax.value_and_grad(
         lambda candidate: cross_entropy(candidate, x, y, config, attention_fn)
     )(params)
@@ -2361,35 +2872,69 @@ def _apply_training_update(
     raw_gradients = gradients
     squared_norms = [jnp.sum(jnp.square(grad)) for grad in jax.tree_util.tree_leaves(gradients)]
     grad_norm = jnp.sqrt(sum(squared_norms))
-    clip_scale = jnp.minimum(1.0, config.grad_clip / (grad_norm + 1.0e-6))
+    clip_scale = (
+        jnp.minimum(1.0, config.grad_clip / (grad_norm + 1.0e-6))
+        if config.grad_clip > 0.0
+        else jnp.asarray(1.0, dtype=jnp.float32)
+    )
     gradients = jax.tree_util.tree_map(lambda grad: grad * clip_scale, gradients)
 
     step = optimizer["step"] + jnp.asarray(1, dtype=jnp.int32)
     lr = learning_rate(step, config)
     m = jax.tree_util.tree_map(
-        lambda old, grad: config.beta1 * old + (1.0 - config.beta1) * grad,
+        lambda old, grad: beta1 * old + (1.0 - beta1) * grad,
         optimizer["m"],
         gradients,
     )
     v = jax.tree_util.tree_map(
-        lambda old, grad: config.beta2 * old + (1.0 - config.beta2) * jnp.square(grad),
+        lambda old, grad: beta2 * old + (1.0 - beta2) * jnp.square(grad),
         optimizer["v"],
         gradients,
     )
-    bias_correction1 = 1.0 - config.beta1**step.astype(jnp.float32)
-    bias_correction2 = 1.0 - config.beta2**step.astype(jnp.float32)
+    bias_correction1 = 1.0 - beta1**step.astype(jnp.float32)
+    bias_correction2 = 1.0 - beta2**step.astype(jnp.float32)
+    epsilon_horizon_scale = math.sqrt(
+        config.data_multiplier / config.batch_multiplier
+    )
+    decay_horizon_scale = math.sqrt(
+        config.batch_multiplier / config.data_multiplier
+    )
 
     def update(
         parameter: jax.Array,
         first: jax.Array,
         second: jax.Array,
         should_decay: bool,
+        lr_multiplier: float,
+        epsilon_multiplier: float,
+        decay_multiplier: float,
     ) -> jax.Array:
-        adam = (first / bias_correction1) / (jnp.sqrt(second / bias_correction2) + 1.0e-8)
-        decay = config.weight_decay * parameter if should_decay else 0.0
-        return parameter - lr * (adam + decay)
+        epsilon = (
+            config.adam_epsilon * epsilon_horizon_scale * epsilon_multiplier
+        )
+        adam = (first / bias_correction1) / (
+            jnp.sqrt(second / bias_correction2) + epsilon
+        )
+        decay = (
+            config.weight_decay
+            * decay_horizon_scale
+            * decay_multiplier
+            * parameter
+            if should_decay
+            else 0.0
+        )
+        return parameter - lr * lr_multiplier * (adam + decay)
 
-    params = jax.tree_util.tree_map(update, params, m, v, decay_mask)
+    params = jax.tree_util.tree_map(
+        update,
+        params,
+        m,
+        v,
+        decay_mask,
+        lr_multipliers,
+        epsilon_multipliers,
+        decay_multipliers,
+    )
     history_row = jnp.stack((loss, lr, grad_norm)).astype(jnp.float32)
     history = optimizer["history"].at[step - 1].set(history_row)
     return (
@@ -2422,11 +2967,7 @@ def train_step(
 def diagnostic_scopes(tree: Mapping[str, Any]) -> tuple[tuple[str, int | None, tuple[Any, ...]], ...]:
     """Group a parameter-shaped tree into stable logical report scopes."""
 
-    embeddings = tuple(
-        jax.tree_util.tree_leaves(
-            (tree["token_embedding"], tree["position_embedding"])
-        )
-    )
+    embeddings = tuple(jax.tree_util.tree_leaves(tree["token_embedding"]))
     blocks = tuple(
         (
             "block",
@@ -2435,17 +2976,21 @@ def diagnostic_scopes(tree: Mapping[str, Any]) -> tuple[tuple[str, int | None, t
         )
         for layer, block in enumerate(tree["blocks"])
     )
-    final_norm = tuple(
-        jax.tree_util.tree_leaves(
-            (tree["final_ln_scale"], tree["final_ln_bias"])
-        )
-    )
-    return (
+    final_norm = tuple(jax.tree_util.tree_leaves(tree["final_ln_scale"]))
+    output = (
         ("overall", None, tuple(jax.tree_util.tree_leaves(tree))),
         ("embeddings", None, embeddings),
         *blocks,
         ("final_norm", None, final_norm),
     )
+    if "output_embedding" in tree:
+        output = (
+            output[0],
+            output[1],
+            ("unembedding", None, tuple(jax.tree_util.tree_leaves(tree["output_embedding"]))),
+            *output[2:],
+        )
+    return output
 
 
 def diagnostic_scope_metadata(
@@ -2562,7 +3107,7 @@ def eval_step(
         hidden = gpt_hidden(params, x, config, attention_fn)
         losses = tiled_tied_cross_entropy_losses(
             hidden,
-            params["token_embedding"],
+            params.get("output_embedding", params["token_embedding"]),
             y,
             semantic_vocab_size=config.semantic_vocab_size,
             vocab_tile_size=config.vocab_tile_size,
@@ -2844,12 +3389,17 @@ def save_checkpoint(
             "heads": config.heads,
             "d_model": config.d_model,
             "mlp_mult": config.mlp_mult,
+            "normalization": config.normalization,
+            "position_encoding": config.position_encoding,
+            "mlp_activation": config.mlp_activation,
             "dtype": config.dtype_name,
             "attention_backend": config.attention_backend,
             "attention_tuning": attention_runtime_metadata(attention_runtime),
             "loss_backend": config.loss_backend,
             "vocab_tile_size": config.vocab_tile_size,
-            "tied_embeddings": True,
+            "tied_embeddings": config.embeddings == "tied",
+            "tier": config.tier,
+            "parameterization": config.parameterization,
         },
     }
     arrays["metadata.json"] = np.frombuffer(
@@ -3319,6 +3869,14 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     decay_mask = weight_decay_mask(host_params)
     diagnostic_metadata = diagnostic_scope_metadata(host_params)
     params_total = parameter_count(host_params)
+    if (
+        config.declared_parameters is not None
+        and params_total != config.declared_parameters
+    ):
+        raise ValueError(
+            f"tier {config.tier} declares {config.declared_parameters:,} parameters, "
+            f"but initialized {params_total:,}"
+        )
     flops_per_token = estimated_flops_per_token(config, params_total)
     tokens_processed = config.steps * config.batch_size * config.seq_len
 
@@ -3344,8 +3902,17 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                     else "not requested"
                 ),
             ),
-            ("model", f"L{config.layers} D{config.d_model} H{config.heads} MLP×{config.mlp_mult}"),
+            (
+                "model",
+                f"{config.tier} · L{config.layers} D{config.d_model} H{config.heads} "
+                f"RoPE RMSNorm GELU MLP×{config.mlp_mult}",
+            ),
             ("parameters", format_count(params_total)),
+            (
+                "parameterization",
+                f"{config.parameterization} · mN={config.width_multiplier:.4g} · "
+                f"mL={config.depth_multiplier:.4g} · mD={config.data_multiplier:.4g}",
+            ),
             ("global batch", f"{config.batch_size} × {config.seq_len} tokens"),
             (
                 "train sampling",
@@ -3891,7 +4458,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             "controller_process_index": process_index,
         },
         "contract": {
-            "model_id": "reference-gpt-v1",
+            "model_id": "reference-gpt-v3-family",
             "dataset_id": dataset_id,
             "tokenizer_id": tokenizer_id,
             "sequence_length": config.seq_len,
@@ -3907,7 +4474,20 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             "tokens_processed": int(tokens_processed),
             "training_token_budget": int(tokens_processed),
             "training_steps": int(config.steps),
+            "model_tier": config.tier,
+            "parameter_count": int(params_total),
+            "tokens_per_parameter": (
+                float(config.tokens_per_parameter)
+                if config.tokens_per_parameter is not None
+                else None
+            ),
+            "base_learning_rate": float(config.learning_rate),
             "training_sampling": config.sampling,
+            "training_data_sharding": (
+                "rank_disjoint_shuffled_windows"
+                if shuffled_train_stream is not None
+                else "rank_local_random_windows"
+            ),
             "training_usable_tokens_per_epoch": int(
                 shuffled_train_stream.usable_tokens_per_epoch
                 if shuffled_train_stream is not None

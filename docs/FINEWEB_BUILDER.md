@@ -144,8 +144,9 @@ publisher-produced immutable URL-bearing manifests at
 `data/manifests/fineweb-scaled-gpt2/{2B,4B,8B,hero}.json`. Then an official
 preparation budget above the classic 900M capacity automatically downloads or
 checks the smallest fitting variant beneath
-`<data-path>/fineweb-scaled/<variant>/`. This routing is preparation-only and
-does not modify the official run contract.
+`<data-path>/fineweb-scaled/<variant>/`. The saved route is then used by doctor,
+profiling, and non-smoke runs; trainer duration remains an independent family
+profile or study setting.
 
 ## Publish to Hugging Face
 

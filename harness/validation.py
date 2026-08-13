@@ -322,6 +322,7 @@ def validate_result(
     expected_validation_tokens: int | None = None,
     expected_downstream_tokens: Mapping[str, int] | None = None,
     evaluator: Evaluator | None = None,
+    require_checkpoint: bool = True,
 ) -> ValidationResult:
     """Validate a trainer result and, optionally, independently evaluate it."""
 
@@ -372,7 +373,15 @@ def validate_result(
         )
     else:
         evaluations = None
-    checkpoint = contained_file(run_dir, payload.get("checkpoint"))
+    declared_checkpoint = payload.get("checkpoint")
+    if declared_checkpoint is None:
+        if require_checkpoint:
+            raise ResultValidationError("checkpoint is required for this run")
+        if evaluator is not None:
+            raise ResultValidationError("an independent evaluator requires a checkpoint")
+        checkpoint = None
+    else:
+        checkpoint = contained_file(run_dir, declared_checkpoint)
     artifact_paths: dict[str, Path] = {}
     artifacts = payload.get("artifacts", {})
     if not isinstance(artifacts, dict):
@@ -400,6 +409,7 @@ def validate_result(
 
     evaluator_metrics: Mapping[str, Any] = {}
     if evaluator is not None:
+        assert checkpoint is not None
         try:
             evaluated = evaluator(checkpoint, payload)
         except ResultValidationError:
@@ -418,11 +428,11 @@ def validate_result(
                     "evaluator result validation_loss",
                 )
 
-    checkpoint_size = checkpoint.stat().st_size
+    checkpoint_size = checkpoint.stat().st_size if checkpoint is not None else None
     return ValidationResult(
         payload=dict(payload),
         checkpoint_path=checkpoint,
-        checkpoint_sha256=sha256_file(checkpoint),
+        checkpoint_sha256=(sha256_file(checkpoint) if checkpoint is not None else None),
         checkpoint_bytes=checkpoint_size,
         declared_train_seconds=declared_time,
         tokens_processed=tokens,
@@ -450,6 +460,7 @@ def verify_run(
     expected_validation_tokens: int | None = None,
     expected_downstream_tokens: Mapping[str, int] | None = None,
     evaluator: Evaluator | None = None,
+    require_checkpoint: bool = True,
 ) -> ValidationResult:
     """Re-validate an existing run from its captured stdout log."""
 
@@ -466,4 +477,5 @@ def verify_run(
         expected_validation_tokens=expected_validation_tokens,
         expected_downstream_tokens=expected_downstream_tokens,
         evaluator=evaluator,
+        require_checkpoint=require_checkpoint,
     )

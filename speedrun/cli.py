@@ -68,12 +68,12 @@ from .report import REPORT_ADMISSION_QUALIFICATION_LOSS, build_report
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _TRACKS = ("open", "sample_efficiency")
 _PROFILES = ("smoke", "dev", "official")
+_TIERS = ("60m", "125m", "250m", "500m", "1b")
 _RETENTION = ("all", "qualifying", "none-after-validation")
 _COLORS = ("auto", "always", "never")
 OFFICIAL_TARGET_LOSS = 3.28
-# The calibrated reference budget: 19,073 × 32 × 1,024 predictions. Alternate
-# global batch/sequence shapes must divide this exactly; a future masked final
-# batch can relax that restriction without changing the comparison budget.
+# Legacy v1 calibration fallback used only when re-verifying an old record that
+# did not capture its token constraint. New family runs record their own horizon.
 OFFICIAL_OPEN_TRAINING_TOKENS = 624_984_064
 _CLUSTER_WORKER_ENV = "SPEEDRUN_CLUSTER_WORKER"
 _CONTROLLER_HOST_ENV = "SPEEDRUN_CONTROLLER_HOSTNAME"
@@ -161,9 +161,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--training-tokens",
         type=_positive_int,
         help=(
-            "corpus budget for prepare only: official routes through 900M to "
-            "classic, through 1.9B/3.9B/7.9B/74.9B to 2B/4B/8B/hero; "
-            "never changes the fixed official run contract"
+            "corpus capacity to prepare and use for non-smoke runs: official "
+            "routes through 900M to classic, through 1.9B/3.9B/7.9B/74.9B "
+            "to 2B/4B/8B/hero"
         ),
     )
     prepare.add_argument("--train-shards", type=_positive_int, help="override train shard count")
@@ -193,6 +193,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     doctor.add_argument("--quick", action="store_true", help="skip compile/collective probe")
     doctor.add_argument("--skip-data", action="store_true", help="skip dataset integrity scan")
+    doctor.add_argument(
+        "--training-tokens",
+        type=_positive_int,
+        help=argparse.SUPPRESS,
+    )
     doctor.add_argument("--color", choices=_COLORS)
 
     run = commands.add_parser(
@@ -203,6 +208,22 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("submission", help="folder name beneath submissions/")
     run.add_argument("--track", choices=_TRACKS)
     run.add_argument("--profile", choices=_PROFILES)
+    run.add_argument("--tier", choices=_TIERS, default="125m")
+    run.add_argument(
+        "--tokens-per-parameter",
+        type=_positive_float,
+        help="research budget, rounded by the trainer to a complete global step",
+    )
+    run.add_argument(
+        "--base-learning-rate",
+        type=_positive_float,
+        help="research override for the family's transferable base learning rate",
+    )
+    run.add_argument(
+        "--study-batch-size",
+        type=_positive_int,
+        help="research-only global batch override",
+    )
     run.add_argument("--data-path", type=Path)
     run.add_argument("--seed", type=_nonnegative_int, default=1337)
     run.add_argument("--target-loss", type=_nonnegative_float)
@@ -210,6 +231,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--checkpoints", choices=_RETENTION)
     run.add_argument("--color", choices=_COLORS)
     run.add_argument("--skip-data-check", action="store_true")
+    run.add_argument(
+        "--omit-checkpoint",
+        action="store_true",
+        help="open/dev research only: retain metrics and curves without model weights",
+    )
+    run.add_argument("--study-id", help=argparse.SUPPRESS)
+    run.add_argument("--study-point", help=argparse.SUPPRESS)
+    run.add_argument("--study-suite-sha256", help=argparse.SUPPRESS)
 
     profile = commands.add_parser(
         "profile",
@@ -220,6 +249,7 @@ def build_parser() -> argparse.ArgumentParser:
         "submission", nargs="?", default="reference", help="folder name beneath submissions/"
     )
     profile.add_argument("--profile", choices=_PROFILES, help="saved profile override")
+    profile.add_argument("--tier", choices=_TIERS, default="125m")
     profile.add_argument("--data-path", type=Path, help="dataset cache root override")
     profile.add_argument("--output-dir", type=Path, required=True)
     profile.add_argument("--steps", type=_positive_int, default=100)
@@ -385,6 +415,7 @@ def command_prepare(args: argparse.Namespace) -> int:
                 profile=proposed.data_profile,
                 require_tpu=require_tpu,
                 expected_process_count=_expected_process_count(proposed),
+                training_tokens=proposed.training_tokens,
                 check_data=args.check_only and not route.is_scaled,
                 compile_probe=True,
             )
@@ -443,8 +474,8 @@ def command_prepare(args: argparse.Namespace) -> int:
                 data_path=proposed.data_path,
                 require_tpu=require_tpu,
                 # Each remote scaled prepare already verifies its routed
-                # manifest and nested cache.  Standalone doctor intentionally
-                # retains the fixed classic official contract.
+                # manifest and nested cache; avoid hashing all 40 shards twice
+                # in the same preparation transaction.
                 check_data=(data_work or args.check_only) and not route.is_scaled,
                 quick=False,
                 color=proposed.color,
@@ -456,6 +487,7 @@ def command_prepare(args: argparse.Namespace) -> int:
 def command_doctor(args: argparse.Namespace) -> int:
     config = load_config()
     profile = args.profile or config.default_profile
+    training_tokens = args.training_tokens or config.training_tokens
     path = resolve_path(args.path or config.data_path)
     color = args.color or config.color
     if config.tpu_vm_count > 1 and not _is_cluster_worker():
@@ -483,6 +515,7 @@ def command_doctor(args: argparse.Namespace) -> int:
             profile=profile,
             require_tpu=args.require_tpu or profile == "official",
             expected_process_count=_expected_process_count(config),
+            training_tokens=training_tokens,
             check_data=not args.skip_data,
             compile_probe=not args.quick,
         )
@@ -514,11 +547,19 @@ def command_run(args: argparse.Namespace) -> int:
     _ensure_artifacts_inside_repo(artifacts, root)
     if profile == "official" and args.skip_data_check:
         raise ConfigError("official runs require full dataset SHA-256 verification")
-    manifest, shards = data_selection(profile)
+    # A profile controls runtime/evaluation policy.  The saved preparation
+    # budget controls which immutable FineWeb prefix backs non-smoke runs.
+    # Keeping those axes separate lets a short dev study consume the same
+    # rank-disjoint corpus as the eventual official family run.
+    run_data_profile = "smoke" if profile == "smoke" else config.data_profile
+    route = preparation_route(run_data_profile, config.training_tokens)
+    manifest = resolve_preparation_manifest(route)
+    route_root = route.data_root(data_path)
+    shards = route.train_shards
     style.heading("Verifying cached data")
     prepared = verify_dataset(
         manifest,
-        data_path,
+        route_root,
         train_shards=shards,
         verify_hash=not args.skip_data_check,
     )
@@ -549,8 +590,12 @@ def command_run(args: argparse.Namespace) -> int:
         )
         style.ok(f"current source synchronized to {len(inventory.remote_hosts)} peer VMs")
 
-    dataset_id, tokenizer_id = _data_identity(profile)
+    dataset_id, tokenizer_id = _data_identity(
+        run_data_profile, prepared_name=prepared.name
+    )
     passthrough = [
+        "--tier",
+        args.tier,
         "--data-format",
         "llmc",
         "--dataset-id",
@@ -560,6 +605,16 @@ def command_run(args: argparse.Namespace) -> int:
         "--color",
         trainer_color,
     ]
+    if args.tokens_per_parameter is not None:
+        passthrough.extend(
+            ("--tokens-per-parameter", str(args.tokens_per_parameter))
+        )
+    if args.base_learning_rate is not None:
+        passthrough.extend(
+            ("--base-learning-rate", str(args.base_learning_rate))
+        )
+    if args.study_batch_size is not None:
+        passthrough.extend(("--study-batch-size", str(args.study_batch_size)))
     for train_file in prepared.train_files:
         passthrough.extend(("--train-data", str(train_file)))
     for validation_file in prepared.validation_files:
@@ -574,7 +629,35 @@ def command_run(args: argparse.Namespace) -> int:
     passthrough.extend(forwarded)
     timeout = args.timeout or {"smoke": 300.0, "dev": 3600.0, "official": 21600.0}[profile]
     retention = args.checkpoints or config.checkpoint_retention
-    reference = _reference_contract(profile) if track == "sample_efficiency" else None
+    if args.omit_checkpoint and (track != "open" or profile != "dev"):
+        raise ConfigError("--omit-checkpoint is restricted to open/dev research runs")
+    if args.omit_checkpoint:
+        passthrough.append("--omit-checkpoint")
+    study_values = (args.study_id, args.study_point, args.study_suite_sha256)
+    if any(value is not None for value in study_values) and not all(
+        value is not None for value in study_values
+    ):
+        raise ConfigError(
+            "--study-id, --study-point, and --study-suite-sha256 must be supplied together"
+        )
+    if args.study_id is not None and (
+        not _NAME.fullmatch(args.study_id) or not _NAME.fullmatch(args.study_point)
+    ):
+        raise ConfigError("study and point IDs must be simple filesystem-safe names")
+    if args.study_suite_sha256 is not None and not re.fullmatch(
+        r"[0-9a-f]{64}", args.study_suite_sha256
+    ):
+        raise ConfigError("study suite SHA-256 must be 64 lowercase hexadecimal digits")
+    reference = (
+        _reference_contract(
+            profile,
+            tier=args.tier,
+            dataset_id=dataset_id,
+            tokenizer_id=tokenizer_id,
+        )
+        if track == "sample_efficiency"
+        else None
+    )
     style.banner(f"run / {track} / {profile}")
     outcome = run_submission(
         RunConfig(
@@ -587,11 +670,7 @@ def command_run(args: argparse.Namespace) -> int:
             seed=args.seed,
             timeout_seconds=timeout,
             target_loss=target_loss,
-            expected_training_tokens=(
-                OFFICIAL_OPEN_TRAINING_TOKENS
-                if profile == "official" and track == "open"
-                else None
-            ),
+            expected_training_tokens=None,
             expected_validation_tokens=(
                 prepared.validation_prefix_tokens if profile == "official" else None
             ),
@@ -607,7 +686,7 @@ def command_run(args: argparse.Namespace) -> int:
             provenance={
                 **_data_provenance(
                     prepared,
-                    profile=profile,
+                    profile=run_data_profile,
                     integrity="headers+size" if args.skip_data_check else "sha256",
                     repo=root,
                     fresh10=fresh10,
@@ -616,9 +695,21 @@ def command_run(args: argparse.Namespace) -> int:
                     "tpu_vm_count": config.tpu_vm_count,
                     "tpu_vm_hosts": config.tpu_vm_hosts,
                 },
+                **(
+                    {
+                        "study": {
+                            "study_id": args.study_id,
+                            "point_id": args.study_point,
+                            "suite_sha256": args.study_suite_sha256,
+                        }
+                    }
+                    if args.study_id is not None
+                    else {}
+                ),
             },
             tpu_vm_count=config.tpu_vm_count,
             tpu_vm_hosts=config.tpu_vm_hosts,
+            require_checkpoint=not args.omit_checkpoint,
         )
     )
     metrics = outcome.record["metrics"]
@@ -673,9 +764,13 @@ def command_profile(args: argparse.Namespace) -> int:
     if config.tpu_vm_count > 1:
         configured_data_path = _cluster_data_argument(configured_data_path, root)
     data_path = resolve_path(configured_data_path, root)
-    manifest, shards = data_selection(profile)
+    run_data_profile = "smoke" if profile == "smoke" else config.data_profile
+    route = preparation_route(run_data_profile, config.training_tokens)
+    manifest = resolve_preparation_manifest(route)
+    route_root = route.data_root(data_path)
+    shards = route.train_shards
     style.heading("Verifying cached profile data")
-    prepared = verify_dataset(manifest, data_path, train_shards=shards)
+    prepared = verify_dataset(manifest, route_root, train_shards=shards)
     style.ok(
         f"{prepared.name}: {prepared.train_tokens:,} train / "
         f"{prepared.validation_tokens:,} validation tokens"
@@ -683,7 +778,9 @@ def command_profile(args: argparse.Namespace) -> int:
 
     output_dir = resolve_path(args.output_dir, root)
     xprof_dir = output_dir / "xprof"
-    dataset_id, tokenizer_id = _data_identity(profile)
+    dataset_id, tokenizer_id = _data_identity(
+        run_data_profile, prepared_name=prepared.name
+    )
     trainer_color = "always" if style.enabled else "never"
     trainer_command = [
         str(root / ".venv" / "bin" / "python"),
@@ -698,6 +795,8 @@ def command_profile(args: argparse.Namespace) -> int:
         config.default_track,
         "--profile",
         profile,
+        "--tier",
+        args.tier,
         "--steps",
         str(args.steps),
         "--val-every",
@@ -764,6 +863,9 @@ def command_profile(args: argparse.Namespace) -> int:
             remote,
             labels=True,
             timeout=float(args.timeout),
+            # A partially launched JAX collective must be torn down, not
+            # replayed while surviving workers may still be waiting.
+            retry_transport=False,
         )
     else:
         try:
@@ -799,7 +901,37 @@ def command_verify(args: argparse.Namespace) -> int:
     profile = args.profile or (
         str(record["profile"]) if record is not None else config.default_profile
     )
-    reference = _reference_contract(profile) if track == "sample_efficiency" else None
+    recorded_contract = record.get("contract") if isinstance(record, dict) else None
+    recorded_model = (
+        recorded_contract.get("model")
+        if isinstance(recorded_contract, dict)
+        else None
+    )
+    recorded_tier = (
+        recorded_model.get("tier") if isinstance(recorded_model, dict) else "125m"
+    )
+    recorded_dataset = (
+        recorded_contract.get("dataset_id")
+        if isinstance(recorded_contract, dict)
+        else None
+    )
+    recorded_tokenizer = (
+        recorded_contract.get("tokenizer_id")
+        if isinstance(recorded_contract, dict)
+        else None
+    )
+    reference = (
+        _reference_contract(
+            profile,
+            tier=str(recorded_tier),
+            dataset_id=(str(recorded_dataset) if recorded_dataset is not None else None),
+            tokenizer_id=(
+                str(recorded_tokenizer) if recorded_tokenizer is not None else None
+            ),
+        )
+        if track == "sample_efficiency"
+        else None
+    )
     expected_downstream = (
         _recorded_downstream_tokens(record)
         if profile == "official" and record is not None
@@ -820,13 +952,21 @@ def command_verify(args: argparse.Namespace) -> int:
         ),
         expected_validation_tokens=10_485_760 if profile == "official" else None,
         expected_downstream_tokens=expected_downstream,
+        require_checkpoint=(
+            record is None or isinstance(record.get("checkpoint"), dict)
+        ),
     )
     if record is not None:
         stdout_sha256 = sha256_file(run_dir / "stdout.log")
         expected_stdout = record.get("logs", {}).get("stdout_sha256")
         if stdout_sha256 != expected_stdout:
             raise HarnessError("captured stdout hash no longer matches its immutable record")
-        expected_checkpoint = record.get("checkpoint", {}).get("sha256")
+        recorded_checkpoint = record.get("checkpoint")
+        expected_checkpoint = (
+            recorded_checkpoint.get("sha256")
+            if isinstance(recorded_checkpoint, dict)
+            else None
+        )
         if result.checkpoint_sha256 != expected_checkpoint:
             raise HarnessError("checkpoint hash no longer matches its immutable record")
         recorded_artifacts = record.get("artifacts", {})
@@ -838,9 +978,14 @@ def command_verify(args: argparse.Namespace) -> int:
                 raise HarnessError(
                     f"artifact {name!r} hash no longer matches its immutable record"
                 )
+    checkpoint_label = (
+        result.checkpoint_sha256[:12]
+        if result.checkpoint_sha256 is not None
+        else "omitted"
+    )
     print(
         f"verified {run_dir.name} ({track}/{profile}): loss={result.validation_loss:.4f}, "
-        f"tokens={result.tokens_processed:,}, checkpoint={result.checkpoint_sha256[:12]}"
+        f"tokens={result.tokens_processed:,}, checkpoint={checkpoint_label}"
     )
     return 0
 
@@ -1087,6 +1232,8 @@ def _run_cluster_doctor(
         data_path,
         "--profile",
         profile,
+        "--training-tokens",
+        str(config.training_tokens),
         "--color",
         color,
     ]
@@ -1209,7 +1356,7 @@ def _prepare_wizard(
         "Smoke/development qualification target", config.target_loss, style
     )
     training_tokens = _ask_int(
-        "Official preparation corpus tokens (≤900M classic; max 74.9B; run fixed)",
+        "Non-smoke corpus capacity (≤900M classic; max 74.9B)",
         config.training_tokens,
         style,
     )
@@ -1350,51 +1497,71 @@ def _print_fresh10(prepared: PreparedFresh10, style: Style) -> None:
     print(f"  scored tokens  {prepared.scored_tokens:,} total")
 
 
-def _reference_contract(profile: str) -> ReferenceContract:
-    dataset_id, tokenizer_id = _data_identity(profile)
-    models: dict[str, dict[str, Any]] = {
-        "smoke": {
+def _reference_contract(
+    profile: str,
+    *,
+    tier: str = "125m",
+    dataset_id: str | None = None,
+    tokenizer_id: str | None = None,
+) -> ReferenceContract:
+    default_dataset_id, default_tokenizer_id = _data_identity(profile)
+    shapes = {
+        "60m": (12, 6, 384),
+        "125m": (12, 10, 640),
+        "250m": (16, 14, 896),
+        "500m": (19, 20, 1280),
+        "1b": (21, 28, 1792),
+    }
+    if tier not in shapes:
+        raise ConfigError(f"unknown model tier in reference contract: {tier!r}")
+    if profile == "smoke":
+        model = {
             "layers": 2,
             "heads": 2,
             "d_model": 64,
             "mlp_mult": 4,
+            "normalization": "rms_norm",
+            "position_encoding": "rope_base_10000",
+            "mlp_activation": "gelu",
             "vocab_size": 256,
             "semantic_vocab_size": 256,
             "tied_embeddings": True,
-        },
-        "dev": {
-            "layers": 6,
-            "heads": 6,
-            "d_model": 384,
+            "tier": "smoke",
+            "parameterization": "standard",
+        }
+        sequence = 32
+    else:
+        layers, heads, width = shapes[tier]
+        model = {
+            "layers": layers,
+            "heads": heads,
+            "d_model": width,
             "mlp_mult": 4,
+            "normalization": "rms_norm",
+            "position_encoding": "rope_base_10000",
+            "mlp_activation": "gelu",
             "vocab_size": 50_304,
             "semantic_vocab_size": 50_304,
-            "tied_embeddings": True,
-        },
-        "official": {
-            "layers": 12,
-            "heads": 12,
-            "d_model": 768,
-            "mlp_mult": 4,
-            "vocab_size": 50_304,
-            "semantic_vocab_size": 50_304,
-            "tied_embeddings": True,
-        },
-    }
-    sequence = {"smoke": 32, "dev": 256, "official": 1024}[profile]
+            "tied_embeddings": False,
+            "tier": tier,
+            "parameterization": "complete_d_p",
+        }
+        sequence = 1024
     return ReferenceContract(
-        model_id="reference-gpt-v1",
-        dataset_id=dataset_id,
-        tokenizer_id=tokenizer_id,
+        model_id="reference-gpt-v3-family",
+        dataset_id=dataset_id or default_dataset_id,
+        tokenizer_id=tokenizer_id or default_tokenizer_id,
         sequence_length=sequence,
-        extra={"model": models[profile]},
+        extra={"model": model},
     )
 
 
-def _data_identity(profile: str) -> tuple[str, str]:
+def _data_identity(
+    profile: str, *, prepared_name: str | None = None
+) -> tuple[str, str]:
     if profile == "smoke":
         return "smoke", "synthetic-byte-v1"
-    return "fineweb10b-gpt2", "gpt2"
+    return prepared_name or "fineweb10b-gpt2", "gpt2"
 
 
 def _effective_target_loss(
@@ -1542,6 +1709,14 @@ def _reject_reserved_trainer_args(arguments: Sequence[str]) -> None:
         "--downstream-root",
         "--downstream-data",
         "--train-tokens",
+        "--tier",
+        "--tokens-per-parameter",
+        "--base-learning-rate",
+        "--study-batch-size",
+        "--omit-checkpoint",
+        "--study-id",
+        "--study-point",
+        "--study-suite-sha256",
         "--color",
     }
     for argument in arguments:

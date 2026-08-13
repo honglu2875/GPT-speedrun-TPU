@@ -2,7 +2,7 @@
   "schema_version": 1,
   "lineage_id": "current_budget_isoflop_v2_24",
   "origin": {
-    "runs_root": "../../runs/scaling/current-budget-isoflop-v2",
+    "runs_root": "lineage-v2-artifacts",
     "suite_path": "../current_budget_isoflop/suite.yaml",
     "template_path": "../current_budget_isoflop/template.yaml",
     "git_commit": "78d03e791f6f6851a80a1ac2ab82ec5e5c36697c",

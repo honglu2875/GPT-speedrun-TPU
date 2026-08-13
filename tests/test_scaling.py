@@ -39,6 +39,7 @@ from speedrun.scaling import (
     _validate_lineage_output_root,
     _public_point,
     _read_run,
+    _resolve_trainer_source,
     _warrants_high_side_extension,
     build_parser,
     fit_results,
@@ -66,6 +67,21 @@ if TRAINER_SPEC is None or TRAINER_SPEC.loader is None:  # pragma: no cover
 reference_trainer = importlib.util.module_from_spec(TRAINER_SPEC)
 sys.modules[TRAINER_SPEC.name] = reference_trainer
 TRAINER_SPEC.loader.exec_module(reference_trainer)
+
+PINNED_TRAINER_PATH = (
+    Path(__file__).parents[1]
+    / "sweeps"
+    / "current_budget_isoflop_v4"
+    / "trainer.py"
+)
+PINNED_TRAINER_SPEC = importlib.util.spec_from_file_location(
+    "scaling_v4_pinned_train", PINNED_TRAINER_PATH
+)
+if PINNED_TRAINER_SPEC is None or PINNED_TRAINER_SPEC.loader is None:  # pragma: no cover
+    raise RuntimeError(f"could not import {PINNED_TRAINER_PATH}")
+pinned_v4_trainer = importlib.util.module_from_spec(PINNED_TRAINER_SPEC)
+sys.modules[PINNED_TRAINER_SPEC.name] = pinned_v4_trainer
+PINNED_TRAINER_SPEC.loader.exec_module(pinned_v4_trainer)
 
 
 def _sha256_test(path: Path) -> str:
@@ -295,6 +311,16 @@ class ScalingTests(unittest.TestCase):
     def test_v4_calibrates_every_slice_shape_without_mutable_lineage(self) -> None:
         suite = self.v4_suite
         self.assertEqual(suite["suite_id"], "current_budget_isoflop_v4")
+        self.assertTrue(suite["trainer_source_explicit"])
+        self.assertEqual(
+            suite["trainer_source_repository_path"],
+            "sweeps/current_budget_isoflop_v4/trainer.py",
+        )
+        self.assertEqual(
+            suite["source_snapshot"][suite["trainer_source_repository_path"]],
+            "b99dd38fe3a47b6b82e8d2c82649b53070f40de99838545ea18a5c2bccd7aea7",
+        )
+        self.assertNotIn("submissions/reference/train.py", suite["source_snapshot"])
         self.assertEqual(suite["learning_rate_scope"], "per_compute_slice_and_shape")
         self.assertIsNone(suite["lineage"])
         self.assertEqual(len(suite["calibrations"]), 45)
@@ -320,6 +346,95 @@ class ScalingTests(unittest.TestCase):
             for point in suite["controls"]
         )
         self.assertEqual(base_cost, 27.25)
+
+    def test_v4_trainer_is_exact_pre_promotion_blob(self) -> None:
+        completed = subprocess.run(
+            [
+                "git",
+                "cat-file",
+                "blob",
+                (
+                    "a3dd3f25bd1b29e30d61764221a6d0eda0791b82:"
+                    "submissions/reference/train.py"
+                ),
+            ],
+            cwd=Path(__file__).parents[1],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+        self.assertEqual(PINNED_TRAINER_PATH.read_bytes(), completed.stdout)
+        self.assertEqual(pinned_v4_trainer.CONFIG_SCHEMA_VERSION, 1)
+        self.assertEqual(reference_trainer.CONFIG_SCHEMA_VERSION, 2)
+
+    def test_v4_generated_schema1_config_is_parsed_by_pinned_trainer(self) -> None:
+        point = self.v4_suite["calibrations"][0]
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.yaml"
+            config_path.write_bytes(variant_config_bytes(self.v4_suite, point))
+            with patch.object(pinned_v4_trainer, "CONFIG_PATH", config_path):
+                profile = pinned_v4_trainer.load_experiment_profile(
+                    "dev", config_path
+                )
+        self.assertEqual(profile.layers, point["layers"])
+        self.assertEqual(profile.d_model, point["d_model"])
+        self.assertEqual(profile.train_tokens, point["train_tokens"])
+        self.assertEqual(profile.learning_rate, point["learning_rate"])
+
+    def test_v4_trainer_source_rejects_escape_symlink_and_hash_drift(self) -> None:
+        repo = Path(__file__).parents[1].resolve()
+        expected = hashlib.sha256(PINNED_TRAINER_PATH.read_bytes()).hexdigest()
+        with tempfile.TemporaryDirectory(dir=repo / "sweeps") as directory:
+            root = Path(directory)
+            suite_path = root / "suite.yaml"
+            trainer = root / "trainer.py"
+            trainer.write_bytes(PINNED_TRAINER_PATH.read_bytes())
+            declaration = {"path": "trainer.py", "sha256": expected}
+            resolved = _resolve_trainer_source(repo, suite_path, declaration)
+            self.assertEqual(resolved["trainer_source_path"], trainer)
+
+            with self.assertRaisesRegex(ScalingError, "normalized relative"):
+                _resolve_trainer_source(
+                    repo,
+                    suite_path,
+                    {"path": "../trainer.py", "sha256": expected},
+                )
+
+            link = root / "linked.py"
+            link.symlink_to(trainer)
+            with self.assertRaisesRegex(ScalingError, "symlink"):
+                _resolve_trainer_source(
+                    repo,
+                    suite_path,
+                    {"path": "linked.py", "sha256": expected},
+                )
+
+            trainer.write_bytes(trainer.read_bytes() + b"\n")
+            with self.assertRaisesRegex(ScalingError, "SHA-256 pin"):
+                _resolve_trainer_source(repo, suite_path, declaration)
+
+    def test_v4_fingerprint_is_independent_of_promoted_reference_trainer(self) -> None:
+        reference_path = TRAINER_PATH.resolve()
+        reference_hashed = False
+
+        def promoted_reference_hash(path: Path) -> str:
+            nonlocal reference_hashed
+            candidate = Path(path).resolve()
+            if candidate == reference_path:
+                reference_hashed = True
+                return "0" * 64
+            return hashlib.sha256(candidate.read_bytes()).hexdigest()
+
+        with patch(
+            "speedrun.scaling._sha256", side_effect=promoted_reference_hash
+        ):
+            reloaded = load_suite(DEFAULT_SUITE)
+        self.assertFalse(reference_hashed)
+        self.assertEqual(
+            reloaded["execution_fingerprint"],
+            self.v4_suite["execution_fingerprint"],
+        )
 
     def test_v4_stability_threshold_boundaries(self) -> None:
         policy = self.v4_suite["stability_admission"]
@@ -428,6 +543,73 @@ class ScalingTests(unittest.TestCase):
                     attention_tuning_cache=None,
                     autotune_attention=False,
                     resume=False,
+                )
+
+    def test_v4_run_copies_pinned_trainer_and_records_actual_source_path(self) -> None:
+        point = self.v4_suite["calibrations"][0]
+
+        class LaunchObserved(RuntimeError):
+            pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            data_root = root / "data"
+            fresh_root = root / "fresh"
+            data_root.mkdir()
+            fresh_root.mkdir()
+            data_provenance = _fake_dataset_provenance(self.v4_suite)
+            data_provenance["root"] = str(data_root)
+            data_provenance["manifest_path"] = str(data_root / "manifest.json")
+            data_inventory = {
+                **data_provenance,
+                "dataset_name": data_provenance.pop("name"),
+            }
+            fresh_inventory = _fake_fresh10_provenance(self.v4_suite)
+            fresh_inventory["root"] = str(fresh_root)
+            downstream_manifest = Path(self.v4_suite["fresh10"]["manifest_path"])
+
+            def observe_launch(*_args, **_kwargs):
+                point_root = root / "runs" / point["id"]
+                copied = point_root / "work" / "train.py"
+                self.assertEqual(copied.read_bytes(), PINNED_TRAINER_PATH.read_bytes())
+                self.assertNotEqual(copied.read_bytes(), TRAINER_PATH.read_bytes())
+                manifest = json.loads(
+                    (point_root / "run-manifest.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(manifest["schema_version"], 5)
+                self.assertEqual(
+                    manifest["trainer_source_repository_path"],
+                    "sweeps/current_budget_isoflop_v4/trainer.py",
+                )
+                self.assertEqual(
+                    manifest["trainer_sha256"],
+                    "b99dd38fe3a47b6b82e8d2c82649b53070f40de99838545ea18a5c2bccd7aea7",
+                )
+                self.assertEqual(
+                    manifest["work_snapshot"]["train.py"],
+                    manifest["trainer_sha256"],
+                )
+                raise LaunchObserved
+
+            with patch(
+                "speedrun.scaling.subprocess.run", side_effect=observe_launch
+            ), self.assertRaises(LaunchObserved):
+                run_variants(
+                    self.v4_suite,
+                    names=[point["id"]],
+                    data_path=data_root,
+                    runs_path=root / "runs",
+                    seed=1337,
+                    color="never",
+                    downstream_manifest=downstream_manifest,
+                    downstream_root=fresh_root,
+                    attention_tuning_cache=None,
+                    autotune_attention=False,
+                    resume=False,
+                    data_inventory=data_inventory,
+                    fresh10_inventory=fresh_inventory,
+                    runtime_inventory=_fake_runtime(self.v4_suite),
+                    allow_adaptive=True,
                 )
 
     def test_v4_lowest_initial_instability_recovers_only_downward(self) -> None:
@@ -576,6 +758,7 @@ class ScalingTests(unittest.TestCase):
         self.assertIsNotNone(lineage)
         self.assertEqual(lineage["allowlisted_artifact_count"], 24)
         self.assertEqual(lineage["origin_suite_id"], "current_budget_isoflop_v2")
+        self.assertFalse(suite["lineage"]["trainer_compatible"])
         upper = suite["learning_rate_search"]["upper"]
         self.assertEqual(upper[-2]["id"], "lr3417")
         self.assertEqual(upper[-2]["value"], 0.0034171875)
@@ -895,13 +1078,35 @@ class ScalingTests(unittest.TestCase):
             )
 
         current_snapshot = dict(self.lineage_suite["source_snapshot"])
-        current_snapshot["submissions/reference/train.py"] = "0" * 64
+        current_snapshot["speedrun/data.py"] = "0" * 64
         with patch("speedrun.scaling._source_snapshot", return_value=current_snapshot):
             with self.assertRaisesRegex(ScalingError, "execution source differs"):
                 _load_lineage_contract(
                     self.lineage_suite,
                     declaration=suite_payload["lineage"],
                     suite_directory=suite_path.parent,
+                )
+
+    def test_v3_rejects_new_runs_after_reference_promotion(self) -> None:
+        point = next(
+            item
+            for item in self.lineage_suite["calibrations"]
+            if _lineage_entry_for_point(self.lineage_suite, item) is None
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ScalingError, "read-only"):
+                run_variants(
+                    self.lineage_suite,
+                    names=[point["id"]],
+                    data_path=Path("/does/not/matter"),
+                    runs_path=Path(directory),
+                    seed=1337,
+                    color="never",
+                    downstream_manifest=Path("/does/not/matter"),
+                    downstream_root=Path("/does/not/matter"),
+                    attention_tuning_cache=None,
+                    autotune_attention=False,
+                    resume=False,
                 )
 
     def test_exact_builder_manifest_contract_rejects_inventory_drift(self) -> None:
@@ -1673,7 +1878,7 @@ def _write_fake_run(
     work = point_root / "work"
     repo = Path(__file__).parents[1]
     source_targets = {
-        "train.py": repo / "submissions" / "reference" / "train.py",
+        "train.py": Path(suite["trainer_source_path"]),
         **{
             relative: repo / relative
             for relative in suite["source_snapshot"]
@@ -1689,7 +1894,9 @@ def _write_fake_run(
     config_path.write_bytes(variant_config_bytes(suite, point))
     work_snapshot = {
         relative: suite["source_snapshot"][
-            "submissions/reference/train.py" if relative == "train.py" else relative
+            suite["trainer_source_repository_path"]
+            if relative == "train.py"
+            else relative
         ]
         for relative in source_targets
     }
@@ -1701,7 +1908,11 @@ def _write_fake_run(
     )
     study_lineage = _lineage_summary(suite)
     run_manifest = {
-        "schema_version": 4 if study_lineage is not None else 3,
+        "schema_version": (
+            5
+            if suite["trainer_source_explicit"]
+            else 4 if study_lineage is not None else 3
+        ),
         "classification": "diagnostic_noncompetition_isoflop",
         "suite_id": suite["suite_id"],
         "suite_sha256": suite["suite_sha256"],
@@ -1710,7 +1921,9 @@ def _write_fake_run(
         "source_snapshot": suite["source_snapshot"],
         "work_snapshot": work_snapshot,
         "point": _public_point(point),
-        "trainer_sha256": suite["source_snapshot"]["submissions/reference/train.py"],
+        "trainer_sha256": suite["source_snapshot"][
+            suite["trainer_source_repository_path"]
+        ],
         "config_sha256": point["config_sha256"],
         "checkpoint_policy": "omit_research_checkpoint",
         "dataset": provenance or _fake_dataset_provenance(suite),
@@ -1720,6 +1933,10 @@ def _write_fake_run(
     }
     if study_lineage is not None:
         run_manifest["study_lineage"] = study_lineage
+    if suite["trainer_source_explicit"]:
+        run_manifest["trainer_source_repository_path"] = suite[
+            "trainer_source_repository_path"
+        ]
     (point_root / "run-manifest.json").write_text(
         json.dumps(run_manifest), encoding="utf-8"
     )

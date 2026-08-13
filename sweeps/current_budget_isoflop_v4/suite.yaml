@@ -4,6 +4,9 @@
 schema_version: 1
 suite_id: current_budget_isoflop_v4
 config_template: template.yaml
+trainer_source:
+  path: trainer.py
+  sha256: b99dd38fe3a47b6b82e8d2c82649b53070f40de99838545ea18a5c2bccd7aea7
 sequence_length: 1024
 batch_size: 32
 vocab_size: 50304

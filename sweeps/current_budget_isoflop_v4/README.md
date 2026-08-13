@@ -5,6 +5,22 @@ every `(compute slice, model shape)` pair. A selected calibration run is itself
 the equal-FLOP model-size measurement, so no short-horizon learning rate is
 reused at a longer horizon.
 
+This study targets the pre-Complete(d)P GPT-2 baseline: 12 layers, width 768,
+and exactly 124,475,904 parameters under the schema-1 trainer's tied-embedding
+parameter count. It does **not** target the newly promoted schema-2 Complete(d)P
+reference baseline, whose architecture, parameterization, and configuration
+contract define a different experiment.
+
+To preserve that experiment across the reference promotion, `suite.yaml` pins
+the regular same-directory `trainer.py` byte-for-byte. The snapshot is exactly
+`submissions/reference/train.py` from commit
+`a3dd3f25bd1b29e30d61764221a6d0eda0791b82`, SHA-256
+`b99dd38fe3a47b6b82e8d2c82649b53070f40de99838545ea18a5c2bccd7aea7`.
+The loader rejects path escape, symlinks, or hash drift before planning. The
+actual repository path and digest are included in the execution fingerprint
+and every v4 run manifest; changing the live `submissions/reference/train.py`
+therefore cannot change which trainer v4 copies or the v4 trainer hash.
+
 V2 and v3 remain immutable archives. V4 deliberately has no lineage declaration:
 their lineage manifests pin `run-manifest.json` and `result.json`, but not the
 full `training.csv`, `validation.csv`, and `diagnostics.csv` evidence now required

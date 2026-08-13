@@ -73,6 +73,7 @@ _FINEWEB4B_NAMES = _FINEWEB4B_VALIDATION_NAMES + _FINEWEB4B_TRAIN_NAMES
 _ARCHIVED_SUITE_IDS = frozenset(
     {"current_budget_isoflop_v2", "current_budget_isoflop_v3"}
 )
+_DEFAULT_TRAINER_SOURCE_REPOSITORY_PATH = "submissions/reference/train.py"
 
 
 class ScalingError(ValueError):
@@ -168,8 +169,83 @@ def _shared_trainer_sources(repo: Path) -> tuple[Path, ...]:
     return tuple(sources)
 
 
-def _source_snapshot(repo: Path) -> dict[str, str]:
-    paths = [repo / "submissions" / "reference" / "train.py"]
+def _resolve_trainer_source(
+    repo: Path,
+    suite_path: Path,
+    declaration: Any,
+) -> dict[str, Any]:
+    """Resolve an optional suite-local trainer pin without following symlinks."""
+
+    repo = repo.resolve(strict=True)
+    if declaration is None:
+        repository_path = _DEFAULT_TRAINER_SOURCE_REPOSITORY_PATH
+        trainer_path = repo / repository_path
+        expected_digest = None
+        explicit = False
+    else:
+        source = dict(_mapping(declaration, "trainer_source"))
+        if set(source) != {"path", "sha256"}:
+            raise ScalingError("trainer_source must define exactly path and sha256")
+        raw_path = source["path"]
+        expected_digest = source["sha256"]
+        relative = Path(raw_path) if isinstance(raw_path, str) else Path()
+        if (
+            not isinstance(raw_path, str)
+            or not raw_path
+            or relative.is_absolute()
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            raise ScalingError("trainer_source.path must be a normalized relative path")
+        if (
+            not isinstance(expected_digest, str)
+            or _SHA256.fullmatch(expected_digest) is None
+        ):
+            raise ScalingError("trainer_source.sha256 must be a lowercase SHA-256")
+        suite_directory = suite_path.parent.resolve(strict=True)
+        unresolved = suite_directory / relative
+        cursor = suite_directory
+        for part in relative.parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise ScalingError("trainer_source.path must not contain a symlink")
+        try:
+            trainer_path = unresolved.resolve(strict=True)
+        except (FileNotFoundError, OSError) as exc:
+            raise ScalingError("trainer_source.path must name an existing file") from exc
+        try:
+            trainer_path.relative_to(suite_directory)
+        except ValueError as exc:
+            raise ScalingError("trainer_source.path escapes the suite directory") from exc
+        try:
+            repository_path = trainer_path.relative_to(repo).as_posix()
+        except ValueError as exc:
+            raise ScalingError("trainer_source.path escapes the repository") from exc
+        explicit = True
+    if not trainer_path.is_file() or trainer_path.is_symlink():
+        raise ScalingError("trainer source must be a regular, non-symlink file")
+    actual_digest = _sha256(trainer_path)
+    if expected_digest is not None and actual_digest != expected_digest:
+        raise ScalingError("trainer source bytes differ from the suite SHA-256 pin")
+    return {
+        "trainer_source_path": trainer_path,
+        "trainer_source_repository_path": repository_path,
+        "trainer_source_sha256": actual_digest,
+        "trainer_source_explicit": explicit,
+    }
+
+
+def _source_snapshot(
+    repo: Path,
+    *,
+    trainer_source_path: Path | None = None,
+    trainer_source_repository_path: str | None = None,
+) -> dict[str, str]:
+    if (trainer_source_path is None) != (trainer_source_repository_path is None):
+        raise ScalingError("trainer source path and repository path must be paired")
+    if trainer_source_path is None:
+        trainer_source_repository_path = _DEFAULT_TRAINER_SOURCE_REPOSITORY_PATH
+        trainer_source_path = repo / trainer_source_repository_path
+    paths = [trainer_source_path]
     paths.extend(_shared_trainer_sources(repo))
     paths.extend(
         (
@@ -183,10 +259,10 @@ def _source_snapshot(repo: Path) -> dict[str, str]:
     )
     if any(not path.is_file() or path.is_symlink() for path in paths):
         raise ScalingError("execution fingerprint source set is incomplete or symlinked")
-    return {
-        path.relative_to(repo).as_posix(): _sha256(path)
-        for path in paths
-    }
+    snapshot = {path.relative_to(repo).as_posix(): _sha256(path) for path in paths}
+    if trainer_source_repository_path not in snapshot:
+        raise ScalingError("canonical trainer role is absent from source snapshot")
+    return snapshot
 
 
 def _load_yaml(path: Path, label: str) -> Mapping[str, Any]:
@@ -306,6 +382,8 @@ def load_suite(path: Path = DEFAULT_SUITE) -> dict[str, Any]:
     root = _load_yaml(path, "suite")
     if root.get("schema_version") != 1:
         raise ScalingError("suite schema_version must be 1")
+    repo = Path(__file__).resolve().parent.parent
+    trainer_source = _resolve_trainer_source(repo, path, root.get("trainer_source"))
     suite_id = _name(root.get("suite_id"), "suite_id")
     seq_len = _integer(root.get("sequence_length"), "sequence_length")
     batch_size = _integer(root.get("batch_size"), "batch_size")
@@ -902,6 +980,7 @@ def load_suite(path: Path = DEFAULT_SUITE) -> dict[str, Any]:
 
     suite = {
         **dict(root),
+        **trainer_source,
         "path": path,
         "suite_sha256": _sha256(path),
         "suite_id": suite_id,
@@ -957,8 +1036,13 @@ def load_suite(path: Path = DEFAULT_SUITE) -> dict[str, Any]:
             suite_directory=path.parent,
         )
     )
-    repo = Path(__file__).resolve().parent.parent
-    source_snapshot = _source_snapshot(repo)
+    source_snapshot = _source_snapshot(
+        repo,
+        trainer_source_path=suite["trainer_source_path"],
+        trainer_source_repository_path=suite[
+            "trainer_source_repository_path"
+        ],
+    )
     fingerprint_payload = {
         "suite_sha256": suite["suite_sha256"],
         "template_sha256": suite["template_sha256"],
@@ -1170,6 +1254,14 @@ def _load_lineage_contract(
     origin_suite_yaml = _load_yaml(origin_suite_path, "lineage origin suite")
     if origin_suite_yaml.get("suite_id") != origin_suite_id:
         raise ScalingError("lineage origin suite ID differs from the pinned suite bytes")
+    origin_trainer_source = _resolve_trainer_source(
+        repo,
+        origin_suite_path,
+        origin_suite_yaml.get("trainer_source"),
+    )
+    origin_trainer_source_repository_path = str(
+        origin_trainer_source["trainer_source_repository_path"]
+    )
 
     commit_paths = {
         origin_suite_path.relative_to(repo).as_posix(): origin["suite_sha256"],
@@ -1179,7 +1271,14 @@ def _load_lineage_contract(
     source_snapshot = dict(
         _mapping(origin["source_snapshot"], "lineage origin source_snapshot")
     )
-    current_snapshot = _source_snapshot(repo)
+    current_trainer_source_repository_path = str(
+        suite["trainer_source_repository_path"]
+    )
+    current_snapshot = _source_snapshot(
+        repo,
+        trainer_source_path=Path(suite["trainer_source_path"]),
+        trainer_source_repository_path=current_trainer_source_repository_path,
+    )
     commit_paths.update(source_snapshot)
     for relative, expected_digest in commit_paths.items():
         try:
@@ -1199,15 +1298,31 @@ def _load_lineage_contract(
             raise ScalingError(
                 f"lineage origin Git commit does not pin expected bytes: {relative}"
             )
-    if set(source_snapshot) != set(current_snapshot):
+    if origin_trainer_source_repository_path not in source_snapshot:
+        raise ScalingError("lineage origin source snapshot omits its trainer source")
+    if (
+        set(source_snapshot) - {origin_trainer_source_repository_path}
+        != set(current_snapshot) - {current_trainer_source_repository_path}
+    ):
         raise ScalingError("lineage origin source snapshot has an incomplete source set")
+    trainer_compatible = (
+        current_trainer_source_repository_path
+        == origin_trainer_source_repository_path
+        and current_snapshot[current_trainer_source_repository_path]
+        == source_snapshot[origin_trainer_source_repository_path]
+    )
     for relative, digest in source_snapshot.items():
         if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
             raise ScalingError(f"lineage origin source digest is invalid: {relative}")
-        # The lineage-aware scaling runner is necessarily newer. Every source
-        # that can affect trainer execution, data identity, or evaluation must
-        # remain byte-identical to v2; only this orchestration module may differ.
-        if relative != "speedrun/scaling.py" and current_snapshot[relative] != digest:
+        # Historical measurements remain readable after a versioned reference
+        # promotion. New launches are disabled below unless the pinned trainer
+        # still matches; all shared execution/data/evaluation sources remain
+        # byte-identical to the origin study.
+        if (
+            relative
+            not in {"speedrun/scaling.py", origin_trainer_source_repository_path}
+            and current_snapshot[relative] != digest
+        ):
             raise ScalingError(
                 f"current execution source differs from lineage origin: {relative}"
             )
@@ -1272,6 +1387,10 @@ def _load_lineage_contract(
         "manifest_repository_path": manifest_path.relative_to(repo).as_posix(),
         "manifest_sha256": manifest_digest,
         "origin": normalized_origin,
+        "origin_trainer_source_repository_path": (
+            origin_trainer_source_repository_path
+        ),
+        "trainer_compatible": trainer_compatible,
         "artifacts": artifacts,
         "artifacts_by_point": {entry["point_id"]: entry for entry in artifacts},
     }
@@ -1350,6 +1469,12 @@ def print_plan(suite: Mapping[str, Any], *, as_json: bool = False) -> None:
                 {
                     "suite_id": suite["suite_id"],
                     "execution_fingerprint": suite["execution_fingerprint"],
+                    "trainer_source_repository_path": suite[
+                        "trainer_source_repository_path"
+                    ],
+                    "trainer_sha256": suite["source_snapshot"][
+                        suite["trainer_source_repository_path"]
+                    ],
                     "lineage": _lineage_summary(suite),
                     "anchor": suite["anchor"],
                     "seed": suite["seed"],
@@ -1383,6 +1508,11 @@ def print_plan(suite: Mapping[str, Any], *, as_json: bool = False) -> None:
         return
     print(f"IsoFLOP suite: {suite['suite_id']}")
     print(f"execution fingerprint: {suite['execution_fingerprint']}")
+    print(
+        "trainer source: "
+        f"{suite['trainer_source_repository_path']} "
+        f"({suite['source_snapshot'][suite['trainer_source_repository_path']]})"
+    )
     lineage = _lineage_summary(suite)
     if lineage is not None:
         print(
@@ -1466,6 +1596,19 @@ def materialize_configs(
     unknown = sorted(set(names) - set(available))
     if unknown:
         raise ScalingError(f"unknown point(s): {', '.join(unknown)}")
+    lineage = suite.get("lineage")
+    if (
+        isinstance(lineage, Mapping)
+        and not bool(lineage.get("trainer_compatible"))
+        and any(
+            _lineage_entry_for_point(suite, available[name]) is None
+            for name in names
+        )
+    ):
+        raise ScalingError(
+            "this lineage suite is read-only because its pinned trainer differs "
+            "from the promoted reference; start a new versioned suite"
+        )
     written: list[Path] = []
     for name in names:
         target = root / name / "config.yaml"
@@ -2341,6 +2484,19 @@ def run_variants(
             "adaptive learning-rate variants may only be launched by --staged; "
             "resume the staged study to preserve geometric ordering"
         )
+    lineage = suite.get("lineage")
+    if (
+        isinstance(lineage, Mapping)
+        and not bool(lineage.get("trainer_compatible"))
+        and any(
+            _lineage_entry_for_point(suite, available[name]) is None
+            for name in names
+        )
+    ):
+        raise ScalingError(
+            "this lineage suite is read-only because its pinned trainer differs "
+            "from the promoted reference; start a new versioned suite"
+        )
     adaptive_groups = sorted(
         {
             (str(point["slice"]), str(point["shape_id"]))
@@ -2418,7 +2574,21 @@ def run_variants(
         runtime=runtime,
     )
     repo = Path(__file__).resolve().parent.parent
-    trainer_source = repo / "submissions" / "reference" / "train.py"
+    trainer_source = Path(suite["trainer_source_path"])
+    trainer_source_repository_path = str(
+        suite["trainer_source_repository_path"]
+    )
+    expected_trainer_digest = suite["source_snapshot"].get(
+        trainer_source_repository_path
+    )
+    if (
+        not isinstance(expected_trainer_digest, str)
+        or _SHA256.fullmatch(expected_trainer_digest) is None
+        or not trainer_source.is_file()
+        or trainer_source.is_symlink()
+        or _sha256(trainer_source) != expected_trainer_digest
+    ):
+        raise ScalingError("trainer source changed after the suite was loaded")
     runs_root.mkdir(parents=True, exist_ok=True)
     dataset_id = str(suite["dataset"]["id"])
 
@@ -2476,7 +2646,11 @@ def run_variants(
         }
         study_lineage = _lineage_summary(suite)
         manifest = {
-            "schema_version": 4 if study_lineage is not None else 3,
+            "schema_version": (
+                5
+                if bool(suite["trainer_source_explicit"])
+                else 4 if study_lineage is not None else 3
+            ),
             "classification": "diagnostic_noncompetition_isoflop",
             "suite_id": suite["suite_id"],
             "suite_sha256": suite["suite_sha256"],
@@ -2495,6 +2669,10 @@ def run_variants(
         }
         if study_lineage is not None:
             manifest["study_lineage"] = study_lineage
+        if bool(suite["trainer_source_explicit"]):
+            manifest["trainer_source_repository_path"] = (
+                trainer_source_repository_path
+            )
         manifest_path = point_root / "run-manifest.json"
         _write_immutable_bytes(
             manifest_path,
@@ -2835,8 +3013,12 @@ def _load_lineage_run_manifest(
     if not isinstance(trainer_digest, str) or _SHA256.fullmatch(trainer_digest) is None:
         raise ScalingError(f"{name}: lineage trainer_sha256 is invalid")
     source_snapshot = _mapping(origin["source_snapshot"], "lineage source snapshot")
+    lineage = _mapping(suite["lineage"], "suite lineage")
+    trainer_source_repository_path = str(
+        lineage["origin_trainer_source_repository_path"]
+    )
     expected_work_snapshot = {
-        "train.py": source_snapshot["submissions/reference/train.py"],
+        "train.py": source_snapshot[trainer_source_repository_path],
         "config.yaml": point["config_sha256"],
         **{
             source_path: digest
@@ -2853,9 +3035,13 @@ def _load_lineage_run_manifest(
             actual_digest = hashlib.sha256(
                 variant_config_bytes(suite, point)
             ).hexdigest()
+        elif relative == "train.py":
+            # The historical trainer blob was already verified against the
+            # pinned origin Git commit while loading the lineage contract.
+            actual_digest = expected_digest
         else:
             source_relative = (
-                "submissions/reference/train.py" if relative == "train.py" else relative
+                trainer_source_repository_path if relative == "train.py" else relative
             )
             source = repo / source_relative
             if not source.is_file() or source.is_symlink():
@@ -2906,10 +3092,16 @@ def _load_run_manifest(
     }
     if study_lineage is not None:
         expected_fields.add("study_lineage")
+    if bool(suite["trainer_source_explicit"]):
+        expected_fields.add("trainer_source_repository_path")
     if set(manifest) != expected_fields:
         raise ScalingError(f"{name}: run manifest has unexpected or missing fields")
     expected_identity = {
-        "schema_version": 4 if study_lineage is not None else 3,
+        "schema_version": (
+            5
+            if bool(suite["trainer_source_explicit"])
+            else 4 if study_lineage is not None else 3
+        ),
         "classification": "diagnostic_noncompetition_isoflop",
         "suite_id": suite["suite_id"],
         "suite_sha256": suite["suite_sha256"],
@@ -2922,6 +3114,10 @@ def _load_run_manifest(
     }
     if study_lineage is not None:
         expected_identity["study_lineage"] = study_lineage
+    if bool(suite["trainer_source_explicit"]):
+        expected_identity["trainer_source_repository_path"] = suite[
+            "trainer_source_repository_path"
+        ]
     for field, expected in expected_identity.items():
         if manifest.get(field) != expected:
             raise ScalingError(f"{name}: run manifest {field} differs from the suite")
@@ -2931,8 +3127,11 @@ def _load_run_manifest(
     if manifest.get("seed") != suite["seed"]:
         raise ScalingError(f"{name}: run manifest seed differs from the suite")
     work = root / name / "work"
+    trainer_source_repository_path = str(
+        suite["trainer_source_repository_path"]
+    )
     expected_work_snapshot = {
-        "train.py": suite["source_snapshot"]["submissions/reference/train.py"],
+        "train.py": suite["source_snapshot"][trainer_source_repository_path],
         "config.yaml": point["config_sha256"],
         **{
             source_path: digest

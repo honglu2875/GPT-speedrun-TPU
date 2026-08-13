@@ -28,7 +28,7 @@ class LocalConfig:
     checkpoint_retention: str = "qualifying"
     color: str = "auto"
     target_loss: float = 3.28
-    # Personal corpus preparation budget; official run contracts stay versioned.
+    # Personal immutable corpus capacity used by non-smoke runs.
     training_tokens: int = 624_984_064
 
     def validate(self) -> "LocalConfig":
@@ -110,7 +110,7 @@ def save_config(config: LocalConfig, root: Path | None = None) -> Path:
     lines = [
         "# Personal defaults written by `speedrun prepare`.",
         "# Official constants live in data/manifests and docs/RULES.md.",
-        "# training_tokens sizes prepared data only; it does not alter a run contract.",
+        "# training_tokens selects the immutable corpus used by non-smoke runs.",
         "[speedrun]",
     ]
     for key, value in values.items():
