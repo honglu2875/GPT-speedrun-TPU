@@ -1538,8 +1538,10 @@ def _fresh10_provenance(inventory: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def validate_runtime_environment(suite: Mapping[str, Any]) -> dict[str, Any]:
-    """Fail before launch unless this process sees the exact locked TPU v4-8."""
+def _runtime_inventory_in_current_process(
+    suite: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Discover the locked TPU runtime inside a short-lived probe process."""
 
     expected = suite["runtime"]
     python_version = host_platform.python_version()
@@ -1605,6 +1607,56 @@ def validate_runtime_environment(suite: Mapping[str, Any]) -> dict[str, Any]:
         "device_ids": device_ids,
         "process_indices": process_indices,
     }
+
+
+def validate_runtime_environment(suite: Mapping[str, Any]) -> dict[str, Any]:
+    """Probe v4-8 in an isolated process so the trainer can acquire libtpu.
+
+    Importing JAX and calling ``jax.devices()`` permanently initializes the TPU
+    client for the life of that process. The sweep runner must therefore never
+    perform discovery in the parent that later launches trainers.
+    """
+
+    repo = Path(__file__).resolve().parent.parent
+    command = [
+        sys.executable,
+        "-m",
+        "speedrun.scaling",
+        "--suite",
+        str(suite["path"]),
+        "--internal-runtime-probe",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=repo,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=60.0,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ScalingError(
+            f"isolated TPU runtime probe failed: {type(exc).__name__}"
+        ) from exc
+    if completed.returncode != 0:
+        detail = next(
+            (
+                line.strip()
+                for line in reversed(completed.stderr.splitlines())
+                if line.strip()
+            ),
+            f"exit status {completed.returncode}",
+        )
+        raise ScalingError(f"isolated TPU runtime probe failed: {detail}")
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise ScalingError("isolated TPU runtime probe returned invalid JSON") from exc
+    return _validated_runtime_provenance(
+        payload, suite, label="isolated TPU runtime probe"
+    )
 
 
 def _write_immutable_bytes(path: Path, payload: bytes) -> None:
@@ -3230,7 +3282,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="Plan, run, and fit the versioned diagnostic IsoFLOP suite.",
     )
     parser.add_argument("--suite", type=Path, default=DEFAULT_SUITE)
-    commands = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument(
+        "--internal-runtime-probe",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    commands = parser.add_subparsers(dest="command")
     plan = commands.add_parser("plan")
     plan.add_argument("--json", action="store_true")
 
@@ -3271,7 +3328,17 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = build_parser().parse_args(list(argv) if argv is not None else None)
     try:
         suite = load_suite(args.suite)
-        if args.command == "plan":
+        if args.internal_runtime_probe:
+            if args.command is not None:
+                raise ScalingError("internal runtime probe cannot be combined with a command")
+            print(
+                json.dumps(
+                    _runtime_inventory_in_current_process(suite),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        elif args.command == "plan":
             print_plan(suite, as_json=args.json)
         elif args.command == "materialize":
             points = list(suite["calibrations"]) + list(suite["controls"])
@@ -3302,7 +3369,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             print(f"wrote {json_path}")
             print(f"wrote {markdown_path}")
         else:  # pragma: no cover - argparse owns choices
-            raise AssertionError(args.command)
+            raise ScalingError("a scaling command is required")
     except (OSError, ScalingError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

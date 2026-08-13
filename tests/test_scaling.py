@@ -5,6 +5,7 @@ import json
 import math
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -33,6 +34,7 @@ from speedrun.scaling import (
     validate_data_directory,
     validate_fresh10_directory,
     validate_runtime_environment,
+    _runtime_inventory_in_current_process,
     variant_config_bytes,
 )
 
@@ -242,7 +244,7 @@ class ScalingTests(unittest.TestCase):
         ), patch("jax.process_count", return_value=1), patch(
             "jax.device_count", return_value=4
         ), patch("jax.local_device_count", return_value=4):
-            runtime = validate_runtime_environment(self.suite)
+            runtime = _runtime_inventory_in_current_process(self.suite)
         self.assertEqual(runtime["device_ids"], [0, 1, 2, 3])
         devices[3].device_kind = "TPU v5p"
         with patch(
@@ -256,7 +258,48 @@ class ScalingTests(unittest.TestCase):
             "jax.device_count", return_value=4
         ), patch("jax.local_device_count", return_value=4):
             with self.assertRaisesRegex(ScalingError, "exactly one-process TPU v4-8"):
-                validate_runtime_environment(self.suite)
+                _runtime_inventory_in_current_process(self.suite)
+
+    def test_runtime_gate_uses_an_isolated_process(self) -> None:
+        expected = {
+            "python_version": "3.12.13",
+            "jax_version": "0.11.0",
+            "jaxlib_version": "0.11.0",
+            "libtpu_version": "0.0.44.1",
+            "platform": "tpu",
+            "device_count": 4,
+            "local_device_count": 4,
+            "process_count": 1,
+            "device_kinds": ["TPU v4"],
+            "device_ids": [0, 1, 2, 3],
+            "process_indices": [0, 0, 0, 0],
+        }
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(expected), stderr=""
+        )
+        with patch(
+            "speedrun.scaling._runtime_inventory_in_current_process",
+            side_effect=AssertionError("runtime discovery must stay out of the parent"),
+        ), patch("speedrun.scaling.subprocess.run", return_value=completed) as run:
+            self.assertEqual(validate_runtime_environment(self.suite), expected)
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command,
+            [
+                sys.executable,
+                "-m",
+                "speedrun.scaling",
+                "--suite",
+                str(self.suite["path"]),
+                "--internal-runtime-probe",
+            ],
+        )
+        self.assertEqual(run.call_args.kwargs["cwd"], Path(__file__).parents[1])
+        self.assertIs(run.call_args.kwargs["stdout"], subprocess.PIPE)
+        self.assertIs(run.call_args.kwargs["stderr"], subprocess.PIPE)
+        self.assertIs(run.call_args.kwargs["text"], True)
+        self.assertIs(run.call_args.kwargs["check"], False)
+        self.assertEqual(run.call_args.kwargs["timeout"], 60.0)
 
     def test_fresh10_preflight_hash_verifies_exact_ten_domains(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
