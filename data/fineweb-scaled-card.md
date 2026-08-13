@@ -75,6 +75,8 @@ The publication includes the exact frozen preparation sources at
 SHA-256 values are respectively
 `26c61bc921af290e6beb28596feb2c50cac5b15a56a2f3adf921682317f6f109`
 and `3a676241de10c3ac7cf36ed19ccbd1c0e419bb90de960d4e14be51a1f225bd5c`.
+The same frozen sources are independently retrievable from immutable Git commit
+[`c6acab32cea6e48260d139be1774b3e3286d7afd`](https://github.com/honglu2875/GPT-speedrun-TPU/tree/c6acab32cea6e48260d139be1774b3e3286d7afd).
 Every production variant pins source-inventory SHA-256
 `02ddc6361cc2f8a3d23b0d8b823c7eb7e2b1663ad3d0eff63e83b373456fc12b`,
 exclusion-policy SHA-256

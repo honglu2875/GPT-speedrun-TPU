@@ -60,7 +60,7 @@ uv run --frozen --no-sync python -m speedrun.scaling plan
 After the 4B dataset exists locally, run the gated sequence:
 
 ```bash
-uv run --frozen --no-sync python -m speedrun.scaling run --staged --data-path /dev/shm/fineweb-scaled/4B --downstream-manifest data/manifests/fresh10.json --downstream-root /dev/shm/fresh10 --confirm-execution-fingerprint DIGEST_FROM_PLAN --attention-tuning-cache /dev/shm/attention-tiles.json --resume --color always
+uv run --frozen --no-sync python -m speedrun.scaling run --staged --data-path /dev/shm/fineweb-scaled/4B --downstream-manifest data/manifests/fresh10.json --downstream-root /dev/shm --confirm-execution-fingerprint DIGEST_FROM_PLAN --resume --color always
 ```
 
 The data gate requires the builder's sibling `manifest.json`, `source.json`,
