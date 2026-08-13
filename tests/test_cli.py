@@ -157,8 +157,8 @@ class CliTests(unittest.TestCase):
             for item in parser._subparsers._group_actions[0].choices["prepare"]._actions
             if item.dest == "training_tokens"
         )
-        self.assertIn("prepare only", action.help)
-        self.assertIn("fixed official run contract", action.help)
+        self.assertIn("prepare and use", action.help)
+        self.assertIn("non-smoke runs", action.help)
 
     def test_prepare_routes_scaled_data_to_dedicated_subfolder(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

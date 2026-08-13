@@ -1,0 +1,27 @@
+# Phase 1: test normalized base-learning-rate transfer before varying batch.
+schema_version: 1
+study_id: complete-d-p-lr-v1
+kind: learning_rate_transfer
+submission: reference
+profile: dev
+tiers:
+  - 60m
+  - 125m
+  - 250m
+  - 500m
+admission_tiers:
+  - 60m
+  - 125m
+  - 250m
+tokens_per_parameter: 5.0
+batch_size: 128
+learning_rates:
+  - 0.0004
+  - 0.000565685424949
+  - 0.0008
+  - 0.001131370849898
+  - 0.0016
+  - 0.002262741699797
+  - 0.0032
+seeds:
+  - 1337

@@ -195,13 +195,18 @@ def run_submission(config: RunConfig, *, evaluator: Evaluator | None = None) -> 
         expected_validation_tokens=config.expected_validation_tokens,
         expected_downstream_tokens=config.expected_downstream_tokens,
         evaluator=evaluator,
+        require_checkpoint=config.require_checkpoint,
     )
     # Preserve the exact accepted payload independently from potentially noisy logs.
     result_path.write_text(
         json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n",
         encoding="utf-8",
     )
-    relative_checkpoint = validated.checkpoint_path.relative_to(run_dir.resolve()).as_posix()
+    relative_checkpoint = (
+        validated.checkpoint_path.relative_to(run_dir.resolve()).as_posix()
+        if validated.checkpoint_path is not None
+        else None
+    )
     contract = payload.get("contract") if isinstance(payload.get("contract"), dict) else None
     qualified = validated.validation_loss <= float(config.target_loss)
     recorded_metrics = dict(validated.declared_metrics)
@@ -243,12 +248,16 @@ def run_submission(config: RunConfig, *, evaluator: Evaluator | None = None) -> 
         ),
         "system": payload.get("system"),
         "reference_contract": reference_contract_dict(config.reference_contract),
-        "checkpoint": {
-            "path": relative_checkpoint,
-            "sha256": validated.checkpoint_sha256,
-            "bytes": validated.checkpoint_bytes,
-            "retained": True,
-        },
+        "checkpoint": (
+            {
+                "path": relative_checkpoint,
+                "sha256": validated.checkpoint_sha256,
+                "bytes": validated.checkpoint_bytes,
+                "retained": True,
+            }
+            if validated.checkpoint_path is not None
+            else None
+        ),
         "artifacts": {
             name: {
                 "path": path.relative_to(run_dir.resolve()).as_posix(),
@@ -276,9 +285,10 @@ def run_submission(config: RunConfig, *, evaluator: Evaluator | None = None) -> 
         config.checkpoint_retention == "qualifying" and qualified
     )
     checkpoint_path: Path | None = validated.checkpoint_path
-    if not keep_checkpoint:
+    if checkpoint_path is not None and not keep_checkpoint:
         validated.checkpoint_path.unlink()
         checkpoint_path = None
+        assert isinstance(record["checkpoint"], dict)
         record["checkpoint"]["retained"] = False
     append_record(records_path, record)
     return RunOutcome(
@@ -475,6 +485,12 @@ def _validate_config(
         raise ConfigurationError("track must be 'open' or 'sample_efficiency'")
     if config.checkpoint_retention not in ("all", "qualifying", "none-after-validation"):
         raise ConfigurationError("invalid checkpoint retention policy")
+    if not isinstance(config.require_checkpoint, bool):
+        raise ConfigurationError("require_checkpoint must be boolean")
+    if not config.require_checkpoint and (config.track != "open" or config.profile != "dev"):
+        raise ConfigurationError(
+            "checkpoint omission is restricted to open/dev research runs"
+        )
     if (
         isinstance(config.tpu_vm_count, bool)
         or not isinstance(config.tpu_vm_count, int)

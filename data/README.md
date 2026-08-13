@@ -70,8 +70,9 @@ and hash exactly like a downloaded shard.
 
 ### Budget-routed scaled preparation
 
-The `speedrun prepare --training-tokens N` setting affects corpus preparation
-for the `official` profile only. Requests through 900M training tokens retain
+The `speedrun prepare --training-tokens N` setting selects the corpus prepared
+for the `official` data profile and used by subsequent non-smoke runs. Requests
+through 900M training tokens retain
 the classic nine-shard selection. Larger requests route to the smallest scaled
 prefix with enough nominal training capacity: `2B` through 1.9B, `4B` through
 3.9B, `8B` through 7.9B, and `hero` through 74.9B. Values above 74.9B are
@@ -89,9 +90,9 @@ never manufactures a placeholder or treats a cache-local build plan as a
 download contract. The standalone builder remains the way to create the local
 bytes before publication.
 
-This setting does not alter `speedrun run`, `speedrun doctor`, the official
-leaderboard dataset, or trainer steps. Custom scaling studies select and
-validate their data through their own versioned runner.
+Doctor, profiling, and runs resolve the same saved route, preventing accidental
+fallback to a different corpus. The setting does not determine trainer steps;
+family profiles and versioned studies define their own token horizons.
 
 ## Binary format
 

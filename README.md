@@ -24,6 +24,7 @@ templates:
 make prepare
 make run
 make baseline
+make sweep-lr
 make profile
 make report
 ```
@@ -31,9 +32,10 @@ make report
 | Target | Purpose |
 |---|---|
 | `make prepare` | synchronize the frozen uv environment, then open the interactive setup wizard |
-| `make run` | verify every configured TPU VM and its data, then run the reference using the saved profile |
+| `make run` | verify every configured TPU VM and its data, then run the 125M reference tier using the saved profile |
 | `make baseline` | compatibility alias for `make run` |
-| `make run TARGET=name` | run `submissions/name/train.py` with its sibling `config.yaml` under the same policy |
+| `make run TARGET=name TIER=250m` | run one tier from the model family in `submissions/name/` |
+| `make sweep-lr` | run or resume the CSV-first 60M–500M Complete(d)P LR study |
 | `make profile` | run a distributed, validation-free 100-step diagnostic, capture worker 0 steps 11–20, then serve XProf on port 8791 |
 | `make report` | integrity-check completed runs and rebuild the standalone `report.html` dashboard |
 
@@ -42,14 +44,16 @@ make report
 ```bash
 uv --cache-dir /tmp/uv-cache sync --frozen
 uv --cache-dir /tmp/uv-cache run --frozen --no-sync speedrun prepare \
-  --training-tokens 624984064
+  --training-tokens 2600000000
 ```
 
 It asks for the data-cache root, data and run profiles, persistent artifact
 directory, TPU VM host count, default track, checkpoint retention, colors, a
-smoke/development loss target, and a corpus-preparation token budget. The token
-answer sizes only the corpus prepared for the `official` profile; it does not
-change trainer steps, the leaderboard budget, or the official run contract.
+smoke/development loss target, and an immutable corpus-capacity budget. The
+saved budget selects the dataset used by every non-smoke run; the default 2.6B
+request routes to the 4B corpus and covers the 500M × 5-TPP transfer point.
+Training duration is independently specified by each family profile (20 TPP in
+the reference official profile) or by an explicit research study.
 The wizard can then probe JAX/TPU health and prepare the selected dataset;
 only the explicit CLI flag `--no-download` skips data preparation. Personal
 choices are stored in the gitignored `.speedrun.toml`; official constants
@@ -60,7 +64,8 @@ tightened explicitly.
 `make run` requires that saved file to contain a default profile; otherwise it
 stops and asks for `make prepare`. `TARGET` defaults to `reference`. A custom
 target must be a folder beneath `submissions/` containing regular, non-symlink
-`train.py` and `config.yaml` files.
+`train.py` and `config.yaml` files. New candidates use schema 2 family configs
+with 60M, 125M, 250M, 500M, and 1B tiers; `TIER` defaults to `125m`.
 
 For a multi-host run using the conventional `shm` cache, preparation requires
 `/dev/shm` to be a writable `tmpfs` or `ramfs` on every VM and creates
@@ -154,10 +159,9 @@ nominal training capacity fits the requested budget:
 | 3.9B+1 through 7.9B | scaled `8B` | 7.9B | `<data-path>/fineweb-scaled/8B/` |
 | 7.9B+1 through 74.9B | scaled `hero` | 74.9B | `<data-path>/fineweb-scaled/hero/` |
 
-The route is preparation-only: `training_tokens` is never consulted by
-standalone doctor or `speedrun run`, and therefore not by `make run` or
-`make baseline`. Official runs continue to use the fixed classic dataset and
-624,984,064-token competition contract. Scaled preparation is fail-closed and
+The saved `training_tokens` route is used by preparation, doctor, profiling,
+and every non-smoke run, so a run cannot silently fall back to the classic
+dataset after a scaled preparation. Scaled preparation is fail-closed and
 starts working only after the corresponding immutable, URL-bearing publication
 manifest is checked into `data/manifests/fineweb-scaled-gpt2/`; no placeholder
 manifest is accepted. `--check-only` verifies the same routed manifest and
@@ -174,11 +178,14 @@ The source is the pinned `kjj0/fineweb10B-gpt2` revision used by
 ## Run an algorithm
 
 ```bash
-# Reference workflow using the profile and policy saved by make prepare
+# Reference workflow: 125M by default, 20 TPP in the official profile
 make run
 
+# Select another size tier
+make run TIER=250m
+
 # Run a variant from submissions/dense_control/train.py
-make run TARGET=dense_control
+make run TARGET=dense_control TIER=125m
 
 # Fast end-to-end check
 uv run --frozen --no-sync speedrun prepare --non-interactive \
@@ -193,6 +200,14 @@ uv run --frozen --no-sync speedrun run reference \
 uv run --frozen --no-sync speedrun run reference --profile dev -- \
   --steps 100
 ```
+
+The first family study is `make sweep-lr`. It holds batch, schedule, weight
+decay, architecture rules, and 5 TPP fixed while sweeping only the normalized
+base learning rate for 60M, 125M, 250M, and 500M. It writes and atomically
+updates `runs/studies/complete_d_p_lr_v1/results.csv`; rerunning the command
+resumes pending points. No chart is rendered yet. See
+[the Complete(d)P contract](docs/COMPLETEP.md) and the
+[versioned suite](studies/complete_d_p_lr_v1/suite.yaml).
 
 The harness creates a unique persistent run directory, captures stdout/stderr,
 validates the final result event and checkpoint, hashes artifacts, and appends a
@@ -210,7 +225,7 @@ they require no additional device logging. The harness records the CSV's
 SHA-256 for later collation across runs.
 
 The reference also writes `validation.csv`. On the official profile it probes
-the first eight validation batches every 250 optimizer steps by default, then
+the first eight validation batches every 500 optimizer steps by default, then
 records the exact canonical validation as its final FineWeb row. Fresh10 rows
 may follow it. Probe synchronization
 and evaluation are included in `train_seconds`; the final canonical evaluation
@@ -220,16 +235,19 @@ cadence override; change `val_probe_batches` in a cloned YAML profile when the
 prefix size is part of the experiment. Smoke and development runs do not probe
 unless explicitly enabled.
 
-The reference is intentionally readable rather than target-capable. Its v2
-architecture uses RoPE, pre-RMSNorm, and a 4× GELU MLP. The historical v1
+The reference is intentionally readable. Its v3 model family uses RoPE,
+pre-RMSNorm, a 4× GELU MLP, untied embeddings, fixed 64-wide heads, and the
+Complete(d)P rules documented in [docs/COMPLETEP.md](docs/COMPLETEP.md). The
+60M/125M/250M tiers determine candidate-admission trends; 500M and 1B are
+larger confirmation and hero tiers. The historical v1
 19,073-step calibration on a TPU v4-8 processed exactly **624,984,064**
 training tokens in **1,716.01 synchronized seconds** (28m36s, compilation
 excluded), sustaining about **364k tokens/s**, **313 analytic TFLOP/s**, and
 **28.5% analytic MFU**. It reached FineWeb validation loss **3.75788** and
 Fresh10 macro loss **3.95959**. Those measurements remain labeled as v1 rather
-than being attributed to the promoted architecture. The exact token budget is fixed for
-official open-track comparisons while we improve the architecture, initialization,
-optimizer, and kernels.
+than being attributed to the promoted architecture. The old token budget
+remains a historical like-hardware calibration, not the training contract for
+the new 20-TPP family ladder.
 
 That calibration is a v4-8 result. A v4-32 run is validly recorded with its
 16-device/four-process system identity, but its wall-clock score is not a
@@ -238,8 +256,9 @@ like-for-like hardware comparison with the original v4-8 number.
 ### TPU kernel baseline
 
 The reference [`config.yaml`](submissions/reference/config.yaml) pins the custom
-trainable Pallas attention with the dense output loss. It also preserves the
-model, objective, schedule, validation cadence, and exact token budget beside
+trainable Pallas attention with the memory-bounded tiled output loss. It also
+preserves the family shapes, Complete(d)P contract, objective, schedule,
+validation cadence, and TPP rule beside
 the entry script. `make run` supplies only saved machine/run policy and lets the
 trainer read that versioned file. To create a dense control, clone the reference
 and change the clone's `attention_backend` field instead of hiding an algorithm
@@ -262,8 +281,8 @@ profile changes the model objective and is not a mere kernel toggle.
 
 The canonical full-step benchmark improved from 93.196 ms to 75.191 ms with
 custom attention and dense loss (435.79k tokens/s, +23.9%). The tiled loss was
-77.048 ms, so it is retained for its memory bound rather than enabled by
-default. Dense attention's completed 3.75788 run remains the historical quality
+77.048 ms in that historical shape and is now the memory-safe family default.
+Dense attention's completed 3.75788 run remains the historical quality
 control until the promoted baseline has completed its full validation. Details,
 APIs, numerical checks, and tuning policy are in
 [docs/KERNELS.md](docs/KERNELS.md).

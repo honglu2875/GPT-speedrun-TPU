@@ -24,6 +24,7 @@ from harness import (
     render_leaderboard,
     run_submission,
     validate_result,
+    verify_run,
 )
 from harness.runner import _validate_payload_identity
 
@@ -48,6 +49,7 @@ parser.add_argument("--stderr-bytes", type=int, default=0)
 parser.add_argument("--sleep-after-stderr", type=float, default=0.0)
 parser.add_argument("--make-cache", action="store_true")
 parser.add_argument("--evaluations-json")
+parser.add_argument("--omit-checkpoint", action="store_true")
 args = parser.parse_args()
 if args.stderr_message:
     sys.stderr.write(args.stderr_message)
@@ -60,7 +62,8 @@ output = Path(args.output_dir)
 if args.make_cache:
     (output / ".jax_cache").mkdir()
     (output / ".jax_cache" / "compiled.bin").write_bytes(b"temporary")
-(output / "model.npz").write_bytes(b"tiny checkpoint")
+if not args.omit_checkpoint:
+    (output / "model.npz").write_bytes(b"tiny checkpoint")
 (output / "training.csv").write_text("step,train_loss\n1,2.5\n")
 (output / "seen.json").write_text(json.dumps({"config": args.config, "seed": args.seed, "track": args.track, "profile": args.profile, "tag": args.tag, "seeded": args.seeded}))
 result = {
@@ -69,7 +72,7 @@ result = {
     "track": args.track,
     "profile": args.profile,
     "seed": args.seed,
-    "checkpoint": "model.npz",
+    "checkpoint": None if args.omit_checkpoint else "model.npz",
     "artifacts": {"training_curve": "training.csv"},
     "metrics": {
         "train_seconds": 0.125,
@@ -583,6 +586,25 @@ class HarnessRunTests(unittest.TestCase):
         self.assertFalse(outcome.record["qualified"])
         self.assertIsNone(outcome.checkpoint_path)
         self.assertFalse(outcome.record["checkpoint"]["retained"])
+
+    def test_research_run_can_explicitly_omit_checkpoint_and_be_reverified(self) -> None:
+        outcome = run_submission(
+            self.config(
+                passthrough_args=("--omit-checkpoint",),
+                profile="dev",
+                require_checkpoint=False,
+            )
+        )
+        self.assertIsNone(outcome.checkpoint_path)
+        self.assertIsNone(outcome.record["checkpoint"])
+        validated = verify_run(
+            outcome.run_dir,
+            track="open",
+            require_checkpoint=False,
+        )
+        self.assertIsNone(validated.checkpoint_path)
+        with self.assertRaisesRegex(ResultValidationError, "checkpoint is required"):
+            verify_run(outcome.run_dir, track="open")
 
     def test_fixed_training_token_budget_is_enforced_and_recorded(self) -> None:
         outcome = run_submission(self.config(expected_training_tokens=96))

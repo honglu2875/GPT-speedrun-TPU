@@ -17,6 +17,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import time
 from typing import Mapping, Sequence
 
 
@@ -50,9 +51,14 @@ RSYNC_SETUP_GUIDANCE = (
 _SSH_OPTIONS = (
     "BatchMode=yes",
     "ConnectTimeout=8",
+    # TPU VM sshd occasionally closes a key exchange while several peers are
+    # contacted together. Give OpenSSH several chances without weakening
+    # authentication; idempotent orchestration commands also retry status 255.
+    "ConnectionAttempts=4",
     "StrictHostKeyChecking=accept-new",
 )
 _DEFAULT_SSH_ARGS = " ".join(f"-o {option}" for option in _SSH_OPTIONS)
+_PROBE_ATTEMPTS = 4
 RAM_CACHE_ROOT = Path("/dev/shm/.speedrun-cache")
 _COMMON_RSYNC_EXCLUDES = (
     ".git/",
@@ -163,23 +169,33 @@ def probe_cluster(
         raise ClusterError(
             f"TPU VM host expression expands to {len(hosts)} host(s), expected {host_count}"
         )
-    try:
-        completed = subprocess.run(
-            _pdsh_command(host_expression, host_count, "hostname", labels=True),
-            env=pdsh_environment(environment),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-            timeout=max(20.0, host_count * 2.0),
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise ClusterAccessError(SSH_SETUP_GUIDANCE) from exc
-    if completed.returncode != 0:
-        raise ClusterAccessError(SSH_SETUP_GUIDANCE)
-    reported = _parse_labeled_output(completed.stdout)
-    if set(reported) != set(hosts):
-        raise ClusterAccessError(SSH_SETUP_GUIDANCE)
+    reported: dict[str, str] = {}
+    last_error: Exception | None = None
+    for attempt in range(_PROBE_ATTEMPTS):
+        try:
+            completed = subprocess.run(
+                _pdsh_command(host_expression, host_count, "hostname", labels=True),
+                env=pdsh_environment(environment),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=max(20.0, host_count * 2.0),
+            )
+        except subprocess.TimeoutExpired as exc:
+            last_error = exc
+        else:
+            if completed.returncode == 0:
+                reported = _parse_labeled_output(completed.stdout)
+                if set(reported) == set(hosts):
+                    break
+            last_error = ClusterAccessError(SSH_SETUP_GUIDANCE)
+        if attempt + 1 < _PROBE_ATTEMPTS:
+            # TPU VM sshd can close a connection during simultaneous key
+            # exchange. Retrying this read-only probe is always safe.
+            time.sleep(1.0)
+    else:
+        raise ClusterAccessError(SSH_SETUP_GUIDANCE) from last_error
 
     local_name = _short_hostname(socket.gethostname())
     matches = [
@@ -271,6 +287,8 @@ def prepare_ram_cache(
             labels=True,
             timeout=60.0,
         )
+    except ClusterAccessError:
+        raise
     except ClusterError as exc:
         raise ClusterError(RAM_CACHE_SETUP_GUIDANCE) from exc
 
@@ -330,6 +348,8 @@ def prepare_ram_cache(
             labels=True,
             timeout=60.0,
         )
+    except ClusterAccessError:
+        raise
     except ClusterError as exc:
         raise ClusterError(RAM_CACHE_PROTECTION_GUIDANCE) from exc
 
@@ -386,6 +406,8 @@ def bootstrap_rsync(
             labels=True,
             timeout=900.0,
         )
+    except ClusterAccessError:
+        raise
     except ClusterError as exc:
         raise ClusterError(RSYNC_SETUP_GUIDANCE) from exc
     _require_program("rsync")
@@ -436,27 +458,37 @@ def run_pdsh(
     environment: Mapping[str, str] | None = None,
     labels: bool = True,
     timeout: float | None = None,
+    retry_transport: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     """Run one command on an explicit host set and require every host to succeed."""
 
     if not hosts:
         raise ClusterError("pdsh target list may not be empty")
     expression = ",".join(hosts)
-    try:
-        completed = subprocess.run(
-            _pdsh_command(expression, len(hosts), remote_command, labels=labels),
-            env=pdsh_environment(environment),
-            stdout=None if labels else subprocess.PIPE,
-            stderr=None if labels else subprocess.PIPE,
-            text=True,
-            check=False,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise ClusterError("pdsh command timed out") from exc
-    if completed.returncode != 0:
-        raise ClusterError(_command_failure("pdsh command failed", completed))
-    return completed
+    attempts = _PROBE_ATTEMPTS if retry_transport else 1
+    for attempt in range(attempts):
+        try:
+            completed = subprocess.run(
+                _pdsh_command(expression, len(hosts), remote_command, labels=labels),
+                env=pdsh_environment(environment),
+                stdout=None if labels else subprocess.PIPE,
+                stderr=None if labels else subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ClusterError("pdsh command timed out") from exc
+        if completed.returncode == 0:
+            return completed
+        # pdsh propagates ssh's reserved transport status 255. Repeating an
+        # idempotent setup/check command is safe; ordinary remote failures are
+        # returned immediately and never disguised as a connection problem.
+        if completed.returncode != 255:
+            raise ClusterError(_command_failure("pdsh command failed", completed))
+        if attempt + 1 < attempts:
+            time.sleep(1.0)
+    raise ClusterAccessError(SSH_SETUP_GUIDANCE)
 
 
 def build_distributed_launch_command(
@@ -591,16 +623,20 @@ def _rsync_to_hosts(
                 f"{host}:{root}/",
             )
         )
-        completed = subprocess.run(
-            command,
-            env=sync_environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-            timeout=300.0,
-        )
-        return host, completed
+        for attempt in range(_PROBE_ATTEMPTS):
+            completed = subprocess.run(
+                command,
+                env=sync_environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=300.0,
+            )
+            if completed.returncode != 255 or attempt + 1 == _PROBE_ATTEMPTS:
+                return host, completed
+            time.sleep(1.0)
+        raise AssertionError("unreachable")
 
     try:
         with ThreadPoolExecutor(max_workers=len(hosts)) as executor:
@@ -609,6 +645,8 @@ def _rsync_to_hosts(
         raise ClusterError("workspace rsync timed out") from exc
     for host, completed in results:
         if completed.returncode != 0:
+            if completed.returncode == 255:
+                raise ClusterAccessError(SSH_SETUP_GUIDANCE)
             raise ClusterError(
                 _command_failure(f"workspace rsync to {host} failed", completed)
             )

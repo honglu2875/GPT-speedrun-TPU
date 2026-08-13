@@ -45,13 +45,18 @@ only the canonical final validation runs outside the training interval.
 ### Open
 
 The open track ranks qualifying runs by synchronized training seconds, lowest
-first. Every official open attempt predicts exactly **624,984,064 training
-tokens**, preserving the calibrated `19,073 × 32 × 1,024` reference budget.
-Architecture, parameter count, optimizer, schedule, precision, batch size,
+first, within one model tier and matching hardware topology. Reference-family
+official runs use approximately **20 tokens per parameter**, rounded to a
+complete global step. Architecture, optimizer, schedule, precision, batch size,
 sequence length, sharding, kernels, data order, and other systems choices may
-change. The selected global batch and sequence length must currently divide the
-fixed budget exactly. A submission must train from its declared initialization
-during the run and may use only the official training split.
+change, but comparisons and candidate-admission trends must use matching tier,
+token horizon, and dataset identity. A submission must train from its declared
+initialization during the run and may use only the selected immutable training
+split.
+
+The older 624,984,064-token records remain an explicitly historical v4-8 timing
+series. The existing `make report` dashboard continues to render that series;
+it is not the charting path for the new family studies.
 
 The leaderboard displays validation loss and tokens consumed alongside the
 score. Parameter count, throughput, compilation time, and FLOP estimates remain
@@ -63,9 +68,10 @@ The sample-efficiency track ranks qualifying runs by the number of predicted
 training tokens consumed by forward/backward passes, lowest first. Synchronized
 training time breaks an exact tie.
 
-This track fixes the `reference-gpt-v2` model contract—including RoPE,
-pre-RMSNorm, GELU, and the semantic output vocabulary—plus the tokenizer,
-selected training shards, validation prefix, and sequence length. Optimizer, schedule, precision,
+This track fixes the selected tier of the `reference-gpt-v3-family` contract—
+including Complete(d)P role, RoPE, pre-RMSNorm, GELU, untied embeddings, and the
+semantic output vocabulary—plus the tokenizer, selected training shards,
+validation prefix, and sequence length. Optimizer, schedule, precision,
 batching, sampling order, regularization, and implementation may change. Every
 predicted token participating in a forward/backward training loss counts,
 including repetitions or overlapping sampled windows. Tokens used only for the
@@ -108,6 +114,13 @@ filenames:
 submissions/<algorithm>/train.py
 submissions/<algorithm>/config.yaml
 ```
+
+A schema-2 candidate directory defines a family, not one isolated shape. Its
+entry must resolve the 60M, 125M, 250M, 500M, and 1B ballparks through `--tier`;
+`make run` defaults to 125M. Candidate admission is based on the 60M, 125M, and
+250M scaling trend. The 500M and 1B tiers are confirmation/hero runs and are not
+required for every idea. Historical schema-1 folders remain provenance for old
+runs and should be cloned from the current reference before new experiments.
 
 Fundamental repository utilities—data validation, result protocol, terminal
 presentation, and run recording—may be imported. The model, optimizer, schedule,

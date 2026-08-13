@@ -1,7 +1,7 @@
 """Training-budget routing for explicit dataset preparation.
 
-This module does not change the dataset used by ``speedrun run``.  It only
-chooses the corpus that the preparation wizard downloads or checks.  Published
+This module chooses the corpus that preparation installs and non-smoke runs use.
+Published
 scaled manifests are deliberately not synthesized here: until an immutable,
 URL-bearing manifest is checked in, a scaled route fails closed.
 """

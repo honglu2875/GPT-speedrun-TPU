@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 from io import StringIO
 import json
+import math
 from pathlib import Path
 import sys
 import tempfile
@@ -63,13 +64,84 @@ class TrainerStaticTests(unittest.TestCase):
             atol=1e-5,
         )
 
+    def test_family_tiers_have_declared_size_fixed_heads_and_20_tpp(self) -> None:
+        parser = trainer.build_parser()
+        expected = {
+            "60m": (59_918_208, 12, 384, 6),
+            "125m": (123_456_640, 12, 640, 10),
+            "250m": (244_444_032, 16, 896, 14),
+            "500m": (502_602_240, 19, 1280, 20),
+            "1b": (989_943_808, 21, 1792, 28),
+        }
+        for tier, (parameters, layers, width, heads) in expected.items():
+            with self.subTest(tier=tier):
+                experiment = trainer.load_experiment_profile("official", tier=tier)
+                config = trainer.resolve_config(
+                    parser.parse_args(["--profile", "official", "--tier", tier]),
+                    "tpu",
+                    50_304,
+                    experiment,
+                )
+                self.assertEqual(config.declared_parameters, parameters)
+                self.assertEqual((config.layers, config.d_model, config.heads), (layers, width, heads))
+                self.assertEqual(config.d_model // config.heads, 64)
+                self.assertAlmostEqual(config.tokens_per_parameter, 20.0, places=3)
+                self.assertEqual(
+                    config.steps * config.batch_size * config.seq_len,
+                    round(parameters * config.tokens_per_parameter),
+                )
+
+    def test_complete_d_p_tensor_and_horizon_multipliers(self) -> None:
+        parser = trainer.build_parser()
+        args = parser.parse_args(
+            ["--profile", "dev", "--tier", "250m", "--tokens-per-parameter", "5"]
+        )
+        config = trainer.resolve_config(args, "tpu", 50_304)
+        params = {
+            "token_embedding": np.zeros((1, 1), dtype=np.float32),
+            "blocks": [
+                {
+                    "qkv_w": np.zeros((1, 1), dtype=np.float32),
+                    "qkv_b": np.zeros((1,), dtype=np.float32),
+                    "ln1_scale": np.ones((1,), dtype=np.float32),
+                }
+            ],
+            "final_ln_scale": np.ones((1,), dtype=np.float32),
+            "output_embedding": np.zeros((1, 1), dtype=np.float32),
+        }
+        lr, epsilon, decay = trainer.optimizer_hyperparameter_trees(params, config)
+        width = 896 / 384
+        depth = 16 / 12
+        self.assertAlmostEqual(lr["token_embedding"], 1.0)
+        self.assertAlmostEqual(epsilon["token_embedding"], width**-1)
+        self.assertAlmostEqual(lr["blocks"][0]["qkv_w"], width**-1)
+        self.assertAlmostEqual(lr["blocks"][0]["qkv_b"], 1.0)
+        self.assertAlmostEqual(epsilon["blocks"][0]["qkv_w"], width**-1 * depth**-1)
+        self.assertAlmostEqual(decay["blocks"][0]["qkv_w"], width)
+        self.assertAlmostEqual(lr["output_embedding"], width**-1)
+        self.assertAlmostEqual(epsilon["output_embedding"], 1.0)
+        self.assertAlmostEqual(decay["output_embedding"], width)
+        self.assertAlmostEqual(config.data_multiplier, 244_444_032 / 59_918_208)
+        effective = trainer.effective_optimizer_metadata(config)
+        self.assertAlmostEqual(
+            effective["global_peak_learning_rate"],
+            config.learning_rate / math.sqrt(config.data_multiplier),
+        )
+
+        diagnostic = trainer.resolve_config(
+            parser.parse_args(["--profile", "dev", "--tier", "250m", "--steps", "2"]),
+            "tpu",
+            50_304,
+        )
+        self.assertEqual(diagnostic.data_multiplier, 1.0)
+
     def test_yaml_config_is_authoritative_strict_and_versioned(self) -> None:
         source = trainer.CONFIG_PATH.read_text(encoding="utf-8")
         official = trainer.load_experiment_profile("official")
-        self.assertEqual(official.schema_version, 1)
-        self.assertEqual(official.train_tokens, 624_984_064)
+        self.assertEqual(official.schema_version, 2)
+        self.assertEqual(official.tokens_per_parameter, 20.0)
         self.assertEqual(official.attention_backend, "tpu_flash")
-        self.assertEqual(official.sampling, "random_windows")
+        self.assertEqual(official.sampling, "shuffled_epochs")
         self.assertEqual(official.dtype_name, "bfloat16")
         self.assertEqual(
             official.source_sha256,
@@ -78,21 +150,21 @@ class TrainerStaticTests(unittest.TestCase):
 
         invalid = {
             "duplicate": source.replace(
-                "schema_version: 1", "schema_version: 1\nschema_version: 1", 1
+                "schema_version: 2", "schema_version: 2\nschema_version: 2", 1
             ),
             "unknown": source + "\nunknown: true\n",
-            "anchor": source.replace("schema_version: 1", "schema_version: &v 1", 1),
+            "anchor": source.replace("schema_version: 2", "schema_version: &v 2", 1),
             "alias": source.replace(
-                "schema_version: 1", "schema_version: &v 1\nextra: *v", 1
+                "schema_version: 2", "schema_version: &v 2\nextra: *v", 1
             ),
-            "tag": source.replace("schema_version: 1", "schema_version: !!int 1", 1),
+            "tag": source.replace("schema_version: 2", "schema_version: !!int 2", 1),
             "directive": "%YAML 1.2\n---\n" + source,
             "multiple documents": source + "\n---\n{}\n",
             "nonfinite": source.replace(
                 "learning_rate: 0.0003", "learning_rate: .nan", 1
             ),
             "invalid unselected profile": source.replace(
-                "warmup_steps: 715", "warmup_steps: -1", 1
+                "warmup_ratio: 0.1", "warmup_ratio: -1", 1
             ),
             "missing sampling": source.replace(
                 "      sampling: random_windows\n", "", 1
@@ -130,15 +202,15 @@ class TrainerStaticTests(unittest.TestCase):
                 trainer.load_experiment_profile("smoke", alternate)
 
             shuffled_source = source.replace(
-                "      seq_len: 256\n      sampling: random_windows\n      dtype: bfloat16",
-                "      seq_len: 256\n      sampling: shuffled_epochs\n      dtype: bfloat16",
+                "      seq_len: 1024\n      sampling: shuffled_epochs\n      dtype: bfloat16",
+                "      seq_len: 1024\n      sampling: random_windows\n      dtype: bfloat16",
                 1,
             )
             path.write_text(shuffled_source, encoding="utf-8")
             with patch.object(trainer, "CONFIG_PATH", path):
                 self.assertEqual(
                     trainer.load_experiment_profile("dev").sampling,
-                    "shuffled_epochs",
+                    "random_windows",
                 )
 
     def test_static_cli_values_are_rejected_but_diagnostic_overrides_resolve(self) -> None:
@@ -187,7 +259,7 @@ class TrainerStaticTests(unittest.TestCase):
             "tpu",
             50_304,
         )
-        self.assertEqual(config.steps, 20)
+        self.assertEqual(config.steps, 5)
         with self.assertRaisesRegex(ValueError, "must be divisible"):
             trainer.resolve_config(
                 parser.parse_args(
@@ -202,7 +274,7 @@ class TrainerStaticTests(unittest.TestCase):
         with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
             parser.parse_args(["--steps", "20", "--train-tokens", "655360"])
 
-    def test_short_diagnostic_run_preserves_yaml_warmup(self) -> None:
+    def test_short_diagnostic_run_resolves_fractional_warmup(self) -> None:
         parser = trainer.build_parser()
         config = trainer.resolve_config(
             parser.parse_args(["--profile", "official", "--steps", "100"]),
@@ -210,7 +282,7 @@ class TrainerStaticTests(unittest.TestCase):
             50_304,
         )
         self.assertEqual(config.steps, 100)
-        self.assertEqual(config.warmup_steps, 715)
+        self.assertEqual(config.warmup_steps, 10)
         with self.assertRaisesRegex(ValueError, "defined by sibling config.yaml"):
             trainer.resolve_config(
                 parser.parse_args(
@@ -349,15 +421,15 @@ class TrainerStaticTests(unittest.TestCase):
         official = trainer.resolve_config(
             parser.parse_args(["--profile", "official"]), "tpu", 50_304
         )
-        self.assertEqual(official.steps, 19_073)
+        self.assertEqual(official.steps, 18_838)
         self.assertEqual(
             official.steps * official.batch_size * official.seq_len,
-            624_984_064,
+            2_469_134_336,
         )
-        self.assertEqual(official.val_every, 250)
+        self.assertEqual(official.val_every, 500)
         self.assertEqual(official.val_probe_batches, 8)
-        self.assertEqual(official.eval_batches, 320)
-        self.assertEqual(official.diagnostics_every, 250)
+        self.assertEqual(official.eval_batches, 80)
+        self.assertEqual(official.diagnostics_every, 500)
 
         smoke = trainer.resolve_config(
             parser.parse_args(["--profile", "smoke"]), "cpu", 256
@@ -398,7 +470,7 @@ class TrainerStaticTests(unittest.TestCase):
             50_304,
         )
         self.assertEqual(disabled.val_every, 0)
-        self.assertEqual(disabled.eval_batches, 320)
+        self.assertEqual(disabled.eval_batches, 80)
         self.assertEqual(disabled.val_probe_batches, 8)
         for option in (
             ("--batch-size", "128"),
@@ -425,7 +497,10 @@ class TrainerStaticTests(unittest.TestCase):
     def test_tiled_loss_resolves_semantic_vocab_and_counts_recompute_flops(self) -> None:
         parser = trainer.build_parser()
         dense = trainer.resolve_config(
-            parser.parse_args(["--profile", "official"]), "tpu", 50_304
+            parser.parse_args(["--profile", "official"]),
+            "tpu",
+            50_304,
+            replace(trainer.load_experiment_profile("official"), loss_backend="dense"),
         )
         experiment = replace(
             trainer.load_experiment_profile("official"), loss_backend="tiled"
@@ -458,7 +533,10 @@ class TrainerStaticTests(unittest.TestCase):
         common = ["--profile", "dev"]
         base = trainer.load_experiment_profile("dev")
         dense = trainer.resolve_config(
-            parser.parse_args(common), "tpu", 50_304, replace(base, seq_len=129)
+            parser.parse_args(common),
+            "tpu",
+            50_304,
+            replace(base, seq_len=129, attention_backend="dense"),
         )
         flash = trainer.resolve_config(
             parser.parse_args(common),
@@ -565,7 +643,7 @@ class TrainerStaticTests(unittest.TestCase):
         )
         self.assertEqual(official.attention_backend, "tpu_flash")
         self.assertEqual(smoke.attention_backend, "dense")
-        self.assertEqual(development.attention_backend, "dense")
+        self.assertEqual(development.attention_backend, "tpu_flash")
 
         with self.assertRaisesRegex(ValueError, "requires --attention-tuning-cache"):
             trainer.validate_args(
@@ -576,7 +654,12 @@ class TrainerStaticTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-dense attention_backend"):
             trainer.validate_args(
                 parser.parse_args(
-                    ["--attention-tuning-cache", "attention-tuning.json"]
+                    [
+                        "--profile",
+                        "smoke",
+                        "--attention-tuning-cache",
+                        "attention-tuning.json",
+                    ]
                 )
             )
 
@@ -619,8 +702,8 @@ class TrainerStaticTests(unittest.TestCase):
 
         key_arguments = make_key.call_args.kwargs
         self.assertEqual(key_arguments["backend"], "tpu_flash")
-        self.assertEqual(key_arguments["batch"], 8)
-        self.assertEqual(key_arguments["heads"], 12)
+        self.assertEqual(key_arguments["batch"], 32)
+        self.assertEqual(key_arguments["heads"], 10)
         self.assertEqual(key_arguments["sequence"], 1_024)
         self.assertEqual(key_arguments["head_dim"], 64)
         self.assertEqual(key_arguments["mode"], "forward_backward")
@@ -806,15 +889,17 @@ class TrainerStaticTests(unittest.TestCase):
             trainer.contract_model_metadata(config),
             {
                 "layers": 12,
-                "heads": 12,
-                "d_model": 768,
+                "heads": 10,
+                "d_model": 640,
                 "mlp_mult": 4,
                 "normalization": "rms_norm",
                 "position_encoding": "rope_base_10000",
                 "mlp_activation": "gelu",
                 "vocab_size": 50_304,
                 "semantic_vocab_size": 50_257,
-                "tied_embeddings": True,
+                "tied_embeddings": False,
+                "tier": "125m",
+                "parameterization": "complete_d_p",
             },
         )
         implementation = trainer.implementation_metadata(config, runtime)

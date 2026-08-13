@@ -62,6 +62,7 @@ class RunConfig:
     provenance: Mapping[str, Any] = field(default_factory=dict)
     tpu_vm_count: int = 1
     tpu_vm_hosts: str = ""
+    require_checkpoint: bool = True
 
 
 @dataclass(frozen=True)
@@ -69,9 +70,9 @@ class ValidationResult:
     """Normalized result returned by protocol validation."""
 
     payload: Mapping[str, Any]
-    checkpoint_path: Path
-    checkpoint_sha256: str
-    checkpoint_bytes: int
+    checkpoint_path: Path | None
+    checkpoint_sha256: str | None
+    checkpoint_bytes: int | None
     declared_train_seconds: float
     tokens_processed: int
     validation_loss: float

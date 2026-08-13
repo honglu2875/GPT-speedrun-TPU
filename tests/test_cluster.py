@@ -19,6 +19,7 @@ from harness.cluster import (
     infer_host_expression,
     prepare_ram_cache,
     probe_cluster,
+    run_pdsh,
     seal_ram_cache_command,
     terminate_distributed_workers,
 )
@@ -71,10 +72,57 @@ class ClusterTests(unittest.TestCase):
         with (
             patch("harness.cluster.expand_host_expression", return_value=hosts),
             patch("harness.cluster.subprocess.run", return_value=completed),
+            patch("harness.cluster.time.sleep"),
         ):
             with self.assertRaisesRegex(ClusterAccessError, "authorized_keys") as raised:
                 probe_cluster("slice-w-[0-1]", 2)
         self.assertEqual(str(raised.exception), SSH_SETUP_GUIDANCE)
+
+    def test_probe_retries_transient_ssh_failure(self) -> None:
+        hosts = ("slice-w-0", "slice-w-1")
+        failed = subprocess.CompletedProcess([], 255, "", "key exchange failed")
+        output = "".join(f"{host}: {host}\n" for host in hosts)
+        succeeded = subprocess.CompletedProcess([], 0, output, "")
+        with (
+            patch("harness.cluster.expand_host_expression", return_value=hosts),
+            patch(
+                "harness.cluster.subprocess.run",
+                side_effect=(failed, succeeded),
+            ) as run,
+            patch("harness.cluster.socket.gethostname", return_value="slice-w-0"),
+            patch("harness.cluster.time.sleep") as sleep,
+        ):
+            inventory = probe_cluster("slice-w-[0-1]", 2)
+
+        self.assertEqual(inventory.local_host, "slice-w-0")
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_called_once_with(1.0)
+
+    def test_pdsh_retries_only_transport_status(self) -> None:
+        failed = subprocess.CompletedProcess([], 255, "", "key exchange failed")
+        succeeded = subprocess.CompletedProcess([], 0, "", "")
+        with (
+            patch("harness.cluster.shutil.which", return_value="/usr/bin/pdsh"),
+            patch(
+                "harness.cluster.subprocess.run",
+                side_effect=(failed, succeeded),
+            ) as run,
+            patch("harness.cluster.time.sleep") as sleep,
+        ):
+            run_pdsh(("slice-w-0", "slice-w-1"), "hostname", labels=False)
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_called_once_with(1.0)
+
+        remote_failure = subprocess.CompletedProcess([], 5, "", "setup failed")
+        with (
+            patch("harness.cluster.shutil.which", return_value="/usr/bin/pdsh"),
+            patch("harness.cluster.subprocess.run", return_value=remote_failure) as run,
+            patch("harness.cluster.time.sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(ClusterError, "setup failed"):
+                run_pdsh(("slice-w-0",), "false", labels=False)
+        self.assertEqual(run.call_count, 1)
+        sleep.assert_not_called()
 
     def test_distributed_command_is_unlabelled_and_shell_quoted(self) -> None:
         with patch("harness.cluster.shutil.which", return_value="/usr/bin/pdsh"):

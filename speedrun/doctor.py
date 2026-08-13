@@ -15,6 +15,7 @@ from harness.doctor import CheckResult
 
 from .config import repo_root
 from .data import DataError, verify_dataset, verify_fresh10
+from .data_routing import preparation_route, resolve_preparation_manifest
 
 
 _EXPECTED_RUNTIME = {"jax": "0.11.0", "jaxlib": "0.11.0", "libtpu": "0.0.44.1"}
@@ -26,6 +27,7 @@ def environment_checks(
     profile: str | None = None,
     require_tpu: bool = False,
     expected_process_count: int = 1,
+    training_tokens: int | None = None,
     check_data: bool = True,
     compile_probe: bool = True,
 ) -> list[Callable[[], CheckResult]]:
@@ -43,7 +45,11 @@ def environment_checks(
     if data_path is not None:
         checks.append(lambda: check_storage(data_path))
         if profile and check_data:
-            checks.append(lambda: check_prepared_data(data_path, profile))
+            checks.append(
+                lambda: check_prepared_data(
+                    data_path, profile, training_tokens=training_tokens
+                )
+            )
     return checks
 
 
@@ -214,10 +220,21 @@ def check_storage(path: Path) -> CheckResult:
     )
 
 
-def check_prepared_data(path: Path, profile: str) -> CheckResult:
-    manifest, shards = data_selection(profile)
+def check_prepared_data(
+    path: Path, profile: str, *, training_tokens: int | None = None
+) -> CheckResult:
+    if training_tokens is None:
+        manifest, shards = data_selection(profile)
+        data_root = path
+    else:
+        route = preparation_route(profile, training_tokens)
+        manifest = resolve_preparation_manifest(route)
+        shards = route.train_shards
+        data_root = route.data_root(path)
     try:
-        prepared = verify_dataset(manifest, path, train_shards=shards, verify_hash=True)
+        prepared = verify_dataset(
+            manifest, data_root, train_shards=shards, verify_hash=True
+        )
     except (DataError, OSError) as exc:
         return CheckResult("dataset", "error", str(exc), "run `make prepare`")
     fresh_detail = ""
