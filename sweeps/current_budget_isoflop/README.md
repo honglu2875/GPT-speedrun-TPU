@@ -1,7 +1,7 @@
 # Current-budget IsoFLOP study
 
 This directory is the immutable v2 definition. The default runner now points to
-the versioned v3 continuation; the commands below name v2 explicitly.
+the fresh v4 corrected protocol; the commands below name v2 explicitly.
 
 This is a diagnostic, non-competition study of model/data allocation on the
 local TPU v4-8 stack. It keeps the completed baseline's analytic compute budget
@@ -60,12 +60,13 @@ compromise rather than a full per-shape, per-budget optimizer sweep.
 
 ## Archived command context
 
-The v2 source fingerprint is historical and this newer lineage-aware runner is
-not allowed to resume or create runs under the v2 suite ID. Use the v3 commands
-in `../current_budget_isoflop_v3/README.md` for continuation. The explicit v2
-plan command below is useful only for inspecting its archived geometry; its
-printed execution fingerprint describes current code, not the recorded v2
-execution.
+The v2 source fingerprint is historical and this newer runner is not allowed to
+resume or create runs under the v2 suite ID. V2 and v3 are archived exploratory
+stages. The prospective corrected protocol is v4; use the commands and stability
+contract in [`../current_budget_isoflop_v4/README.md`](../current_budget_isoflop_v4/README.md).
+The explicit v2 plan command below is useful only for inspecting its archived
+geometry; its printed execution fingerprint describes current code, not the
+recorded v2 execution.
 
 Inspect the complete step/token/FLOP plan without JAX initialization:
 

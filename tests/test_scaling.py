@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import hashlib
 import importlib.util
 import json
 import math
@@ -21,6 +23,12 @@ from speedrun.scaling import (
     LearningRateEdgeError,
     ScalingError,
     _fit_slice,
+    _selected_calibration_run,
+    _classify_stability_series,
+    _calibrate_shape,
+    _completed_v4_extensions_for_fit,
+    _expected_learning_rate,
+    _validate_stability_evidence,
     _lineage_entry_for_point,
     _lineage_summary,
     _load_lineage_contract,
@@ -33,6 +41,7 @@ from speedrun.scaling import (
     _read_run,
     _warrants_high_side_extension,
     build_parser,
+    fit_results,
     load_suite,
     main,
     materialize_configs,
@@ -59,16 +68,466 @@ sys.modules[TRAINER_SPEC.name] = reference_trainer
 TRAINER_SPEC.loader.exec_module(reference_trainer)
 
 
+def _sha256_test(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_v4_stability_fixture(root: Path, suite: dict) -> tuple[dict, dict, dict]:
+    """Emit one compact, structurally complete stable v4 curve set."""
+
+    point = dict(suite["calibrations"][0])
+    point.update(
+        {
+            "steps": 1_024,
+            "train_tokens": 1_024 * suite["batch_size"] * suite["sequence_length"],
+            "warmup_steps": 40,
+            "val_every": 128,
+            "diagnostics_every": 128,
+            "log_every": 256,
+        }
+    )
+    point["total_flops"] = point["train_tokens"] * point["flops_per_token"]
+    point["relative_flop_error"] = 0.0
+    point["tokens_per_parameter"] = point["train_tokens"] / point["parameters"]
+    name = point["id"]
+    artifacts = root / name / "artifacts"
+    artifacts.mkdir(parents=True)
+    tokens_per_step = suite["batch_size"] * suite["sequence_length"]
+    flops_per_step = point["flops_per_token"] * tokens_per_step
+
+    with (artifacts / "training.csv").open("w", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(
+            (
+                "step",
+                "tokens_processed",
+                "cumulative_estimated_flops",
+                "train_loss",
+                "learning_rate",
+                "grad_norm",
+            )
+        )
+        for step in range(1, point["steps"] + 1):
+            writer.writerow(
+                (
+                    step,
+                    step * tokens_per_step,
+                    step * flops_per_step,
+                    1.0,
+                    _expected_learning_rate(step, point, suite),
+                    1.0,
+                )
+            )
+
+    probe_steps = list(range(point["val_every"], point["steps"], point["val_every"]))
+    with (artifacts / "validation.csv").open("w", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(
+            (
+                "step",
+                "tokens_processed",
+                "kind",
+                "domain",
+                "validation_tokens",
+                "validation_loss",
+                "perplexity",
+                "validation_seconds",
+                "canonical",
+            )
+        )
+        for step in probe_steps:
+            writer.writerow(
+                (
+                    step,
+                    step * tokens_per_step,
+                    "fineweb_probe",
+                    "fineweb",
+                    8 * tokens_per_step,
+                    1.0,
+                    math.exp(1.0),
+                    0.1,
+                    "false",
+                )
+            )
+        writer.writerow(
+            (
+                point["steps"],
+                point["train_tokens"],
+                "fineweb",
+                "fineweb",
+                suite["validation_tokens"],
+                3.0,
+                math.exp(3.0),
+                1.0,
+                "true",
+            )
+        )
+        for domain in FRESH10_DOMAINS:
+            writer.writerow(
+                (
+                    point["steps"],
+                    point["train_tokens"],
+                    "downstream",
+                    domain,
+                    8_192,
+                    4.0,
+                    math.exp(4.0),
+                    0.1,
+                    "false",
+                )
+            )
+        writer.writerow(
+            (
+                point["steps"],
+                point["train_tokens"],
+                "downstream_macro",
+                "fresh10_macro",
+                81_920,
+                4.0,
+                math.exp(4.0),
+                1.0,
+                "false",
+            )
+        )
+
+    diagnostic_steps = sorted({1, point["steps"], *range(128, 1_025, 128)})
+    scopes = (
+        ("overall", "", point["parameters"]),
+        (
+            "embeddings",
+            "",
+            (suite["vocab_size"] + suite["sequence_length"]) * point["d_model"],
+        ),
+        *(
+            (
+                "block",
+                layer,
+                12 * point["d_model"] ** 2 + 13 * point["d_model"],
+            )
+            for layer in range(point["layers"])
+        ),
+        ("final_norm", "", 2 * point["d_model"]),
+    )
+    with (artifacts / "diagnostics.csv").open("w", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(
+            (
+                "step",
+                "tokens_processed",
+                "cumulative_estimated_flops",
+                "scope",
+                "layer",
+                "family",
+                "stat",
+                "value",
+                "element_count",
+            )
+        )
+        for step in diagnostic_steps:
+            for scope, layer, count in scopes:
+                for family in ("param", "grad", "update"):
+                    for statistic in (
+                        "l1_norm",
+                        "l2_norm",
+                        "mean",
+                        "std",
+                        "third_moment",
+                        "fourth_moment",
+                    ):
+                        value = 0.1
+                        if scope == "overall" and family == "grad" and statistic == "l2_norm":
+                            value = 1.0
+                        elif scope == "overall" and family == "param" and statistic == "l2_norm":
+                            value = 10.0
+                        elif scope == "block" and family == "param" and statistic == "l2_norm":
+                            value = 1.0
+                        writer.writerow(
+                            (
+                                step,
+                                step * tokens_per_step,
+                                step * flops_per_step,
+                                scope,
+                                layer,
+                                family,
+                                statistic,
+                                value,
+                                count,
+                            )
+                        )
+
+    result = {
+        "artifacts": {
+            "training_curve": "training.csv",
+            "validation_curve": "validation.csv",
+            "diagnostics": "diagnostics.csv",
+        }
+    }
+    metrics = {
+        "train_loss": 1.0,
+        "validation_probe_count": len(probe_steps),
+        "diagnostic_point_count": len(diagnostic_steps),
+    }
+    fresh = {
+        "macro_loss": 4.0,
+        "scored_tokens": 81_920,
+        "domain_losses": {domain: 4.0 for domain in FRESH10_DOMAINS},
+    }
+    return point, result, {"metrics": metrics, "fresh": fresh}
+
+
 class ScalingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.lineage_suite = load_suite(DEFAULT_SUITE)
+        cls.v4_suite = load_suite(DEFAULT_SUITE)
+        cls.lineage_suite = load_suite(
+            Path(__file__).parents[1]
+            / "sweeps"
+            / "current_budget_isoflop_v3"
+            / "suite.yaml"
+        )
         cls.suite = load_suite(
             Path(__file__).parents[1]
             / "sweeps"
             / "current_budget_isoflop"
             / "suite.yaml"
         )
+
+    def test_v4_calibrates_every_slice_shape_without_mutable_lineage(self) -> None:
+        suite = self.v4_suite
+        self.assertEqual(suite["suite_id"], "current_budget_isoflop_v4")
+        self.assertEqual(suite["learning_rate_scope"], "per_compute_slice_and_shape")
+        self.assertIsNone(suite["lineage"])
+        self.assertEqual(len(suite["calibrations"]), 45)
+        self.assertEqual(len(suite["variants"]), 0)
+        self.assertEqual(len(suite["extension_calibrations"]), 18)
+        self.assertEqual(len(suite["adaptive_calibrations"]), 168)
+        for slice_id in ("c025", "c050", "c100"):
+            self.assertEqual(
+                len(
+                    [
+                        point
+                        for point in suite["calibrations"]
+                        if point["slice"] == slice_id
+                    ]
+                ),
+                15,
+            )
+        base_cost = sum(
+            suite["slices_by_id"][point["slice"]]["multiplier"]
+            for point in suite["calibrations"]
+        ) + sum(
+            suite["slices_by_id"][point["slice"]]["multiplier"]
+            for point in suite["controls"]
+        )
+        self.assertEqual(base_cost, 27.25)
+
+    def test_v4_stability_threshold_boundaries(self) -> None:
+        policy = self.v4_suite["stability_admission"]
+
+        def classify(
+            *,
+            probes=(1.0, 1.0, 1.0),
+            gradients=None,
+            losses=None,
+            blocks=(1.0, 1.0, 1.0),
+        ):
+            gradients = [1.0] * 1_024 if gradients is None else gradients
+            losses = [1.0] * 1_024 if losses is None else losses
+            return _classify_stability_series(
+                policy,
+                probe_steps=(100, 200, 300),
+                probe_losses=probes,
+                gradients=gradients,
+                training_losses=losses,
+                final_block_parameter_l2=blocks,
+            )
+
+        self.assertEqual(
+            classify(probes=(3.0, 3.05, 3.05))["classification"], "rejected"
+        )
+        self.assertEqual(
+            classify(probes=(3.0, 3.05, 3.0))["classification"], "stable"
+        )
+        self.assertEqual(
+            classify(gradients=[11.0] * 256 + [10.0] * 256 + [1.0] * 512)[
+                "classification"
+            ],
+            "rejected",
+        )
+        self.assertEqual(
+            classify(gradients=[11.0] * 255 + [10.0] * 257 + [1.0] * 512)[
+                "classification"
+            ],
+            "stable",
+        )
+        self.assertEqual(
+            classify(losses=[1.0] * 512 + [1.2] * 512)["classification"],
+            "rejected",
+        )
+        self.assertEqual(classify(blocks=(1.0, 1.0, 2.0))["classification"], "stable")
+        self.assertEqual(
+            classify(blocks=(1.0, 1.0, 2.0001))["classification"], "suspect"
+        )
+
+    def test_v4_full_curve_admission_is_immutable_and_detects_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            point, result, expected = _write_v4_stability_fixture(
+                root, self.v4_suite
+            )
+            admission = _validate_stability_evidence(
+                self.v4_suite,
+                point,
+                artifact_root=root,
+                result=result,
+                metrics=expected["metrics"],
+                validation_loss=3.0,
+                fresh10_result=expected["fresh"],
+            )
+            self.assertEqual(admission["classification"], "stable")
+            admission_path = (
+                root / point["id"] / "artifacts" / "stability-admission.json"
+            )
+            self.assertEqual(
+                admission["artifact"]["sha256"], _sha256_test(admission_path)
+            )
+
+            training = root / point["id"] / "artifacts" / "training.csv"
+            with training.open(newline="") as handle:
+                rows = list(csv.reader(handle))
+            rows[1][3] = str(float(rows[1][3]) + 1e-6)
+            with training.open("w", newline="") as handle:
+                csv.writer(handle, lineterminator="\n").writerows(rows)
+            with self.assertRaisesRegex(ScalingError, "immutable file differs"):
+                _validate_stability_evidence(
+                    self.v4_suite,
+                    point,
+                    artifact_root=root,
+                    result=result,
+                    metrics=expected["metrics"],
+                    validation_loss=3.0,
+                    fresh10_result=expected["fresh"],
+                )
+
+    def test_v4_materialization_allowed_but_direct_calibration_launch_forbidden(self) -> None:
+        point = self.v4_suite["calibrations"][0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = materialize_configs(self.v4_suite, root, [point["id"]])
+            self.assertEqual(len(paths), 1)
+            with self.assertRaisesRegex(ScalingError, "only be launched by --staged"):
+                run_variants(
+                    self.v4_suite,
+                    names=[point["id"]],
+                    data_path=Path("/not/reached"),
+                    runs_path=root / "runs",
+                    seed=1337,
+                    color="never",
+                    downstream_manifest=Path("/not/reached"),
+                    downstream_root=Path("/not/reached"),
+                    attention_tuning_cache=None,
+                    autotune_attention=False,
+                    resume=False,
+                )
+
+    def test_v4_lowest_initial_instability_recovers_only_downward(self) -> None:
+        suite = self.v4_suite
+        launched: list[str] = []
+        completed: set[str] = set()
+        classifications = {"lr200": "rejected", "lr133": "stable", "lr089": "stable"}
+
+        def run_fake(_suite, *, names, **_kwargs):
+            launched.extend(names)
+            completed.update(names)
+
+        def has_result(_suite, point, _root):
+            return point["id"] in completed
+
+        def read_fake(_suite, point, _root):
+            rate_id = next(key for key in classifications if key in point["id"])
+            return {
+                "id": point["id"],
+                "stability_admission": {"classification": classifications[rate_id]},
+            }
+
+        selected = {"selected_learning_rate": 0.00013333333333333334}
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "speedrun.scaling.run_variants", side_effect=run_fake
+        ), patch("speedrun.scaling._point_has_result", side_effect=has_result), patch(
+            "speedrun.scaling._read_run", side_effect=read_fake
+        ), patch(
+            "speedrun.scaling.select_learning_rate", return_value=selected
+        ):
+            result = _calibrate_shape(
+                suite, "n023", Path(directory), {}, slice_id="c025"
+            )
+        self.assertEqual(result, selected)
+        self.assertEqual(
+            launched,
+            [
+                "c025_n023_lr200",
+                "c025_n023_lr133_adaptive",
+                "c025_n023_lr089_adaptive",
+            ],
+        )
+
+    def test_v4_resume_allows_stable_prefix_but_rejects_holes_and_lower_frontier(self) -> None:
+        suite = self.v4_suite
+
+        def validate(completed, classifications):
+            with patch(
+                "speedrun.scaling._point_has_result",
+                side_effect=lambda _suite, point, _root: point["id"] in completed,
+            ), patch(
+                "speedrun.scaling._read_run",
+                side_effect=lambda _suite, point, _root: {
+                    "id": point["id"],
+                    "stability_admission": {
+                        "classification": classifications.get(point["id"], "stable")
+                    },
+                },
+            ):
+                _validate_adaptive_completion_prefix(
+                    suite, "n023", Path("/unused"), slice_id="c025"
+                )
+
+        validate({"c025_n023_lr200"}, {})
+        validate({"c025_n023_lr200", "c025_n023_lr300"}, {})
+        with self.assertRaisesRegex(ScalingError, "initial learning-rate completion"):
+            validate({"c025_n023_lr300"}, {})
+        with self.assertRaisesRegex(ScalingError, "lower LR expansion is ineligible"):
+            validate(
+                {"c025_n023_lr200", "c025_n023_lr133_adaptive"},
+                {"c025_n023_lr133_adaptive": "rejected"},
+            )
+
+    def test_v4_resume_after_lower_recovery_completion_does_not_launch(self) -> None:
+        suite = self.v4_suite
+        completed = {
+            "c025_n023_lr089_adaptive": "stable",
+            "c025_n023_lr133_adaptive": "stable",
+            "c025_n023_lr200": "rejected",
+        }
+        selected = {"selected_learning_rate": 0.00013333333333333334}
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "speedrun.scaling._point_has_result",
+            side_effect=lambda _suite, point, _root: point["id"] in completed,
+        ), patch(
+            "speedrun.scaling._read_run",
+            side_effect=lambda _suite, point, _root: {
+                "id": point["id"],
+                "stability_admission": {
+                    "classification": completed[point["id"]]
+                },
+            },
+        ), patch(
+            "speedrun.scaling.select_learning_rate", return_value=selected
+        ), patch("speedrun.scaling.run_variants") as launch:
+            result = _calibrate_shape(
+                suite, "n023", Path(directory), {}, slice_id="c025"
+            )
+        self.assertEqual(result, selected)
+        launch.assert_not_called()
 
     def test_suite_matches_exact_current_budget_and_cost(self) -> None:
         suite = self.suite
@@ -399,8 +858,32 @@ class ScalingTests(unittest.TestCase):
         fit.assert_called_once_with(self.lineage_suite, DEFAULT_RUNS)
         write.assert_called_once_with(result, output)
 
+    def test_run_cli_rejects_archived_v3_before_launch(self) -> None:
+        argv = [
+            "run",
+            "--data-path",
+            "/does/not/matter",
+            "--downstream-manifest",
+            "/does/not/matter",
+            "--downstream-root",
+            "/does/not/matter",
+            "--confirm-execution-fingerprint",
+            self.lineage_suite["execution_fingerprint"],
+            "--staged",
+        ]
+        with patch(
+            "speedrun.scaling.load_suite", return_value=self.lineage_suite
+        ), patch("speedrun.scaling.run_staged") as launch, patch("sys.stderr"):
+            self.assertEqual(main(argv), 1)
+        launch.assert_not_called()
+
     def test_lineage_manifest_hash_and_origin_source_are_release_gating(self) -> None:
-        suite_path = DEFAULT_SUITE.resolve()
+        suite_path = (
+            Path(__file__).parents[1]
+            / "sweeps"
+            / "current_budget_isoflop_v3"
+            / "suite.yaml"
+        ).resolve()
         suite_payload = yaml.safe_load(suite_path.read_text(encoding="utf-8"))
         declaration = dict(suite_payload["lineage"])
         declaration["sha256"] = "0" * 64
@@ -822,6 +1305,191 @@ class ScalingTests(unittest.TestCase):
             [("c050", "n082"), ("c025", "n102"), ("c050", "n102")],
         )
         self.assertEqual(len(launches), len(set(launches)))
+
+    def test_v4_fit_rejects_begun_extension_without_valid_selection(self) -> None:
+        suite = self.v4_suite
+        point = next(
+            item
+            for item in suite["extension_calibrations"]
+            if item["slice"] == "c025" and item["shape_id"] == "n082"
+        )
+        real_selected = _selected_calibration_run
+        extension_attempts: list[tuple[str, str]] = []
+
+        def selected(_suite, shape_id, root, *, slice_id=None):
+            if shape_id in {"n082", "n102"}:
+                extension_attempts.append((slice_id, shape_id))
+                return real_selected(
+                    _suite, shape_id, root, slice_id=slice_id
+                )
+            return {"slice": slice_id}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = root / point["id"] / "artifacts" / "result.json"
+            result.parent.mkdir(parents=True)
+            result.touch()
+            with patch(
+                "speedrun.scaling._selected_calibration_run",
+                side_effect=selected,
+            ), self.assertRaises(ScalingError):
+                fit_results(suite, root)
+        self.assertEqual(extension_attempts, [("c025", "n082")])
+
+    def test_v4_fit_rejects_later_extension_selection_without_prefix(self) -> None:
+        suite = self.v4_suite
+        selected_calls: list[tuple[str | None, str]] = []
+
+        def selected(_suite, shape_id, _root, *, slice_id=None):
+            selected_calls.append((slice_id, shape_id))
+            return {"slice": slice_id}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            selection = (
+                root
+                / "learning-rate-selections"
+                / "c025"
+                / "n102.json"
+            )
+            selection.parent.mkdir(parents=True)
+            selection.write_text("{}\n", encoding="utf-8")
+            with patch(
+                "speedrun.scaling._selected_calibration_run",
+                side_effect=selected,
+            ), self.assertRaisesRegex(
+                ScalingError, "optional extension evidence is not a model-size prefix"
+            ):
+                fit_results(suite, root)
+        self.assertFalse(
+            any(shape_id in {"n082", "n102"} for _, shape_id in selected_calls)
+        )
+
+    def test_v4_fit_rejects_n082_after_base_grid_brackets(self) -> None:
+        suite = self.v4_suite
+        measured_fit = [{"slice": "c025"} for _ in suite["fit_shapes"]]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            selection = root / "learning-rate-selections" / "c025" / "n082.json"
+            selection.parent.mkdir(parents=True)
+            selection.write_text("{}\n", encoding="utf-8")
+            with patch(
+                "speedrun.scaling._selected_calibration_run",
+                return_value={"id": "n082", "slice": "c025", "parameters": 82},
+            ), patch(
+                "speedrun.scaling._fit_slice",
+                return_value=({"bracketed": True}, None),
+            ), patch(
+                "speedrun.scaling._warrants_high_side_extension"
+            ) as warrants, self.assertRaisesRegex(
+                ScalingError, "beyond the prospective model-size stopping frontier"
+            ):
+                _completed_v4_extensions_for_fit(suite, root, measured_fit)
+        warrants.assert_not_called()
+
+    def test_v4_fit_rejects_n102_after_n082_closes_bracket(self) -> None:
+        suite = self.v4_suite
+        measured_fit = [{"slice": "c025"} for _ in suite["fit_shapes"]]
+
+        def selected(_suite, shape_id, _root, *, slice_id=None):
+            return {
+                "id": shape_id,
+                "slice": slice_id,
+                "parameters": 82 if shape_id == "n082" else 102,
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            selections = root / "learning-rate-selections" / "c025"
+            selections.mkdir(parents=True)
+            for shape_id in ("n082", "n102"):
+                (selections / f"{shape_id}.json").write_text(
+                    "{}\n", encoding="utf-8"
+                )
+            with patch(
+                "speedrun.scaling._selected_calibration_run",
+                side_effect=selected,
+            ), patch(
+                "speedrun.scaling._fit_slice",
+                side_effect=(
+                    ({"bracketed": False}, None),
+                    ({"bracketed": True}, None),
+                ),
+            ), patch(
+                "speedrun.scaling._warrants_high_side_extension",
+                return_value=True,
+            ) as warrants, self.assertRaisesRegex(
+                ScalingError, "c025/n102.*stopping frontier"
+            ):
+                _completed_v4_extensions_for_fit(suite, root, measured_fit)
+        warrants.assert_called_once()
+
+    def test_v4_fit_admits_legitimate_high_side_extension_prefix(self) -> None:
+        suite = self.v4_suite
+        measured_fit = [
+            {"slice": compute_slice["id"]}
+            for compute_slice in suite["compute_slices"]
+            for _ in suite["fit_shapes"]
+        ]
+
+        def selected(_suite, shape_id, _root, *, slice_id=None):
+            return {
+                "id": shape_id,
+                "slice": slice_id,
+                "parameters": 82 if shape_id == "n082" else 102,
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            selections = root / "learning-rate-selections" / "c025"
+            selections.mkdir(parents=True)
+            for shape_id in ("n082", "n102"):
+                (selections / f"{shape_id}.json").write_text(
+                    "{}\n", encoding="utf-8"
+                )
+            with patch(
+                "speedrun.scaling._selected_calibration_run",
+                side_effect=selected,
+            ), patch(
+                "speedrun.scaling._fit_slice",
+                side_effect=lambda _points, *, slice_id, **_kwargs: (
+                    {"bracketed": slice_id != "c025"},
+                    None,
+                ),
+            ), patch(
+                "speedrun.scaling._warrants_high_side_extension",
+                return_value=True,
+            ):
+                completed = _completed_v4_extensions_for_fit(
+                    suite, root, measured_fit
+                )
+        self.assertEqual([item["id"] for item in completed], ["n082", "n102"])
+
+    def test_v4_fit_rejects_interrupted_warranted_extension_frontier(self) -> None:
+        suite = self.v4_suite
+        measured_fit = [{"slice": "c025"} for _ in suite["fit_shapes"]]
+
+        def selected(_suite, shape_id, _root, *, slice_id=None):
+            return {"id": shape_id, "slice": slice_id, "parameters": 82}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            selection = root / "learning-rate-selections" / "c025" / "n082.json"
+            selection.parent.mkdir(parents=True)
+            selection.write_text("{}\n", encoding="utf-8")
+            with patch(
+                "speedrun.scaling._selected_calibration_run",
+                side_effect=selected,
+            ), patch(
+                "speedrun.scaling._fit_slice",
+                return_value=({"bracketed": False}, None),
+            ), patch(
+                "speedrun.scaling._warrants_high_side_extension",
+                return_value=True,
+            ), self.assertRaisesRegex(
+                ScalingError, "optional extension frontier is incomplete.*n102"
+            ):
+                _completed_v4_extensions_for_fit(suite, root, measured_fit)
 
     def test_result_fresh10_counts_are_release_gating(self) -> None:
         point = self.suite["calibrations"][0]

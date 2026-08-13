@@ -9,6 +9,7 @@ compute-allocation law only when every measured optimum is bracketed.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 from importlib import metadata as importlib_metadata
 import json
@@ -56,10 +57,10 @@ from speedrun.fineweb_builder import (
 DEFAULT_SUITE = (
     Path(__file__).resolve().parent.parent
     / "sweeps"
-    / "current_budget_isoflop_v3"
+    / "current_budget_isoflop_v4"
     / "suite.yaml"
 )
-DEFAULT_RUNS = Path("runs/scaling/current-budget-isoflop-v3")
+DEFAULT_RUNS = Path("runs/scaling/current-budget-isoflop-v4")
 _LLMC_MAGIC = 20_240_520
 _LLMC_VERSION = 1
 _SAFE_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,47}$")
@@ -69,7 +70,9 @@ _FINEWEB4B_TRAIN_NAMES = tuple(
 )
 _FINEWEB4B_VALIDATION_NAMES = ("fineweb_val_000000.bin",)
 _FINEWEB4B_NAMES = _FINEWEB4B_VALIDATION_NAMES + _FINEWEB4B_TRAIN_NAMES
-_ARCHIVED_SUITE_IDS = frozenset({"current_budget_isoflop_v2"})
+_ARCHIVED_SUITE_IDS = frozenset(
+    {"current_budget_isoflop_v2", "current_budget_isoflop_v3"}
+)
 
 
 class ScalingError(ValueError):
@@ -79,12 +82,21 @@ class ScalingError(ValueError):
 class LearningRateEdgeError(ScalingError):
     """The best measured learning rate is still on a bounded grid edge."""
 
-    def __init__(self, shape_id: str, side: str, learning_rate: float) -> None:
+    def __init__(
+        self,
+        shape_id: str,
+        side: str,
+        learning_rate: float,
+        *,
+        slice_id: str | None = None,
+    ) -> None:
         self.shape_id = shape_id
+        self.slice_id = slice_id
         self.side = side
         self.learning_rate = learning_rate
+        label = shape_id if slice_id is None else f"{slice_id}/{shape_id}"
         super().__init__(
-            f"{shape_id}: lowest validation loss is at the {side} learning-rate "
+            f"{label}: lowest admitted validation loss is at the {side} learning-rate "
             f"edge ({learning_rate:.8g})"
         )
 
@@ -379,6 +391,84 @@ def load_suite(path: Path = DEFAULT_SUITE) -> dict[str, Any]:
         raise ScalingError("optimizer must define exactly the fixed suite hyperparameters")
     for key in optimizer:
         optimizer[key] = _finite(optimizer[key], f"optimizer.{key}")
+    learning_rate_scope = root.get(
+        "learning_rate_scope", "first_compute_slice_per_shape"
+    )
+    if learning_rate_scope not in {
+        "first_compute_slice_per_shape",
+        "per_compute_slice_and_shape",
+    }:
+        raise ScalingError(
+            "learning_rate_scope must be first_compute_slice_per_shape or "
+            "per_compute_slice_and_shape"
+        )
+    stability_raw = root.get("stability_admission")
+    stability_admission: dict[str, Any] | None = None
+    if stability_raw is not None:
+        stability_source = dict(_mapping(stability_raw, "stability_admission"))
+        expected_stability_fields = {
+            "schema_version",
+            "probe_regression_threshold",
+            "probe_regression_consecutive",
+            "trailing_window_steps",
+            "gradient_norm_threshold",
+            "maximum_large_gradient_fraction",
+            "train_loss_window_regression_threshold",
+            "maximum_final_block_param_l2_to_median",
+        }
+        if set(stability_source) != expected_stability_fields:
+            raise ScalingError(
+                "stability_admission has unexpected or missing fields"
+            )
+        if stability_source["schema_version"] != 1:
+            raise ScalingError("stability_admission.schema_version must be 1")
+        maximum_large_gradient_fraction = _finite(
+            stability_source["maximum_large_gradient_fraction"],
+            "stability_admission.maximum_large_gradient_fraction",
+        )
+        if not 0.0 <= maximum_large_gradient_fraction <= 1.0:
+            raise ScalingError(
+                "stability_admission.maximum_large_gradient_fraction must be in [0, 1]"
+            )
+        stability_admission = {
+            "schema_version": 1,
+            "probe_regression_threshold": _finite(
+                stability_source["probe_regression_threshold"],
+                "stability_admission.probe_regression_threshold",
+                positive=True,
+            ),
+            "probe_regression_consecutive": _integer(
+                stability_source["probe_regression_consecutive"],
+                "stability_admission.probe_regression_consecutive",
+            ),
+            "trailing_window_steps": _integer(
+                stability_source["trailing_window_steps"],
+                "stability_admission.trailing_window_steps",
+            ),
+            "gradient_norm_threshold": _finite(
+                stability_source["gradient_norm_threshold"],
+                "stability_admission.gradient_norm_threshold",
+                positive=True,
+            ),
+            "maximum_large_gradient_fraction": maximum_large_gradient_fraction,
+            "train_loss_window_regression_threshold": _finite(
+                stability_source["train_loss_window_regression_threshold"],
+                "stability_admission.train_loss_window_regression_threshold",
+                positive=True,
+            ),
+            "maximum_final_block_param_l2_to_median": _finite(
+                stability_source["maximum_final_block_param_l2_to_median"],
+                "stability_admission.maximum_final_block_param_l2_to_median",
+                positive=True,
+            ),
+        }
+    if (
+        learning_rate_scope == "per_compute_slice_and_shape"
+        and stability_admission is None
+    ):
+        raise ScalingError(
+            "per-compute-slice learning-rate selection requires stability_admission"
+        )
     raw_learning_rates = root.get("learning_rate_candidates")
     if not isinstance(raw_learning_rates, list) or len(raw_learning_rates) < 2:
         raise ScalingError("learning_rate_candidates must contain at least two values")
@@ -519,29 +609,39 @@ def load_suite(path: Path = DEFAULT_SUITE) -> dict[str, Any]:
         for compute_slice in compute_slices
         for shape in shapes
     ]
+    calibration_slices = (
+        compute_slices
+        if learning_rate_scope == "per_compute_slice_and_shape"
+        else compute_slices[:1]
+    )
     calibration_slice = compute_slices[0]
     calibrations = [
         _point(
             shape=shape,
-            compute_slice=calibration_slice,
+            compute_slice=compute_slice,
             batch_size=batch_size,
             seq_len=seq_len,
             schedule=schedule,
             role="learning_rate_calibration",
-            identifier=f"{calibration_slice['id']}_{shape['shape_id']}_{candidate['id']}",
+            identifier=f"{compute_slice['id']}_{shape['shape_id']}_{candidate['id']}",
             learning_rate=float(candidate["value"]),
         )
+        for compute_slice in calibration_slices
         for shape in shapes
         for candidate in learning_rates
     ]
-    variants = [
-        {
-            **point,
-            "learning_rate_source": point["shape_id"],
-        }
-        for point in fit_geometry
-        if point["slice"] != calibration_slice["id"]
-    ]
+    variants = (
+        []
+        if learning_rate_scope == "per_compute_slice_and_shape"
+        else [
+            {
+                **point,
+                "learning_rate_source": point["shape_id"],
+            }
+            for point in fit_geometry
+            if point["slice"] != calibration_slice["id"]
+        ]
+    )
 
     def extra_points(field: str, role: str) -> list[dict[str, Any]]:
         raw_points = root.get(field, [])
@@ -603,42 +703,48 @@ def load_suite(path: Path = DEFAULT_SUITE) -> dict[str, Any]:
         raise ScalingError("optional extension shapes must be ordered by parameter count")
     if extension_shapes and extension_shapes[0]["parameters"] <= shapes[-1]["parameters"]:
         raise ScalingError("optional extension shapes must be larger than the base grid")
-    # c025 reuses the selected calibration result for an extension shape. Only
-    # later slices need a distinct dependent point.
-    extensions = [
-        _point(
-            shape=shape,
-            compute_slice=compute_slice,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            schedule=schedule,
-            role="extension",
-            identifier=f"{compute_slice['id']}_{shape['shape_id']}_extension",
-            learning_rate_source=str(shape["shape_id"]),
-        )
-        for compute_slice in compute_slices[1:]
-        for shape in extension_shapes
-    ]
+    # Under the legacy policy, c025 reuses the selected extension calibration
+    # and only later slices need a dependent point.  Under the fail-closed v4
+    # policy every slice gets its own selected extension calibration instead.
+    extensions = (
+        []
+        if learning_rate_scope == "per_compute_slice_and_shape"
+        else [
+            _point(
+                shape=shape,
+                compute_slice=compute_slice,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                schedule=schedule,
+                role="extension",
+                identifier=f"{compute_slice['id']}_{shape['shape_id']}_extension",
+                learning_rate_source=str(shape["shape_id"]),
+            )
+            for compute_slice in compute_slices[1:]
+            for shape in extension_shapes
+        ]
+    )
     extension_calibrations = [
         _point(
             shape=extension,
-            compute_slice=calibration_slice,
+            compute_slice=compute_slice,
             batch_size=batch_size,
             seq_len=seq_len,
             schedule=schedule,
             role="extension_learning_rate_calibration",
             identifier=(
-                f"{calibration_slice['id']}_{extension['shape_id']}_{candidate['id']}_ext"
+                f"{compute_slice['id']}_{extension['shape_id']}_{candidate['id']}_ext"
             ),
             learning_rate=float(candidate["value"]),
         )
+        for compute_slice in calibration_slices
         for extension in extension_shapes
         for candidate in learning_rates
     ]
     adaptive_calibrations = [
         _point(
             shape=shape,
-            compute_slice=calibration_slice,
+            compute_slice=compute_slice,
             batch_size=batch_size,
             seq_len=seq_len,
             schedule=schedule,
@@ -648,11 +754,12 @@ def load_suite(path: Path = DEFAULT_SUITE) -> dict[str, Any]:
                 else "learning_rate_search"
             ),
             identifier=(
-                f"{calibration_slice['id']}_{shape['shape_id']}_{candidate['id']}_"
+                f"{compute_slice['id']}_{shape['shape_id']}_{candidate['id']}_"
                 "adaptive"
             ),
             learning_rate=float(candidate["value"]),
         )
+        for compute_slice in calibration_slices
         for shape in shapes + extension_shapes
         for candidate in lower_learning_rates + upper_learning_rates
     ]
@@ -811,6 +918,8 @@ def load_suite(path: Path = DEFAULT_SUITE) -> dict[str, Any]:
         "anchor": anchor,
         "schedule": schedule,
         "optimizer": optimizer,
+        "learning_rate_scope": learning_rate_scope,
+        "stability_admission": stability_admission,
         "learning_rate_candidates": learning_rates,
         "learning_rate_search": {
             "geometric_factor": geometric_factor,
@@ -1309,14 +1418,13 @@ def print_plan(suite: Mapping[str, Any], *, as_json: bool = False) -> None:
             "optional edge extensions: "
             + ", ".join(item["id"] for item in suite["optional_extensions"])
         )
-    calibration_multiplier = (
-        float(suite["compute_slices"][0]["multiplier"])
-        * len(suite["fit_shapes"])
-        * len(suite["learning_rate_candidates"])
+    calibration_multiplier = sum(
+        float(suite["slices_by_id"][item["slice"]]["multiplier"])
+        for item in suite["calibrations"]
     )
     fit_multiplier = sum(
-        float(item["multiplier"]) * len(suite["fit_shapes"])
-        for item in suite["compute_slices"][1:]
+        float(suite["slices_by_id"][item["slice"]]["multiplier"])
+        for item in suite["variants"]
     )
     total_multiplier = calibration_multiplier + fit_multiplier + sum(
         float(suite["slices_by_id"][item["slice"]]["multiplier"])
@@ -1329,10 +1437,16 @@ def print_plan(suite: Mapping[str, Any], *, as_json: bool = False) -> None:
         f"{float(item['value']):.8g}"
         for item in suite["learning_rate_search"]["upper"]
     )
-    print(
-        f"\nlearning-rate calibration: {rates} at {suite['compute_slices'][0]['id']}; "
-        "the lowest 100M-token validation loss per shape continues to later slices"
-    )
+    if suite["learning_rate_scope"] == "per_compute_slice_and_shape":
+        print(
+            f"\nlearning-rate calibration: {rates} independently at every "
+            "(compute slice, model shape); only stable interior winners are admitted"
+        )
+    else:
+        print(
+            f"\nlearning-rate calibration: {rates} at {suite['compute_slices'][0]['id']}; "
+            "the lowest 100M-token validation loss per shape continues to later slices"
+        )
     print(f"bounded geometric upper LR schedule: {upper_rates}")
     print(f"\nplanned base cost: {total_multiplier:.2f} completed-baseline equivalents")
     print(
@@ -2062,8 +2176,38 @@ def trainer_command(
     return command
 
 
-def _learning_rate_selection_path(runs_root: Path, shape_id: str) -> Path:
-    return runs_root / "learning-rate-selections" / f"{shape_id}.json"
+def _per_slice_learning_rates(suite: Mapping[str, Any]) -> bool:
+    return suite.get("learning_rate_scope") == "per_compute_slice_and_shape"
+
+
+def _calibration_slice_id(
+    suite: Mapping[str, Any], slice_id: str | None
+) -> str:
+    if _per_slice_learning_rates(suite):
+        if slice_id is None:
+            raise ScalingError(
+                "this suite requires a compute slice for learning-rate selection"
+            )
+        if slice_id not in suite["slices_by_id"]:
+            raise ScalingError(f"unknown learning-rate calibration slice: {slice_id}")
+        return slice_id
+    canonical = str(suite["compute_slices"][0]["id"])
+    if slice_id is not None and slice_id != canonical:
+        raise ScalingError(
+            f"legacy learning-rate calibration is defined only at {canonical}"
+        )
+    return canonical
+
+
+def _learning_rate_selection_path(
+    runs_root: Path,
+    shape_id: str,
+    *,
+    slice_id: str | None = None,
+) -> Path:
+    if slice_id is None:
+        return runs_root / "learning-rate-selections" / f"{shape_id}.json"
+    return runs_root / "learning-rate-selections" / slice_id / f"{shape_id}.json"
 
 
 def _resolve_point_learning_rate(
@@ -2076,25 +2220,44 @@ def _resolve_point_learning_rate(
             resolved["config_sha256"] = hashlib.sha256(payload).hexdigest()
         return resolved
     shape_id = str(resolved.get("learning_rate_source", resolved["shape_id"]))
-    selection_path = _learning_rate_selection_path(runs_root, shape_id)
+    selection_slice = (
+        str(resolved["slice"]) if _per_slice_learning_rates(suite) else None
+    )
+    selection_path = _learning_rate_selection_path(
+        runs_root, shape_id, slice_id=selection_slice
+    )
     if not selection_path.is_file():
         raise ScalingError(
             f"{point['id']}: missing learning-rate selection for {shape_id}; "
-            "run its c025 calibration stage first"
+            "run its matching calibration stage first"
         )
     # Recompute from the immutable calibration results every time a dependent
     # point resolves its LR. This catches edited/stale selection JSON, newly
     # added edge trials, and mixed provenance before a launch or fit.
     selection = select_learning_rate(
-        suite, shape_id=shape_id, runs_path=runs_root
+        suite,
+        shape_id=shape_id,
+        slice_id=selection_slice,
+        runs_path=runs_root,
     )
     if (
         selection.get("schema_version")
-        != (3 if _lineage_summary(suite) is not None else 2)
+        != (
+            4
+            if _per_slice_learning_rates(suite)
+            else 3
+            if _lineage_summary(suite) is not None
+            else 2
+        )
         or selection.get("suite_id") != suite["suite_id"]
         or selection.get("suite_sha256") != suite["suite_sha256"]
         or selection.get("execution_fingerprint") != suite["execution_fingerprint"]
         or selection.get("shape_id") != shape_id
+        or (
+            _per_slice_learning_rates(suite)
+            and selection.get("slice")
+            != _calibration_slice_id(suite, selection_slice)
+        )
     ):
         raise ScalingError(f"learning-rate selection identity mismatch: {selection_path}")
     selected_rate = _finite(
@@ -2111,7 +2274,9 @@ def _resolve_point_learning_rate(
                 + suite["extension_calibrations"]
                 + suite["adaptive_calibrations"]
             )
-            if candidate["shape_id"] == shape_id and candidate["id"] == selected_id
+            if candidate["shape_id"] == shape_id
+            and candidate["slice"] == _calibration_slice_id(suite, selection_slice)
+            and candidate["id"] == selected_id
         ),
         None,
     )
@@ -2154,6 +2319,18 @@ def run_variants(
     unknown = sorted(set(names) - set(available))
     if unknown:
         raise ScalingError(f"unknown point(s): {', '.join(unknown)}")
+    if _per_slice_learning_rates(suite) and not allow_adaptive:
+        v4_calibration_roles = {
+            "learning_rate_calibration",
+            "learning_rate_search",
+            "extension_learning_rate_calibration",
+            "extension_learning_rate_search",
+        }
+        if any(available[name]["role"] in v4_calibration_roles for name in names):
+            raise ScalingError(
+                "v4 learning-rate trials may only be launched by --staged to "
+                "preserve the low-to-high instability frontier"
+            )
     adaptive_roles = {
         "learning_rate_search",
         "extension_learning_rate_search",
@@ -2164,8 +2341,19 @@ def run_variants(
             "adaptive learning-rate variants may only be launched by --staged; "
             "resume the staged study to preserve geometric ordering"
         )
-    for shape_id in sorted({str(point["shape_id"]) for point in adaptive}):
-        _validate_adaptive_completion_prefix(suite, shape_id, runs_root)
+    adaptive_groups = sorted(
+        {
+            (str(point["slice"]), str(point["shape_id"]))
+            for point in adaptive
+        }
+    )
+    for slice_id, shape_id in adaptive_groups:
+        _validate_adaptive_completion_prefix(
+            suite,
+            shape_id,
+            runs_root,
+            slice_id=(slice_id if _per_slice_learning_rates(suite) else None),
+        )
     initial_rates = [float(item["value"]) for item in suite["learning_rate_candidates"]]
     for point in adaptive:
         side = (
@@ -2174,7 +2362,15 @@ def run_variants(
             else "upper"
         )
         next_point = _next_adaptive_calibration(
-            suite, str(point["shape_id"]), side, runs_root
+            suite,
+            str(point["shape_id"]),
+            side,
+            runs_root,
+            slice_id=(
+                str(point["slice"])
+                if _per_slice_learning_rates(suite)
+                else None
+            ),
         )
         if next_point is None or next_point["id"] != point["id"]:
             expected = "none" if next_point is None else str(next_point["id"])
@@ -2831,6 +3027,686 @@ def _validated_fresh10_result(
     }
 
 
+_TRAINING_CSV_FIELDS = (
+    "step",
+    "tokens_processed",
+    "cumulative_estimated_flops",
+    "train_loss",
+    "learning_rate",
+    "grad_norm",
+)
+_VALIDATION_CSV_FIELDS = (
+    "step",
+    "tokens_processed",
+    "kind",
+    "domain",
+    "validation_tokens",
+    "validation_loss",
+    "perplexity",
+    "validation_seconds",
+    "canonical",
+)
+_DIAGNOSTICS_CSV_FIELDS = (
+    "step",
+    "tokens_processed",
+    "cumulative_estimated_flops",
+    "scope",
+    "layer",
+    "family",
+    "stat",
+    "value",
+    "element_count",
+)
+_DIAGNOSTIC_FAMILIES = ("param", "grad", "update")
+_DIAGNOSTIC_STATS = (
+    "l1_norm",
+    "l2_norm",
+    "mean",
+    "std",
+    "third_moment",
+    "fourth_moment",
+)
+
+
+def _csv_rows(path: Path, expected_fields: Sequence[str], label: str) -> list[dict[str, str]]:
+    if not path.is_file() or path.is_symlink():
+        raise ScalingError(f"{label} must be a regular, non-symlink file")
+    try:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if tuple(reader.fieldnames or ()) != tuple(expected_fields):
+                raise ScalingError(f"{label} header differs from the emitted schema")
+            rows = list(reader)
+    except (UnicodeDecodeError, csv.Error) as exc:
+        raise ScalingError(f"{label} is not valid UTF-8 CSV: {exc}") from exc
+    if not rows:
+        raise ScalingError(f"{label} has no data rows")
+    if any(None in row for row in rows):
+        raise ScalingError(f"{label} contains a row wider than its header")
+    return rows
+
+
+def _csv_int(text: Any, label: str, *, minimum: int = 0) -> int:
+    if not isinstance(text, str) or re.fullmatch(r"0|[1-9][0-9]*", text) is None:
+        raise ScalingError(f"{label} must be a canonical non-negative integer")
+    value = int(text)
+    if value < minimum:
+        raise ScalingError(f"{label} must be >= {minimum}")
+    return value
+
+
+def _csv_float(text: Any, label: str, *, minimum: float | None = None) -> float:
+    if not isinstance(text, str) or not text:
+        raise ScalingError(f"{label} must be a finite number")
+    try:
+        value = float(text)
+    except ValueError as exc:
+        raise ScalingError(f"{label} must be a finite number") from exc
+    if not math.isfinite(value) or (minimum is not None and value < minimum):
+        raise ScalingError(f"{label} must be finite and >= {minimum}")
+    return value
+
+
+def _nearest_rank(values: Sequence[float], quantile: float) -> float:
+    if not values:
+        raise ScalingError("cannot compute a stability percentile without values")
+    ordered = sorted(values)
+    index = max(0, math.ceil(quantile * len(ordered)) - 1)
+    return float(ordered[index])
+
+
+def _median(values: Sequence[float]) -> float:
+    if not values:
+        raise ScalingError("cannot compute a stability median without values")
+    ordered = sorted(values)
+    midpoint = len(ordered) // 2
+    if len(ordered) % 2:
+        return float(ordered[midpoint])
+    return (float(ordered[midpoint - 1]) + float(ordered[midpoint])) / 2.0
+
+
+def _expected_learning_rate(
+    step: int, point: Mapping[str, Any], suite: Mapping[str, Any]
+) -> float:
+    """Reproduce the trainer's JAX float32 warmup/cosine schedule exactly."""
+
+    step32 = np.asarray(step, dtype=np.float32)
+    warmup_steps = int(point["warmup_steps"])
+    warmup = (
+        np.minimum(np.float32(1.0), step32 / np.float32(warmup_steps))
+        if warmup_steps
+        else np.asarray(1.0, dtype=np.float32)
+    )
+    decay_span = max(1, int(point["steps"]) - warmup_steps)
+    progress = np.clip(
+        (step32 - np.float32(warmup_steps)) / np.float32(decay_span),
+        np.float32(0.0),
+        np.float32(1.0),
+    )
+    cosine = np.float32(0.5) * (
+        np.float32(1.0) + np.cos(np.float32(np.pi) * progress)
+    )
+    min_ratio = np.float32(suite["optimizer"]["min_lr_ratio"])
+    multiplier = min_ratio + (np.float32(1.0) - min_ratio) * cosine
+    return float(np.float32(point["learning_rate"]) * warmup * multiplier)
+
+
+def _stability_artifact_path(
+    artifact_root: Path, point_name: str, filename: str
+) -> Path:
+    path = artifact_root / point_name / "artifacts" / filename
+    if not path.is_file() or path.is_symlink():
+        raise ScalingError(
+            f"{point_name}: stability evidence is missing or symlinked: {filename}"
+        )
+    return path
+
+
+def _classify_stability_series(
+    policy: Mapping[str, Any],
+    *,
+    probe_steps: Sequence[int],
+    probe_losses: Sequence[float],
+    gradients: Sequence[float],
+    training_losses: Sequence[float],
+    final_block_parameter_l2: Sequence[float],
+) -> dict[str, Any]:
+    """Apply the frozen temporal gates to already-validated numeric series."""
+
+    consecutive = int(policy["probe_regression_consecutive"])
+    probe_threshold = float(policy["probe_regression_threshold"])
+    probe_flags: list[bool] = []
+    best_preceding = float(probe_losses[0])
+    for index, loss in enumerate(probe_losses):
+        regression = float(loss) - best_preceding
+        probe_flags.append(
+            index > 0
+            and (
+                regression > probe_threshold
+                or math.isclose(
+                    regression, probe_threshold, rel_tol=0.0, abs_tol=1e-12
+                )
+            )
+        )
+        best_preceding = min(best_preceding, float(loss))
+    probe_triggers = [
+        int(probe_steps[index])
+        for index in range(consecutive - 1, len(probe_flags))
+        if all(probe_flags[index - offset] for offset in range(consecutive))
+    ]
+    maximum_probe_regression = max(
+        (
+            float(probe_losses[index]) - min(probe_losses[:index])
+            for index in range(1, len(probe_losses))
+        ),
+        default=0.0,
+    )
+
+    window = int(policy["trailing_window_steps"])
+    if len(gradients) < window * 2 or len(training_losses) != len(gradients):
+        raise ScalingError("training schedule is too short for two stability windows")
+    gradient_threshold = float(policy["gradient_norm_threshold"])
+    fraction_limit = float(policy["maximum_large_gradient_fraction"])
+    large_count = sum(value > gradient_threshold for value in gradients[:window])
+    maximum_gradient_fraction = large_count / window
+    gradient_first: int | None = window if maximum_gradient_fraction >= fraction_limit else None
+    gradient_count = 1 if gradient_first is not None else 0
+    for end in range(window, len(gradients)):
+        large_count += gradients[end] > gradient_threshold
+        large_count -= gradients[end - window] > gradient_threshold
+        fraction = large_count / window
+        maximum_gradient_fraction = max(maximum_gradient_fraction, fraction)
+        if fraction >= fraction_limit:
+            if gradient_first is None:
+                gradient_first = end + 1
+            gradient_count += 1
+
+    cumulative = [0.0]
+    for loss in training_losses:
+        cumulative.append(cumulative[-1] + float(loss))
+    window_means = [
+        (cumulative[end] - cumulative[end - window]) / window
+        for end in range(window, len(training_losses) + 1)
+    ]
+    loss_threshold = float(policy["train_loss_window_regression_threshold"])
+    loss_first: int | None = None
+    loss_count = 0
+    maximum_loss_regression = 0.0
+    best_prior = window_means[0]
+    for index, mean in enumerate(window_means[1:], 1):
+        regression = mean - best_prior
+        maximum_loss_regression = max(maximum_loss_regression, regression)
+        if regression > loss_threshold or math.isclose(
+            regression, loss_threshold, rel_tol=0.0, abs_tol=1e-12
+        ):
+            if loss_first is None:
+                loss_first = window + index
+            loss_count += 1
+        best_prior = min(best_prior, mean)
+
+    block_median = _median(final_block_parameter_l2)
+    block_ratio = max(final_block_parameter_l2) / block_median
+    hard_reasons: list[str] = []
+    witnesses: dict[str, dict[str, Any]] = {}
+    if probe_triggers:
+        hard_reasons.append("consecutive_fixed_prefix_probe_regression")
+        witnesses[hard_reasons[-1]] = {
+            "first_trigger_step": probe_triggers[0],
+            "trigger_count": len(probe_triggers),
+            "maximum_regression": maximum_probe_regression,
+        }
+    if gradient_first is not None:
+        hard_reasons.append("trailing_window_large_gradient_fraction")
+        witnesses[hard_reasons[-1]] = {
+            "first_trigger_step": gradient_first,
+            "trigger_count": gradient_count,
+            "maximum_fraction": maximum_gradient_fraction,
+        }
+    if loss_first is not None:
+        hard_reasons.append("trailing_window_train_loss_regression")
+        witnesses[hard_reasons[-1]] = {
+            "first_trigger_step": loss_first,
+            "trigger_count": loss_count,
+            "maximum_regression": maximum_loss_regression,
+        }
+    suspect_reasons = (
+        ["final_block_parameter_l2_imbalance"]
+        if block_ratio
+        > float(policy["maximum_final_block_param_l2_to_median"])
+        else []
+    )
+    classification = (
+        "rejected" if hard_reasons else "suspect" if suspect_reasons else "stable"
+    )
+    return {
+        "classification": classification,
+        "reasons": hard_reasons + suspect_reasons,
+        "witnesses": witnesses,
+        "summaries": {
+            "best_probe_loss": min(probe_losses),
+            "maximum_probe_regression_from_best_preceding": maximum_probe_regression,
+            "gradient_median": _median(gradients),
+            "gradient_maximum": max(gradients),
+            "large_gradient_count": sum(
+                value > gradient_threshold for value in gradients
+            ),
+            "maximum_trailing_large_gradient_fraction": maximum_gradient_fraction,
+            "best_trailing_train_loss_window_mean": min(window_means),
+            "final_trailing_train_loss_window_mean": window_means[-1],
+            "maximum_train_loss_window_regression_from_best_prior": maximum_loss_regression,
+            "final_block_parameter_l2": list(final_block_parameter_l2),
+            "final_max_block_parameter_l2_to_median": block_ratio,
+        },
+    }
+
+
+def _validate_stability_evidence(
+    suite: Mapping[str, Any],
+    point: Mapping[str, Any],
+    *,
+    artifact_root: Path,
+    result: Mapping[str, Any],
+    metrics: Mapping[str, Any],
+    validation_loss: float,
+    fresh10_result: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Validate every emitted curve row and apply the frozen v4 gate.
+
+    Structural corruption is an error.  A complete, finite run that crossed a
+    frozen instability threshold remains valid raw evidence but is
+    explicitly rejected from LR selection and all downstream fitting.
+    """
+
+    policy = suite.get("stability_admission")
+    if not isinstance(policy, Mapping):
+        return None
+    name = str(point["id"])
+    expected_artifacts = {
+        "training_curve": "training.csv",
+        "validation_curve": "validation.csv",
+        "diagnostics": "diagnostics.csv",
+    }
+    if dict(_mapping(result.get("artifacts"), f"{name}.artifacts")) != expected_artifacts:
+        raise ScalingError(
+            f"{name}: stability admission requires all three canonical curve artifacts"
+        )
+    paths = {
+        key: _stability_artifact_path(artifact_root, name, filename)
+        for key, filename in expected_artifacts.items()
+    }
+    steps = int(point["steps"])
+    tokens_per_step = int(suite["batch_size"]) * int(suite["sequence_length"])
+    flops_per_step = int(point["flops_per_token"]) * tokens_per_step
+
+    training_rows = _csv_rows(
+        paths["training_curve"], _TRAINING_CSV_FIELDS, f"{name}.training.csv"
+    )
+    if len(training_rows) != steps:
+        raise ScalingError(
+            f"{name}: training.csv must contain exactly one row per optimizer step"
+        )
+    gradients: list[float] = []
+    training_losses: list[float] = []
+    for expected_step, row in enumerate(training_rows, 1):
+        label = f"{name}.training.csv:{expected_step + 1}"
+        step = _csv_int(row["step"], f"{label}.step", minimum=1)
+        tokens = _csv_int(row["tokens_processed"], f"{label}.tokens", minimum=1)
+        flops = _csv_int(
+            row["cumulative_estimated_flops"], f"{label}.flops", minimum=1
+        )
+        if (
+            step != expected_step
+            or tokens != expected_step * tokens_per_step
+            or flops != expected_step * flops_per_step
+        ):
+            raise ScalingError(
+                f"{label} step/token/FLOP coordinates differ from the suite"
+            )
+        training_losses.append(
+            _csv_float(row["train_loss"], f"{label}.train_loss", minimum=0.0)
+        )
+        observed_lr = _csv_float(
+            row["learning_rate"], f"{label}.learning_rate", minimum=0.0
+        )
+        expected_lr = _expected_learning_rate(expected_step, point, suite)
+        if not math.isclose(
+            observed_lr, expected_lr, rel_tol=2e-6, abs_tol=1e-12
+        ):
+            raise ScalingError(
+                f"{label}.learning_rate differs from the configured float32 "
+                "schedule within the pinned tolerance"
+            )
+        if observed_lr < 0.0 or observed_lr > float(point["learning_rate"]) * (1.0 + 2e-6):
+            raise ScalingError(f"{label}.learning_rate is outside the configured range")
+        gradients.append(
+            _csv_float(row["grad_norm"], f"{label}.grad_norm", minimum=0.0)
+        )
+    if not math.isclose(
+        training_losses[-1],
+        _finite(metrics.get("train_loss"), f"{name}.metrics.train_loss"),
+        rel_tol=1e-12,
+        abs_tol=1e-12,
+    ):
+        raise ScalingError(f"{name}: training.csv final loss differs from result.json")
+
+    validation_rows = _csv_rows(
+        paths["validation_curve"],
+        _VALIDATION_CSV_FIELDS,
+        f"{name}.validation.csv",
+    )
+    probe_steps = list(range(int(point["val_every"]), steps, int(point["val_every"])))
+    if len(validation_rows) != len(probe_steps) + 12:
+        raise ScalingError(f"{name}: validation.csv row count differs from the schedule")
+    probe_losses: list[float] = []
+    for index, expected_step in enumerate(probe_steps):
+        row = validation_rows[index]
+        label = f"{name}.validation.csv:{index + 2}"
+        loss = _csv_float(
+            row["validation_loss"], f"{label}.validation_loss", minimum=0.0
+        )
+        perplexity = _csv_float(
+            row["perplexity"], f"{label}.perplexity", minimum=0.0
+        )
+        if (
+            _csv_int(row["step"], f"{label}.step", minimum=1) != expected_step
+            or _csv_int(row["tokens_processed"], f"{label}.tokens", minimum=1)
+            != expected_step * tokens_per_step
+            or row["kind"] != "fineweb_probe"
+            or row["domain"] != "fineweb"
+            or _csv_int(
+                row["validation_tokens"], f"{label}.validation_tokens", minimum=1
+            )
+            != 8 * tokens_per_step
+            or row["canonical"] != "false"
+            or not math.isclose(math.log(perplexity), loss, rel_tol=1e-9, abs_tol=1e-12)
+        ):
+            raise ScalingError(f"{label} differs from the fixed-prefix probe contract")
+        _csv_float(
+            row["validation_seconds"], f"{label}.validation_seconds", minimum=0.0
+        )
+        probe_losses.append(loss)
+    consecutive_probes = int(policy["probe_regression_consecutive"])
+    if len(probe_losses) <= consecutive_probes:
+        raise ScalingError(
+            f"{name}: too few fixed-prefix probes for stability admission"
+        )
+
+    final_rows = validation_rows[len(probe_steps) :]
+
+    def validate_final_row(
+        row: Mapping[str, str],
+        *,
+        offset: int,
+        kind: str,
+        domain: str,
+        validation_tokens: int,
+        expected_loss: float,
+        canonical: str,
+    ) -> None:
+        label = f"{name}.validation.csv:{len(probe_steps) + offset + 2}"
+        loss = _csv_float(
+            row["validation_loss"], f"{label}.validation_loss", minimum=0.0
+        )
+        perplexity = _csv_float(
+            row["perplexity"], f"{label}.perplexity", minimum=0.0
+        )
+        if (
+            _csv_int(row["step"], f"{label}.step", minimum=1) != steps
+            or _csv_int(row["tokens_processed"], f"{label}.tokens", minimum=1)
+            != steps * tokens_per_step
+            or row["kind"] != kind
+            or row["domain"] != domain
+            or _csv_int(
+                row["validation_tokens"], f"{label}.validation_tokens", minimum=1
+            )
+            != validation_tokens
+            or row["canonical"] != canonical
+            or not math.isclose(loss, expected_loss, rel_tol=1e-12, abs_tol=1e-12)
+            or not math.isclose(math.log(perplexity), loss, rel_tol=1e-9, abs_tol=1e-12)
+        ):
+            raise ScalingError(f"{label} differs from the final evaluation contract")
+        _csv_float(
+            row["validation_seconds"], f"{label}.validation_seconds", minimum=0.0
+        )
+
+    validate_final_row(
+        final_rows[0],
+        offset=0,
+        kind="fineweb",
+        domain="fineweb",
+        validation_tokens=int(suite["validation_tokens"]),
+        expected_loss=validation_loss,
+        canonical="true",
+    )
+    domain_losses = _mapping(
+        fresh10_result["domain_losses"], f"{name}.fresh10_domain_losses"
+    )
+    for offset, domain in enumerate(FRESH10_DOMAINS, 1):
+        validate_final_row(
+            final_rows[offset],
+            offset=offset,
+            kind="downstream",
+            domain=domain,
+            validation_tokens=int(suite["fresh10"]["scored_tokens_per_domain"]),
+            expected_loss=float(domain_losses[domain]),
+            canonical="false",
+        )
+    validate_final_row(
+        final_rows[-1],
+        offset=11,
+        kind="downstream_macro",
+        domain="fresh10_macro",
+        validation_tokens=int(suite["fresh10"]["scored_tokens"]),
+        expected_loss=float(fresh10_result["macro_loss"]),
+        canonical="false",
+    )
+    if metrics.get("validation_probe_count") != len(probe_steps):
+        raise ScalingError(f"{name}: result validation probe count differs from CSV")
+
+    diagnostics_rows = _csv_rows(
+        paths["diagnostics"],
+        _DIAGNOSTICS_CSV_FIELDS,
+        f"{name}.diagnostics.csv",
+    )
+    diagnostic_steps = sorted(
+        {1, steps, *range(int(point["diagnostics_every"]), steps + 1, int(point["diagnostics_every"]))}
+    )
+    scopes = (
+        (("overall", None), ("embeddings", None))
+        + tuple(("block", layer) for layer in range(int(point["layers"])))
+        + (("final_norm", None),)
+    )
+    expected_grid = {
+        (scope, layer, family, statistic)
+        for scope, layer in scopes
+        for family in _DIAGNOSTIC_FAMILIES
+        for statistic in _DIAGNOSTIC_STATS
+    }
+    expected_row_count = len(diagnostic_steps) * len(expected_grid)
+    if len(diagnostics_rows) != expected_row_count:
+        raise ScalingError(f"{name}: diagnostics.csv row count differs from schedule")
+    identities_by_step: dict[int, set[tuple[str, int | None, str, str]]] = {}
+    element_counts: dict[tuple[str, int | None], int] = {}
+    overall_parameter_l2: dict[int, float] = {}
+    overall_gradient_l2: dict[int, float] = {}
+    final_block_parameter_l2: dict[int, float] = {}
+    allowed_steps = set(diagnostic_steps)
+    allowed_scopes = set(scopes)
+    for index, row in enumerate(diagnostics_rows, 2):
+        label = f"{name}.diagnostics.csv:{index}"
+        step = _csv_int(row["step"], f"{label}.step", minimum=1)
+        if step not in allowed_steps:
+            raise ScalingError(f"{label}.step is outside the diagnostic schedule")
+        if (
+            _csv_int(row["tokens_processed"], f"{label}.tokens", minimum=1)
+            != step * tokens_per_step
+            or _csv_int(
+                row["cumulative_estimated_flops"], f"{label}.flops", minimum=1
+            )
+            != step * flops_per_step
+        ):
+            raise ScalingError(f"{label} token/FLOP coordinates differ from training")
+        scope = row["scope"]
+        layer_text = row["layer"]
+        layer = (
+            _csv_int(layer_text, f"{label}.layer")
+            if scope == "block"
+            else None
+        )
+        if (scope != "block" and layer_text) or (scope, layer) not in allowed_scopes:
+            raise ScalingError(f"{label} scope/layer is invalid")
+        family = row["family"]
+        statistic = row["stat"]
+        identity = (scope, layer, family, statistic)
+        if family not in _DIAGNOSTIC_FAMILIES or statistic not in _DIAGNOSTIC_STATS:
+            raise ScalingError(f"{label} family/stat is invalid")
+        step_identities = identities_by_step.setdefault(step, set())
+        if identity in step_identities:
+            raise ScalingError(f"{label} duplicates a diagnostic identity")
+        step_identities.add(identity)
+        count = _csv_int(row["element_count"], f"{label}.element_count", minimum=1)
+        prior_count = element_counts.setdefault((scope, layer), count)
+        if prior_count != count:
+            raise ScalingError(f"{label} element count changes across diagnostic steps")
+        value = _csv_float(row["value"], f"{label}.value")
+        if statistic in {"l1_norm", "l2_norm", "std", "fourth_moment"} and value < 0.0:
+            raise ScalingError(f"{label} non-negative diagnostic is negative")
+        if identity == ("overall", None, "param", "l2_norm"):
+            overall_parameter_l2[step] = value
+        if identity == ("overall", None, "grad", "l2_norm"):
+            overall_gradient_l2[step] = value
+        if (
+            step == steps
+            and scope == "block"
+            and family == "param"
+            and statistic == "l2_norm"
+            and layer is not None
+        ):
+            final_block_parameter_l2[layer] = value
+    if set(identities_by_step) != allowed_steps or any(
+        identities != expected_grid for identities in identities_by_step.values()
+    ):
+        raise ScalingError(f"{name}: diagnostics.csv has an incomplete diagnostic grid")
+    expected_counts = {
+        ("overall", None): int(point["parameters"]),
+        ("embeddings", None): (
+            int(suite["vocab_size"]) + int(suite["sequence_length"])
+        )
+        * int(point["d_model"]),
+        ("final_norm", None): 2 * int(point["d_model"]),
+        **{
+            ("block", layer): 12 * int(point["d_model"]) ** 2
+            + 13 * int(point["d_model"])
+            for layer in range(int(point["layers"]))
+        },
+    }
+    if element_counts != expected_counts:
+        raise ScalingError(f"{name}: diagnostic scope element counts differ from model")
+    for step in diagnostic_steps:
+        if overall_gradient_l2[step] != gradients[step - 1]:
+            raise ScalingError(
+                f"{name}: diagnostics gradient norm differs from training.csv at step {step}"
+            )
+    if metrics.get("diagnostic_point_count") != len(diagnostic_steps):
+        raise ScalingError(f"{name}: result diagnostic point count differs from CSV")
+
+    block_l2_values = [
+        final_block_parameter_l2[layer] for layer in sorted(final_block_parameter_l2)
+    ]
+    if len(block_l2_values) != int(point["layers"]):
+        raise ScalingError(f"{name}: final block parameter L2 diagnostics are incomplete")
+    decision = _classify_stability_series(
+        policy,
+        probe_steps=probe_steps,
+        probe_losses=probe_losses,
+        gradients=gradients,
+        training_losses=training_losses,
+        final_block_parameter_l2=block_l2_values,
+    )
+    classification = str(decision["classification"])
+    reasons = list(decision["reasons"])
+    witnesses = dict(decision["witnesses"])
+    payload = {
+        "schema_version": 1,
+        "method": "full_curve_temporal_stability_v1",
+        "suite_id": suite["suite_id"],
+        "suite_sha256": suite["suite_sha256"],
+        "execution_fingerprint": suite["execution_fingerprint"],
+        "point": _public_point(point),
+        "config_sha256": point["config_sha256"],
+        "policy_sha256": _canonical_mapping_sha256(dict(policy)),
+        "validation_tolerances": {
+            "learning_rate_relative": 2e-6,
+            "learning_rate_absolute": 1e-12,
+            "inclusive_threshold_absolute": 1e-12,
+        },
+        "classification": classification,
+        "admitted": classification == "stable",
+        "reasons": reasons,
+        "witnesses": witnesses,
+        "policy": dict(policy),
+        "evidence": {
+            key: {
+                "path": f"{name}/artifacts/{expected_artifacts[key]}",
+                "sha256": _sha256(path),
+                "bytes": path.stat().st_size,
+                "rows": len(
+                    training_rows
+                    if key == "training_curve"
+                    else validation_rows
+                    if key == "validation_curve"
+                    else diagnostics_rows
+                ),
+                "header": list(
+                    _TRAINING_CSV_FIELDS
+                    if key == "training_curve"
+                    else _VALIDATION_CSV_FIELDS
+                    if key == "validation_curve"
+                    else _DIAGNOSTICS_CSV_FIELDS
+                ),
+            }
+            for key, path in paths.items()
+        },
+        "counts": {
+            "training_steps": len(training_rows),
+            "fixed_prefix_probes": len(probe_losses),
+            "diagnostic_points": len(diagnostic_steps),
+            "diagnostic_rows": len(diagnostics_rows),
+        },
+        "summaries": {
+            **dict(decision["summaries"]),
+            "learning_rate_first": float(training_rows[0]["learning_rate"]),
+            "learning_rate_peak": max(
+                float(row["learning_rate"]) for row in training_rows
+            ),
+            "learning_rate_final": float(training_rows[-1]["learning_rate"]),
+            "initial_parameter_l2": overall_parameter_l2[1],
+            "final_parameter_l2": overall_parameter_l2[steps],
+        },
+    }
+    admission_path = artifact_root / name / "artifacts" / "stability-admission.json"
+    _write_immutable_bytes(
+        admission_path,
+        (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+    )
+    payload["artifact"] = {
+        "path": f"{name}/artifacts/stability-admission.json",
+        "sha256": _sha256(admission_path),
+        "bytes": admission_path.stat().st_size,
+    }
+    return payload
+
+
+def _require_stable_measurement(measurement: Mapping[str, Any]) -> None:
+    stability = measurement.get("stability_admission")
+    if isinstance(stability, Mapping) and stability.get("classification") != "stable":
+        reasons = stability.get("reasons")
+        detail = ", ".join(str(item) for item in reasons) if isinstance(reasons, list) else "unknown"
+        raise ScalingError(
+            f"{measurement.get('id')}: rejected by stability admission ({detail})"
+        )
+
+
 def _read_run(
     suite: Mapping[str, Any], point: Mapping[str, Any], root: Path
 ) -> dict[str, Any]:
@@ -3045,6 +3921,15 @@ def _read_run(
     fresh10_result = _validated_fresh10_result(
         evaluations["fresh10"], suite, label=f"{name}.evaluations.fresh10"
     )
+    stability = _validate_stability_evidence(
+        suite,
+        point,
+        artifact_root=artifact_root,
+        result=result,
+        metrics=metrics,
+        validation_loss=validation_loss,
+        fresh10_result=fresh10_result,
+    )
     measurement = {
         "id": name,
         "slice": point["slice"],
@@ -3073,61 +3958,128 @@ def _read_run(
         "_fresh10_provenance": run_manifest["fresh10"],
         "_runtime_provenance": run_manifest["runtime"],
     }
+    if stability is not None:
+        measurement["stability_admission"] = stability
+        measurement["stability_admission_path"] = stability["artifact"]["path"]
+        measurement["stability_admission_sha256"] = stability["artifact"]["sha256"]
     if lineage_public is not None:
         measurement["lineage"] = lineage_public
     return measurement
 
 
 def select_learning_rate(
-    suite: Mapping[str, Any], *, shape_id: str, runs_path: Path
+    suite: Mapping[str, Any],
+    *,
+    shape_id: str,
+    runs_path: Path,
+    slice_id: str | None = None,
 ) -> dict[str, Any]:
-    """Select one shape's LR by its completed c025 canonical validation loss."""
+    """Select a stable, bracketed LR for one slice/shape calibration."""
 
     root = runs_path.expanduser().resolve()
     _validate_lineage_output_root(suite, root, label="learning-rate selection root")
-    _validate_adaptive_completion_prefix(suite, shape_id, root)
+    calibration_slice = _calibration_slice_id(suite, slice_id)
+    group_label = (
+        f"{calibration_slice}/{shape_id}"
+        if _per_slice_learning_rates(suite)
+        else shape_id
+    )
+    _validate_adaptive_completion_prefix(
+        suite, shape_id, root, slice_id=slice_id
+    )
     initial_candidates = [
         point
         for point in suite["calibrations"] + suite["extension_calibrations"]
-        if point["shape_id"] == shape_id
+        if point["shape_id"] == shape_id and point["slice"] == calibration_slice
     ]
     if len(initial_candidates) != len(suite["learning_rate_candidates"]):
-        raise ScalingError(f"{shape_id}: incomplete learning-rate candidate definition")
+        raise ScalingError(f"{group_label}: incomplete learning-rate candidate definition")
     adaptive_candidates = [
         point
         for point in suite["adaptive_calibrations"]
-        if point["shape_id"] == shape_id
+        if point["shape_id"] == shape_id and point["slice"] == calibration_slice
     ]
     candidates = sorted(
         initial_candidates + adaptive_candidates,
         key=lambda point: float(point["learning_rate"]),
     )
-    for point in initial_candidates:
-        if not _point_has_result(suite, point, root):
-            raise ScalingError(f"{shape_id}: initial learning-rate grid is incomplete")
     completed = [
         point
         for point in candidates
         if _point_has_result(suite, point, root)
     ]
+    initial_completed = [point for point in initial_candidates if point in completed]
+    if not _per_slice_learning_rates(suite) and len(initial_completed) != len(initial_candidates):
+        raise ScalingError(f"{group_label}: initial learning-rate grid is incomplete")
+    if _per_slice_learning_rates(suite) and len(completed) < 2:
+        raise ScalingError(
+            f"{group_label}: at least two contiguous learning-rate trials are required"
+        )
     measured = [_read_run(suite, point, root) for point in completed]
     dataset_identity = _coherent_dataset_identity(measured)
     fresh10_identity = _coherent_fresh10_identity(measured)
     runtime_identity = _coherent_auxiliary_identity(
         measured, "_runtime_provenance", "runtime identity"
     )
+    stable = [
+        item
+        for item in measured
+        if not isinstance(item.get("stability_admission"), Mapping)
+        or item["stability_admission"].get("classification") == "stable"
+    ]
+    if not stable:
+        raise ScalingError(f"{group_label}: no stable learning-rate candidates")
     selected = min(
-        measured,
+        stable,
         key=lambda item: (float(item["validation_loss"]), float(item["learning_rate"])),
     )
     selected_index = measured.index(selected)
-    if selected_index in (0, len(measured) - 1):
-        side = "lower" if selected_index == 0 else "upper"
+    lower_neighbor = measured[selected_index - 1] if selected_index else None
+    lower_stability = (
+        lower_neighbor.get("stability_admission")
+        if isinstance(lower_neighbor, Mapping)
+        else None
+    )
+    lower_is_stable = lower_neighbor is not None and (
+        not isinstance(lower_stability, Mapping)
+        or lower_stability.get("classification") == "stable"
+    )
+    if not lower_is_stable:
         raise LearningRateEdgeError(
-            shape_id, side, float(selected["learning_rate"])
+            shape_id,
+            "lower",
+            float(selected["learning_rate"]),
+            slice_id=(calibration_slice if _per_slice_learning_rates(suite) else None),
+        )
+    if selected_index == len(measured) - 1:
+        raise LearningRateEdgeError(
+            shape_id,
+            "upper",
+            float(selected["learning_rate"]),
+            slice_id=(calibration_slice if _per_slice_learning_rates(suite) else None),
+        )
+    upper_neighbor = measured[selected_index + 1]
+    upper_stability = upper_neighbor.get("stability_admission")
+    upper_is_stable = (
+        not isinstance(upper_stability, Mapping)
+        or upper_stability.get("classification") == "stable"
+    )
+    if (
+        upper_is_stable
+        and float(upper_neighbor["validation_loss"])
+        < float(selected["validation_loss"])
+    ):
+        raise ScalingError(
+            f"{group_label}: selected LR is not the lowest-loss stable candidate"
         )
     payload = {
-        "schema_version": 3 if _lineage_summary(suite) is not None else 2,
+        "schema_version": (
+            4
+            if _per_slice_learning_rates(suite)
+            else 3
+            if _lineage_summary(suite) is not None
+            else 2
+        ),
         "suite_id": suite["suite_id"],
         "suite_sha256": suite["suite_sha256"],
         "execution_fingerprint": suite["execution_fingerprint"],
@@ -3138,11 +4090,16 @@ def select_learning_rate(
             "manifest_canonical_sha256"
         ],
         "runtime": runtime_identity,
+        "slice": calibration_slice,
         "shape_id": shape_id,
         "criterion": (
-            "interior minimum canonical 99,975,168-token validation loss at c025"
+            "lowest canonical validation loss among stable candidates, with a "
+            "stable lower-LR neighbor and an adjacent completed upper boundary"
         ),
-        "edge_policy": "geometric expansion exhausted only after an interior winner",
+        "edge_policy": (
+            "never cross the first suspect/rejected high-LR frontier; an adjacent "
+            "ineligible trial closes the upper bracket"
+        ),
         "seed_count": 1,
         "study_lineage": _lineage_summary(suite),
         "candidates": [
@@ -3156,8 +4113,16 @@ def select_learning_rate(
                         "result",
                         "result_sha256",
                         "run_manifest_sha256",
+                        "stability_admission_path",
+                        "stability_admission_sha256",
                     )
+                    if key in item
                 },
+                **(
+                    {"stability_admission": item["stability_admission"]}
+                    if "stability_admission" in item
+                    else {}
+                ),
                 **({"lineage": item["lineage"]} if "lineage" in item else {}),
             }
             for item in measured
@@ -3165,8 +4130,19 @@ def select_learning_rate(
         "selected_point_id": selected["id"],
         "selected_learning_rate": selected["learning_rate"],
         "selected_validation_loss": selected["validation_loss"],
+        "lower_boundary_point_id": lower_neighbor["id"],
+        "upper_boundary_point_id": upper_neighbor["id"],
+        "upper_boundary_classification": (
+            upper_stability.get("classification")
+            if isinstance(upper_stability, Mapping)
+            else "legacy_unclassified"
+        ),
     }
-    selection_path = _learning_rate_selection_path(root, shape_id)
+    selection_path = _learning_rate_selection_path(
+        root,
+        shape_id,
+        slice_id=(calibration_slice if _per_slice_learning_rates(suite) else None),
+    )
     if selection_path.is_symlink():
         raise ScalingError(
             f"learning-rate selection must not be a symlink: {selection_path}"
@@ -3179,12 +4155,16 @@ def select_learning_rate(
 
 
 def _selected_calibration_run(
-    suite: Mapping[str, Any], shape_id: str, runs_root: Path
+    suite: Mapping[str, Any],
+    shape_id: str,
+    runs_root: Path,
+    *,
+    slice_id: str | None = None,
 ) -> dict[str, Any]:
     # Recompute the selection from all completed immutable calibration runs.
     # `_write_immutable_bytes` makes any edited/stale selection fail closed.
     selection = select_learning_rate(
-        suite, shape_id=shape_id, runs_path=runs_root
+        suite, shape_id=shape_id, slice_id=slice_id, runs_path=runs_root
     )
     selected_id = selection.get("selected_point_id")
     candidate = next(
@@ -3195,13 +4175,17 @@ def _selected_calibration_run(
                 + suite["extension_calibrations"]
                 + suite["adaptive_calibrations"]
             )
-            if point["id"] == selected_id and point["shape_id"] == shape_id
+            if point["id"] == selected_id
+            and point["shape_id"] == shape_id
+            and point["slice"] == _calibration_slice_id(suite, slice_id)
         ),
         None,
     )
     if candidate is None:
         raise ScalingError(f"{shape_id}: selected calibration point is not in the suite")
-    return _read_run(suite, candidate, runs_root)
+    measurement = _read_run(suite, candidate, runs_root)
+    _require_stable_measurement(measurement)
+    return measurement
 
 
 def _coherent_dataset_identity(
@@ -3348,6 +4332,8 @@ def _fit_slice(
     target_total_flops: int,
     random_seed: int = 20_260_813,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray] | None]:
+    for point in points:
+        _require_stable_measurement(point)
     ordered = sorted(points, key=lambda item: int(item["parameters"]))
     if len(ordered) < 5:
         raise ScalingError(f"{slice_id}: at least five measured points are required")
@@ -3471,28 +4457,150 @@ def _warrants_high_side_extension(fitted: Mapping[str, Any]) -> bool:
     return optimum_x >= math.log(largest_parameters / anchor)
 
 
+def _completed_v4_extensions_for_fit(
+    suite: Mapping[str, Any],
+    root: Path,
+    measured_fit: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Validate and read the prospective optional model-size frontier."""
+
+    completed: list[dict[str, Any]] = []
+    for slice_index, compute_slice in enumerate(suite["compute_slices"]):
+        slice_id = str(compute_slice["id"])
+        extension_states: list[tuple[str, bool]] = []
+        for shape in suite["optional_extension_shapes"]:
+            shape_id = str(shape["shape_id"])
+            selection_path = _learning_rate_selection_path(
+                root, shape_id, slice_id=slice_id
+            )
+            candidates = [
+                point
+                for point in (
+                    suite["extension_calibrations"]
+                    + suite["adaptive_calibrations"]
+                )
+                if point["slice"] == slice_id
+                and point["shape_id"] == shape_id
+            ]
+            raw_evidence = any(
+                (
+                    root
+                    / str(point["id"])
+                    / "artifacts"
+                    / "result.json"
+                ).exists()
+                or (
+                    root
+                    / str(point["id"])
+                    / "artifacts"
+                    / "result.json"
+                ).is_symlink()
+                for point in candidates
+            )
+            derived_evidence = selection_path.exists() or selection_path.is_symlink()
+            extension_states.append((shape_id, raw_evidence or derived_evidence))
+
+        gap_shape: str | None = None
+        for shape_id, begun in extension_states:
+            if not begun:
+                if gap_shape is None:
+                    gap_shape = shape_id
+                continue
+            if gap_shape is not None:
+                raise ScalingError(
+                    f"{slice_id}: optional extension evidence is not a "
+                    f"model-size prefix: {shape_id} exists before {gap_shape}"
+                )
+
+        prior = [item for item in measured_fit if item["slice"] == slice_id]
+        first_missing: str | None = None
+        for extension_index, (shape_id, begun) in enumerate(extension_states):
+            if not begun:
+                first_missing = shape_id
+                break
+            # Recompute the selection from raw curves even when a derived JSON
+            # exists. A crash after any extension result but before selection
+            # therefore fails closed if its LR bracket is not complete.
+            measurement = _selected_calibration_run(
+                suite, shape_id, root, slice_id=slice_id
+            )
+            prior_fit, _ = _fit_slice(
+                prior,
+                slice_id=slice_id,
+                target_total_flops=int(compute_slice["target_total_flops"]),
+                random_seed=20_260_900 + slice_index * 10 + extension_index,
+            )
+            if prior_fit["bracketed"] or not _warrants_high_side_extension(prior_fit):
+                reason = (
+                    "the preceding model-size grid is already bracketed"
+                    if prior_fit["bracketed"]
+                    else "the preceding model-size grid does not warrant a high-side extension"
+                )
+                raise ScalingError(
+                    f"{slice_id}/{shape_id}: optional extension evidence lies "
+                    f"beyond the prospective model-size stopping frontier: {reason}"
+                )
+            completed.append(measurement)
+            prior.append(measurement)
+        if first_missing is not None:
+            current_fit, _ = _fit_slice(
+                prior,
+                slice_id=slice_id,
+                target_total_flops=int(compute_slice["target_total_flops"]),
+                random_seed=20_260_950 + slice_index,
+            )
+            if (
+                not current_fit["bracketed"]
+                and _warrants_high_side_extension(current_fit)
+            ):
+                raise ScalingError(
+                    f"{slice_id}: optional extension frontier is incomplete; "
+                    f"the current model-size grid still warrants {first_missing}"
+                )
+    return completed
+
+
 def fit_results(suite: Mapping[str, Any], runs_path: Path) -> dict[str, Any]:
     root = _validate_lineage_output_root(suite, runs_path, label="fit --runs")
     if not root.is_dir() or root.is_symlink():
         raise ScalingError(f"fit --runs must be a regular directory: {root}")
-    measured_fit = [
-        _selected_calibration_run(suite, shape["shape_id"], root)
-        for shape in suite["fit_shapes"]
-    ]
-    measured_fit.extend(_read_run(suite, point, root) for point in suite["variants"])
-    completed_extensions: list[dict[str, Any]] = []
-    # A selected c025 calibration is the extension shape's c025 IsoFLOP
-    # measurement; do not spend compute rerunning an identical point.
-    for shape in suite["optional_extension_shapes"]:
-        selection_path = _learning_rate_selection_path(root, shape["shape_id"])
-        if selection_path.is_file():
-            completed_extensions.append(
-                _selected_calibration_run(suite, shape["shape_id"], root)
+    if _per_slice_learning_rates(suite):
+        measured_fit = [
+            _selected_calibration_run(
+                suite,
+                str(shape["shape_id"]),
+                root,
+                slice_id=str(compute_slice["id"]),
             )
-    for point in suite["optional_extensions"]:
-        result_path = root / point["id"] / "artifacts" / "result.json"
-        if result_path.is_file():
-            completed_extensions.append(_read_run(suite, point, root))
+            for compute_slice in suite["compute_slices"]
+            for shape in suite["fit_shapes"]
+        ]
+    else:
+        measured_fit = [
+            _selected_calibration_run(suite, shape["shape_id"], root)
+            for shape in suite["fit_shapes"]
+        ]
+        measured_fit.extend(
+            _read_run(suite, point, root) for point in suite["variants"]
+        )
+    completed_extensions: list[dict[str, Any]] = []
+    if _per_slice_learning_rates(suite):
+        completed_extensions = _completed_v4_extensions_for_fit(
+            suite, root, measured_fit
+        )
+    else:
+        # A selected c025 calibration is the extension shape's c025 IsoFLOP
+        # measurement; do not spend compute rerunning an identical point.
+        for shape in suite["optional_extension_shapes"]:
+            selection_path = _learning_rate_selection_path(root, shape["shape_id"])
+            if selection_path.is_file():
+                completed_extensions.append(
+                    _selected_calibration_run(suite, shape["shape_id"], root)
+                )
+        for point in suite["optional_extensions"]:
+            result_path = root / point["id"] / "artifacts" / "result.json"
+            if result_path.is_file():
+                completed_extensions.append(_read_run(suite, point, root))
     completed_controls: list[dict[str, Any]] = []
     for point in suite["controls"]:
         result_path = root / point["id"] / "artifacts" / "result.json"
@@ -3617,9 +4725,18 @@ def fit_results(suite: Mapping[str, Any], runs_path: Path) -> dict[str, Any]:
             "build, dense-transformer aspect family, initialization, global batch, "
             "and fixed optimizer schedule. Fit-only intervals come from quadratic "
             "residuals and exclude run-to-run noise, learning-rate uncertainty, data "
-            "quality shifts, and alternative architectures. Learning rates are "
-            "selected at 0.25 C0 and may not remain optimal at longer horizons. "
-            "It is not a universal Chinchilla law."
+            "quality shifts, and alternative architectures. "
+            + (
+                "Learning rates are independently selected with a fail-closed "
+                "stability gate for every compute-slice/model-shape pair. The "
+                "same canonical FineWeb validation set is reused across many LR "
+                "candidates for selection and again for the model-size fit; the "
+                "intervals exclude selection and multiple-comparison optimism. "
+                if _per_slice_learning_rates(suite)
+                else "Learning rates are selected at 0.25 C0 and may not remain "
+                "optimal at longer horizons. "
+            )
+            + "It is not a universal Chinchilla law."
         ),
     }
 
@@ -3728,24 +4845,30 @@ def _run_kwargs(
 
 
 def _initial_calibrations(
-    suite: Mapping[str, Any], shape_id: str
+    suite: Mapping[str, Any], shape_id: str, *, slice_id: str | None = None
 ) -> list[dict[str, Any]]:
+    calibration_slice = _calibration_slice_id(suite, slice_id)
     return [
         item
         for item in suite["calibrations"] + suite["extension_calibrations"]
-        if item["shape_id"] == shape_id
+        if item["shape_id"] == shape_id and item["slice"] == calibration_slice
     ]
 
 
 def _validate_adaptive_completion_prefix(
-    suite: Mapping[str, Any], shape_id: str, runs_root: Path
+    suite: Mapping[str, Any],
+    shape_id: str,
+    runs_root: Path,
+    *,
+    slice_id: str | None = None,
 ) -> None:
-    """Fail if either geometric LR side contains a completed-point hole."""
+    """Fail on completion holes or any run beyond an ineligible LR frontier."""
 
+    calibration_slice = _calibration_slice_id(suite, slice_id)
     points = [
         item
         for item in suite["adaptive_calibrations"]
-        if item["shape_id"] == shape_id
+        if item["shape_id"] == shape_id and item["slice"] == calibration_slice
     ]
     by_rate = {float(item["learning_rate"]): item for item in points}
     for side in ("lower", "upper"):
@@ -3765,16 +4888,92 @@ def _validate_adaptive_completion_prefix(
                 )
             if not complete:
                 gap = True
+    if not _per_slice_learning_rates(suite):
+        return
+
+    initial = _initial_calibrations(suite, shape_id, slice_id=slice_id)
+    all_points = sorted(
+        initial + points, key=lambda item: float(item["learning_rate"])
+    )
+    completed_indices = [
+        index
+        for index, point in enumerate(all_points)
+        if _point_has_result(suite, point, runs_root)
+    ]
+    if completed_indices and completed_indices != list(
+        range(min(completed_indices), max(completed_indices) + 1)
+    ):
+        raise ScalingError(
+            f"{calibration_slice}/{shape_id}: learning-rate completions have a "
+            "missing middle point"
+        )
+    initial_complete = [
+        _point_has_result(suite, point, runs_root) for point in initial
+    ]
+    if any(initial_complete[index] and not all(initial_complete[:index]) for index in range(len(initial))):
+        raise ScalingError(
+            f"{calibration_slice}/{shape_id}: initial learning-rate completion "
+            "is not a low-to-high prefix"
+        )
+    measured: list[dict[str, Any]] = []
+    for point in all_points:
+        if _point_has_result(suite, point, runs_root):
+            measured.append(_read_run(suite, point, runs_root))
+    by_id = {str(item["id"]): item for item in measured}
+    lower_rates = {
+        float(item["value"]) for item in suite["learning_rate_search"]["lower"]
+    }
+    for point in points:
+        measurement = by_id.get(str(point["id"]))
+        if (
+            float(point["learning_rate"]) in lower_rates
+            and measurement is not None
+            and measurement["stability_admission"]["classification"] != "stable"
+        ):
+            raise ScalingError(
+                f"{calibration_slice}/{shape_id}: lower LR expansion is ineligible; "
+                "refusing to search beyond it"
+            )
+    initial_and_upper = [
+        point
+        for point in all_points
+        if float(point["learning_rate"]) >= float(initial[0]["learning_rate"])
+        and point["id"] in by_id
+    ]
+    frontier_index = next(
+        (
+            index
+            for index, point in enumerate(initial_and_upper)
+            if by_id[point["id"]]["stability_admission"]["classification"]
+            != "stable"
+        ),
+        None,
+    )
+    if frontier_index is not None and frontier_index != len(initial_and_upper) - 1:
+        frontier = initial_and_upper[frontier_index]
+        raise ScalingError(
+            f"{calibration_slice}/{shape_id}: completed LR "
+            f"{float(frontier['learning_rate']):.8g} is an ineligible frontier, "
+            "but a higher LR artifact also exists"
+        )
 
 
 def _next_adaptive_calibration(
-    suite: Mapping[str, Any], shape_id: str, side: str, runs_root: Path
+    suite: Mapping[str, Any],
+    shape_id: str,
+    side: str,
+    runs_root: Path,
+    *,
+    slice_id: str | None = None,
 ) -> dict[str, Any] | None:
-    _validate_adaptive_completion_prefix(suite, shape_id, runs_root)
-    all_points = _initial_calibrations(suite, shape_id) + [
+    calibration_slice = _calibration_slice_id(suite, slice_id)
+    _validate_adaptive_completion_prefix(
+        suite, shape_id, runs_root, slice_id=slice_id
+    )
+    all_points = _initial_calibrations(suite, shape_id, slice_id=slice_id) + [
         item
         for item in suite["adaptive_calibrations"]
-        if item["shape_id"] == shape_id
+        if item["shape_id"] == shape_id and item["slice"] == calibration_slice
     ]
     completed = [
         item
@@ -3788,6 +4987,7 @@ def _next_adaptive_calibration(
         item
         for item in suite["adaptive_calibrations"]
         if item["shape_id"] == shape_id
+        and item["slice"] == calibration_slice
         and not _point_has_result(suite, item, runs_root)
     ]
     if side == "lower":
@@ -3798,6 +4998,16 @@ def _next_adaptive_calibration(
         ]
         return max(candidates, key=lambda item: float(item["learning_rate"]), default=None)
     if side == "upper":
+        if _per_slice_learning_rates(suite):
+            highest = max(
+                completed, key=lambda item: float(item["learning_rate"])
+            )
+            highest_measurement = _read_run(suite, highest, runs_root)
+            if (
+                highest_measurement["stability_admission"]["classification"]
+                != "stable"
+            ):
+                return None
         candidates = [
             item
             for item in pending
@@ -3812,37 +5022,129 @@ def _calibrate_shape(
     shape_id: str,
     runs_root: Path,
     run_options: Mapping[str, Any],
+    *,
+    slice_id: str | None = None,
 ) -> dict[str, Any]:
-    selection_path = _learning_rate_selection_path(runs_root, shape_id)
+    calibration_slice = _calibration_slice_id(suite, slice_id)
+    group_label = (
+        f"{calibration_slice}/{shape_id}"
+        if _per_slice_learning_rates(suite)
+        else shape_id
+    )
+    selection_path = _learning_rate_selection_path(
+        runs_root,
+        shape_id,
+        slice_id=(calibration_slice if _per_slice_learning_rates(suite) else None),
+    )
     if selection_path.is_file():
         # Fully validate the immutable selection and selected run before reuse.
-        _selected_calibration_run(suite, shape_id, runs_root)
+        _selected_calibration_run(
+            suite, shape_id, runs_root, slice_id=slice_id
+        )
         return dict(_read_regular_json(selection_path, "learning-rate selection"))
-    initial = _initial_calibrations(suite, shape_id)
+    initial = _initial_calibrations(suite, shape_id, slice_id=slice_id)
     if len(initial) != len(suite["learning_rate_candidates"]):
-        raise ScalingError(f"{shape_id}: initial learning-rate grid is incomplete")
-    run_variants(
-        suite,
-        names=[str(item["id"]) for item in initial],
-        **run_options,
+        raise ScalingError(f"{group_label}: initial learning-rate grid is incomplete")
+    _validate_adaptive_completion_prefix(
+        suite, shape_id, runs_root, slice_id=slice_id
     )
+    # V4 launches low-to-high, validates each completed curve immediately, and
+    # never crosses the first ineligible high-LR frontier.  Legacy suites retain
+    # their original all-at-once initial grid behavior.
+    if _per_slice_learning_rates(suite):
+        frontier = False
+        first_initial_classification: str | None = None
+        for point in initial:
+            if not _point_has_result(suite, point, runs_root):
+                if frontier:
+                    break
+                run_variants(
+                    suite, names=[str(point["id"])], **run_options
+                )
+            measurement = _read_run(suite, point, runs_root)
+            stability = _mapping(
+                measurement.get("stability_admission"),
+                f"{point['id']}.stability_admission",
+            )
+            if stability.get("classification") != "stable":
+                frontier = True
+                if point is initial[0]:
+                    first_initial_classification = str(stability["classification"])
+                break
+        # If even the lowest initial LR is ineligible, move only toward safer
+        # (lower) declared rates until a stable point appears or the bounded
+        # table is exhausted. Never try lr300/lr450 beyond the lr200 frontier.
+        if first_initial_classification is not None:
+            lower_completed = [
+                point
+                for point in suite["adaptive_calibrations"]
+                if point["slice"] == calibration_slice
+                and point["shape_id"] == shape_id
+                and float(point["learning_rate"])
+                < float(initial[0]["learning_rate"])
+                and _point_has_result(suite, point, runs_root)
+            ]
+            stable_lower_count = sum(
+                _read_run(suite, point, runs_root)["stability_admission"][
+                    "classification"
+                ]
+                == "stable"
+                for point in lower_completed
+            )
+            while True:
+                if stable_lower_count >= 2:
+                    break
+                next_lower = _next_adaptive_calibration(
+                    suite,
+                    shape_id,
+                    "lower",
+                    runs_root,
+                    slice_id=slice_id,
+                )
+                if next_lower is None:
+                    raise ScalingError(
+                        f"{group_label}: bounded lower LR recovery exhausted "
+                        "without a stable candidate"
+                    )
+                run_variants(
+                    suite, names=[str(next_lower["id"])], **run_options
+                )
+                recovery = _read_run(suite, next_lower, runs_root)
+                if (
+                    recovery["stability_admission"]["classification"]
+                    == "stable"
+                ):
+                    stable_lower_count += 1
+    else:
+        run_variants(
+            suite,
+            names=[str(item["id"]) for item in initial],
+            **run_options,
+        )
     while True:
         try:
             return select_learning_rate(
-                suite, shape_id=shape_id, runs_path=runs_root
+                suite,
+                shape_id=shape_id,
+                slice_id=slice_id,
+                runs_path=runs_root,
             )
         except LearningRateEdgeError as exc:
             next_point = _next_adaptive_calibration(
-                suite, shape_id, exc.side, runs_root
+                suite,
+                shape_id,
+                exc.side,
+                runs_root,
+                slice_id=slice_id,
             )
             if next_point is None:
                 raise ScalingError(
-                    f"{shape_id}: bounded geometric learning-rate search is "
+                    f"{group_label}: bounded geometric learning-rate search is "
                     f"exhausted on the {exc.side} side; refusing to select an "
                     "edge winner or launch dependent runs"
                 ) from exc
             print(
-                f"{shape_id}: expanding {exc.side} LR edge with "
+                f"{group_label}: expanding {exc.side} LR edge with "
                 f"{float(next_point['learning_rate']):.8g}",
                 flush=True,
             )
@@ -3859,7 +5161,30 @@ def _completed_slice_measurements(
     """Read every completed fit/extension measurement for one compute slice."""
 
     calibration_slice_id = str(suite["compute_slices"][0]["id"])
-    if slice_id == calibration_slice_id:
+    if _per_slice_learning_rates(suite):
+        measured = [
+            _selected_calibration_run(
+                suite,
+                shape["shape_id"],
+                runs_root,
+                slice_id=slice_id,
+            )
+            for shape in suite["fit_shapes"]
+        ]
+        for shape in suite["optional_extension_shapes"]:
+            selection = _learning_rate_selection_path(
+                runs_root, str(shape["shape_id"]), slice_id=slice_id
+            )
+            if selection.is_file():
+                measured.append(
+                    _selected_calibration_run(
+                        suite,
+                        str(shape["shape_id"]),
+                        runs_root,
+                        slice_id=slice_id,
+                    )
+                )
+    elif slice_id == calibration_slice_id:
         measured = [
             _selected_calibration_run(suite, shape["shape_id"], runs_root)
             for shape in suite["fit_shapes"]
@@ -3902,7 +5227,17 @@ def _ensure_slice_extension(
 
     slice_id = str(compute_slice["id"])
     shape_id = str(shape["shape_id"])
-    _calibrate_shape(suite, shape_id, runs_root, run_options)
+    _calibrate_shape(
+        suite,
+        shape_id,
+        runs_root,
+        run_options,
+        slice_id=(slice_id if _per_slice_learning_rates(suite) else None),
+    )
+    if _per_slice_learning_rates(suite):
+        return _selected_calibration_run(
+            suite, shape_id, runs_root, slice_id=slice_id
+        )
     if slice_id == str(suite["compute_slices"][0]["id"]):
         return _selected_calibration_run(suite, shape_id, runs_root)
 
@@ -4009,72 +5344,138 @@ def run_staged(suite: Mapping[str, Any], args: argparse.Namespace) -> None:
     )
     run_options["allow_adaptive"] = True
     runs_root = args.runs.expanduser().resolve()
-    for shape in suite["fit_shapes"]:
-        shape_id = str(shape["shape_id"])
-        selection = _calibrate_shape(suite, shape_id, runs_root, run_options)
-        print(
-            f"selected {shape_id}: lr={selection['selected_learning_rate']:.2e} "
-            f"at loss {selection['selected_validation_loss']:.6f}",
-            flush=True,
-        )
-
-    for compute_slice in suite["compute_slices"]:
-        slice_id = str(compute_slice["id"])
-        if compute_slice is suite["compute_slices"][0]:
-            measured = [
-                _selected_calibration_run(suite, shape["shape_id"], runs_root)
-                for shape in suite["fit_shapes"]
-            ]
-        else:
-            points = [
-                item for item in suite["variants"] if item["slice"] == slice_id
-            ]
-            run_variants(
-                suite, names=[str(item["id"]) for item in points], **run_options
-            )
-            measured = [_read_run(suite, item, runs_root) for item in points]
-        fitted, _ = _fit_slice(
-            measured,
-            slice_id=slice_id,
-            target_total_flops=int(compute_slice["target_total_flops"]),
-        )
-        for shape in suite["optional_extension_shapes"]:
-            if fitted["bracketed"]:
-                break
-            if not _warrants_high_side_extension(fitted):
+    if _per_slice_learning_rates(suite):
+        for compute_slice in suite["compute_slices"]:
+            slice_id = str(compute_slice["id"])
+            for shape in suite["fit_shapes"]:
+                shape_id = str(shape["shape_id"])
+                selection = _calibrate_shape(
+                    suite,
+                    shape_id,
+                    runs_root,
+                    run_options,
+                    slice_id=slice_id,
+                )
                 print(
-                    f"{slice_id}: minimum remains unbracketed, but not on the "
-                    "high-model-size side; recording no-law instead of extrapolating",
+                    f"selected {slice_id}/{shape_id}: "
+                    f"lr={selection['selected_learning_rate']:.2e} "
+                    f"at loss {selection['selected_validation_loss']:.6f}",
                     flush=True,
                 )
-                break
-            shape_id = str(shape["shape_id"])
-            _calibrate_shape(suite, shape_id, runs_root, run_options)
-            if slice_id == suite["compute_slices"][0]["id"]:
-                measurement = _selected_calibration_run(suite, shape_id, runs_root)
-            else:
-                extension = next(
-                    item
-                    for item in suite["optional_extensions"]
-                    if item["slice"] == slice_id and item["shape_id"] == shape_id
+            measured = [
+                _selected_calibration_run(
+                    suite,
+                    str(shape["shape_id"]),
+                    runs_root,
+                    slice_id=slice_id,
                 )
-                run_variants(suite, names=[str(extension["id"])], **run_options)
-                measurement = _read_run(suite, extension, runs_root)
-            if all(item["parameters"] != measurement["parameters"] for item in measured):
-                measured.append(measurement)
+                for shape in suite["fit_shapes"]
+            ]
             fitted, _ = _fit_slice(
                 measured,
                 slice_id=slice_id,
                 target_total_flops=int(compute_slice["target_total_flops"]),
             )
-        _write_derived_json(runs_root / "fits" / f"{slice_id}.json", fitted)
+            for shape in suite["optional_extension_shapes"]:
+                if fitted["bracketed"]:
+                    break
+                if not _warrants_high_side_extension(fitted):
+                    print(
+                        f"{slice_id}: minimum remains unbracketed, but not on the "
+                        "high-model-size side; recording no-law instead of extrapolating",
+                        flush=True,
+                    )
+                    break
+                measurement = _ensure_slice_extension(
+                    suite,
+                    compute_slice=compute_slice,
+                    shape=shape,
+                    runs_root=runs_root,
+                    run_options=run_options,
+                )
+                measured.append(measurement)
+                fitted, _ = _fit_slice(
+                    measured,
+                    slice_id=slice_id,
+                    target_total_flops=int(compute_slice["target_total_flops"]),
+                )
+            _write_derived_json(runs_root / "fits" / f"{slice_id}.json", fitted)
+    else:
+        for shape in suite["fit_shapes"]:
+            shape_id = str(shape["shape_id"])
+            selection = _calibrate_shape(
+                suite, shape_id, runs_root, run_options
+            )
+            print(
+                f"selected {shape_id}: lr={selection['selected_learning_rate']:.2e} "
+                f"at loss {selection['selected_validation_loss']:.6f}",
+                flush=True,
+            )
 
-    # A shape calibrated while extending a later compute slice contributes a
-    # new c025 endpoint after c025 may already have been visited. Close those
-    # finite cross-slice dependencies before deciding whether a law is valid.
-    _revisit_extension_fixed_point(
-        suite, runs_root=runs_root, run_options=run_options
-    )
+        for compute_slice in suite["compute_slices"]:
+            slice_id = str(compute_slice["id"])
+            if compute_slice is suite["compute_slices"][0]:
+                measured = [
+                    _selected_calibration_run(
+                        suite, shape["shape_id"], runs_root
+                    )
+                    for shape in suite["fit_shapes"]
+                ]
+            else:
+                points = [
+                    item for item in suite["variants"] if item["slice"] == slice_id
+                ]
+                run_variants(
+                    suite, names=[str(item["id"]) for item in points], **run_options
+                )
+                measured = [_read_run(suite, item, runs_root) for item in points]
+            fitted, _ = _fit_slice(
+                measured,
+                slice_id=slice_id,
+                target_total_flops=int(compute_slice["target_total_flops"]),
+            )
+            for shape in suite["optional_extension_shapes"]:
+                if fitted["bracketed"]:
+                    break
+                if not _warrants_high_side_extension(fitted):
+                    print(
+                        f"{slice_id}: minimum remains unbracketed, but not on the "
+                        "high-model-size side; recording no-law instead of extrapolating",
+                        flush=True,
+                    )
+                    break
+                shape_id = str(shape["shape_id"])
+                _calibrate_shape(suite, shape_id, runs_root, run_options)
+                if slice_id == suite["compute_slices"][0]["id"]:
+                    measurement = _selected_calibration_run(
+                        suite, shape_id, runs_root
+                    )
+                else:
+                    extension = next(
+                        item
+                        for item in suite["optional_extensions"]
+                        if item["slice"] == slice_id
+                        and item["shape_id"] == shape_id
+                    )
+                    run_variants(
+                        suite, names=[str(extension["id"])], **run_options
+                    )
+                    measurement = _read_run(suite, extension, runs_root)
+                if all(
+                    item["parameters"] != measurement["parameters"]
+                    for item in measured
+                ):
+                    measured.append(measurement)
+                fitted, _ = _fit_slice(
+                    measured,
+                    slice_id=slice_id,
+                    target_total_flops=int(compute_slice["target_total_flops"]),
+                )
+            _write_derived_json(runs_root / "fits" / f"{slice_id}.json", fitted)
+
+        _revisit_extension_fixed_point(
+            suite, runs_root=runs_root, run_options=run_options
+        )
 
     control_names = [str(item["id"]) for item in suite["controls"]]
     if control_names:
