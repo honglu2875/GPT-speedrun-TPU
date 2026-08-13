@@ -16,6 +16,14 @@ target.
 The recorded run is
 `20260813T062057.933780Z-modern_rope_gelu_b128_vocab50257_lr15e3_min0200-8e6ce590`.
 
+A seed-1338 replication trained in 383.727 seconds and reached canonical loss
+3.6119 plus Fresh10 loss 3.7083. Against the seed-matched `1.2e-3` control
+(384.080 seconds, 3.6161, 3.6985), the higher peak retained a 0.0042 canonical
+gain and a 0.353-second speed advantage, while the 0.0098 Fresh10 regression
+shows that the small downstream difference is seed-sensitive. The replication
+run is
+`20260813T063647.298110Z-modern_rope_gelu_b128_vocab50257_lr15e3_min0200-5f391290`.
+
 ```bash
 make run TARGET=modern_rope_gelu_b128_vocab50257_lr15e3_min0200
 ```
