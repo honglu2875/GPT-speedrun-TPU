@@ -76,6 +76,10 @@ learning_rate_search:
       value: 0.000675
     - id: lr1013
       value: 0.0010125
+    - id: lr1519
+      value: 0.00151875
+    - id: lr2278
+      value: 0.002278125
 compute_slices:
   - id: c025
     numerator: 1

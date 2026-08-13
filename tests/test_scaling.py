@@ -67,7 +67,7 @@ class ScalingTests(unittest.TestCase):
         self.assertEqual(len(suite["calibrations"]), 15)
         self.assertEqual(len(suite["variants"]), 10)
         self.assertEqual(len(suite["controls"]), 1)
-        self.assertEqual(len(suite["adaptive_calibrations"]), 28)
+        self.assertEqual(len(suite["adaptive_calibrations"]), 42)
         self.assertEqual(len(suite["optional_extensions"]), 4)
         self.assertEqual(suite["required_train_tokens"], 3_463_512_064)
         self.assertEqual(suite["validation_tokens"], 99_975_168)

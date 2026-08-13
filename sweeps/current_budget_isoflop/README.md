@@ -18,11 +18,15 @@ The `0.25 C0` slice doubles as bounded learning-rate calibration. Each shape is
 trained at `2e-4`, `3e-4`, and `4.5e-4`; canonical loss over exactly 99,975,168
 validation targets selects the learning rate propagated to its `0.50 C0` and
 `1.00 C0` runs. An edge winner expands geometrically, one point at a time, down
-through `1.333e-4`/`8.889e-5` or up through `6.75e-4`/`1.0125e-3`. If the winner
-is still an edge at that bound, the runner refuses selection and does not launch
-dependent runs. Warmup, validation cadence, and logging cadence preserve the
-completed baseline's fraction of total steps. All runs share seed 1337 because
-three-seed replication does not fit the current time budget.
+through `1.333e-4`/`8.889e-5` or up through `6.75e-4`, `1.0125e-3`,
+`1.51875e-3`, and `2.278125e-3`. The two higher points were preregistered after
+the first bounded pilot remained monotone through `1.0125e-3`; all pilot runs
+were archived and the fingerprinted study restarted rather than importing
+measurements across search policies. If the winner is still an edge at the new
+bound, the runner refuses selection and does not launch dependent runs. Warmup,
+validation cadence, and logging cadence preserve the completed baseline's
+fraction of total steps. All runs share seed 1337 because three-seed replication
+does not fit the current time budget.
 
 Training uses the YAML-only `shuffled_epochs` sampler. It gives a deterministic
 pseudorandom permutation of non-overlapping shard windows, needs no giant index
@@ -112,14 +116,13 @@ rounding. There are 26 run-level compilations (with possible persistent-cache
 reuse), while 26 full 100M-token validations add roughly 30–40 minutes at the
 measured validation rate. Budget 7–9 hours on the v4-8.
 
-Adaptive work is paid only when needed. Each base shape can add at most two
-same-side LR trials (`0.50 C0` per shape); an extension shape can likewise add
-at most two trials. Each extension shape costs `0.75 C0` for its initial LR
-grid, with its selected trial reused as the c025 fit point, then at most
-`0.50 C0` and `1.00 C0` for later slices. The absolute bounded maximum is 50
-runs and `20.25 C0`: about 9.69 ideal training hours plus roughly 65 minutes of
-full validation and compilation overhead, so this rare path may exceed 12
-hours. The expected no-expansion path remains 26 runs/`12.25 C0`; both model
-extensions across all slices without LR-edge expansion give 36 runs/`16.75 C0`. Larger models
-are not launched for a low-side or non-directional failure; the final artifact
-then explicitly reports no scaling law.
+Adaptive work is paid only when needed. Each shape can add at most two lower-side
+or four upper-side LR trials. Each extension shape costs `0.75 C0` for its
+initial LR grid, with its selected trial reused as the c025 fit point, then at
+most `0.50 C0` and `1.00 C0` for later slices. The absolute bounded maximum is
+64 runs and `23.75 C0`: about 11.36 ideal training hours plus validation and
+compilation overhead, so this rare path may exceed 12 hours. The expected
+no-expansion path remains 26 runs/`12.25 C0`; both model extensions across all
+slices without LR-edge expansion give 36 runs/`16.75 C0`. Larger models are not
+launched for a low-side or non-directional failure; the final artifact then
+explicitly reports no scaling law.
