@@ -20,12 +20,22 @@ from scripts.publish_scaling_evidence import (
     PUBLISHED_4B_MANIFEST_SHA256,
     RUN_FILES,
     SEMANTIC_FLAGS,
+    STOPPED_CONTROLLER_ERROR,
+    STOPPED_KIND,
+    STOPPED_OUTCOME,
+    STOPPED_RECEIPT_KIND,
+    STOPPED_SCHEMA_VERSION,
+    STOPPED_SEMANTIC_FLAGS,
+    STOPPED_STATUS,
+    V4_RUN_4B_MANIFEST_CANONICAL_SHA256,
+    V4_RUN_4B_MANIFEST_RAW_SHA256,
     EvidenceError,
     anonymous_download,
     anonymous_revalidate,
     build_archive,
     canonical_json_bytes,
     deterministic_git_archive,
+    derive_stopped_terminal_contract,
     discover_runs_source,
     hash_regular_file,
     publication_receipt,
@@ -39,10 +49,12 @@ from scripts.publish_scaling_evidence import (
     semantic_verify,
     sha256_bytes,
     snapshot_bundle,
+    stopped_terminal_contract,
     validate_publication_paths,
     validate_published_4b_binding,
     validate_manifest,
     validate_repo_id,
+    verify_stopped_terminal_state,
     write_atomic,
 )
 
@@ -52,6 +64,177 @@ RUN = "c025_n023_lr200"
 CONTROL = "c100_n124_control"
 SELECTION = "runs/learning-rate-selections/c025/n023.json"
 SOURCE_PATH = f"provenance/source-{LAUNCH_COMMIT}.tar"
+STOPPED_SELECTION_PATHS = tuple(
+    f"runs/learning-rate-selections/c025/{shape}.json"
+    for shape in ("n023", "n030", "n040", "n051", "n065", "n082")
+)
+STOPPED_REJECTED = (
+    "c025_n023_lr1519_adaptive",
+    "c025_n030_lr675_adaptive",
+    "c050_n023_lr133_adaptive",
+    "c050_n023_lr200",
+)
+
+
+def _stopped_run_names() -> tuple[str, ...]:
+    by_shape = {
+        "n023": ("200", "300", "450", "675_adaptive", "1013_adaptive", "1519_adaptive"),
+        "n030": ("200", "300", "450", "675_adaptive"),
+        "n040": (
+            "200",
+            "300",
+            "450",
+            "675_adaptive",
+            "1013_adaptive",
+            "1519_adaptive",
+            "2278_adaptive",
+        ),
+        "n051": (
+            "200",
+            "300",
+            "450",
+            "675_adaptive",
+            "1013_adaptive",
+            "1519_adaptive",
+            "2278_adaptive",
+            "3417_adaptive",
+        ),
+        "n065": (
+            "200",
+            "300",
+            "450",
+            "675_adaptive",
+            "1013_adaptive",
+            "1519_adaptive",
+            "2278_adaptive",
+            "3417_adaptive",
+        ),
+        "n082": (
+            "200_ext",
+            "300_ext",
+            "450_ext",
+            "675_adaptive",
+            "1013_adaptive",
+            "1519_adaptive",
+            "2278_adaptive",
+        ),
+    }
+    names = [
+        f"c025_{shape}_lr{suffix}"
+        for shape, suffixes in by_shape.items()
+        for suffix in suffixes
+    ]
+    names.extend(("c050_n023_lr200", "c050_n023_lr133_adaptive"))
+    return tuple(sorted(names))
+
+
+def _terminal_suite() -> dict[str, object]:
+    rates = {
+        "089": 0.00008888888888888889,
+        "133": 0.00013333333333333334,
+        "200": 0.0002,
+        "300": 0.0003,
+        "450": 0.00045,
+        "675": 0.000675,
+        "1013": 0.0010125,
+        "1519": 0.00151875,
+        "2278": 0.002278125,
+        "3417": 0.0034171875,
+        "5126": 0.00512578125,
+    }
+    calibrations: list[dict[str, object]] = []
+    extension_calibrations: list[dict[str, object]] = []
+    adaptive_calibrations: list[dict[str, object]] = []
+    for name in _stopped_run_names():
+        if not name.startswith("c025_"):
+            continue
+        slice_id, shape_id, raw_lr, *_suffix = name.split("_")
+        rate_id = raw_lr.removeprefix("lr")
+        point = {
+            "id": name,
+            "slice": slice_id,
+            "shape_id": shape_id,
+            "learning_rate": rates[rate_id],
+        }
+        if rate_id in {"200", "300", "450"}:
+            target = extension_calibrations if shape_id == "n082" else calibrations
+            target.append(point)
+        else:
+            adaptive_calibrations.append(point)
+    calibrations.append(
+        {
+            "id": "c050_n023_lr200",
+            "slice": "c050",
+            "shape_id": "n023",
+            "learning_rate": rates["200"],
+        }
+    )
+    adaptive_calibrations.extend(
+        (
+            {
+                "id": "c050_n023_lr133_adaptive",
+                "slice": "c050",
+                "shape_id": "n023",
+                "learning_rate": rates["133"],
+            },
+            {
+                "id": "c050_n023_lr089_adaptive",
+                "slice": "c050",
+                "shape_id": "n023",
+                "learning_rate": rates["089"],
+            },
+        )
+    )
+    for shape_id in ("n023", "n030", "n040", "n051", "n065", "n082"):
+        existing = {
+            (str(point["slice"]), str(point["shape_id"]), float(point["learning_rate"]))
+            for point in adaptive_calibrations
+        }
+        for rate_id in ("133", "089", "675", "1013", "1519", "2278", "3417", "5126"):
+            key = ("c025", shape_id, rates[rate_id])
+            if key not in existing:
+                adaptive_calibrations.append(
+                    {
+                        "id": f"c025_{shape_id}_lr{rate_id}_adaptive",
+                        "slice": "c025",
+                        "shape_id": shape_id,
+                        "learning_rate": rates[rate_id],
+                    }
+                )
+    return {
+        "compute_slices": [
+            {"id": "c025", "target_total_flops": 1},
+            {"id": "c050", "target_total_flops": 2},
+            {"id": "c100", "target_total_flops": 4},
+        ],
+        "fit_shapes": [
+            {"shape_id": shape}
+            for shape in ("n023", "n030", "n040", "n051", "n065")
+        ],
+        "optional_extension_shapes": [
+            {"shape_id": "n082"},
+            {"shape_id": "n102"},
+        ],
+        "controls": [{"id": "c100_n124_control"}],
+        "learning_rate_candidates": [
+            {"id": "lr200", "value": 0.0002},
+            {"id": "lr300", "value": 0.0003},
+            {"id": "lr450", "value": 0.00045},
+        ],
+        "learning_rate_search": {
+            "lower": [
+                {"id": "lr133", "value": 0.00013333333333333334},
+                {"id": "lr089", "value": 0.00008888888888888889},
+            ],
+            "upper": [
+                {"id": f"lr{rate_id}", "value": rates[rate_id]}
+                for rate_id in ("675", "1013", "1519", "2278", "3417", "5126")
+            ],
+        },
+        "calibrations": calibrations,
+        "extension_calibrations": extension_calibrations,
+        "adaptive_calibrations": adaptive_calibrations,
+    }
 
 
 def _base_files(
@@ -151,6 +334,90 @@ def _manifest(
     }
 
 
+def _stopped_files() -> dict[str, tuple[bytes, str]]:
+    files: dict[str, tuple[bytes, str]] = {
+        "README.md": (b"INCONCLUSIVE / NEGATIVE RESULT; NO SCALING LAW\n", "documentation"),
+        "verify.py": (b"# verifier\n", "verifier"),
+        SOURCE_PATH: (b"tar bytes", "source_archive"),
+        "runs/fits/c025.json": (b"{}\n", "slice_fit"),
+    }
+    for selection in STOPPED_SELECTION_PATHS:
+        files[selection] = (b"{}\n", "learning_rate_selection")
+    for run_name in _stopped_run_names():
+        for relative, role in RUN_FILES:
+            files[f"runs/{run_name}/{relative}"] = (b"{}\n", role)
+    return files
+
+
+def _stopped_manifest() -> dict[str, object]:
+    files = _stopped_files()
+    inventory = [
+        {
+            "path": path,
+            "bytes": len(payload),
+            "sha256": sha256_bytes(payload),
+            "role": role,
+        }
+        for path, (payload, role) in sorted(files.items())
+    ]
+    archive_id = (
+        "current_budget_isoflop_v4-stopped-"
+        f"{sha256_bytes(canonical_json_bytes(inventory))[:16]}-"
+        f"{LAUNCH_COMMIT[:12]}"
+    )
+    runs = list(_stopped_run_names())
+    rejected = list(STOPPED_REJECTED)
+    return {
+        "schema_version": STOPPED_SCHEMA_VERSION,
+        "kind": STOPPED_KIND,
+        "archive_id": archive_id,
+        "identity": {
+            "suite_id": "current_budget_isoflop_v4",
+            "suite_sha256": "1" * 64,
+            "template_sha256": "2" * 64,
+            "execution_fingerprint": "3" * 64,
+            "trainer_sha256": "4" * 64,
+            "seed": 1337,
+            "launch_commit": LAUNCH_COMMIT,
+        },
+        "publication_target": {
+            "repository": "quintic/gpt-tpu-speedrun-scaling-evidence",
+            "directory": f"current_budget_isoflop_v4/stopped-inconclusive/{archive_id}",
+        },
+        "source_archive": {
+            "path": SOURCE_PATH,
+            "commit": LAUNCH_COMMIT,
+            "prefix": "source/",
+            "bytes": len(files[SOURCE_PATH][0]),
+            "sha256": sha256_bytes(files[SOURCE_PATH][0]),
+        },
+        "study": {
+            "status": STOPPED_STATUS,
+            "outcome": STOPPED_OUTCOME,
+            "runs": runs,
+            "classifications": {
+                "stable": sorted(set(runs) - set(rejected)),
+                "suspect": [],
+                "rejected": rejected,
+            },
+            "learning_rate_selections": list(STOPPED_SELECTION_PATHS),
+            "fit_paths": {
+                "final_json": None,
+                "final_markdown": None,
+                "slices": ["runs/fits/c025.json"],
+            },
+            "terminal": stopped_terminal_contract(),
+            "can_estimate_scaling_exponent": False,
+            "scaling_law": None,
+        },
+        "inventory": {
+            "file_count": len(inventory),
+            "total_bytes": sum(item["bytes"] for item in inventory),
+            "files": inventory,
+        },
+    }
+
+
 def _write_bundle(
     root: Path,
     *,
@@ -187,6 +454,135 @@ class ScalingEvidencePublisherTests(unittest.TestCase):
         missing["inventory"]["total_bytes"] -= 3
         with self.assertRaisesRegex(EvidenceError, "exact closed v4 archive"):
             validate_manifest(missing)
+
+    def test_stopped_manifest_is_schema_v2_inconclusive_and_never_claims_a_law(self) -> None:
+        manifest = _stopped_manifest()
+        self.assertEqual(validate_manifest(manifest), manifest)
+        self.assertEqual(len(manifest["study"]["runs"]), 42)
+        self.assertEqual(len(manifest["study"]["classifications"]["stable"]), 38)
+        self.assertEqual(len(manifest["study"]["classifications"]["rejected"]), 4)
+        self.assertIsNone(manifest["study"]["scaling_law"])
+
+        claimed = json.loads(json.dumps(manifest))
+        claimed["study"]["scaling_law"] = {"parameter_exponent_a": 0.5}
+        with self.assertRaisesRegex(EvidenceError, "must not contain a scaling-law claim"):
+            validate_manifest(claimed)
+
+        mislabeled = json.loads(json.dumps(manifest))
+        mislabeled["publication_target"]["directory"] = (
+            f"current_budget_isoflop_v4/{manifest['archive_id']}"
+        )
+        with self.assertRaisesRegex(EvidenceError, "stopped-inconclusive namespace"):
+            validate_manifest(mislabeled)
+
+    def test_stopped_terminal_contract_is_derived_from_frozen_suite(self) -> None:
+        suite = _terminal_suite()
+        self.assertEqual(derive_stopped_terminal_contract(suite), stopped_terminal_contract())
+        self.assertEqual(
+            stopped_terminal_contract()["controller_error"], STOPPED_CONTROLLER_ERROR
+        )
+
+    def test_stopped_terminal_replay_rejects_any_post_terminal_run(self) -> None:
+        suite = _terminal_suite()
+        run_names = list(_stopped_run_names())
+        points = {
+            str(point["id"]): point
+            for point in (
+                suite["calibrations"]
+                + suite["extension_calibrations"]
+                + suite["adaptive_calibrations"]
+            )
+        }
+        selected_rates = {
+            "n023": 0.0010125,
+            "n030": 0.00045,
+            "n040": 0.00151875,
+            "n051": 0.002278125,
+            "n065": 0.002278125,
+            "n082": 0.00151875,
+        }
+        measurements = {
+            name: {
+                "id": name,
+                "validation_loss": (
+                    1.0
+                    + abs(
+                        float(points[name]["learning_rate"])
+                        - selected_rates[str(points[name]["shape_id"])]
+                    )
+                ),
+                "stability_admission": {
+                    "classification": "rejected" if name in STOPPED_REJECTED else "stable"
+                },
+            }
+            for name in run_names
+        }
+        selected_ids = {
+            "n023": "c025_n023_lr1013_adaptive",
+            "n030": "c025_n030_lr450",
+            "n040": "c025_n040_lr1519_adaptive",
+            "n051": "c025_n051_lr2278_adaptive",
+            "n065": "c025_n065_lr2278_adaptive",
+            "n082": "c025_n082_lr1519_adaptive",
+        }
+        selected = {
+            ("c025", shape): measurements[point]
+            for shape, point in selected_ids.items()
+        }
+        terminal_ids = {
+            stopped_terminal_contract()["failed_initial_point"],
+            stopped_terminal_contract()["failed_recovery_point"],
+        }
+        accounted = set(run_names) - terminal_ids
+        completed_fit = {"bracketed": True, "slice": "c025", "points": [1, 2, 3]}
+
+        class ScalingError(Exception):
+            pass
+
+        class FakeScaling:
+            @staticmethod
+            def _fit_slice(points, **_kwargs):
+                if len(points) == 5:
+                    return {"bracketed": False, "stage": "base"}, None
+                return completed_fit, None
+
+            @staticmethod
+            def _warrants_high_side_extension(fitted):
+                return fitted["bracketed"] is False
+
+            @staticmethod
+            def _validate_adaptive_completion_prefix(*_args, **_kwargs):
+                raise ScalingError(STOPPED_CONTROLLER_ERROR)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fit = root / "fits/c025.json"
+            fit.parent.mkdir(parents=True)
+            fit.write_text(
+                json.dumps(completed_fit, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            verify_stopped_terminal_state(
+                scaling=FakeScaling(),
+                suite=suite,
+                runs_root=root,
+                run_names=run_names,
+                measurements=measurements,
+                selected_measurements=selected,
+                accounted_selection_runs=accounted,
+                manifest_terminal=stopped_terminal_contract(),
+            )
+            with self.assertRaisesRegex(EvidenceError, "exactly six c025"):
+                verify_stopped_terminal_state(
+                    scaling=FakeScaling(),
+                    suite=suite,
+                    runs_root=root,
+                    run_names=[*run_names, "c100_n124_control"],
+                    measurements=measurements,
+                    selected_measurements=selected,
+                    accounted_selection_runs=accounted,
+                    manifest_terminal=stopped_terminal_contract(),
+                )
 
     def test_snapshot_rejects_extra_file_empty_directory_links_and_hash_drift(self) -> None:
         cases = ("extra", "empty", "link", "hardlink", "drift")
@@ -252,6 +648,49 @@ class ScalingEvidencePublisherTests(unittest.TestCase):
             (root / "unexpected-empty").mkdir()
             with self.assertRaisesRegex(EvidenceError, "directory tree is not closed"):
                 discover_runs_source(root, {RUN})
+
+    def test_stopped_source_ignores_only_exact_generated_caches(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for relative, _role in RUN_FILES:
+                path = root / RUN / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}\n", encoding="utf-8")
+            fit = root / "fits/c025.json"
+            fit.parent.mkdir(parents=True)
+            fit.write_text("{}\n", encoding="utf-8")
+            for archive_path in STOPPED_SELECTION_PATHS:
+                relative = archive_path.removeprefix("runs/")
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}\n", encoding="utf-8")
+            cache_paths = (
+                "work/speedrun/__pycache__/__init__.cpython-312.pyc",
+                "work/speedrun/kernels/__pycache__/__init__.cpython-312.pyc",
+                "work/speedrun/kernels/__pycache__/autotune.cpython-312.pyc",
+                "work/speedrun/kernels/__pycache__/linear_cross_entropy.cpython-312.pyc",
+                "work/speedrun/kernels/__pycache__/tpu_flash_attention.cpython-312.pyc",
+            )
+            for relative in cache_paths:
+                path = root / RUN / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"generated cache")
+
+            runs, selections, inventory = discover_runs_source(
+                root, {RUN}, stopped_study=True
+            )
+            self.assertEqual(runs, [RUN])
+            self.assertEqual(
+                selections,
+                [path.removeprefix("runs/") for path in STOPPED_SELECTION_PATHS],
+            )
+            self.assertFalse(any("__pycache__" in path for path in inventory))
+            self.assertEqual(len(inventory), len(RUN_FILES) + 7)
+
+            evil = root / RUN / "work/speedrun/kernels/__pycache__/evil.cpython-312.pyc"
+            evil.write_bytes(b"not allowlisted")
+            with self.assertRaisesRegex(EvidenceError, "non-evidence extras"):
+                discover_runs_source(root, {RUN}, stopped_study=True)
 
     def test_deterministic_source_archive_is_pinned_and_repeatable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -334,6 +773,28 @@ class ScalingEvidencePublisherTests(unittest.TestCase):
             receipt["archive_manifest"]["sha256"],
             sha256_bytes(canonical_json_bytes(manifest)),
         )
+
+    def test_stopped_receipt_requires_negative_result_semantic_flags(self) -> None:
+        manifest = _stopped_manifest()
+        verification = {
+            "semantic_verification": {
+                flag: True for flag in STOPPED_SEMANTIC_FLAGS
+            }
+        }
+        receipt = publication_receipt(
+            manifest=manifest,
+            revision="b" * 40,
+            verification=verification,
+        )
+        self.assertEqual(receipt["kind"], STOPPED_RECEIPT_KIND)
+        self.assertTrue(receipt["anonymous_verification"]["no_scaling_law_claimed"])
+        wrong = {"semantic_verification": {flag: True for flag in SEMANTIC_FLAGS}}
+        with self.assertRaisesRegex(EvidenceError, "semantic verification is incomplete"):
+            publication_receipt(
+                manifest=manifest,
+                revision="b" * 40,
+                verification=wrong,
+            )
 
     def test_anonymous_revalidation_rejects_remote_extra_before_download(self) -> None:
         manifest = _manifest()
@@ -1063,8 +1524,8 @@ class ScalingEvidencePublisherTests(unittest.TestCase):
         }
         provenance = {
             "name": public["name"],
-            "manifest_raw_sha256": PUBLISHED_4B_MANIFEST_SHA256,
-            "manifest_canonical_sha256": PUBLISHED_4B_MANIFEST_CANONICAL_SHA256,
+            "manifest_raw_sha256": V4_RUN_4B_MANIFEST_RAW_SHA256,
+            "manifest_canonical_sha256": V4_RUN_4B_MANIFEST_CANONICAL_SHA256,
             "production": {
                 "source_inventory_sha256": source["inventory_sha256"],
                 "exclusion_policy_sha256": source["exclusion_policy_sha256"],
@@ -1452,6 +1913,35 @@ class ScalingEvidencePublisherTests(unittest.TestCase):
                 ]
             )
         self.assertEqual(result, 0)
+        token.assert_not_called()
+        publish.assert_not_called()
+
+    def test_stopped_dry_run_is_explicit_and_credential_free(self) -> None:
+        from scripts.publish_scaling_evidence import main
+
+        manifest = _stopped_manifest()
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch(
+                "scripts.publish_scaling_evidence.build_archive",
+                return_value=(Path(directory) / "bundle", manifest),
+            ) as build,
+            patch("scripts.publish_scaling_evidence.read_token_file") as token,
+            patch("scripts.publish_scaling_evidence.publish_archive") as publish,
+        ):
+            result = main(
+                [
+                    "build",
+                    "--runs",
+                    str(Path(directory) / "runs"),
+                    "--output",
+                    str(Path(directory) / "bundle"),
+                    "--stopped-study",
+                    "--dry-run",
+                ]
+            )
+        self.assertEqual(result, 0)
+        self.assertIs(build.call_args.kwargs["stopped_study"], True)
         token.assert_not_called()
         publish.assert_not_called()
 

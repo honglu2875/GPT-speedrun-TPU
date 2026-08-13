@@ -49,10 +49,16 @@ SOURCE_ARCHIVE_SHA256 = "dc3d58bfbb0075dc4fb14060fd5336eb539e1ea6b508b2fef366502
 SUITE_REPOSITORY_PATH = "sweeps/current_budget_isoflop_v4/suite.yaml"
 DEFAULT_REPOSITORY = "quintic/gpt-tpu-speedrun-scaling-evidence"
 DEFAULT_PREFIX = "current_budget_isoflop_v4"
+DEFAULT_STOPPED_PREFIX = "current_budget_isoflop_v4/stopped-inconclusive"
 DEFAULT_RECEIPT = Path("data/manifests/scaling/current_budget_isoflop_v4.json")
 MANIFEST_NAME = "archive-manifest.json"
 SOURCE_PREFIX = "source/"
 SCHEMA_VERSION = 1
+STOPPED_SCHEMA_VERSION = 2
+COMPLETE_KIND = "gpt_tpu_speedrun_scaling_evidence"
+STOPPED_KIND = "gpt_tpu_speedrun_stopped_scaling_evidence"
+COMPLETE_RECEIPT_KIND = "gpt_tpu_speedrun_scaling_evidence_receipt"
+STOPPED_RECEIPT_KIND = "gpt_tpu_speedrun_stopped_scaling_evidence_receipt"
 TOKEN_PATTERN = re.compile(r"hf_[A-Za-z0-9]{20,}\Z")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 COMMIT_PATTERN = re.compile(r"[0-9a-f]{40,64}\Z")
@@ -64,6 +70,7 @@ READ_CHUNK = 1024 * 1024
 HTTP_ATTEMPTS = 5
 MAX_ARCHIVE_BYTES = 64 * 1024 * 1024 * 1024
 MAX_INVENTORY_FILES = 4_096
+MAX_IGNORED_PYC_BYTES = 1024 * 1024
 ROLE_MAX_BYTES = {
     "documentation": 2 * 1024 * 1024,
     "verifier": 4 * 1024 * 1024,
@@ -90,6 +97,12 @@ PUBLISHED_4B_MANIFEST_SHA256 = (
 )
 PUBLISHED_4B_MANIFEST_CANONICAL_SHA256 = (
     "92b21722236814a046a621cb4a801928dcf0318ca52693e11a3f32b1c6998dc1"
+)
+V4_RUN_4B_MANIFEST_RAW_SHA256 = (
+    "68eff87a6a8a62c3cecc9b357bd1d9b2299662b6916c7287e4d889c39b79b2d1"
+)
+V4_RUN_4B_MANIFEST_CANONICAL_SHA256 = (
+    "f3bdc21452fd6341d3235b87c66ec58e1bc42cf469502f2cdf5d4ae9eb62ba4c"
 )
 
 RUN_FILES: tuple[tuple[str, str], ...] = (
@@ -137,6 +150,29 @@ SEMANTIC_FLAGS = (
     "slice_fits_recomputed",
     "final_fit_recomputed",
     "scaling_law_present",
+)
+STOPPED_SEMANTIC_FLAGS = (
+    "all_runs_recomputed",
+    "stopped_run_set_exact",
+    "terminal_state_recomputed",
+    "published_4b_manifest_bound",
+    "metrics_equal_results",
+    "admissions_recomputed",
+    "learning_rate_selections_recomputed",
+    "completed_slice_fit_recomputed",
+    "no_control_present",
+    "no_global_fit_present",
+    "no_scaling_law_claimed",
+)
+STOPPED_STATUS = "stopped_inconclusive"
+STOPPED_OUTCOME = "negative_result_no_scaling_law"
+STOPPED_REASON_CODE = "lower_learning_rate_recovery_rejected"
+STOPPED_CONTROLLER_ERROR = (
+    "c050/n023: lower LR expansion is ineligible; refusing to search beyond it"
+)
+STOPPED_SELECTIONS = tuple(
+    f"learning-rate-selections/c025/{shape_id}.json"
+    for shape_id in ("n023", "n030", "n040", "n051", "n065", "n082")
 )
 
 
@@ -561,15 +597,46 @@ def inventory_digest(files: Sequence[Mapping[str, Any]]) -> str:
     return sha256_bytes(canonical_json_bytes(list(files)))
 
 
+def stopped_terminal_contract() -> dict[str, str]:
+    """Return the one exact fail-closed terminal state supported by schema v2."""
+
+    return {
+        "reason_code": STOPPED_REASON_CODE,
+        "slice": "c050",
+        "shape_id": "n023",
+        "failed_initial_point": "c050_n023_lr200",
+        "failed_recovery_point": "c050_n023_lr133_adaptive",
+        "unlaunched_next_point": "c050_n023_lr089_adaptive",
+        "controller_error": STOPPED_CONTROLLER_ERROR,
+    }
+
+
+def _stopped_manifest(manifest: Mapping[str, Any]) -> bool:
+    return (
+        manifest.get("schema_version") == STOPPED_SCHEMA_VERSION
+        and manifest.get("kind") == STOPPED_KIND
+    )
+
+
+def semantic_flags_for(manifest: Mapping[str, Any]) -> tuple[str, ...]:
+    return STOPPED_SEMANTIC_FLAGS if _stopped_manifest(manifest) else SEMANTIC_FLAGS
+
+
 def validate_manifest(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Validate the exact schema and return a plain, non-normalized copy."""
 
     manifest = dict(payload)
     _exact_keys(manifest, MANIFEST_TOP_KEYS, "archive manifest")
-    if manifest["schema_version"] != SCHEMA_VERSION:
+    if manifest["schema_version"] not in {SCHEMA_VERSION, STOPPED_SCHEMA_VERSION}:
         raise EvidenceError("unsupported archive manifest schema_version")
-    if manifest["kind"] != "gpt_tpu_speedrun_scaling_evidence":
+    expected_kind = (
+        STOPPED_KIND
+        if manifest["schema_version"] == STOPPED_SCHEMA_VERSION
+        else COMPLETE_KIND
+    )
+    if manifest["kind"] != expected_kind:
         raise EvidenceError("archive manifest kind is invalid")
+    stopped = manifest["schema_version"] == STOPPED_SCHEMA_VERSION
     archive_id = manifest["archive_id"]
     if not isinstance(archive_id, str) or SAFE_COMPONENT.fullmatch(archive_id) is None:
         raise EvidenceError("archive_id is not filesystem safe")
@@ -607,6 +674,10 @@ def validate_manifest(payload: Mapping[str, Any]) -> dict[str, Any]:
     directory = normalized_path(publication["directory"], "publication_target.directory")
     if PurePosixPath(directory).name != archive_id:
         raise EvidenceError("publication directory must end with archive_id")
+    if stopped and PurePosixPath(directory).parent.name != "stopped-inconclusive":
+        raise EvidenceError(
+            "stopped evidence must publish below a stopped-inconclusive namespace"
+        )
 
     source = _mapping(manifest["source_archive"], "source_archive")
     _exact_keys(source, {"path", "commit", "prefix", "bytes", "sha256"}, "source_archive")
@@ -622,17 +693,40 @@ def validate_manifest(payload: Mapping[str, Any]) -> dict[str, Any]:
     _sha256(source["sha256"], "source_archive.sha256")
 
     study = _mapping(manifest["study"], "study")
-    _exact_keys(
-        study,
-        {
-            "runs",
-            "classifications",
-            "learning_rate_selections",
-            "fit_paths",
-            "can_estimate_scaling_exponent",
-        },
-        "study",
-    )
+    if stopped:
+        _exact_keys(
+            study,
+            {
+                "status",
+                "outcome",
+                "runs",
+                "classifications",
+                "learning_rate_selections",
+                "fit_paths",
+                "terminal",
+                "can_estimate_scaling_exponent",
+                "scaling_law",
+            },
+            "study",
+        )
+        if study["status"] != STOPPED_STATUS or study["outcome"] != STOPPED_OUTCOME:
+            raise EvidenceError("schema-v2 study is not the exact stopped outcome")
+        if study["terminal"] != stopped_terminal_contract():
+            raise EvidenceError("schema-v2 terminal state differs from the exact v4 stop")
+        if study["scaling_law"] is not None:
+            raise EvidenceError("stopped evidence must not contain a scaling-law claim")
+    else:
+        _exact_keys(
+            study,
+            {
+                "runs",
+                "classifications",
+                "learning_rate_selections",
+                "fit_paths",
+                "can_estimate_scaling_exponent",
+            },
+            "study",
+        )
     runs = study["runs"]
     if not isinstance(runs, list) or not runs or runs != sorted(set(runs)):
         raise EvidenceError("study.runs must be a nonempty sorted unique list")
@@ -655,6 +749,13 @@ def validate_manifest(payload: Mapping[str, Any]) -> dict[str, Any]:
         classified.extend(values)
     if sorted(classified) != runs or len(classified) != len(set(classified)):
         raise EvidenceError("study classifications must partition the run list")
+    if stopped and (
+        len(runs) != 42
+        or len(classifications["stable"]) != 38
+        or classifications["suspect"]
+        or len(classifications["rejected"]) != 4
+    ):
+        raise EvidenceError("stopped study must contain exactly 38 stable and 4 rejected runs")
     selections = study["learning_rate_selections"]
     if (
         not isinstance(selections, list)
@@ -669,17 +770,29 @@ def validate_manifest(payload: Mapping[str, Any]) -> dict[str, Any]:
         )
     ):
         raise EvidenceError("learning-rate selections must be sorted canonical JSON paths")
+    if stopped and selections != [f"runs/{path}" for path in STOPPED_SELECTIONS]:
+        raise EvidenceError("stopped study must contain the exact six c025 selections")
     fit_paths = _mapping(study["fit_paths"], "study.fit_paths")
     _exact_keys(fit_paths, {"final_json", "final_markdown", "slices"}, "study.fit_paths")
-    if (
-        fit_paths["final_json"] != "runs/fit.json"
-        or fit_paths["final_markdown"] != "runs/fit.md"
-        or fit_paths["slices"]
-        != ["runs/fits/c025.json", "runs/fits/c050.json", "runs/fits/c100.json"]
-    ):
-        raise EvidenceError("study.fit_paths differs from the exact v4 fit set")
-    if study["can_estimate_scaling_exponent"] is not True:
-        raise EvidenceError("publication requires a fully bracketed scaling law")
+    if stopped:
+        if fit_paths != {
+            "final_json": None,
+            "final_markdown": None,
+            "slices": ["runs/fits/c025.json"],
+        }:
+            raise EvidenceError("stopped study.fit_paths differs from the exact terminal set")
+        if study["can_estimate_scaling_exponent"] is not False:
+            raise EvidenceError("stopped evidence must explicitly deny a scaling exponent")
+    else:
+        if (
+            fit_paths["final_json"] != "runs/fit.json"
+            or fit_paths["final_markdown"] != "runs/fit.md"
+            or fit_paths["slices"]
+            != ["runs/fits/c025.json", "runs/fits/c050.json", "runs/fits/c100.json"]
+        ):
+            raise EvidenceError("study.fit_paths differs from the exact v4 fit set")
+        if study["can_estimate_scaling_exponent"] is not True:
+            raise EvidenceError("publication requires a fully bracketed scaling law")
 
     inventory = _mapping(manifest["inventory"], "inventory")
     _exact_keys(inventory, {"file_count", "total_bytes", "files"}, "inventory")
@@ -719,11 +832,14 @@ def validate_manifest(payload: Mapping[str, Any]) -> dict[str, Any]:
     if total_bytes > MAX_ARCHIVE_BYTES:
         raise EvidenceError("inventory exceeds the bounded archive byte budget")
 
+    expected_fit_paths = (
+        {"runs/fits/c025.json"} if stopped else set(FIT_PATHS)
+    )
     expected_nonrun = {
         "README.md",
         "verify.py",
         source_path,
-        *FIT_PATHS,
+        *expected_fit_paths,
         *selections,
     }
     expected_run_paths = {
@@ -742,11 +858,17 @@ def validate_manifest(payload: Mapping[str, Any]) -> dict[str, Any]:
         "README.md": "documentation",
         "verify.py": "verifier",
         source_path: "source_archive",
-        "runs/fit.json": "final_fit_json",
-        "runs/fit.md": "final_fit_markdown",
-        "runs/fits/c025.json": "slice_fit",
-        "runs/fits/c050.json": "slice_fit",
-        "runs/fits/c100.json": "slice_fit",
+        **(
+            {"runs/fits/c025.json": "slice_fit"}
+            if stopped
+            else {
+                "runs/fit.json": "final_fit_json",
+                "runs/fit.md": "final_fit_markdown",
+                "runs/fits/c025.json": "slice_fit",
+                "runs/fits/c050.json": "slice_fit",
+                "runs/fits/c100.json": "slice_fit",
+            }
+        ),
         **{path: "learning_rate_selection" for path in selections},
         **{
             f"runs/{run}/{relative}": role
@@ -763,8 +885,9 @@ def validate_manifest(payload: Mapping[str, Any]) -> dict[str, Any]:
         or source_entry["role"] != "source_archive"
     ):
         raise EvidenceError("source_archive metadata differs from its inventory entry")
+    archive_stem = f"{identity['suite_id']}-stopped" if stopped else identity["suite_id"]
     expected_archive_id = (
-        f"{identity['suite_id']}-{inventory_digest(files)[:16]}-"
+        f"{archive_stem}-{inventory_digest(files)[:16]}-"
         f"{identity['launch_commit'][:12]}"
     )
     if archive_id != expected_archive_id:
@@ -970,10 +1093,15 @@ def semantic_verify(bundle: Path, manifest: Mapping[str, Any]) -> dict[str, bool
         if classifications != study["classifications"]:
             raise EvidenceError("manifest classification partition differs from recomputation")
 
-        selection_groups = prospective_selection_groups(
-            suite,
-            run_names=run_names,
-            measurements=measurements,
+        stopped = _stopped_manifest(manifest)
+        selection_groups = (
+            stopped_selection_groups(suite)
+            if stopped
+            else prospective_selection_groups(
+                suite,
+                run_names=run_names,
+                measurements=measurements,
+            )
         )
         expected_selection_paths = {
             f"runs/learning-rate-selections/{slice_id}/{shape_id}.json"
@@ -985,10 +1113,12 @@ def semantic_verify(bundle: Path, manifest: Mapping[str, Any]) -> dict[str, bool
                 "required or begun slice/shape calibration"
             )
 
-        accounted_runs = {
-            str(point["id"])
-            for point in suite["controls"]
-        }
+        accounted_runs = (
+            set()
+            if stopped
+            else {str(point["id"]) for point in suite["controls"]}
+        )
+        selected_measurements: dict[tuple[str, str], Mapping[str, Any]] = {}
         for relative in sorted(expected_selection_paths):
             parts = PurePosixPath(relative).parts
             if len(parts) != 4:
@@ -1010,6 +1140,15 @@ def semantic_verify(bundle: Path, manifest: Mapping[str, Any]) -> dict[str, bool
                 raise EvidenceError(f"{slice_id}/{shape_id}: LR recomputation failed: {exc}") from exc
             if recomputed != existing:
                 raise EvidenceError(f"{slice_id}/{shape_id}: LR selection JSON differs")
+            selected_id = recomputed.get("selected_point_id")
+            if stopped and (
+                not isinstance(selected_id, str) or selected_id not in measurements
+            ):
+                raise EvidenceError(
+                    f"{slice_id}/{shape_id}: selected LR identity is not archived"
+                )
+            if isinstance(selected_id, str) and selected_id in measurements:
+                selected_measurements[(slice_id, shape_id)] = measurements[selected_id]
             candidates = recomputed.get("candidates")
             if not isinstance(candidates, list):
                 raise EvidenceError(f"{slice_id}/{shape_id}: LR candidates are malformed")
@@ -1021,58 +1160,76 @@ def semantic_verify(bundle: Path, manifest: Mapping[str, Any]) -> dict[str, bool
                         f"{slice_id}/{shape_id}: LR candidate identity is malformed"
                     )
                 accounted_runs.add(str(candidate["id"]))
-        if accounted_runs != set(run_names):
-            raise EvidenceError(
-                "archived runs are not exactly the required control plus every "
-                "candidate in a recomputed LR selection"
+        if stopped:
+            verify_stopped_terminal_state(
+                scaling=scaling,
+                suite=suite,
+                runs_root=runs_root,
+                run_names=run_names,
+                measurements=measurements,
+                selected_measurements=selected_measurements,
+                accounted_selection_runs=accounted_runs,
+                manifest_terminal=study.get("terminal"),
             )
+        else:
+            if accounted_runs != set(run_names):
+                raise EvidenceError(
+                    "archived runs are not exactly the required control plus every "
+                    "candidate in a recomputed LR selection"
+                )
 
-        try:
-            final_fit = scaling.fit_results(suite, runs_root)
-        except Exception as exc:
-            raise EvidenceError(f"final fit recomputation failed: {exc}") from exc
-        existing_fit = read_json_regular(runs_root / "fit.json", "runs/fit.json")
-        if final_fit != existing_fit:
-            raise EvidenceError("runs/fit.json differs from full recomputation")
-        if (
-            final_fit.get("can_estimate_scaling_exponent") is not True
-            or not isinstance(final_fit.get("scaling_law"), Mapping)
-        ):
-            raise EvidenceError("publication requires a fully bracketed final scaling law")
-        control_ids = [str(point["id"]) for point in suite["controls"]]
-        if control_ids != ["c100_n124_control"]:
-            raise EvidenceError("archived launch suite has an unexpected control contract")
-        fitted_controls = final_fit.get("controls")
-        if (
-            not isinstance(fitted_controls, list)
-            or [item.get("id") for item in fitted_controls] != control_ids
-        ):
-            raise EvidenceError("final fit does not contain the mandatory c100_n124_control")
-        slices = final_fit.get("slices")
-        if not isinstance(slices, list) or [item.get("slice") for item in slices] != [
-            "c025",
-            "c050",
-            "c100",
-        ]:
-            raise EvidenceError("final fit has the wrong ordered slice set")
-        for fitted in slices:
-            slice_id = str(fitted["slice"])
-            existing_slice = read_json_regular(
-                runs_root / "fits" / f"{slice_id}.json",
-                f"runs/fits/{slice_id}.json",
-            )
-            if fitted != existing_slice:
-                raise EvidenceError(f"{slice_id}: stored slice fit differs from recomputation")
-        with tempfile.TemporaryDirectory(prefix="scaling-evidence-fit-") as directory:
-            generated_json, generated_markdown = scaling.write_fit(
-                final_fit, Path(directory) / "fit.json"
-            )
-            if read_regular_once(generated_json) != read_regular_once(runs_root / "fit.json"):
-                raise EvidenceError("final fit JSON bytes are not deterministic")
-            if read_regular_once(generated_markdown) != read_regular_once(runs_root / "fit.md"):
-                raise EvidenceError("final fit Markdown differs from recomputation")
+            try:
+                final_fit = scaling.fit_results(suite, runs_root)
+            except Exception as exc:
+                raise EvidenceError(f"final fit recomputation failed: {exc}") from exc
+            existing_fit = read_json_regular(runs_root / "fit.json", "runs/fit.json")
+            if final_fit != existing_fit:
+                raise EvidenceError("runs/fit.json differs from full recomputation")
+            if (
+                final_fit.get("can_estimate_scaling_exponent") is not True
+                or not isinstance(final_fit.get("scaling_law"), Mapping)
+            ):
+                raise EvidenceError("publication requires a fully bracketed final scaling law")
+            control_ids = [str(point["id"]) for point in suite["controls"]]
+            if control_ids != ["c100_n124_control"]:
+                raise EvidenceError("archived launch suite has an unexpected control contract")
+            fitted_controls = final_fit.get("controls")
+            if (
+                not isinstance(fitted_controls, list)
+                or [item.get("id") for item in fitted_controls] != control_ids
+            ):
+                raise EvidenceError("final fit does not contain the mandatory c100_n124_control")
+            slices = final_fit.get("slices")
+            if not isinstance(slices, list) or [item.get("slice") for item in slices] != [
+                "c025",
+                "c050",
+                "c100",
+            ]:
+                raise EvidenceError("final fit has the wrong ordered slice set")
+            for fitted in slices:
+                slice_id = str(fitted["slice"])
+                existing_slice = read_json_regular(
+                    runs_root / "fits" / f"{slice_id}.json",
+                    f"runs/fits/{slice_id}.json",
+                )
+                if fitted != existing_slice:
+                    raise EvidenceError(
+                        f"{slice_id}: stored slice fit differs from recomputation"
+                    )
+            with tempfile.TemporaryDirectory(prefix="scaling-evidence-fit-") as directory:
+                generated_json, generated_markdown = scaling.write_fit(
+                    final_fit, Path(directory) / "fit.json"
+                )
+                if read_regular_once(generated_json) != read_regular_once(
+                    runs_root / "fit.json"
+                ):
+                    raise EvidenceError("final fit JSON bytes are not deterministic")
+                if read_regular_once(generated_markdown) != read_regular_once(
+                    runs_root / "fit.md"
+                ):
+                    raise EvidenceError("final fit Markdown differs from recomputation")
 
-    return {flag: True for flag in SEMANTIC_FLAGS}
+    return {flag: True for flag in semantic_flags_for(manifest)}
 
 
 def validate_published_4b_binding(
@@ -1159,10 +1316,14 @@ def validate_published_4b_binding(
         production = provenance.get("production")
         if (
             provenance.get("name") != public["name"]
+            # Training consumed the local prepared-manifest representation,
+            # not the publication card itself.  Pin those exact v4 launch
+            # bytes, then bind their full shard/provenance content below to
+            # the separately pinned public 4B manifest.
             or provenance.get("manifest_raw_sha256")
-            != PUBLISHED_4B_MANIFEST_SHA256
+            != V4_RUN_4B_MANIFEST_RAW_SHA256
             or provenance.get("manifest_canonical_sha256")
-            != PUBLISHED_4B_MANIFEST_CANONICAL_SHA256
+            != V4_RUN_4B_MANIFEST_CANONICAL_SHA256
             or not isinstance(production, Mapping)
             or production.get("source_inventory_sha256")
             != source["inventory_sha256"]
@@ -1364,6 +1525,330 @@ def prospective_selection_groups(
     return groups
 
 
+def prospective_lr_run_ids_for_groups(
+    suite: Mapping[str, Any],
+    *,
+    groups: set[tuple[str, str]],
+    measurements: Mapping[str, Mapping[str, Any]],
+) -> set[str]:
+    """Replay the frozen LR controller for an explicit set of completed groups."""
+
+    completed = set(measurements)
+    calibration_points = list(suite["calibrations"]) + list(
+        suite["extension_calibrations"]
+    )
+    adaptive_points = list(suite["adaptive_calibrations"])
+    expected: set[str] = set()
+
+    def classification(point: Mapping[str, Any]) -> str:
+        point_id = str(point["id"])
+        measurement = measurements.get(point_id)
+        if measurement is None:
+            raise EvidenceError(f"{point_id}: prospectively required LR trial is missing")
+        admission = measurement.get("stability_admission")
+        if not isinstance(admission, Mapping) or admission.get("classification") not in {
+            "stable",
+            "suspect",
+            "rejected",
+        }:
+            raise EvidenceError(f"{point_id}: stability admission is malformed")
+        return str(admission["classification"])
+
+    def selection_state(
+        launched: Sequence[Mapping[str, Any]], group_label: str
+    ) -> str:
+        ordered = sorted(launched, key=lambda point: float(point["learning_rate"]))
+        stable = [point for point in ordered if classification(point) == "stable"]
+        if not stable:
+            raise EvidenceError(f"{group_label}: no stable LR candidate")
+        selected = min(
+            stable,
+            key=lambda point: (
+                float(measurements[str(point["id"])]["validation_loss"]),
+                float(point["learning_rate"]),
+            ),
+        )
+        index = ordered.index(selected)
+        if index == 0 or classification(ordered[index - 1]) != "stable":
+            return "lower"
+        if index == len(ordered) - 1:
+            return "upper"
+        return "valid"
+
+    for slice_id, shape_id in sorted(groups):
+        group_label = f"{slice_id}/{shape_id}"
+        initial = sorted(
+            (
+                point
+                for point in calibration_points
+                if str(point["slice"]) == slice_id
+                and str(point["shape_id"]) == shape_id
+            ),
+            key=lambda point: float(point["learning_rate"]),
+        )
+        if len(initial) != len(suite["learning_rate_candidates"]):
+            raise EvidenceError(f"{group_label}: initial LR definition is incomplete")
+        lower = [
+            next(
+                point
+                for point in adaptive_points
+                if str(point["slice"]) == slice_id
+                and str(point["shape_id"]) == shape_id
+                and float(point["learning_rate"]) == float(candidate["value"])
+            )
+            for candidate in suite["learning_rate_search"]["lower"]
+        ]
+        upper = [
+            next(
+                point
+                for point in adaptive_points
+                if str(point["slice"]) == slice_id
+                and str(point["shape_id"]) == shape_id
+                and float(point["learning_rate"]) == float(candidate["value"])
+            )
+            for candidate in suite["learning_rate_search"]["upper"]
+        ]
+
+        launched: list[Mapping[str, Any]] = []
+        for point in initial:
+            point_id = str(point["id"])
+            if point_id not in completed:
+                raise EvidenceError(
+                    f"{group_label}: stable initial LR prefix has a missing suffix"
+                )
+            launched.append(point)
+            expected.add(point_id)
+            if classification(point) != "stable":
+                break
+        if classification(initial[0]) != "stable":
+            if len(launched) != 1:
+                raise EvidenceError(f"{group_label}: ran beyond the lr200 frontier")
+            for point in lower:
+                point_id = str(point["id"])
+                if point_id not in completed:
+                    raise EvidenceError(
+                        f"{group_label}: mandatory lower-LR recovery is incomplete"
+                    )
+                if classification(point) != "stable":
+                    raise EvidenceError(
+                        f"{group_label}: lower-LR recovery crossed an ineligible frontier"
+                    )
+                launched.append(point)
+                expected.add(point_id)
+
+        lower_index = sum(point in launched for point in lower)
+        upper_index = sum(point in launched for point in upper)
+        while True:
+            state = selection_state(launched, group_label)
+            if state == "valid":
+                break
+            table = lower if state == "lower" else upper
+            index = lower_index if state == "lower" else upper_index
+            if index >= len(table):
+                raise EvidenceError(
+                    f"{group_label}: bounded {state} LR search exhausted without a bracket"
+                )
+            point = table[index]
+            point_id = str(point["id"])
+            if point_id not in completed:
+                raise EvidenceError(
+                    f"{group_label}: prospectively necessary {state} LR trial is missing"
+                )
+            if state == "lower" and classification(point) != "stable":
+                raise EvidenceError(f"{group_label}: lower LR expansion is ineligible")
+            launched.append(point)
+            expected.add(point_id)
+            if state == "lower":
+                lower_index += 1
+            else:
+                upper_index += 1
+    return expected
+
+
+def stopped_selection_groups(suite: Mapping[str, Any]) -> set[tuple[str, str]]:
+    """Return the exact completed calibration groups at the supported v4 stop."""
+
+    slice_ids = [str(item["id"]) for item in suite["compute_slices"]]
+    fit_shape_ids = [str(item["shape_id"]) for item in suite["fit_shapes"]]
+    extension_ids = [
+        str(item["shape_id"]) for item in suite["optional_extension_shapes"]
+    ]
+    control_ids = [str(item["id"]) for item in suite["controls"]]
+    if (
+        slice_ids != ["c025", "c050", "c100"]
+        or fit_shape_ids != ["n023", "n030", "n040", "n051", "n065"]
+        or extension_ids != ["n082", "n102"]
+        or control_ids != ["c100_n124_control"]
+    ):
+        raise EvidenceError("archived launch suite differs from the stopped-v4 contract")
+    return {("c025", shape_id) for shape_id in (*fit_shape_ids, extension_ids[0])}
+
+
+def derive_stopped_terminal_contract(suite: Mapping[str, Any]) -> dict[str, str]:
+    """Derive the supported stop from the launch suite's declared controller order."""
+
+    stopped_selection_groups(suite)  # validates the exact frozen suite geometry
+    slice_id = str(suite["compute_slices"][1]["id"])
+    shape_id = str(suite["fit_shapes"][0]["shape_id"])
+    initial_rate = float(suite["learning_rate_candidates"][0]["value"])
+    lower_rates = [float(item["value"]) for item in suite["learning_rate_search"]["lower"]]
+    initial = next(
+        point
+        for point in suite["calibrations"]
+        if str(point["slice"]) == slice_id
+        and str(point["shape_id"]) == shape_id
+        and float(point["learning_rate"]) == initial_rate
+    )
+    lower = [
+        next(
+            point
+            for point in suite["adaptive_calibrations"]
+            if str(point["slice"]) == slice_id
+            and str(point["shape_id"]) == shape_id
+            and float(point["learning_rate"]) == rate
+        )
+        for rate in lower_rates
+    ]
+    if len(lower) < 2:
+        raise EvidenceError("frozen v4 suite lacks the two-point lower LR table")
+    derived = {
+        "reason_code": STOPPED_REASON_CODE,
+        "slice": slice_id,
+        "shape_id": shape_id,
+        "failed_initial_point": str(initial["id"]),
+        "failed_recovery_point": str(lower[0]["id"]),
+        "unlaunched_next_point": str(lower[1]["id"]),
+        "controller_error": (
+            f"{slice_id}/{shape_id}: lower LR expansion is ineligible; "
+            "refusing to search beyond it"
+        ),
+    }
+    if derived != stopped_terminal_contract():
+        raise EvidenceError("frozen suite no longer derives the schema-v2 terminal contract")
+    return derived
+
+
+def verify_stopped_terminal_state(
+    *,
+    scaling: ModuleType,
+    suite: Mapping[str, Any],
+    runs_root: Path,
+    run_names: Sequence[str],
+    measurements: Mapping[str, Mapping[str, Any]],
+    selected_measurements: Mapping[tuple[str, str], Mapping[str, Any]],
+    accounted_selection_runs: set[str],
+    manifest_terminal: Any,
+) -> None:
+    """Prove the exact 42-run stop by replaying frozen controller semantics."""
+
+    groups = stopped_selection_groups(suite)
+    if set(selected_measurements) != groups:
+        raise EvidenceError("stopped selection measurements differ from six c025 groups")
+    prospective_c025_runs = prospective_lr_run_ids_for_groups(
+        suite, groups=groups, measurements=measurements
+    )
+    if accounted_selection_runs != prospective_c025_runs:
+        raise EvidenceError(
+            "stopped c025 trials differ from the exact prospective LR frontiers"
+        )
+
+    fit_shape_ids = [str(item["shape_id"]) for item in suite["fit_shapes"]]
+    base = [selected_measurements[("c025", shape_id)] for shape_id in fit_shape_ids]
+    compute_slice = suite["compute_slices"][0]
+    target = int(compute_slice["target_total_flops"])
+    try:
+        base_fit, _ = scaling._fit_slice(
+            base,
+            slice_id="c025",
+            target_total_flops=target,
+            random_seed=20_260_813,
+        )
+    except Exception as exc:
+        raise EvidenceError(f"stopped c025 base-fit recomputation failed: {exc}") from exc
+    if base_fit.get("bracketed") is not False or not scaling._warrants_high_side_extension(
+        base_fit
+    ):
+        raise EvidenceError("c025 base grid did not prospectively warrant n082")
+
+    completed_c025 = [*base, selected_measurements[("c025", "n082")]]
+    try:
+        completed_fit, _ = scaling._fit_slice(
+            completed_c025,
+            slice_id="c025",
+            target_total_flops=target,
+            random_seed=20_260_813,
+        )
+    except Exception as exc:
+        raise EvidenceError(f"stopped c025 fit recomputation failed: {exc}") from exc
+    if completed_fit.get("bracketed") is not True or scaling._warrants_high_side_extension(
+        completed_fit
+    ):
+        raise EvidenceError("c025 did not stop at a bracketed n082 extension")
+    existing_c025 = read_json_regular(
+        runs_root / "fits" / "c025.json", "runs/fits/c025.json"
+    )
+    if completed_fit != existing_c025:
+        raise EvidenceError("c025: stored stopped-study slice fit differs")
+    expected_fit_bytes = (
+        json.dumps(completed_fit, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if read_regular_once(runs_root / "fits" / "c025.json") != expected_fit_bytes:
+        raise EvidenceError("c025: stopped-study slice fit bytes are not deterministic")
+
+    derived_terminal = derive_stopped_terminal_contract(suite)
+    initial_id = derived_terminal["failed_initial_point"]
+    recovery_id = derived_terminal["failed_recovery_point"]
+    next_id = derived_terminal["unlaunched_next_point"]
+    terminal_ids = {initial_id, recovery_id}
+    expected_runs = accounted_selection_runs | terminal_ids
+    if set(run_names) != expected_runs or len(expected_runs) != 42:
+        raise EvidenceError(
+            "stopped run set is not exactly six c025 selections plus the c050 terminal pair"
+        )
+    if next_id in measurements:
+        raise EvidenceError("stopped archive improperly crossed the lower-LR frontier")
+    for point_id in terminal_ids:
+        admission = measurements[point_id].get("stability_admission")
+        if not isinstance(admission, Mapping) or admission.get("classification") != "rejected":
+            raise EvidenceError(f"{point_id}: terminal trial must recompute as rejected")
+
+    expected_rejected = {
+        "c025_n023_lr1519_adaptive",
+        "c025_n030_lr675_adaptive",
+        initial_id,
+        recovery_id,
+    }
+    actual_rejected = {
+        name
+        for name, measurement in measurements.items()
+        if measurement["stability_admission"]["classification"] == "rejected"
+    }
+    actual_suspect = {
+        name
+        for name, measurement in measurements.items()
+        if measurement["stability_admission"]["classification"] == "suspect"
+    }
+    if actual_rejected != expected_rejected or actual_suspect:
+        raise EvidenceError("stopped archive does not have the exact four rejections")
+
+    try:
+        scaling._validate_adaptive_completion_prefix(
+            suite, "n023", runs_root, slice_id="c050"
+        )
+    except Exception as exc:
+        if (
+            exc.__class__.__name__ != "ScalingError"
+            or str(exc) != derived_terminal["controller_error"]
+        ):
+            raise EvidenceError(
+                f"frozen controller reached a different terminal state: {exc}"
+            ) from exc
+    else:
+        raise EvidenceError("frozen controller does not recognize the archived stop")
+    if manifest_terminal != derived_terminal:
+        raise EvidenceError("manifest terminal reason differs from frozen controller state")
+
+
 def verify_bundle(bundle: Path) -> dict[str, Any]:
     """Verify a local/archive download through a private read-once snapshot."""
 
@@ -1556,7 +2041,30 @@ def _load_suite_from_source_archive(source_archive: Path) -> dict[str, Any]:
             sys.path[:] = old_path
 
 
-def discover_runs_source(runs: Path, declared_points: set[str]) -> tuple[list[str], list[str], dict[str, tuple[int, ...]]]:
+def _allowed_generated_pyc_paths(run_names: Sequence[str]) -> set[str]:
+    """Return the exact CPython-3.12 cache debris produced by the v4 trainer.
+
+    These files are neither copied nor trusted.  They are named explicitly so
+    stopped-study collection can tolerate the launcher's import cache without
+    weakening the evidence allowlist for any other file or directory.
+    """
+
+    relative = (
+        "work/speedrun/__pycache__/__init__.cpython-312.pyc",
+        "work/speedrun/kernels/__pycache__/__init__.cpython-312.pyc",
+        "work/speedrun/kernels/__pycache__/autotune.cpython-312.pyc",
+        "work/speedrun/kernels/__pycache__/linear_cross_entropy.cpython-312.pyc",
+        "work/speedrun/kernels/__pycache__/tpu_flash_attention.cpython-312.pyc",
+    )
+    return {f"{run}/{path}" for run in run_names for path in relative}
+
+
+def discover_runs_source(
+    runs: Path,
+    declared_points: set[str],
+    *,
+    stopped_study: bool = False,
+) -> tuple[list[str], list[str], dict[str, tuple[int, ...]]]:
     """Validate the source run tree against the exact run/derived allowlist."""
 
     # The caller supplies the one canonical root chosen at workflow preflight.
@@ -1565,13 +2073,17 @@ def discover_runs_source(runs: Path, declared_points: set[str]) -> tuple[list[st
     runs = lexical_absolute(runs)
     directories: dict[str, tuple[int, ...]] = {}
     inventory = scan_regular_tree(runs, directories=directories)
-    required_derived = {
-        "fit.json",
-        "fit.md",
-        "fits/c025.json",
-        "fits/c050.json",
-        "fits/c100.json",
-    }
+    required_derived = (
+        {"fits/c025.json"}
+        if stopped_study
+        else {
+            "fit.json",
+            "fit.md",
+            "fits/c025.json",
+            "fits/c050.json",
+            "fits/c100.json",
+        }
+    )
     run_names = sorted(
         {
             PurePosixPath(path).parts[0]
@@ -1598,17 +2110,37 @@ def discover_runs_source(runs: Path, declared_points: set[str]) -> tuple[list[st
             or SAFE_COMPONENT.fullmatch(parts[2][:-5]) is None
         ):
             raise EvidenceError(f"unexpected learning-rate selection path: {path}")
+    if stopped_study and selections != list(STOPPED_SELECTIONS):
+        raise EvidenceError("stopped source must contain exactly six c025 selections")
     expected = set(required_derived) | set(selections)
     for name in run_names:
         expected.update(f"{name}/{relative}" for relative, _role in RUN_FILES)
-    if set(inventory) != expected:
+    ignored_pyc: set[str] = set()
+    if stopped_study:
+        allowed_pyc = _allowed_generated_pyc_paths(run_names)
+        ignored_pyc = set(inventory) - expected
+        unexpected_pyc = ignored_pyc - allowed_pyc
+        if unexpected_pyc:
+            raise EvidenceError(
+                "stopped run source contains non-evidence extras: "
+                f"{sorted(unexpected_pyc)[:8]!r}"
+            )
+        oversized_pyc = sorted(
+            path for path in ignored_pyc if inventory[path][6] > MAX_IGNORED_PYC_BYTES
+        )
+        if oversized_pyc:
+            raise EvidenceError(
+                "ignored generated bytecode exceeds its per-file bound: "
+                f"{oversized_pyc[:8]!r}"
+            )
+    if set(inventory) != expected | ignored_pyc:
         missing = sorted(expected - set(inventory))
-        extra = sorted(set(inventory) - expected)
+        extra = sorted(set(inventory) - expected - ignored_pyc)
         raise EvidenceError(
             "run source is not the strict 15-file/run closed tree: "
             f"missing={missing[:8]!r}, extra={extra[:8]!r}"
         )
-    expected_directories = expected_parent_directories(expected)
+    expected_directories = expected_parent_directories(expected | ignored_pyc)
     if set(directories) != expected_directories:
         raise EvidenceError(
             "run source directory tree is not closed: "
@@ -1616,7 +2148,10 @@ def discover_runs_source(runs: Path, declared_points: set[str]) -> tuple[list[st
             f"extra={sorted(set(directories) - expected_directories)[:8]!r}"
         )
     total_bytes = 0
-    for relative, metadata in inventory.items():
+    evidence_inventory = {
+        relative: metadata for relative, metadata in inventory.items() if relative in expected
+    }
+    for relative, metadata in evidence_inventory.items():
         archive_path = f"runs/{relative}"
         role = _role_for_archive_path(archive_path, run_names, selections)
         size = metadata[6]
@@ -1627,7 +2162,7 @@ def discover_runs_source(runs: Path, declared_points: set[str]) -> tuple[list[st
         total_bytes += size
     if total_bytes > MAX_ARCHIVE_BYTES:
         raise EvidenceError("run source exceeds the bounded archive byte budget")
-    return run_names, selections, inventory
+    return run_names, selections, evidence_inventory
 
 
 def _classification_from_admission(path: Path, run_name: str) -> str:
@@ -1638,7 +2173,31 @@ def _classification_from_admission(path: Path, run_name: str) -> str:
     return str(classification)
 
 
-def archive_readme(identity: Mapping[str, Any]) -> bytes:
+def archive_readme(identity: Mapping[str, Any], *, stopped_study: bool = False) -> bytes:
+    if stopped_study:
+        return (
+            "# GPT TPU speedrun v4 stopped-study evidence\n\n"
+            "**Outcome: INCONCLUSIVE / NEGATIVE RESULT. NO SCALING LAW WAS FIT OR "
+            "CLAIMED.**\n\n"
+            f"Suite: `{identity['suite_id']}`  \n"
+            f"Launch source: `{identity['launch_commit']}`\n\n"
+            "This closed bundle records the exact 42-run terminal state of the "
+            "one-seed local v4 IsoFLOP study. The c025 slice completed, but c050/n023 "
+            "rejected both its initial lr200 trial and its first lower-recovery lr133 "
+            "trial. The frozen fail-closed controller then refused to search beyond "
+            "that ineligible lower-LR frontier. No c050 selection, c100 run, control, "
+            "global fit, or scaling exponent exists.\n\n"
+            "The bundle proves that this exact raw state is terminal when replayed "
+            "under the hash-pinned controller. It does not claim to contain a separate "
+            "historical stderr or process-exit transcript.\n\n"
+            "Every retained raw curve, admission, c025 LR selection, and the c025 "
+            "slice fit can be independently recomputed with:\n\n"
+            "```bash\n"
+            "python verify.py verify --bundle .\n"
+            "```\n\n"
+            "`archive-manifest.json` is excluded from its own inventory; the external "
+            "publication receipt pins its SHA-256 and immutable repository revision.\n"
+        ).encode("utf-8")
     return (
         "# GPT TPU speedrun scaling evidence\n\n"
         f"Suite: `{identity['suite_id']}`  \n"
@@ -1819,12 +2378,15 @@ def build_archive(
     repo_id: str,
     prefix: str,
     launch_commit: str = LAUNCH_COMMIT,
+    stopped_study: bool = False,
     _pinned_runs: PinnedEvidenceRoot | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     """Build atomically from a stable source tree, then fully reverify it."""
 
     if launch_commit != LAUNCH_COMMIT:
         raise EvidenceError(f"v4 publication pins launch commit {LAUNCH_COMMIT}")
+    if stopped_study and prefix == DEFAULT_PREFIX:
+        prefix = DEFAULT_STOPPED_PREFIX
     repository_root = repository_root.expanduser().resolve(strict=True)
     repository_descriptor = open_directory_chain(repository_root, create=False)
     os.close(repository_descriptor)
@@ -1867,14 +2429,18 @@ def build_archive(
                 raise EvidenceError("launch source does not contain the v4 suite")
             declared = {str(point["id"]) for point in suite["all_variants"]}
             run_names, source_selections, before_inventory = discover_runs_source(
-                runs, declared
+                runs, declared, stopped_study=stopped_study
             )
             before_directories: dict[str, tuple[int, ...]] = {}
             checked_before_inventory = scan_regular_tree(
                 runs, directories=before_directories
             )
+            checked_before_evidence = {
+                path: checked_before_inventory[path] for path in before_inventory
+                if path in checked_before_inventory
+            }
             if (
-                checked_before_inventory != before_inventory
+                checked_before_evidence != before_inventory
                 or (
                     checked_before_inventory != pinned_runs.files
                     or before_directories != pinned_runs.directories
@@ -1904,8 +2470,12 @@ def build_archive(
             after_inventory = scan_regular_tree(
                 runs, directories=after_directories
             )
+            after_evidence = {
+                path: after_inventory[path] for path in before_inventory
+                if path in after_inventory
+            }
             if (
-                before_inventory != after_inventory
+                before_inventory != after_evidence
                 or before_directories != after_directories
                 or (
                     after_inventory != pinned_runs.files
@@ -1939,7 +2509,10 @@ def build_archive(
                 "seed": suite["seed"],
                 "launch_commit": launch_commit,
             }
-            write_new(temporary / "README.md", archive_readme(identity))
+            write_new(
+                temporary / "README.md",
+                archive_readme(identity, stopped_study=stopped_study),
+            )
             verifier_source = Path(__file__).resolve(strict=True)
             copy_regular_once(verifier_source, temporary / "verify.py")
 
@@ -1953,35 +2526,57 @@ def build_archive(
                     {"path": path, "bytes": size, "sha256": digest, "role": role}
                 )
             copied.sort(key=lambda item: str(item["path"]))
+            archive_stem = (
+                f"{suite['suite_id']}-stopped" if stopped_study else suite["suite_id"]
+            )
             archive_id = (
-                f"{suite['suite_id']}-{inventory_digest(copied)[:16]}-"
+                f"{archive_stem}-{inventory_digest(copied)[:16]}-"
                 f"{launch_commit[:12]}"
             )
 
-            staged_fit = read_json_regular(
-                temporary / "runs" / "fit.json", "runs/fit.json"
-            )
-            if staged_fit.get("can_estimate_scaling_exponent") is not True:
-                raise EvidenceError("stored fit cannot estimate a scaling exponent")
             selection_paths = [f"runs/{path}" for path in source_selections]
-            study = {
-                "runs": run_names,
-                "classifications": classifications,
-                "learning_rate_selections": selection_paths,
-                "fit_paths": {
-                    "final_json": "runs/fit.json",
-                    "final_markdown": "runs/fit.md",
-                    "slices": [
-                        "runs/fits/c025.json",
-                        "runs/fits/c050.json",
-                        "runs/fits/c100.json",
-                    ],
-                },
-                "can_estimate_scaling_exponent": True,
-            }
+            if stopped_study:
+                study = {
+                    "status": STOPPED_STATUS,
+                    "outcome": STOPPED_OUTCOME,
+                    "runs": run_names,
+                    "classifications": classifications,
+                    "learning_rate_selections": selection_paths,
+                    "fit_paths": {
+                        "final_json": None,
+                        "final_markdown": None,
+                        "slices": ["runs/fits/c025.json"],
+                    },
+                    "terminal": stopped_terminal_contract(),
+                    "can_estimate_scaling_exponent": False,
+                    "scaling_law": None,
+                }
+            else:
+                staged_fit = read_json_regular(
+                    temporary / "runs" / "fit.json", "runs/fit.json"
+                )
+                if staged_fit.get("can_estimate_scaling_exponent") is not True:
+                    raise EvidenceError("stored fit cannot estimate a scaling exponent")
+                study = {
+                    "runs": run_names,
+                    "classifications": classifications,
+                    "learning_rate_selections": selection_paths,
+                    "fit_paths": {
+                        "final_json": "runs/fit.json",
+                        "final_markdown": "runs/fit.md",
+                        "slices": [
+                            "runs/fits/c025.json",
+                            "runs/fits/c050.json",
+                            "runs/fits/c100.json",
+                        ],
+                    },
+                    "can_estimate_scaling_exponent": True,
+                }
             manifest = {
-                "schema_version": SCHEMA_VERSION,
-                "kind": "gpt_tpu_speedrun_scaling_evidence",
+                "schema_version": (
+                    STOPPED_SCHEMA_VERSION if stopped_study else SCHEMA_VERSION
+                ),
+                "kind": STOPPED_KIND if stopped_study else COMPLETE_KIND,
                 "archive_id": archive_id,
                 "identity": identity,
                 "publication_target": {
@@ -2269,12 +2864,15 @@ def publication_receipt(
     manifest = validate_manifest(manifest)
     manifest_bytes = canonical_json_bytes(manifest)
     flags = _mapping(verification.get("semantic_verification"), "semantic verification")
-    if flags != {flag: True for flag in SEMANTIC_FLAGS}:
+    expected_flags = {flag: True for flag in semantic_flags_for(manifest)}
+    if flags != expected_flags:
         raise EvidenceError("anonymous semantic verification is incomplete")
     inventory = _mapping(manifest["inventory"], "inventory")
     return {
         "schema_version": 1,
-        "kind": "gpt_tpu_speedrun_scaling_evidence_receipt",
+        "kind": (
+            STOPPED_RECEIPT_KIND if _stopped_manifest(manifest) else COMPLETE_RECEIPT_KIND
+        ),
         "archive_id": manifest["archive_id"],
         "identity": manifest["identity"],
         "publication": {
@@ -2970,6 +3568,14 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--repo-id", default=DEFAULT_REPOSITORY)
     build.add_argument("--prefix", default=DEFAULT_PREFIX)
     build.add_argument("--launch-commit", default=LAUNCH_COMMIT)
+    build.add_argument(
+        "--stopped-study",
+        action="store_true",
+        help=(
+            "archive only the exact supported 42-run inconclusive v4 terminal state; "
+            "never emit a scaling-law claim"
+        ),
+    )
     build.add_argument("--token-file", type=Path)
     build.add_argument("--receipt-output", type=Path, default=DEFAULT_RECEIPT)
     build.add_argument(
@@ -3018,6 +3624,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             repo_id=args.repo_id,
             prefix=args.prefix,
             launch_commit=args.launch_commit,
+            stopped_study=bool(args.stopped_study),
             _pinned_runs=workflow_runs,
         )
         plan = {
@@ -3028,6 +3635,10 @@ def main(argv: Iterable[str] | None = None) -> int:
             "files": manifest["inventory"]["file_count"] + 1,
             "bytes_excluding_manifest": manifest["inventory"]["total_bytes"],
             "manifest_sha256": sha256_bytes(canonical_json_bytes(manifest)),
+            "study_status": manifest["study"].get("status", "complete"),
+            "can_estimate_scaling_exponent": manifest["study"][
+                "can_estimate_scaling_exponent"
+            ],
             "dry_run": bool(args.dry_run),
         }
         if args.dry_run:

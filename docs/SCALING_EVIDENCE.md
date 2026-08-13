@@ -5,9 +5,10 @@ archive for `current_budget_isoflop_v4`. It is intentionally specific to the
 study launched from Git commit
 `317ca1dae79cc75acf2ae48583b0392e8bb95114`; it is not a general run uploader.
 
-Do not publish a partial study. The build requires a fitted scaling law and the
-complete staged output: `fit.json`, `fit.md`, all three slice fits, all existing
-per-slice learning-rate selections, and exactly these 15 files for every run:
+The default build does not publish a partial study. It requires a fitted scaling
+law and the complete staged output: `fit.json`, `fit.md`, all three slice fits,
+all existing per-slice learning-rate selections, and exactly these 15 files for
+every run:
 
 1. `run-manifest.json`
 2. `work/config.yaml`
@@ -43,9 +44,69 @@ and geometric adaptation stops at the first valid bracket. A missing stable
 initial suffix or an unnecessary post-bracket trial fails publication.
 
 Each recomputed run is also bound to the exact checked-in public 4B manifest
-(`99ac90a5...c2c14` raw; `92b21722...8dc1` canonical): both manifest hashes,
-the prepared immutable revision, production identity, and all 40 shard paths,
-sizes, token counts, and SHA-256s must agree.
+(`99ac90a5...c2c14` raw; `92b21722...8dc1` canonical). The distinct local
+prepared-manifest representation consumed by v4 is independently pinned
+(`68eff87a...b79b2d1` raw; `f3bdc214...62ba4c` canonical). The prepared immutable
+revision, production identity, and all 40 shard paths, sizes, token counts, and
+SHA-256s must agree between those representations.
+
+## Exact stopped-study outcome
+
+Schema version 2 supports one explicit negative-result archive, selected with
+`--stopped-study`. It is not a general “allow partial” switch. The verifier
+requires exactly the observed 42-run terminal state: 38 stable trials, four
+specific rejected trials, six completed c025 LR selections, the deterministic
+c025 slice fit, and no c050 selection, c100 run, control, final fit, or scaling
+law. It replays the hash-pinned controller and requires the exact terminal error:
+
+```text
+c050/n023: lower LR expansion is ineligible; refusing to search beyond it
+```
+
+The c025 five-shape grid prospectively required n082, and the resulting six-point
+fit is bracketed, so n102 is forbidden. At c050/n023, both the initial lr200 trial
+and first lower-recovery lr133 trial are rejected. The frozen controller then
+refuses to cross that ineligible lower-LR frontier. This proves that the archived
+raw state is terminal under the pinned controller; it does not claim a separate
+historical stderr or process-exit transcript.
+
+The source tree produced five known CPython 3.12 cache files per run. Stopped
+preflight scans and pins them in its before/after source identity checks, tolerates
+only those exact generated paths, and never copies them. The published bundle
+remains exactly 15 evidentiary files per run. Any other file, cache name, empty
+directory, link, or special object fails closed.
+
+Build and verify the stopped result locally without credentials or network:
+
+```bash
+uv run --script scripts/publish_scaling_evidence.py build \
+  --runs runs/scaling/current-budget-isoflop-v4 \
+  --output /tmp/current_budget_isoflop_v4-stopped-evidence \
+  --stopped-study --dry-run
+
+uv run --script /tmp/current_budget_isoflop_v4-stopped-evidence/verify.py \
+  verify --bundle /tmp/current_budget_isoflop_v4-stopped-evidence
+```
+
+Schema-v2 manifests and receipts say `stopped_inconclusive` and
+`negative_result_no_scaling_law`, set `can_estimate_scaling_exponent` false, and
+carry a null scaling law. Their default immutable remote namespace is
+`current_budget_isoflop_v4/stopped-inconclusive/...`.
+
+After the local gate, publish this stopped result with a distinct receipt:
+
+```bash
+uv run --script scripts/publish_scaling_evidence.py build \
+  --runs runs/scaling/current-budget-isoflop-v4 \
+  --output /tmp/current_budget_isoflop_v4-stopped-release \
+  --stopped-study \
+  --token-file /absolute/private/path/hf-token \
+  --receipt-output data/manifests/scaling/current_budget_isoflop_v4-stopped.json
+```
+
+Credential access still occurs only after the complete stopped-state semantic
+verification passes. Publication then performs the same anonymous immutable
+download and recomputation gate as a complete-study archive.
 
 ## Local release gate
 

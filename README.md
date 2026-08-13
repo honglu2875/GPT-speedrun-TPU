@@ -211,7 +211,9 @@ resumes pending points. No chart is rendered yet. See
 
 The legacy-baseline v4 IsoFLOP study has a dedicated fail-closed evidence
 publisher. It archives every raw curve and derived decision and then repeats the
-full semantic verification from an anonymous immutable download. See the
+full semantic verification from an anonymous immutable download. Its explicit
+schema-v2 stopped-study mode records the exact 42-run inconclusive terminal
+state as a negative result without making a scaling-law claim. See the
 [v4 scaling-evidence release gate](docs/SCALING_EVIDENCE.md).
 
 The harness creates a unique persistent run directory, captures stdout/stderr,

@@ -79,6 +79,17 @@ side. It stops at a bracketed or non-high-side fit. An interrupted warranted nex
 shape is an incomplete fit error; a no-law result is allowed only after that
 stopping rule fires or the declared `n102` grid is exhausted.
 
+## Recorded terminal outcome
+
+The fresh execution stopped fail-closed after 42 trials. All six c025 LR groups
+completed and its n082-extended slice fit bracketed the local minimum. The first
+c050/n023 trial at lr200 was rejected; its first lower-recovery trial at lr133
+was also rejected. On replay, the frozen controller then raises `c050/n023:
+lower LR expansion is ineligible; refusing to search beyond it`. Consequently
+there is no c050 selection, c100/control evidence, global fit, or scaling-law
+claim. The schema-v2 `--stopped-study` evidence mode documents and verifies this
+inconclusive negative result; it does not reinterpret it as a completed law.
+
 ## Run
 
 ```bash
@@ -86,7 +97,8 @@ uv run --frozen --no-sync python -m speedrun.scaling plan
 uv run --frozen --no-sync python -m speedrun.scaling run --staged --data-path /dev/shm/fineweb-scaled/4B --downstream-manifest data/manifests/fresh10.json --downstream-root /dev/shm --runs runs/scaling/current-budget-isoflop-v4 --confirm-execution-fingerprint DIGEST_FROM_PLAN --resume --color always
 ```
 
-This remains a one-seed local law, not a universal Chinchilla estimate. The same
-canonical FineWeb validation set is reused across the many LR candidates for
-selection and again as the model-size-fit outcome, so fit-only uncertainty does
-not include selection or multiple-comparison optimism.
+Any law from a future versioned continuation would remain a one-seed local law,
+not a universal Chinchilla estimate. The stopped v4 result contains no exponent.
+The same canonical FineWeb validation set was reused across the many LR
+candidates for selection and again for the c025 model-size fit, so its fit-only
+uncertainty does not include selection or multiple-comparison optimism.
