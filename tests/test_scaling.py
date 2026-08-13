@@ -20,6 +20,7 @@ from speedrun.scaling import (
     LearningRateEdgeError,
     ScalingError,
     _fit_slice,
+    _revisit_extension_fixed_point,
     _manifest_shard_contract,
     _next_adaptive_calibration,
     _public_point,
@@ -468,6 +469,61 @@ class ScalingTests(unittest.TestCase):
                 self.suite, shape_id, "lower", root
             )
             self.assertAlmostEqual(next_lower["learning_rate"], 0.0002 / 2.25)
+
+    def test_extension_revisit_reaches_cross_slice_fixed_point_once(self) -> None:
+        suite = {
+            "compute_slices": [
+                {"id": "c025", "target_total_flops": 1},
+                {"id": "c050", "target_total_flops": 2},
+            ],
+            "optional_extension_shapes": [
+                {"shape_id": "n082", "parameters": 82},
+                {"shape_id": "n102", "parameters": 102},
+            ],
+        }
+        state = {"c025": {65}, "c050": {65}}
+        launches: list[tuple[str, str]] = []
+
+        def measurements(_suite, slice_id, _root):
+            return [
+                {"parameters": parameters}
+                for parameters in sorted(state[slice_id])
+            ]
+
+        def fitted(points, *, slice_id, target_total_flops):
+            del target_total_flops
+            maximum = max(int(point["parameters"]) for point in points)
+            # c050 first requests n082. Its calibration exposes n082 at c025,
+            # which makes c025 request n102 on the fixed-point revisit.
+            bracketed = maximum >= 102 or (slice_id == "c025" and maximum == 65)
+            return {"bracketed": bracketed}, None
+
+        def extend(_suite, *, compute_slice, shape, runs_root, run_options):
+            del runs_root, run_options
+            slice_id = compute_slice["id"]
+            shape_id = shape["shape_id"]
+            launches.append((slice_id, shape_id))
+            state["c025"].add(shape["parameters"])
+            state[slice_id].add(shape["parameters"])
+            return {"parameters": shape["parameters"]}
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "speedrun.scaling._completed_slice_measurements",
+            side_effect=measurements,
+        ), patch("speedrun.scaling._fit_slice", side_effect=fitted), patch(
+            "speedrun.scaling._warrants_high_side_extension", return_value=True
+        ), patch(
+            "speedrun.scaling._ensure_slice_extension", side_effect=extend
+        ), patch("speedrun.scaling._write_derived_json"):
+            _revisit_extension_fixed_point(
+                suite, runs_root=Path(directory), run_options={}
+            )
+
+        self.assertEqual(
+            launches,
+            [("c050", "n082"), ("c025", "n102"), ("c050", "n102")],
+        )
+        self.assertEqual(len(launches), len(set(launches)))
 
     def test_result_fresh10_counts_are_release_gating(self) -> None:
         point = self.suite["calibrations"][0]

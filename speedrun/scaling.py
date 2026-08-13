@@ -3184,6 +3184,143 @@ def _calibrate_shape(
             )
 
 
+def _completed_slice_measurements(
+    suite: Mapping[str, Any], slice_id: str, runs_root: Path
+) -> list[dict[str, Any]]:
+    """Read every completed fit/extension measurement for one compute slice."""
+
+    calibration_slice_id = str(suite["compute_slices"][0]["id"])
+    if slice_id == calibration_slice_id:
+        measured = [
+            _selected_calibration_run(suite, shape["shape_id"], runs_root)
+            for shape in suite["fit_shapes"]
+        ]
+        for shape in suite["optional_extension_shapes"]:
+            if _learning_rate_selection_path(runs_root, shape["shape_id"]).is_file():
+                measured.append(
+                    _selected_calibration_run(suite, shape["shape_id"], runs_root)
+                )
+    else:
+        base_points = [
+            point for point in suite["variants"] if point["slice"] == slice_id
+        ]
+        measured = [_read_run(suite, point, runs_root) for point in base_points]
+        for point in suite["optional_extensions"]:
+            result = runs_root / point["id"] / "artifacts" / "result.json"
+            if point["slice"] == slice_id and result.is_file():
+                measured.append(_read_run(suite, point, runs_root))
+
+    by_parameters: dict[int, dict[str, Any]] = {}
+    for measurement in measured:
+        parameters = int(measurement["parameters"])
+        if parameters in by_parameters:
+            raise ScalingError(
+                f"{slice_id}: duplicate completed measurement at {parameters:,} parameters"
+            )
+        by_parameters[parameters] = measurement
+    return list(by_parameters.values())
+
+
+def _ensure_slice_extension(
+    suite: Mapping[str, Any],
+    *,
+    compute_slice: Mapping[str, Any],
+    shape: Mapping[str, Any],
+    runs_root: Path,
+    run_options: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Materialize one missing extension, reusing any completed immutable run."""
+
+    slice_id = str(compute_slice["id"])
+    shape_id = str(shape["shape_id"])
+    _calibrate_shape(suite, shape_id, runs_root, run_options)
+    if slice_id == str(suite["compute_slices"][0]["id"]):
+        return _selected_calibration_run(suite, shape_id, runs_root)
+
+    extension = next(
+        point
+        for point in suite["optional_extensions"]
+        if point["slice"] == slice_id and point["shape_id"] == shape_id
+    )
+    result = runs_root / extension["id"] / "artifacts" / "result.json"
+    if not result.is_file():
+        run_variants(suite, names=[str(extension["id"])], **run_options)
+    return _read_run(suite, extension, runs_root)
+
+
+def _revisit_extension_fixed_point(
+    suite: Mapping[str, Any],
+    *,
+    runs_root: Path,
+    run_options: Mapping[str, Any],
+) -> None:
+    """Close cross-slice extension dependencies over the finite declared grid.
+
+    Calibrating an extension first requested by c050/c100 also creates its c025
+    IsoFLOP measurement. That new endpoint can invalidate c025's earlier
+    bracket. Restarting from the lowest slice after every newly materialized
+    (slice, shape) point reaches the fixed point without skipping that case.
+    """
+
+    shapes = list(suite["optional_extension_shapes"])
+    max_actions = len(suite["compute_slices"]) * len(shapes)
+    actions = 0
+    while True:
+        restarted = False
+        for compute_slice in suite["compute_slices"]:
+            slice_id = str(compute_slice["id"])
+            measured = _completed_slice_measurements(suite, slice_id, runs_root)
+            fitted, _ = _fit_slice(
+                measured,
+                slice_id=slice_id,
+                target_total_flops=int(compute_slice["target_total_flops"]),
+            )
+            if fitted["bracketed"] or not _warrants_high_side_extension(fitted):
+                _write_derived_json(
+                    runs_root / "fits" / f"{slice_id}.json", fitted
+                )
+                continue
+
+            measured_parameters = {int(item["parameters"]) for item in measured}
+            missing = [
+                shape
+                for shape in shapes
+                if int(shape["parameters"]) not in measured_parameters
+            ]
+            if not missing:
+                print(
+                    f"{slice_id}: bounded model-size extension grid exhausted; "
+                    "recording no-law instead of extrapolating",
+                    flush=True,
+                )
+                _write_derived_json(
+                    runs_root / "fits" / f"{slice_id}.json", fitted
+                )
+                continue
+            if actions >= max_actions:
+                raise ScalingError(
+                    "model-grid fixed point exceeded its finite slice/shape bound"
+                )
+
+            shape = missing[0]
+            measurement = _ensure_slice_extension(
+                suite,
+                compute_slice=compute_slice,
+                shape=shape,
+                runs_root=runs_root,
+                run_options=run_options,
+            )
+            if int(measurement["parameters"]) in measured_parameters:
+                raise ScalingError(
+                    f"{slice_id}: extension did not add a new model-size measurement"
+                )
+            actions += 1
+            restarted = True
+            break
+        if not restarted:
+            return
+
+
 def run_staged(suite: Mapping[str, Any], args: argparse.Namespace) -> None:
     """Run low-to-high compute with bounded LR and model-grid adaptation."""
 
@@ -3260,6 +3397,13 @@ def run_staged(suite: Mapping[str, Any], args: argparse.Namespace) -> None:
                 target_total_flops=int(compute_slice["target_total_flops"]),
             )
         _write_derived_json(runs_root / "fits" / f"{slice_id}.json", fitted)
+
+    # A shape calibrated while extending a later compute slice contributes a
+    # new c025 endpoint after c025 may already have been visited. Close those
+    # finite cross-slice dependencies before deciding whether a law is valid.
+    _revisit_extension_fixed_point(
+        suite, runs_root=runs_root, run_options=run_options
+    )
 
     control_names = [str(item["id"]) for item in suite["controls"]]
     if control_names:
