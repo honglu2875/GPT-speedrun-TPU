@@ -539,6 +539,28 @@ class ScalingTests(unittest.TestCase):
             with self.assertRaisesRegex(ScalingError, "scored token count differs"):
                 _read_run(self.suite, point, root)
 
+    def test_result_accepts_sorted_fresh10_mapping_and_returns_canonical_order(self) -> None:
+        point = self.suite["calibrations"][0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_fake_run(root, self.suite, point, 3.1)
+            result_path = root / point["id"] / "artifacts" / "result.json"
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            result_path.write_text(
+                json.dumps(result, sort_keys=True), encoding="utf-8"
+            )
+
+            serialized = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                list(serialized["evaluations"]["fresh10"]["domains"]),
+                sorted(FRESH10_DOMAINS),
+            )
+            measurement = _read_run(self.suite, point, root)
+            self.assertEqual(
+                list(measurement["fresh10_domain_losses"]),
+                list(FRESH10_DOMAINS),
+            )
+
 
 def _fake_manifest(suite: dict) -> dict:
     files = [

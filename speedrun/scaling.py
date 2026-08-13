@@ -2272,8 +2272,8 @@ def _validated_fresh10_result(
     }:
         raise ScalingError(f"{label} has unexpected or missing fields")
     domains = _mapping(fresh["domains"], f"{label}.domains")
-    if tuple(domains) != tuple(FRESH10_DOMAINS):
-        raise ScalingError(f"{label} must contain the ten canonical domains in order")
+    if set(domains) != set(FRESH10_DOMAINS):
+        raise ScalingError(f"{label} must contain exactly the ten canonical domains")
     losses: dict[str, float] = {}
     seconds: list[float] = []
     scored_total = 0
