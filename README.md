@@ -209,6 +209,11 @@ resumes pending points. No chart is rendered yet. See
 [the Complete(d)P contract](docs/COMPLETEP.md) and the
 [versioned suite](studies/complete_d_p_lr_v1/suite.yaml).
 
+The legacy-baseline v4 IsoFLOP study has a dedicated fail-closed evidence
+publisher. It archives every raw curve and derived decision and then repeats the
+full semantic verification from an anonymous immutable download. See the
+[v4 scaling-evidence release gate](docs/SCALING_EVIDENCE.md).
+
 The harness creates a unique persistent run directory, captures stdout/stderr,
 validates the final result event and checkpoint, hashes artifacts, and appends a
 JSONL record. The trainer's synchronized accelerator time is the open-track

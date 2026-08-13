@@ -63,6 +63,8 @@ Admission hashes do not make missing raw curves independently auditable. Before
 any scaling-law claim, all v4 raw CSVs, run manifests, results, configs, and
 admission records will be archived together in an immutable Hugging Face or
 release bundle whose object/revision identity is recorded in the final report.
+The release gate and exact 15-file-per-run archive contract are documented in
+[`docs/SCALING_EVIDENCE.md`](../../docs/SCALING_EVIDENCE.md).
 
 The LR grid is launched low-to-high. No trial may be launched beyond the first
 suspect/rejected high-LR frontier. Selection requires an immediately adjacent
