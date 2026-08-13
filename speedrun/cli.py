@@ -11,7 +11,6 @@ import re
 import shlex
 import shutil
 import sys
-import time
 from typing import Any, Callable, Iterable, Sequence
 
 from harness import (
@@ -58,6 +57,7 @@ from .data import (
     verify_dataset,
     verify_fresh10,
 )
+from .data_routing import preparation_route, resolve_preparation_manifest
 from .doctor import data_selection, environment_checks
 from .report import REPORT_ADMISSION_QUALIFICATION_LOSS, build_report
 
@@ -153,6 +153,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--target-loss",
         type=_nonnegative_float,
         help="default qualification target for smoke/development runs only",
+    )
+    prepare.add_argument(
+        "--training-tokens",
+        type=_positive_int,
+        help=(
+            "corpus budget for prepare only: official routes through 900M to "
+            "classic, through 1.9B/3.9B/7.9B/74.9B to 2B/4B/8B/hero; "
+            "never changes the fixed official run contract"
+        ),
     )
     prepare.add_argument("--train-shards", type=_positive_int, help="override train shard count")
     prepare.add_argument("--offline", action="store_true", help="forbid network access")
@@ -286,6 +295,7 @@ def command_prepare(args: argparse.Namespace) -> int:
             "checkpoint_retention": args.checkpoints,
             "color": args.color,
             "target_loss": args.target_loss,
+            "training_tokens": args.training_tokens,
         },
     )
     interactive = not (args.non_interactive or args.yes)
@@ -311,6 +321,19 @@ def command_prepare(args: argparse.Namespace) -> int:
     data_path = resolve_path(proposed.data_path, root)
     artifacts_path = resolve_path(proposed.artifacts_path, root)
     _ensure_artifacts_inside_repo(artifacts_path, root)
+    route = preparation_route(proposed.data_profile, proposed.training_tokens)
+    if route.is_scaled and args.train_shards is not None:
+        raise ConfigError(
+            "--train-shards cannot truncate a budget-selected scaled dataset; "
+            "choose a smaller --training-tokens budget instead"
+        )
+    route_root = route.data_root(data_path)
+    route_manifest = (
+        resolve_preparation_manifest(route) if data_work else route.manifest
+    )
+    style.note(route.summary(proposed.training_tokens))
+    if route.is_scaled:
+        style.note(f"scaled shards use the dedicated cache {route_root}")
     if args.check_only and save:
         style.note("check-only mode does not write .speedrun.toml")
         save = False
@@ -329,7 +352,7 @@ def command_prepare(args: argparse.Namespace) -> int:
                 profile=proposed.data_profile,
                 require_tpu=require_tpu,
                 expected_process_count=_expected_process_count(proposed),
-                check_data=args.check_only,
+                check_data=args.check_only and not route.is_scaled,
                 compile_probe=True,
             )
         )
@@ -341,15 +364,14 @@ def command_prepare(args: argparse.Namespace) -> int:
         style.note("dataset preparation skipped (--no-download)")
     else:
         style.heading("Dataset cache")
-        manifest, default_shards = data_selection(proposed.data_profile)
-        shards = args.train_shards or default_shards
+        shards = args.train_shards or route.train_shards
         if args.check_only:
-            prepared = verify_dataset(manifest, data_path, train_shards=shards)
+            prepared = verify_dataset(route_manifest, route_root, train_shards=shards)
         else:
             progress = _progress_reporter(style)
             prepared = prepare_data(
-                data_path,
-                manifest,
+                route_root,
+                route_manifest,
                 train_shards=shards,
                 offline=args.offline,
                 force=args.force,
@@ -388,7 +410,10 @@ def command_prepare(args: argparse.Namespace) -> int:
                 profile=proposed.data_profile,
                 data_path=proposed.data_path,
                 require_tpu=require_tpu,
-                check_data=data_work or args.check_only,
+                # Each remote scaled prepare already verifies its routed
+                # manifest and nested cache.  Standalone doctor intentionally
+                # retains the fixed classic official contract.
+                check_data=(data_work or args.check_only) and not route.is_scaled,
                 quick=False,
                 color=proposed.color,
                 root=root,
@@ -789,6 +814,8 @@ def _run_remote_prepare(
         "never",
         "--target-loss",
         str(config.target_loss),
+        "--training-tokens",
+        str(config.training_tokens),
         "--timeout",
         str(args.timeout),
     ]
@@ -808,8 +835,29 @@ def _run_remote_prepare(
         inventory.remote_hosts,
         remote,
         labels=True,
-        timeout=max(900.0, float(args.timeout) * 20.0),
+        timeout=_remote_prepare_timeout(config, args),
     )
+
+
+def _remote_prepare_timeout(config: LocalConfig, args: argparse.Namespace) -> float:
+    """Return a whole-peer cap distinct from the per-request HTTP timeout.
+
+    Budget routing determines the nominal shard bytes each peer must install.
+    Estimate transfer plus verification at 10 MiB/s, add 50% for contention and
+    retries, then add 30 minutes for fixed setup.  This gives hero roughly 6.5
+    hours while retaining a 15-minute absolute floor.  Offline and check-only
+    paths still use the same safe upper bound; it is a deadline, not an expected
+    duration.
+    """
+
+    route = preparation_route(config.data_profile, config.training_tokens)
+    token_bytes = 2 * (
+        (route.train_capacity or route.train_shards * 100_000_000)
+        + (100_000_000 if config.data_profile != "smoke" else 0)
+    )
+    transfer_and_verify = token_bytes / (10 * 1024**2)
+    route_deadline = transfer_and_verify * 1.5 + 30 * 60.0
+    return max(900.0, float(args.timeout) * 20.0, route_deadline)
 
 
 def _probe_configured_cluster(config: LocalConfig) -> ClusterInventory:
@@ -927,7 +975,10 @@ def _prepare_wizard(
         descriptions={
             "smoke": "tiny generated CI data",
             "dev": "one 100M-token FineWeb train shard",
-            "official": "nine train shards and fixed validation shard (~2.0 GB)",
+            "official": (
+                "classic 900M train corpus, or the smallest published scaled "
+                "prefix selected by the preparation budget"
+            ),
         },
     )
     artifacts = _ask("Persistent run/artifact directory", config.artifacts_path, style)
@@ -957,6 +1008,11 @@ def _prepare_wizard(
     target = _ask_float(
         "Smoke/development qualification target", config.target_loss, style
     )
+    training_tokens = _ask_int(
+        "Official preparation corpus tokens (≤900M classic; max 74.9B; run fixed)",
+        config.training_tokens,
+        style,
+    )
     run_diagnostics = _confirm("Run environment diagnostics now", run_diagnostics, style)
     if run_diagnostics:
         require_tpu = _confirm(
@@ -977,6 +1033,7 @@ def _prepare_wizard(
         checkpoint_retention=retention,
         color=color,
         target_loss=target,
+        training_tokens=training_tokens,
     ).validate()
     return resolved, run_diagnostics, require_tpu, download, save
 
@@ -1285,6 +1342,7 @@ def _reject_reserved_trainer_args(arguments: Sequence[str]) -> None:
         "--downstream-manifest",
         "--downstream-root",
         "--downstream-data",
+        "--train-tokens",
         "--color",
     }
     for argument in arguments:

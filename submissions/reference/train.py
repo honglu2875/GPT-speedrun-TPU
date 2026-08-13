@@ -105,6 +105,7 @@ class Config:
     steps: int
     batch_size: int
     seq_len: int
+    sampling: str
     layers: int
     heads: int
     d_model: int
@@ -145,6 +146,7 @@ class ExperimentProfile:
     train_tokens: int | None
     batch_size: int
     seq_len: int
+    sampling: str
     dtype_name: str
     layers: int
     heads: int
@@ -507,6 +509,159 @@ class ShardedTokens:
         return windows
 
 
+_UINT64_MASK = (1 << 64) - 1
+
+
+def _mix_uint64(value: int) -> int:
+    """Return a stable SplitMix64 avalanche without relying on Python hashes."""
+
+    value = (value + 0x9E3779B97F4A7C15) & _UINT64_MASK
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & _UINT64_MASK
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & _UINT64_MASK
+    return (value ^ (value >> 31)) & _UINT64_MASK
+
+
+def _permute_bounded(value: int, size: int, key: int) -> int:
+    """Pseudo-randomly permute ``range(size)`` with O(1) auxiliary memory.
+
+    A six-round balanced Feistel network permutes the next even-bit power-of-two
+    domain. Cycle walking restricts that permutation to the requested interval.
+    The domain is less than four times ``size``, so the expected work is bounded
+    and no multi-billion-element index array is ever materialized.
+    """
+
+    if not 0 <= value < size:
+        raise ValueError("permutation input must lie inside its domain")
+    if size == 1:
+        return 0
+    bits = max(2, (size - 1).bit_length())
+    if bits % 2:
+        bits += 1
+    half_bits = bits // 2
+    half_mask = (1 << half_bits) - 1
+
+    def feistel(candidate: int) -> int:
+        left = candidate >> half_bits
+        right = candidate & half_mask
+        for round_index in range(6):
+            round_key = _mix_uint64(key + round_index * 0xD1B54A32D192ED03)
+            mixed = _mix_uint64(right ^ round_key) & half_mask
+            left, right = right, left ^ mixed
+        return (left << half_bits) | right
+
+    candidate = value
+    while True:
+        candidate = feistel(candidate)
+        if candidate < size:
+            return candidate
+
+
+class ShuffledEpochBatchStream:
+    """Deterministic, distributed, no-replacement windows within each epoch.
+
+    Shards are reordered once per epoch and all non-overlapping target windows
+    across that layout are traversed through a keyed permutation. Every process
+    constructs the same global order and takes only its contiguous rank-local
+    part of each global batch. This keeps hosts disjoint without communication,
+    while auxiliary memory remains O(number_of_shards + local_batch_size).
+    """
+
+    def __init__(
+        self,
+        tokens: ShardedTokens,
+        *,
+        global_batch_size: int,
+        seq_len: int,
+        vocab_size: int,
+        seed: int,
+        process_index: int = 0,
+        process_count: int = 1,
+    ) -> None:
+        if global_batch_size <= 0 or seq_len <= 0 or vocab_size <= 0:
+            raise ValueError(
+                "stream batch, sequence, and vocabulary sizes must be positive"
+            )
+        if process_count <= 0 or not 0 <= process_index < process_count:
+            raise ValueError("invalid process index/count for shuffled stream")
+        if global_batch_size % process_count:
+            raise ValueError("global batch size must be divisible by process count")
+        self.tokens = tokens
+        self.global_batch_size = int(global_batch_size)
+        self.local_batch_size = global_batch_size // process_count
+        self.seq_len = int(seq_len)
+        self.vocab_size = int(vocab_size)
+        self.seed = int(seed) & _UINT64_MASK
+        self.process_index = int(process_index)
+        self.window_counts = np.asarray(
+            [(len(shard) - 1) // seq_len for shard in tokens.shards], dtype=np.int64
+        )
+        self.windows_per_epoch = int(self.window_counts.sum())
+        if self.windows_per_epoch <= 0:
+            raise ValueError(
+                f"no training shard contains a full {seq_len:,}-target window"
+            )
+        self.usable_tokens_per_epoch = self.windows_per_epoch * seq_len
+        self._global_cursor = 0
+        self._planned_epoch = -1
+        self._ordered_shards = np.empty((0,), dtype=np.int64)
+        self._ordered_cumulative = np.empty((0,), dtype=np.int64)
+        self._epoch_key = 0
+
+    def _prepare_epoch(self, epoch: int) -> None:
+        seed_words = (
+            self.seed & 0xFFFFFFFF,
+            self.seed >> 32,
+            epoch & 0xFFFFFFFF,
+            epoch >> 32,
+        )
+        rng = np.random.default_rng(np.random.SeedSequence(seed_words))
+        self._ordered_shards = rng.permutation(len(self.tokens.shards)).astype(
+            np.int64, copy=False
+        )
+        ordered_counts = self.window_counts[self._ordered_shards]
+        self._ordered_cumulative = np.cumsum(ordered_counts, dtype=np.int64)
+        self._epoch_key = _mix_uint64(self.seed ^ _mix_uint64(epoch))
+        self._planned_epoch = epoch
+
+    def _window(self, global_ordinal: int) -> np.ndarray:
+        epoch, epoch_ordinal = divmod(global_ordinal, self.windows_per_epoch)
+        if epoch != self._planned_epoch:
+            self._prepare_epoch(epoch)
+        permuted = _permute_bounded(
+            int(epoch_ordinal), self.windows_per_epoch, self._epoch_key
+        )
+        ordered_index = int(
+            np.searchsorted(self._ordered_cumulative, permuted, side="right")
+        )
+        previous = (
+            int(self._ordered_cumulative[ordered_index - 1]) if ordered_index else 0
+        )
+        shard_index = int(self._ordered_shards[ordered_index])
+        local_window = permuted - previous
+        start = local_window * self.seq_len
+        return self.tokens.shards[shard_index][start : start + self.seq_len + 1]
+
+    def next_batch(self) -> tuple[np.ndarray, np.ndarray]:
+        rank_start = self._global_cursor + self.process_index * self.local_batch_size
+        windows = np.empty(
+            (self.local_batch_size, self.seq_len + 1), dtype=np.int32
+        )
+        for row in range(self.local_batch_size):
+            windows[row] = self._window(rank_start + row)
+        self._global_cursor += self.global_batch_size
+        observed_min = int(windows.min())
+        observed_max = int(windows.max())
+        if observed_min < 0 or observed_max >= self.vocab_size:
+            raise ValueError(
+                f"streamed token ids [{observed_min}, {observed_max}] do not fit "
+                f"vocab_size={self.vocab_size}"
+            )
+        return (
+            np.ascontiguousarray(windows[:, :-1]),
+            np.ascontiguousarray(windows[:, 1:]),
+        )
+
+
 class TokenDataset:
     def __init__(self, train: ShardedTokens, validation: ShardedTokens, source: str) -> None:
         self.train = train
@@ -666,7 +821,7 @@ def _parse_experiment_profile(
     training = _config_keys(
         selected["training"],
         f"profiles.{profile}.training",
-        {"batch_size", "seq_len", "dtype"},
+        {"batch_size", "seq_len", "sampling", "dtype"},
         optional={"steps", "train_tokens"},
     )
     has_steps = "steps" in training
@@ -747,6 +902,11 @@ def _parse_experiment_profile(
         ),
         seq_len=_config_int(
             training["seq_len"], f"{prefix}.training.seq_len", minimum=1
+        ),
+        sampling=_config_choice(
+            training["sampling"],
+            f"{prefix}.training.sampling",
+            ("random_windows", "shuffled_epochs"),
         ),
         dtype_name=_config_choice(
             training["dtype"], f"{prefix}.training.dtype", ("bfloat16", "float32")
@@ -982,6 +1142,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="diagnostic-only: omit the checkpoint and competition result",
     )
+    profiling.add_argument(
+        "--omit-checkpoint",
+        action="store_true",
+        help=(
+            "open/dev research only: retain final validation and metrics but omit "
+            "the parameter checkpoint"
+        ),
+    )
 
     data = parser.add_argument_group("data")
     data.add_argument(
@@ -1161,6 +1329,12 @@ def validate_args(args: argparse.Namespace) -> ExperimentProfile:
         raise ValueError(
             "--no-final-validation and --no-checkpoint must be used together"
         )
+    if args.omit_checkpoint and args.no_checkpoint:
+        raise ValueError("--omit-checkpoint and --no-checkpoint are mutually exclusive")
+    if args.omit_checkpoint and (
+        args.track != "open" or selected_profile(args) != "dev"
+    ):
+        raise ValueError("--omit-checkpoint is restricted to open/dev research runs")
     if args.no_final_validation and (
         args.downstream_manifest is not None or args.downstream_data
     ):
@@ -1322,6 +1496,7 @@ def resolve_config(
         steps=steps,
         batch_size=batch_size,
         seq_len=seq_len,
+        sampling=experiment.sampling,
         layers=experiment.layers,
         heads=experiment.heads,
         d_model=experiment.d_model,
@@ -1860,6 +2035,7 @@ def experiment_config_metadata(config: Config) -> dict[str, Any]:
                 "train_tokens": config.steps * config.batch_size * config.seq_len,
                 "batch_size": config.batch_size,
                 "seq_len": config.seq_len,
+                "sampling": config.sampling,
                 "dtype": config.dtype_name,
             },
             "model": contract_model_metadata(config),
@@ -3105,6 +3281,19 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             f"visible device count {len(devices)}"
         )
     local_batch = local_batch_size(config.batch_size, process_count)
+    shuffled_train_stream = (
+        ShuffledEpochBatchStream(
+            dataset.train,
+            global_batch_size=config.batch_size,
+            seq_len=config.seq_len,
+            vocab_size=config.semantic_vocab_size,
+            seed=args.seed + 1,
+            process_index=process_index,
+            process_count=process_count,
+        )
+        if config.sampling == "shuffled_epochs"
+        else None
+    )
     if config.attention_backend != "dense":
         console.phase(
             "Attention tile preflight",
@@ -3158,6 +3347,15 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             ("model", f"L{config.layers} D{config.d_model} H{config.heads} MLP×{config.mlp_mult}"),
             ("parameters", format_count(params_total)),
             ("global batch", f"{config.batch_size} × {config.seq_len} tokens"),
+            (
+                "train sampling",
+                (
+                    f"shuffled epochs · "
+                    f"{shuffled_train_stream.usable_tokens_per_epoch:,} unique targets/epoch"
+                    if shuffled_train_stream is not None
+                    else "random windows with replacement"
+                ),
+            ),
             ("compute", config.dtype_name),
             ("attention", config.attention_backend),
             *attention_console_rows(attention_runtime),
@@ -3333,13 +3531,16 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                 # Keep the host sampling, transfer, dispatch, and any logging
                 # synchronization inside the step annotation. This exposes input
                 # gaps alongside TPU execution in the same XProf timeline.
-                batch_x, batch_y = dataset.batch(
-                    "train",
-                    train_rng,
-                    local_batch,
-                    config.seq_len,
-                    config.semantic_vocab_size,
-                )
+                if shuffled_train_stream is None:
+                    batch_x, batch_y = dataset.batch(
+                        "train",
+                        train_rng,
+                        local_batch,
+                        config.seq_len,
+                        config.semantic_vocab_size,
+                    )
+                else:
+                    batch_x, batch_y = shuffled_train_stream.next_batch()
                 batch_x = put_host_local_array(
                     batch_x, mesh, P("data", None), data_sharding, process_count
                 )
@@ -3599,7 +3800,8 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     artifact_names = [TRAINING_CSV_NAME, VALIDATION_CSV_NAME]
     if diagnostic_points:
         artifact_names.append(DIAGNOSTICS_CSV_NAME)
-    artifact_names.append(CHECKPOINT_NAME)
+    if not args.omit_checkpoint:
+        artifact_names.append(CHECKPOINT_NAME)
     console.phase("Artifacts", " + ".join(artifact_names))
     if is_controller:
         write_training_csv(
@@ -3614,7 +3816,8 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                 flops_per_token,
             )
         write_validation_csv(output_dir, validation_rows)
-        save_checkpoint(output_dir, params, config, args.seed, attention_runtime)
+        if not args.omit_checkpoint:
+            save_checkpoint(output_dir, params, config, args.seed, attention_runtime)
 
     tokens_per_second = finite_metric(
         "tokens_per_second", tokens_processed / train_seconds, positive=True
@@ -3656,7 +3859,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         "track": args.track,
         "profile": profile,
         "seed": int(args.seed),
-        "checkpoint": CHECKPOINT_NAME,
+        "checkpoint": None if args.omit_checkpoint else CHECKPOINT_NAME,
         "artifacts": {
             "training_curve": TRAINING_CSV_NAME,
             "validation_curve": VALIDATION_CSV_NAME,
@@ -3687,6 +3890,22 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             "tokens_processed": int(tokens_processed),
             "training_token_budget": int(tokens_processed),
             "training_steps": int(config.steps),
+            "training_sampling": config.sampling,
+            "training_usable_tokens_per_epoch": int(
+                shuffled_train_stream.usable_tokens_per_epoch
+                if shuffled_train_stream is not None
+                else len(dataset.train)
+            ),
+            "training_data_epochs": finite_metric(
+                "training_data_epochs",
+                tokens_processed
+                / (
+                    shuffled_train_stream.usable_tokens_per_epoch
+                    if shuffled_train_stream is not None
+                    else len(dataset.train)
+                ),
+                positive=True,
+            ),
             "validation_loss": validation_loss,
             "validation_tokens": int(fineweb_tokens),
             "validation_probe_count": sum(

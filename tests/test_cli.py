@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from speedrun import cli
 from speedrun.config import ConfigError, LocalConfig
-from speedrun.data import Fresh10Domain, PreparedDataset, PreparedFresh10
+from speedrun.data import DataError, Fresh10Domain, PreparedDataset, PreparedFresh10
 from speedrun.report import REPORT_ADMISSION_QUALIFICATION_LOSS
 
 
@@ -42,6 +42,7 @@ class CliTests(unittest.TestCase):
             ["--data-f", "raw"],
             ["--downstream-manifest", "other.json"],
             ["--down", "other.json"],
+            ["--train-tokens", "100"],
         ):
             with self.subTest(arguments=arguments), self.assertRaisesRegex(
                 ConfigError, "harness-controlled|controlled by the harness"
@@ -115,8 +116,9 @@ class CliTests(unittest.TestCase):
     def test_wizard_accepts_defaults_and_returns_complete_config(self) -> None:
         defaults = LocalConfig()
         # Two path prompts, one host-count prompt, five menu prompts, one target
-        # prompt, and four confirmations. Empty input accepts every default.
-        with patch("builtins.input", side_effect=[""] * 13):
+        # prompt, one token-budget prompt, and four confirmations. Empty input
+        # accepts every default.
+        with patch("builtins.input", side_effect=[""] * 14):
             result, diagnostics, require_tpu, download, save = cli._prepare_wizard(
                 defaults,
                 run_diagnostics=True,
@@ -130,8 +132,167 @@ class CliTests(unittest.TestCase):
         self.assertTrue(download)
         self.assertTrue(save)
 
+    def test_prepare_training_budget_is_explicit_and_positive(self) -> None:
+        parser = cli.build_parser()
+        prepared = parser.parse_args(["prepare", "--training-tokens", "1250000000"])
+        self.assertEqual(prepared.training_tokens, 1_250_000_000)
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["prepare", "--training-tokens", "0"])
+        self.assertFalse(
+            hasattr(parser.parse_args(["run", "reference"]), "training_tokens")
+        )
+        action = next(
+            item
+            for item in parser._subparsers._group_actions[0].choices["prepare"]._actions
+            if item.dest == "training_tokens"
+        )
+        self.assertIn("prepare only", action.help)
+        self.assertIn("fixed official run contract", action.help)
+
+    def test_prepare_routes_scaled_data_to_dedicated_subfolder(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = root / "cache"
+            scaled = base / "fineweb-scaled" / "2B"
+            manifest = root / "trusted-2B.json"
+            prepared = PreparedDataset(
+                name="fineweb-2b-gpt2",
+                root=scaled,
+                manifest_path=manifest,
+                manifest_sha256="a" * 64,
+                train_files=(scaled / "fineweb_train_000001.bin",),
+                validation_files=(scaled / "fineweb_val_000000.bin",),
+                train_tokens=1_900_000_000,
+                validation_tokens=100_000_000,
+                validation_prefix_tokens=100_000_000,
+            )
+            fresh10 = PreparedFresh10(
+                name="fresh10-v1",
+                root=base,
+                manifest_path=root / "fresh10.json",
+                manifest_sha256="b" * 64,
+                domains=(),
+            )
+            args = cli.build_parser().parse_args(
+                [
+                    "prepare",
+                    "--non-interactive",
+                    "--no-save",
+                    "--check-only",
+                    "--path",
+                    str(base),
+                    "--profile",
+                    "official",
+                    "--training-tokens",
+                    "1900000000",
+                ]
+            )
+            with (
+                patch("speedrun.cli.repo_root", return_value=root),
+                patch(
+                    "speedrun.cli.resolve_preparation_manifest",
+                    return_value=manifest,
+                ),
+                patch("speedrun.cli.environment_checks", return_value=[]) as checks,
+                patch("speedrun.cli.run_doctor", return_value=[]),
+                patch("speedrun.cli.doctor_ok", return_value=True),
+                patch("speedrun.cli.verify_dataset", return_value=prepared) as verify,
+                patch("speedrun.cli.verify_fresh10", return_value=fresh10) as fresh,
+            ):
+                self.assertEqual(cli.command_prepare(args), 0)
+            self.assertFalse(checks.call_args.kwargs["check_data"])
+            verify.assert_called_once_with(manifest, scaled, train_shards=19)
+            fresh.assert_called_once_with(base)
+
+    def test_remote_prepare_forwards_corpus_budget_to_every_peer(self) -> None:
+        config = LocalConfig(
+            training_tokens=3_900_000_000,
+            tpu_vm_count=2,
+            tpu_vm_hosts="slice-w-[0-1]",
+        ).validate()
+        inventory = cli.ClusterInventory(
+            host_expression="slice-w-[0-1]",
+            hosts=("slice-w-0", "slice-w-1"),
+            remote_hosts=("slice-w-1",),
+            local_host="slice-w-0",
+            reported_hostnames={
+                "slice-w-0": "slice-w-0",
+                "slice-w-1": "slice-w-1",
+            },
+        )
+        args = cli.build_parser().parse_args(["prepare", "--non-interactive"])
+        with patch("speedrun.cli.run_pdsh") as run:
+            cli._run_remote_prepare(config, args, inventory, root=Path("/repo"))
+        remote = run.call_args.args[1]
+        self.assertIn("--training-tokens 3900000000", remote)
+        self.assertIn("--profile official", remote)
+        self.assertEqual(run.call_args.kwargs["timeout"], cli._remote_prepare_timeout(config, args))
+
+    def test_remote_prepare_timeout_scales_with_routed_corpus_bytes(self) -> None:
+        args = cli.build_parser().parse_args(["prepare", "--non-interactive"])
+        classic = cli._remote_prepare_timeout(LocalConfig(), args)
+        two_b = cli._remote_prepare_timeout(
+            LocalConfig(training_tokens=1_000_000_000), args
+        )
+        eight_b = cli._remote_prepare_timeout(
+            LocalConfig(training_tokens=4_000_000_000), args
+        )
+        hero = cli._remote_prepare_timeout(
+            LocalConfig(training_tokens=8_000_000_000), args
+        )
+        self.assertLess(classic, two_b)
+        self.assertLess(two_b, eight_b)
+        self.assertLess(eight_b, hero)
+        self.assertGreaterEqual(hero, 6 * 3600)
+
+    def test_unsupported_prepare_budget_is_not_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = cli.build_parser().parse_args(
+                [
+                    "prepare",
+                    "--non-interactive",
+                    "--no-doctor",
+                    "--no-download",
+                    "--path",
+                    str(root / "cache"),
+                    "--profile",
+                    "official",
+                    "--training-tokens",
+                    "74900000001",
+                ]
+            )
+            with patch("speedrun.cli.repo_root", return_value=root):
+                with self.assertRaisesRegex(DataError, "largest prepared corpus"):
+                    cli.command_prepare(args)
+            self.assertFalse((root / ".speedrun.toml").exists())
+
+    def test_scaled_budget_rejects_manual_shard_truncation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = cli.build_parser().parse_args(
+                [
+                    "prepare",
+                    "--non-interactive",
+                    "--no-doctor",
+                    "--no-download",
+                    "--no-save",
+                    "--path",
+                    str(root / "cache"),
+                    "--profile",
+                    "official",
+                    "--training-tokens",
+                    "1000000000",
+                    "--train-shards",
+                    "1",
+                ]
+            )
+            with patch("speedrun.cli.repo_root", return_value=root):
+                with self.assertRaisesRegex(ConfigError, "cannot truncate"):
+                    cli.command_prepare(args)
+
     def test_wizard_infers_cloud_tpu_host_expression(self) -> None:
-        answers = ["", "", "", "4", "", "", "", "", "", "", "", "", "", ""]
+        answers = ["", "", "", "4", "", "", "", "", "", "", "", "", "", "", ""]
         with (
             patch("builtins.input", side_effect=answers),
             patch("speedrun.cli.infer_host_expression", return_value="slice-w-[0-3]"),

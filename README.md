@@ -38,16 +38,19 @@ make report
 
 ```bash
 uv --cache-dir /tmp/uv-cache sync --frozen
-uv --cache-dir /tmp/uv-cache run --frozen --no-sync speedrun prepare
+uv --cache-dir /tmp/uv-cache run --frozen --no-sync speedrun prepare \
+  --training-tokens 624984064
 ```
 
 It asks for the data-cache root, data and run profiles, persistent artifact
 directory, TPU VM host count, default track, checkpoint retention, colors, and a
-smoke/development loss target. It can then probe JAX/TPU health and prepare the
-selected dataset. Personal choices are stored in the gitignored
-`.speedrun.toml`; official constants remain versioned in Git. The personal
-target applies only to smoke/development work; the official target is fixed at
-3.28 and may only be tightened explicitly.
+smoke/development loss target. The training-token answer sizes only the corpus
+prepared for the `official` profile; it does not change trainer steps, the
+leaderboard budget, or the official run contract. The wizard can then probe
+JAX/TPU health and prepare the selected dataset. Personal choices are stored in
+the gitignored `.speedrun.toml`; official constants remain versioned in Git.
+The personal target applies only to smoke/development work; the official target
+is fixed at 3.28 and may only be tightened explicitly.
 
 On this node, `shm/` is a symlink to the 201 GiB RAM filesystem and is an ideal
 ephemeral data cache:
@@ -118,6 +121,26 @@ are never timed.
 | `smoke` | generated locally | CPU/CI end-to-end checks |
 | `dev` | 100M train + 100M validation tokens (~400 MB cached) | quick TPU iteration |
 | `official` | 900M train + 100M validation tokens, plus Fresh10 (~2.0 GB cached) | record attempts |
+
+For official preparation, `training_tokens` selects the smallest corpus whose
+nominal training capacity fits the requested budget:
+
+| Requested preparation budget | Corpus | Training capacity | Cache root |
+|---:|---|---:|---|
+| up to 900M | classic | 900M | `<data-path>/` |
+| 900M+1 through 1.9B | scaled `2B` | 1.9B | `<data-path>/fineweb-scaled/2B/` |
+| 1.9B+1 through 3.9B | scaled `4B` | 3.9B | `<data-path>/fineweb-scaled/4B/` |
+| 3.9B+1 through 7.9B | scaled `8B` | 7.9B | `<data-path>/fineweb-scaled/8B/` |
+| 7.9B+1 through 74.9B | scaled `hero` | 74.9B | `<data-path>/fineweb-scaled/hero/` |
+
+The route is preparation-only: `speedrun run --profile official`, standalone
+doctor checks, and `make baseline` retain the fixed classic dataset and
+624,984,064-token competition contract. Scaled preparation is fail-closed and
+starts working only after the corresponding immutable, URL-bearing publication
+manifest is checked into `data/manifests/fineweb-scaled-gpt2/`; no placeholder
+manifest is accepted. `--check-only` verifies the same routed manifest and
+dedicated folder without mutation. Smoke and development profile selection is
+unchanged.
 
 Official evaluation covers exactly the first 10,485,760 validation predictions.
 The harness requires official result events to report that exact coverage;
@@ -343,6 +366,7 @@ harness/                 execution, validation, records, scoring
 speedrun/                CLI, wizard, doctor, and shared data preparation
 speedrun/kernels/        shared TPU attention, loss, and autotuning primitives
 submissions/reference/   JAX entry trainer + versioned experiment config
+sweeps/                  versioned non-competition IsoFLOP study definitions
 tests/                   CPU-only infrastructure tests
 runs/                    gitignored persistent run artifacts
 ```

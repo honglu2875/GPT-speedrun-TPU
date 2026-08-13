@@ -28,6 +28,8 @@ class LocalConfig:
     checkpoint_retention: str = "qualifying"
     color: str = "auto"
     target_loss: float = 3.28
+    # Personal corpus preparation budget; official run contracts stay versioned.
+    training_tokens: int = 624_984_064
 
     def validate(self) -> "LocalConfig":
         if isinstance(self.tpu_vm_count, bool) or not isinstance(self.tpu_vm_count, int):
@@ -58,6 +60,12 @@ class LocalConfig:
             raise ConfigError("color must be auto, always, or never")
         if not math.isfinite(self.target_loss) or self.target_loss < 0:
             raise ConfigError("target_loss must be finite and non-negative")
+        if isinstance(self.training_tokens, bool) or not isinstance(
+            self.training_tokens, int
+        ):
+            raise ConfigError("training_tokens must be a positive integer")
+        if self.training_tokens <= 0:
+            raise ConfigError("training_tokens must be a positive integer")
         if not self.data_path.strip() or not self.artifacts_path.strip():
             raise ConfigError("data and artifact paths may not be empty")
         return self
@@ -102,6 +110,7 @@ def save_config(config: LocalConfig, root: Path | None = None) -> Path:
     lines = [
         "# Personal defaults written by `speedrun prepare`.",
         "# Official constants live in data/manifests and docs/RULES.md.",
+        "# training_tokens sizes prepared data only; it does not alter a run contract.",
         "[speedrun]",
     ]
     for key, value in values.items():

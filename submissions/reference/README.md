@@ -6,6 +6,12 @@ checkpoint logic in one entry file. The sibling `config.yaml` is the versioned
 experiment definition: each profile records its model shape, token budget,
 precision, kernel choices, optimizer schedule, and validation cadence.
 
+The YAML also pins training order. `random_windows` preserves the official
+baseline's uniform with-replacement window sampling. Diagnostic scaling studies
+can select `shuffled_epochs`: a deterministic keyed permutation visits each
+non-overlapping shard window once per epoch without allocating a global index
+array, and multi-host ranks receive disjoint slices of every global batch.
+
 The checkpoint contains model parameters and versioned model metadata. It is an
 evaluation artifact, not a resumable training snapshot: Adam moments and the
 input RNG are deliberately omitted from this compact baseline.
@@ -105,6 +111,11 @@ cache, then a source-pinned shipped entry, then a deterministic shape heuristic.
 Pass `--attention-tuning-cache PATH --autotune-attention` to benchmark bounded
 synthetic candidates explicitly. Tuning never reads the dataset or occurs
 inside `jax.jit`; its time is reported separately from `train_seconds`.
+
+`--omit-checkpoint` is limited to open-track `dev` research runs. It keeps
+training curves, diagnostics, final FineWeb/Fresh10 evaluation, and `metrics.json`
+while avoiding a large parameter archive. Official and sample-efficiency runs
+always retain their ordinary checkpoint behavior.
 
 On this v4-8, an identical full-step benchmark measured 93.196 ms for the
 dense reference, 75.191 ms for custom TPU FlashAttention with dense loss, and

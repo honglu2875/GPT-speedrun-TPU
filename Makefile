@@ -6,6 +6,7 @@ DATA_PATH ?= shm
 RUNS_PATH ?= runs
 SUBMISSION ?= reference
 REPORT ?= report.html
+TRAIN_TOKENS ?= 624984064
 
 XPROF_VERSION ?= 2.22.3
 XPROF_PORT ?= 8791
@@ -29,12 +30,13 @@ help:
 	  '  make profile   run a 100-step XProf diagnostic, then serve it on :8791' \
 	  '  make report    rebuild report.html from integrity-checked run logs' \
 	  '' \
-	  'Useful overrides: DATA_PATH=shm SUBMISSION=reference REPORT=report.html'
+	  'Useful overrides: DATA_PATH=shm TRAIN_TOKENS=624984064 SUBMISSION=reference REPORT=report.html' \
+	  'TRAIN_TOKENS sizes prepare-only corpus selection; the official baseline remains fixed.'
 
 # This is intentionally interactive: the wizard owns personal paths and defaults.
 prepare:
 	$(UV_BASE) sync --frozen
-	$(UV_RUN) speedrun prepare
+	$(UV_RUN) speedrun prepare --training-tokens "$(TRAIN_TOKENS)"
 
 # Full SHA-256 data checks plus a small BF16 matmul and topology-wide collective.
 preflight:

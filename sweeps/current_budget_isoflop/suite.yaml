@@ -1,0 +1,134 @@
+# One-seed local compute-allocation study. This is diagnostic research, not an
+# official competition submission. Every duration is nearest-step aligned to
+# the completed 19,073-step baseline's analytic FLOP budget.
+schema_version: 1
+suite_id: current_budget_isoflop_v1
+config_template: template.yaml
+sequence_length: 1024
+batch_size: 32
+vocab_size: 50304
+seed: 1337
+validation_tokens: 99975168  # 3,051 global batches; leaves 24,832 of 0.1B unused.
+runtime:
+  python_major_minor: "3.12"
+  jax_version: "0.11.0"
+  jaxlib_version: "0.11.0"
+  libtpu_version: "0.0.44.1"
+  platform: tpu
+  device_kind: TPU v4
+  device_count: 4
+  local_device_count: 4
+  process_count: 1
+anchor:
+  parameters: 124475904
+  train_tokens: 624984064
+  flops_per_token: 860101632
+  total_flops: 537549813420392448
+dataset:
+  id: fineweb-4b-gpt2
+  source_repository: HuggingFaceFW/fineweb_100BT-shuffled
+  source_revision: ee8552966e3d6a5fee2f317f2ae0b342be03d998
+  tokenizer_version: "0.11.0"
+  source_inventory_sha256: 02ddc6361cc2f8a3d23b0d8b823c7eb7e2b1663ad3d0eff63e83b373456fc12b
+  exclusion_policy_sha256: ab25cabd0781b1046b7ad7b281b4147ff6e27d36977f4e842b8c92573399ad77
+  preparation_core_sha256: 4bbdcb76da837276f6f337b805d37a74e3272b476e01fd198f416097abe19241
+  minimum_usable_train_tokens: 3463512064
+  requested_train_tokens: 3900000000
+  requested_validation_tokens: 100000000
+fresh10:
+  manifest: ../../data/manifests/fresh10.json
+  name: fresh10-gpt2-v1
+  manifest_raw_sha256: dbac93361cdb1c9c85b804bbddfd451143e9e8c2bfd5bd57a4866af894dd8193
+  manifest_canonical_sha256: 470b28af2e5900108dc137f99051d60b5a72b5d32921f7a9228e310c132113eb
+  repository: quintic/fresh10
+  revision: 69427969d58fa128f2295ea111f5f67c4fb66f06
+  publication_not_before: "2025-05-01"
+  domains: 10
+  scored_tokens_per_domain: 8192
+  scored_tokens: 81920
+schedule:
+  reference_steps: 19073
+  reference_warmup_steps: 715
+  reference_val_every: 250
+  reference_log_every: 953
+optimizer:
+  min_lr_ratio: 0.1
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+learning_rate_candidates:
+  - id: lr200
+    value: 0.0002
+  - id: lr300
+    value: 0.0003
+  - id: lr450
+    value: 0.00045
+learning_rate_search:
+  geometric_factor: 1.5
+  lower:
+    - id: lr133
+      value: 0.00013333333333333334
+    - id: lr089
+      value: 0.00008888888888888889
+  upper:
+    - id: lr675
+      value: 0.000675
+    - id: lr1013
+      value: 0.0010125
+compute_slices:
+  - id: c025
+    numerator: 1
+    denominator: 4
+  - id: c050
+    numerator: 1
+    denominator: 2
+  - id: c100
+    numerator: 1
+    denominator: 1
+fit_shapes:
+  - id: n023
+    layers: 5
+    heads: 5
+    d_model: 320
+    parameters: 22590400
+  - id: n030
+    layers: 6
+    heads: 6
+    d_model: 384
+    parameters: 30357504
+  - id: n040
+    layers: 7
+    heads: 7
+    d_model: 448
+    parameters: 39895744
+  - id: n051
+    layers: 8
+    heads: 8
+    d_model: 512
+    parameters: 51500032
+  - id: n065
+    layers: 9
+    heads: 9
+    d_model: 576
+    parameters: 65465280
+controls:
+  - point_id: c100_n124_control
+    id: n124
+    slice: c100
+    layers: 12
+    heads: 12
+    d_model: 768
+    parameters: 124475904
+    learning_rate: 0.0003
+optional_extension_shapes:
+  - id: n082
+    layers: 10
+    heads: 10
+    d_model: 640
+    parameters: 82086400
+  - id: n102
+    layers: 11
+    heads: 11
+    d_model: 704
+    parameters: 101658304

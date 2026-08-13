@@ -38,6 +38,7 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertEqual(official.schema_version, 1)
         self.assertEqual(official.train_tokens, 624_984_064)
         self.assertEqual(official.attention_backend, "tpu_flash")
+        self.assertEqual(official.sampling, "random_windows")
         self.assertEqual(official.dtype_name, "bfloat16")
         self.assertEqual(
             official.source_sha256,
@@ -61,6 +62,9 @@ class TrainerStaticTests(unittest.TestCase):
             ),
             "invalid unselected profile": source.replace(
                 "warmup_steps: 715", "warmup_steps: -1", 1
+            ),
+            "missing sampling": source.replace(
+                "      sampling: random_windows\n", "", 1
             ),
         }
         with tempfile.TemporaryDirectory() as directory:
@@ -93,6 +97,18 @@ class TrainerStaticTests(unittest.TestCase):
             alternate.write_text(source, encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "beside train.py"):
                 trainer.load_experiment_profile("smoke", alternate)
+
+            shuffled_source = source.replace(
+                "      seq_len: 256\n      sampling: random_windows\n      dtype: bfloat16",
+                "      seq_len: 256\n      sampling: shuffled_epochs\n      dtype: bfloat16",
+                1,
+            )
+            path.write_text(shuffled_source, encoding="utf-8")
+            with patch.object(trainer, "CONFIG_PATH", path):
+                self.assertEqual(
+                    trainer.load_experiment_profile("dev").sampling,
+                    "shuffled_epochs",
+                )
 
     def test_static_cli_values_are_rejected_but_diagnostic_overrides_resolve(self) -> None:
         parser = trainer.build_parser()
@@ -250,6 +266,34 @@ class TrainerStaticTests(unittest.TestCase):
             },
         )
 
+    def test_checkpoint_omission_is_restricted_to_open_dev_research(self) -> None:
+        parser = trainer.build_parser()
+        valid = parser.parse_args(
+            ["--track", "open", "--profile", "dev", "--omit-checkpoint"]
+        )
+        trainer.validate_args(valid)
+        invalid_commands = (
+            ["--track", "open", "--profile", "official", "--omit-checkpoint"],
+            [
+                "--track",
+                "sample_efficiency",
+                "--profile",
+                "dev",
+                "--omit-checkpoint",
+            ],
+            [
+                "--track",
+                "open",
+                "--profile",
+                "dev",
+                "--omit-checkpoint",
+                "--no-checkpoint",
+            ],
+        )
+        for command in invalid_commands:
+            with self.subTest(command=command), self.assertRaises(ValueError):
+                trainer.validate_args(parser.parse_args(command))
+
     def test_diagnostic_main_omits_competition_result(self) -> None:
         stdout = StringIO()
         with (
@@ -399,6 +443,46 @@ class TrainerStaticTests(unittest.TestCase):
             dataset.batch("train", rng, 1, 7, 7)
         with self.assertRaisesRegex(ValueError, "do not fit"):
             dataset.validation_batch(0, 1, 7, 7)
+
+    def test_shuffled_epoch_stream_is_bijective_deterministic_and_rank_disjoint(self) -> None:
+        shards = trainer.ShardedTokens(
+            (
+                np.arange(9, dtype=np.int32),
+                np.arange(20, 29, dtype=np.int32),
+            )
+        )
+        expected_starts = {0, 2, 4, 6, 20, 22, 24, 26}
+
+        def epoch(seed: int) -> tuple[list[int], list[int]]:
+            streams = tuple(
+                trainer.ShuffledEpochBatchStream(
+                    shards,
+                    global_batch_size=4,
+                    seq_len=2,
+                    vocab_size=32,
+                    seed=seed,
+                    process_index=rank,
+                    process_count=2,
+                )
+                for rank in range(2)
+            )
+            rank_starts = ([], [])
+            for _ in range(2):
+                for rank, stream in enumerate(streams):
+                    x, y = stream.next_batch()
+                    self.assertTrue(np.array_equal(x[:, 1:], y[:, :-1]))
+                    rank_starts[rank].extend(int(value) for value in x[:, 0])
+            return rank_starts
+
+        first = epoch(17)
+        self.assertEqual(set(first[0]).intersection(first[1]), set())
+        self.assertEqual(set(first[0] + first[1]), expected_starts)
+        self.assertEqual(first, epoch(17))
+        self.assertNotEqual(first, epoch(18))
+
+        for size in range(1, 80):
+            permuted = [trainer._permute_bounded(i, size, 1234) for i in range(size)]
+            self.assertEqual(set(permuted), set(range(size)))
 
     def test_trainable_flash_attention_backends_are_tpu_only(self) -> None:
         parser = trainer.build_parser()

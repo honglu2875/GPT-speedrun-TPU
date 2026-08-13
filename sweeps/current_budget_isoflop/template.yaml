@@ -1,6 +1,6 @@
-# Versioned experiment definition for submissions/reference/train.py.
-# Keep algorithm/model/schedule choices here. Runtime paths, seed, run identity,
-# and profiling destinations remain command-line inputs owned by the harness.
+# Generator template for diagnostic sweep configs. `speedrun.scaling` replaces
+# the dev profile in every materialized config and preserves the smoke/official
+# guards byte-semantically. Actual resolved configs live beside each run.
 schema_version: 1
 profiles:
   smoke:
@@ -37,20 +37,21 @@ profiles:
       diagnostics_every: 0
       log_every: 10
 
+  # Placeholder only; generated configs replace this complete mapping.
   dev:
     training:
-      steps: 100
-      batch_size: 32
-      seq_len: 256
+      steps: 1
+      batch_size: 4
+      seq_len: 32
       sampling: random_windows
-      dtype: bfloat16
+      dtype: float32
     model:
-      layers: 6
-      heads: 6
-      d_model: 384
+      layers: 2
+      heads: 2
+      d_model: 64
       mlp_mult: 4
-      vocab_size: 50304
-      semantic_vocab_size: 50304
+      vocab_size: 256
+      semantic_vocab_size: 256
     kernels:
       attention_backend: dense
       loss_backend: dense
@@ -58,18 +59,18 @@ profiles:
     optimizer:
       learning_rate: 0.0003
       min_lr_ratio: 0.1
-      warmup_steps: 10
+      warmup_steps: 1
       weight_decay: 0.1
       beta1: 0.9
       beta2: 0.95
       grad_clip: 1.0
     evaluation:
-      eval_batches: 8
+      eval_batches: 1
       val_every: 0
-      val_probe_batches: 8
+      val_probe_batches: 1
     logging:
       diagnostics_every: 0
-      log_every: 10
+      log_every: 1
 
   official:
     training:
