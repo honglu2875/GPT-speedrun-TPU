@@ -1,5 +1,8 @@
 # Current-budget IsoFLOP study
 
+This directory is the immutable v2 definition. The default runner now points to
+the versioned v3 continuation; the commands below name v2 explicitly.
+
 This is a diagnostic, non-competition study of model/data allocation on the
 local TPU v4-8 stack. It keeps the completed baseline's analytic compute budget
 as `C0 = 537,549,813,420,392,448` training FLOPs and measures three slices:
@@ -55,18 +58,19 @@ The learning rate chosen at `0.25 C0` may itself cease to be optimal at the
 longer `0.50 C0` and `1.00 C0` horizons; this bounded calibration is a practical
 compromise rather than a full per-shape, per-budget optimizer sweep.
 
-## Commands
+## Archived command context
+
+The v2 source fingerprint is historical and this newer lineage-aware runner is
+not allowed to resume or create runs under the v2 suite ID. Use the v3 commands
+in `../current_budget_isoflop_v3/README.md` for continuation. The explicit v2
+plan command below is useful only for inspecting its archived geometry; its
+printed execution fingerprint describes current code, not the recorded v2
+execution.
 
 Inspect the complete step/token/FLOP plan without JAX initialization:
 
 ```bash
-uv run --frozen --no-sync python -m speedrun.scaling plan
-```
-
-After the 4B dataset exists locally, run the gated sequence:
-
-```bash
-uv run --frozen --no-sync python -m speedrun.scaling run --staged --data-path /dev/shm/fineweb-scaled/4B --downstream-manifest data/manifests/fresh10.json --downstream-root /dev/shm --confirm-execution-fingerprint DIGEST_FROM_PLAN --resume --color always
+uv run --frozen --no-sync python -m speedrun.scaling --suite sweeps/current_budget_isoflop/suite.yaml plan
 ```
 
 The data gate requires the builder's sibling `manifest.json`, `source.json`,
@@ -100,12 +104,6 @@ optional shapes run); this policy reduces that to zero. Learning-rate choices
 live beneath `learning-rate-selections/`. Derived slice fits are replaced safely
 beneath `fits/`; raw configs and run manifests are immutable and a byte mismatch
 stops resumption.
-
-If every required run is already complete, rebuild the fit with:
-
-```bash
-uv run --frozen --no-sync python -m speedrun.scaling fit
-```
 
 The base plan costs 12.25 completed-baseline compute equivalents. At the
 observed baseline training time of roughly 28.7 minutes this is approximately

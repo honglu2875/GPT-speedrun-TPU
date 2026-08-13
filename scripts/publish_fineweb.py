@@ -67,6 +67,22 @@ PROVENANCE_FILES = (
 )
 HTTP_ATTEMPTS = 5
 MAX_JSON_BYTES = 16 * 1024 * 1024
+PUBLICATION_LEDGER_SCHEMA_VERSION = 1
+PLAN_IDENTITY_FIELDS = (
+    "repository",
+    "public",
+    "manifest_output",
+    "source_inventory_sha256",
+    "exclusion_policy_sha256",
+    "core_sha256",
+)
+PLAN_FIELDS = (*PLAN_IDENTITY_FIELDS, "variants", "shards")
+ANONYMOUS_VERIFICATION_FLAGS = (
+    "manifest",
+    "closed_tree_inventory",
+    "all_shard_lfs_sizes_and_sha256",
+    "selected_shard_headers",
+)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -279,6 +295,329 @@ def publication_validation_chain(names: Sequence[str]) -> tuple[str, ...]:
     return VARIANT_ORDER[: max(order) + 1]
 
 
+def expected_publication_shards(variant: str) -> int:
+    """Return the fixed validation-plus-training shard count for one variant."""
+
+    selected = scaled_variant_named(variant)
+    return selected.train_shards + 1
+
+
+def required_preserved_predecessors(
+    requested_variants: Sequence[str],
+) -> tuple[str, ...]:
+    """Return nested predecessors omitted from this upload request."""
+
+    if not requested_variants:
+        return ()
+    requested = set(requested_variants)
+    furthest = max(VARIANT_ORDER.index(name) for name in requested_variants)
+    return tuple(
+        name for name in VARIANT_ORDER[:furthest] if name not in requested
+    )
+
+
+def require_preserved_predecessor_chain(
+    *,
+    requested_variants: Sequence[str],
+    prior_variants: Sequence[str],
+    receipts: Mapping[str, Any],
+) -> None:
+    """Require a complete trusted ledger for predecessors not being uploaded."""
+
+    required = required_preserved_predecessors(requested_variants)
+    if not required:
+        return
+    prior = set(prior_variants)
+    missing_plan = [name for name in required if name not in prior]
+    missing_receipts = [name for name in required if name not in receipts]
+    if missing_plan or missing_receipts:
+        details: list[str] = []
+        if missing_plan:
+            details.append(f"missing from prior plan: {', '.join(missing_plan)}")
+        if missing_receipts:
+            details.append(
+                f"missing verified receipts: {', '.join(missing_receipts)}"
+            )
+        raise FineWebBuildError(
+            "publication request omits nested predecessors and requires their "
+            "complete verified prior plan and receipts; " + "; ".join(details)
+        )
+
+
+def validate_publication_plan(
+    plan: Mapping[str, Any], *, label: str
+) -> tuple[str, ...]:
+    """Validate one exact schema-v1 publication plan without normalizing it."""
+
+    if set(plan) != set(PLAN_FIELDS):
+        raise FineWebBuildError(f"{label} has an unexpected publication plan schema")
+    repository = plan.get("repository")
+    public = plan.get("public")
+    manifest_output = plan.get("manifest_output")
+    if not isinstance(repository, str) or not repository:
+        raise FineWebBuildError(f"{label} repository identity is malformed")
+    if not isinstance(public, bool):
+        raise FineWebBuildError(f"{label} public/private identity is malformed")
+    if (
+        not isinstance(manifest_output, str)
+        or not manifest_output
+        or not Path(manifest_output).is_absolute()
+    ):
+        raise FineWebBuildError(f"{label} manifest output identity is malformed")
+    for field in (
+        "source_inventory_sha256",
+        "exclusion_policy_sha256",
+        "core_sha256",
+    ):
+        value = plan.get(field)
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise FineWebBuildError(f"{label} {field} identity is malformed")
+
+    variants = plan.get("variants")
+    shards = plan.get("shards")
+    if not isinstance(variants, list) or not variants:
+        raise FineWebBuildError(f"{label} variants must be a non-empty list")
+    if any(not isinstance(name, str) for name in variants):
+        raise FineWebBuildError(f"{label} contains a malformed variant name")
+    canonical = tuple(name for name in VARIANT_ORDER if name in variants)
+    if tuple(variants) != canonical or len(canonical) != len(variants):
+        raise FineWebBuildError(
+            f"{label} variants are not unique and in canonical publication order"
+        )
+    if not isinstance(shards, dict) or set(shards) != set(canonical):
+        raise FineWebBuildError(f"{label} shard counts do not match its variants")
+    for name in canonical:
+        count = shards.get(name)
+        if (
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or count != expected_publication_shards(name)
+        ):
+            raise FineWebBuildError(
+                f"{label} has the wrong fixed shard count for {name}"
+            )
+    return canonical
+
+
+def validate_preserved_receipt(
+    *,
+    variant: str,
+    receipt: Any,
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Authenticate one prior row before it can enter a cumulative ledger."""
+
+    if variant not in VARIANT_ORDER or not isinstance(receipt, dict):
+        raise FineWebBuildError("publication ledger contains a malformed receipt")
+    public = plan["public"]
+    expected_keys = {
+        "shard_revision",
+        "manifest_revision",
+        "manifest_sha256",
+        "repository",
+        "staged_manifest",
+    }
+    if public:
+        expected_keys.add("anonymous_verification")
+    if set(receipt) != expected_keys:
+        raise FineWebBuildError(
+            f"publication ledger receipt for {variant} has an unexpected schema"
+        )
+    if receipt.get("repository") != plan["repository"]:
+        raise FineWebBuildError(
+            f"publication ledger receipt repository differs for {variant}"
+        )
+    for field in ("shard_revision", "manifest_revision"):
+        value = receipt.get(field)
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value):
+            raise FineWebBuildError(
+                f"publication ledger receipt has an invalid {field} for {variant}"
+            )
+    manifest_sha256 = receipt.get("manifest_sha256")
+    if not isinstance(manifest_sha256, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", manifest_sha256
+    ):
+        raise FineWebBuildError(
+            f"publication ledger receipt has an invalid manifest hash for {variant}"
+        )
+    expected_staged = str(Path(str(plan["manifest_output"])) / f"{variant}.json")
+    if receipt.get("staged_manifest") != expected_staged:
+        raise FineWebBuildError(
+            f"publication ledger staged manifest differs for {variant}"
+        )
+    staged_path = Path(expected_staged)
+    try:
+        staging_metadata = staged_path.parent.lstat()
+    except OSError as exc:
+        raise FineWebBuildError(
+            f"cannot inspect publication ledger staging directory: {exc}"
+        ) from exc
+    if stat.S_ISLNK(staging_metadata.st_mode) or not stat.S_ISDIR(
+        staging_metadata.st_mode
+    ):
+        raise FineWebBuildError(
+            "publication ledger staging directory must be a real directory"
+        )
+    staged = read_json_regular(staged_path)
+    if canonical_json_sha256(staged) != manifest_sha256:
+        raise FineWebBuildError(
+            f"publication ledger staged manifest hash differs for {variant}"
+        )
+    try:
+        # Validate the same parsed object whose canonical hash was authenticated,
+        # avoiding a second file read between the hash and contract checks.
+        staged, _in_memory_source = load_manifest(staged)
+        validate_scaled_manifest_contract(
+            staged,
+            scaled_variant_named(variant),
+            staged_path,
+            # Repository identity is a publisher setting.  Validate every
+            # repository-independent production invariant here, then bind the
+            # staged source and every URL to the plan/receipt immediately below.
+            require_publication=False,
+        )
+    except DataError as exc:
+        raise FineWebBuildError(
+            "publication ledger staged manifest violates the complete production "
+            f"contract for {variant}: {exc}"
+        ) from exc
+    source = staged.get("source")
+    if not isinstance(source, dict) or (
+        source.get("prepared_repository") != plan["repository"]
+        or source.get("prepared_revision") != receipt["shard_revision"]
+    ):
+        raise FineWebBuildError(
+            f"publication ledger staged manifest identity differs for {variant}"
+        )
+    entries = staged.get("files")
+    if not isinstance(entries, list) or not entries:
+        raise FineWebBuildError(
+            f"publication ledger staged manifest has no files for {variant}"
+        )
+    repository = quote(str(plan["repository"]), safe="/")
+    revision = quote(str(receipt["shard_revision"]), safe="")
+    for entry in entries:
+        entry_path = entry.get("path") if isinstance(entry, dict) else None
+        if (
+            not isinstance(entry_path, str)
+            or not entry_path
+            or Path(entry_path).name != entry_path
+        ):
+            raise FineWebBuildError(
+                f"publication ledger staged manifest is malformed for {variant}"
+            )
+        remote_path = quote(f"{variant}/{entry_path}", safe="/")
+        expected_url = (
+            f"https://huggingface.co/datasets/{repository}/resolve/"
+            f"{revision}/{remote_path}"
+        )
+        if entry.get("url") != expected_url:
+            raise FineWebBuildError(
+                f"publication ledger staged manifest URL differs for {variant}"
+            )
+    if public:
+        verification = receipt.get("anonymous_verification")
+        if not isinstance(verification, dict) or set(verification) != set(
+            ANONYMOUS_VERIFICATION_FLAGS
+        ):
+            raise FineWebBuildError(
+                f"publication ledger anonymous verification is malformed for {variant}"
+            )
+        if any(
+            verification.get(flag) is not True
+            for flag in ANONYMOUS_VERIFICATION_FLAGS
+        ):
+            raise FineWebBuildError(
+                "publication ledger lacks successful anonymous verification for "
+                f"{variant}"
+            )
+    return json.loads(json.dumps(receipt))
+
+
+def load_and_merge_publication_ledger(
+    path: Path, requested_plan: Mapping[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load a fail-closed ledger and merge the new request in canonical order."""
+
+    requested_variants = validate_publication_plan(
+        requested_plan, label="requested publication"
+    )
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        prior: dict[str, Any] | None = None
+    except OSError as exc:
+        raise FineWebBuildError(f"cannot inspect publication ledger: {exc}") from exc
+    else:
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise FineWebBuildError(
+                "publication ledger must be a regular non-symlink file"
+            )
+        prior = read_json_regular(path)
+
+    if prior is None:
+        require_preserved_predecessor_chain(
+            requested_variants=requested_variants,
+            prior_variants=(),
+            receipts={},
+        )
+        merged_plan = dict(requested_plan)
+        merged_plan["variants"] = list(requested_variants)
+        merged_plan["shards"] = {
+            name: expected_publication_shards(name) for name in requested_variants
+        }
+        return merged_plan, {}
+
+    expected_ledger_keys = {"schema_version", *PLAN_FIELDS, "receipts"}
+    if set(prior) != expected_ledger_keys:
+        raise FineWebBuildError("publication ledger has an unexpected schema")
+    schema_version = prior.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or schema_version != PUBLICATION_LEDGER_SCHEMA_VERSION
+    ):
+        raise FineWebBuildError("publication ledger has an unsupported schema version")
+    prior_plan = {field: prior[field] for field in PLAN_FIELDS}
+    prior_variants = validate_publication_plan(
+        prior_plan, label="publication ledger"
+    )
+    for field in PLAN_IDENTITY_FIELDS:
+        if prior_plan[field] != requested_plan[field]:
+            raise FineWebBuildError(
+                f"publication ledger identity differs in {field}"
+            )
+    raw_receipts = prior.get("receipts")
+    if not isinstance(raw_receipts, dict) or not set(raw_receipts).issubset(
+        set(prior_variants)
+    ):
+        raise FineWebBuildError(
+            "publication ledger receipts do not match its planned variants"
+        )
+    receipts = {
+        name: validate_preserved_receipt(
+            variant=name, receipt=raw_receipts[name], plan=requested_plan
+        )
+        for name in VARIANT_ORDER
+        if name in raw_receipts
+    }
+    require_preserved_predecessor_chain(
+        requested_variants=requested_variants,
+        prior_variants=prior_variants,
+        receipts=receipts,
+    )
+    merged_variants = tuple(
+        name
+        for name in VARIANT_ORDER
+        if name in prior_variants or name in requested_variants
+    )
+    merged_plan = dict(requested_plan)
+    merged_plan["variants"] = list(merged_variants)
+    merged_plan["shards"] = {
+        name: expected_publication_shards(name) for name in merged_variants
+    }
+    return merged_plan, receipts
+
+
 def validate_closed_directory(directory: Path, expected_names: set[str]) -> None:
     """Reject every unplanned entry before handing a folder to the Hub client."""
 
@@ -411,6 +750,7 @@ def publish(
     private: bool,
     manifest_output: Path | None = None,
     receipt_callback: Callable[[Mapping[str, Any]], None] | None = None,
+    initial_receipts: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     api.create_repo(
         repo_id=repo_id,
@@ -436,7 +776,11 @@ def publish(
             token=token,
             commit_message="Add exact frozen preparation source",
         )
-    receipts: dict[str, Any] = {}
+    receipts: dict[str, Any] = {
+        name: json.loads(json.dumps(initial_receipts[name]))
+        for name in VARIANT_ORDER
+        if initial_receipts is not None and name in initial_receipts
+    }
     for variant, manifest in manifests.items():
         allowed = [str(entry["path"]) for entry in manifest["files"]]
         allowed.extend(METADATA_FILENAMES)
@@ -481,18 +825,17 @@ def publish(
                 expected_remote=expected_remote,
             )
             receipts[variant]["anonymous_verification"] = {
-                "manifest": True,
-                "closed_tree_inventory": True,
-                "all_shard_lfs_sizes_and_sha256": True,
-                "selected_shard_headers": True,
+                flag: True for flag in ANONYMOUS_VERIFICATION_FLAGS
             }
         if manifest_output is not None:
             staged = manifest_output / f"{variant}.json"
             write_json_atomic(staged, remote_manifest)
             receipts[variant]["staged_manifest"] = str(staged)
         if receipt_callback:
-            receipt_callback(dict(receipts))
-    return receipts
+            receipt_callback(
+                {name: receipts[name] for name in VARIANT_ORDER if name in receipts}
+            )
+    return {name: receipts[name] for name in VARIANT_ORDER if name in receipts}
 
 
 def immutable_commit_revision(commit: Any, operation: str) -> str:
@@ -900,7 +1243,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.manifest_output is not None
             else root / ".fineweb-build" / "staged-manifests"
         )
-        plan = {
+        requested_plan = {
             "repository": repo_id,
             "public": not args.private,
             "variants": list(manifests),
@@ -912,8 +1255,18 @@ def main(argv: list[str] | None = None) -> int:
             "exclusion_policy_sha256": SCALED_EXCLUSION_POLICY_SHA256,
             "core_sha256": SCALED_CORE_SHA256,
         }
+        receipt_path = safe_child_directory(root, ".fineweb-build") / "publication.json"
+        plan, initial_receipts = load_and_merge_publication_ledger(
+            receipt_path, requested_plan
+        )
         if args.dry_run:
-            print(json.dumps({**plan, "dry_run": True}, indent=2, sort_keys=True))
+            print(
+                json.dumps(
+                    {**plan, "receipts": initial_receipts, "dry_run": True},
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
             return 0
         token = read_token_file(args.token_file)
         os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
@@ -923,7 +1276,6 @@ def main(argv: list[str] | None = None) -> int:
             raise FineWebBuildError(
                 "huggingface_hub is required; run this file with `uv run --script`"
             ) from exc
-        receipt_path = safe_child_directory(root, ".fineweb-build") / "publication.json"
         manifest_output = ensure_staging_directory(staging_display)
 
         def save_receipts(receipts: Mapping[str, Any]) -> None:
@@ -942,6 +1294,7 @@ def main(argv: list[str] | None = None) -> int:
             private=args.private,
             manifest_output=manifest_output,
             receipt_callback=save_receipts,
+            initial_receipts=initial_receipts,
         )
         save_receipts(receipts)
         print(json.dumps({**plan, "receipts": receipts}, indent=2, sort_keys=True))
@@ -959,7 +1312,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except KeyboardInterrupt:
         print(
-            "\npublication interrupted; rerun to resume deduplicated upload",
+            "\npublication interrupted; rerun safely; Hub/Xet may deduplicate "
+            "repeated content",
             file=sys.stderr,
         )
         return 130

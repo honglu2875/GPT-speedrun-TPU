@@ -1,0 +1,230 @@
+{
+  "artifacts": {
+    "diagnostics": "diagnostics.csv",
+    "training_curve": "training.csv",
+    "validation_curve": "validation.csv"
+  },
+  "checkpoint": null,
+  "contract": {
+    "dataset_id": "fineweb-4b-gpt2",
+    "model": {
+      "d_model": 384,
+      "heads": 6,
+      "layers": 6,
+      "mlp_mult": 4,
+      "semantic_vocab_size": 50304,
+      "tied_embeddings": true,
+      "vocab_size": 50304
+    },
+    "model_id": "reference-gpt-v1",
+    "sequence_length": 1024,
+    "tokenizer_id": "gpt2"
+  },
+  "evaluations": {
+    "fineweb": {
+      "canonical": true,
+      "loss": 4.140668187990067,
+      "perplexity": 62.84479956331034,
+      "scored_tokens": 99975168,
+      "seconds": 29.940221182070673
+    },
+    "fresh10": {
+      "domains": {
+        "climate": {
+          "loss": 4.334944725036621,
+          "perplexity": 76.32074014705668,
+          "scored_tokens": 8192,
+          "seconds": 0.010350920259952545
+        },
+        "economics": {
+          "loss": 4.053549766540527,
+          "perplexity": 57.60156667441384,
+          "scored_tokens": 8192,
+          "seconds": 0.010397649370133877
+        },
+        "education": {
+          "loss": 4.258080959320068,
+          "perplexity": 70.67422651868638,
+          "scored_tokens": 8192,
+          "seconds": 0.01026981882750988
+        },
+        "fiction": {
+          "loss": 4.288236618041992,
+          "perplexity": 72.83791412408605,
+          "scored_tokens": 8192,
+          "seconds": 0.010292639955878258
+        },
+        "government": {
+          "loss": 4.011040210723877,
+          "perplexity": 55.204264775474364,
+          "scored_tokens": 8192,
+          "seconds": 0.010362358763813972
+        },
+        "history": {
+          "loss": 4.488386154174805,
+          "perplexity": 88.97773360121303,
+          "scored_tokens": 8192,
+          "seconds": 0.01035807840526104
+        },
+        "legal": {
+          "loss": 4.227105140686035,
+          "perplexity": 68.51859310905128,
+          "scored_tokens": 8192,
+          "seconds": 0.010348258540034294
+        },
+        "medicine": {
+          "loss": 4.240099906921387,
+          "perplexity": 69.41478650995752,
+          "scored_tokens": 8192,
+          "seconds": 0.010361130349338055
+        },
+        "science": {
+          "loss": 4.4213151931762695,
+          "perplexity": 83.20564492453444,
+          "scored_tokens": 8192,
+          "seconds": 0.010530839674174786
+        },
+        "software": {
+          "loss": 4.9013671875,
+          "perplexity": 134.47350455765496,
+          "scored_tokens": 8192,
+          "seconds": 0.010304490104317665
+        }
+      },
+      "macro_loss": 4.322412586212158,
+      "macro_perplexity": 75.37024633645302,
+      "scored_tokens": 81920,
+      "seconds": 0.10357618425041437
+    }
+  },
+  "implementation": {
+    "attention_backend": "tpu_flash",
+    "attention_tuning": {
+      "key_digest": "9bebff05d4ed95a1538348feefff4b60eace53634ed5dea12c3dd2cff282ef61",
+      "resolution_source": "heuristic",
+      "tiles": {
+        "block_kv": 512,
+        "block_kv_compute": 256,
+        "block_kv_dkv": 512,
+        "block_kv_dkv_compute": 256,
+        "block_kv_dq": 512,
+        "block_kv_dq_compute": 256,
+        "block_q": 512,
+        "block_q_dkv": 512,
+        "block_q_dkv_compute": 256,
+        "block_q_dq": 256
+      },
+      "tune_seconds": 0.0
+    },
+    "configuration": {
+      "overrides": {},
+      "path": "config.yaml",
+      "profile": "dev",
+      "resolved": {
+        "evaluation": {
+          "eval_batches": 3051,
+          "val_every": 255,
+          "val_probe_batches": 8
+        },
+        "kernels": {
+          "attention_backend": "tpu_flash",
+          "loss_backend": "dense",
+          "vocab_tile_size": 2048
+        },
+        "logging": {
+          "diagnostics_every": 255,
+          "log_every": 974
+        },
+        "model": {
+          "d_model": 384,
+          "heads": 6,
+          "layers": 6,
+          "mlp_mult": 4,
+          "semantic_vocab_size": 50304,
+          "tied_embeddings": true,
+          "vocab_size": 50304
+        },
+        "optimizer": {
+          "beta1": 0.9,
+          "beta2": 0.95,
+          "grad_clip": 1.0,
+          "learning_rate": 0.0003,
+          "min_lr_ratio": 0.1,
+          "warmup_steps": 731,
+          "weight_decay": 0.1
+        },
+        "training": {
+          "batch_size": 32,
+          "dtype": "bfloat16",
+          "sampling": "shuffled_epochs",
+          "seq_len": 1024,
+          "steps": 19487,
+          "train_tokens": 638550016
+        }
+      },
+      "schema_version": 1,
+      "sha256": "87209d95d12c0a7a243493601ea87bbae40199a45d1d7ca97aad6e38404c5828"
+    },
+    "loss_backend": "dense",
+    "vocab_tile_size": 2048
+  },
+  "metrics": {
+    "achieved_tflops": 294.51852765234617,
+    "attention_tune_seconds": 0.0,
+    "diagnostic_compile_seconds": 32.85781950503588,
+    "diagnostic_point_count": 78,
+    "diagnostics_every": 255,
+    "estimated_total_flops": 134387049972105216,
+    "eval_compile_seconds": 4.532672529108822,
+    "final_validation_seconds": 29.940221182070673,
+    "flops_per_token": 210456576,
+    "mfu_estimate": 0.2677441160475874,
+    "parameters": 30357504,
+    "tokens_per_second": 1399426.585997228,
+    "tokens_processed": 638550016,
+    "total_compile_seconds": 53.45468781609088,
+    "train_compile_seconds": 16.064195781946182,
+    "train_loss": 4.029482364654541,
+    "train_seconds": 456.29404385294765,
+    "training_data_epochs": 0.16373119248518608,
+    "training_sampling": "shuffled_epochs",
+    "training_steps": 19487,
+    "training_token_budget": 638550016,
+    "training_usable_tokens_per_epoch": 3899990016,
+    "validation_loss": 4.140668187990067,
+    "validation_probe_count": 76,
+    "validation_probe_seconds": 6.039651964791119,
+    "validation_tokens": 99975168
+  },
+  "profile": "dev",
+  "schema_version": 1,
+  "seed": 1337,
+  "status": "ok",
+  "system": {
+    "controller_process_index": 0,
+    "device_count": 4,
+    "device_ids": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "device_kinds": [
+      "TPU v4"
+    ],
+    "jax_version": "0.11.0",
+    "jaxlib_version": "0.11.0",
+    "libtpu_version": "0.0.44.1",
+    "local_device_count": 4,
+    "platform": "tpu",
+    "process_count": 1,
+    "process_indices": [
+      0,
+      0,
+      0,
+      0
+    ],
+    "python_version": "3.12.13"
+  },
+  "track": "open"
+}

@@ -16,20 +16,28 @@ import yaml
 
 from speedrun.data import FRESH10_DOMAINS, manifest_digest
 from speedrun.scaling import (
+    DEFAULT_RUNS,
     DEFAULT_SUITE,
     LearningRateEdgeError,
     ScalingError,
     _fit_slice,
+    _lineage_entry_for_point,
+    _lineage_summary,
+    _load_lineage_contract,
     _revisit_extension_fixed_point,
     _manifest_shard_contract,
     _next_adaptive_calibration,
+    _validate_adaptive_completion_prefix,
+    _validate_lineage_output_root,
     _public_point,
     _read_run,
     _warrants_high_side_extension,
     build_parser,
     load_suite,
+    main,
     materialize_configs,
     parameter_count,
+    run_variants,
     select_learning_rate,
     trainer_command,
     validate_data_directory,
@@ -54,7 +62,13 @@ TRAINER_SPEC.loader.exec_module(reference_trainer)
 class ScalingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.suite = load_suite(DEFAULT_SUITE)
+        cls.lineage_suite = load_suite(DEFAULT_SUITE)
+        cls.suite = load_suite(
+            Path(__file__).parents[1]
+            / "sweeps"
+            / "current_budget_isoflop"
+            / "suite.yaml"
+        )
 
     def test_suite_matches_exact_current_budget_and_cost(self) -> None:
         suite = self.suite
@@ -95,6 +109,19 @@ class ScalingTests(unittest.TestCase):
             suite["dataset"]["preparation_core_sha256"],
             "4bbdcb76da837276f6f337b805d37a74e3272b476e01fd198f416097abe19241",
         )
+    def test_v3_extends_lr_bound_with_exact_v2_lineage(self) -> None:
+        suite = self.lineage_suite
+        self.assertEqual(suite["suite_id"], "current_budget_isoflop_v3")
+        self.assertEqual(len(suite["adaptive_calibrations"]), 56)
+        lineage = _lineage_summary(suite)
+        self.assertIsNotNone(lineage)
+        self.assertEqual(lineage["allowlisted_artifact_count"], 24)
+        self.assertEqual(lineage["origin_suite_id"], "current_budget_isoflop_v2")
+        upper = suite["learning_rate_search"]["upper"]
+        self.assertEqual(upper[-2]["id"], "lr3417")
+        self.assertEqual(upper[-2]["value"], 0.0034171875)
+        self.assertEqual(upper[-1]["id"], "lr5126")
+        self.assertEqual(upper[-1]["value"], 0.00512578125)
 
     def test_parameter_formula_matches_reference_anchor(self) -> None:
         self.assertEqual(
@@ -122,6 +149,277 @@ class ScalingTests(unittest.TestCase):
             paths[0].write_text("changed", encoding="utf-8")
             with self.assertRaisesRegex(ScalingError, "immutable file differs"):
                 materialize_configs(self.suite, root, [point["id"]])
+
+    def test_exact_v2_lineage_is_read_without_copying_or_relabeling(self) -> None:
+        point = next(
+            item
+            for item in self.lineage_suite["adaptive_calibrations"]
+            if item["id"] == "c025_n051_lr2278_adaptive"
+        )
+        entry = _lineage_entry_for_point(self.lineage_suite, point)
+        self.assertIsNotNone(entry)
+        with tempfile.TemporaryDirectory() as directory:
+            v3_root = Path(directory).resolve()
+            measured = _read_run(self.lineage_suite, point, v3_root)
+            self.assertEqual(measured["validation_loss"], 3.992864087463324)
+            self.assertEqual(
+                measured["run_manifest_sha256"], entry["run_manifest_sha256"]
+            )
+            self.assertEqual(measured["result_sha256"], entry["result_sha256"])
+            self.assertEqual(
+                measured["lineage"]["origin_suite_id"],
+                "current_budget_isoflop_v2",
+            )
+            self.assertEqual(
+                measured["result"],
+                "c025_n051_lr2278_adaptive/artifacts/result.json",
+            )
+            self.assertFalse((v3_root / point["id"]).exists())
+
+    def test_all_24_tracked_v2_artifacts_pass_exact_semantic_admission(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            points = {
+                item["id"]: item for item in self.lineage_suite["all_variants"]
+            }
+            for entry in self.lineage_suite["lineage"]["artifacts"]:
+                measured = _read_run(
+                    self.lineage_suite, points[entry["point_id"]], root
+                )
+                self.assertEqual(measured["result_sha256"], entry["result_sha256"])
+                self.assertEqual(
+                    measured["run_manifest_sha256"],
+                    entry["run_manifest_sha256"],
+                )
+
+    def test_v3_selection_exposes_each_reused_artifact_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            selected = select_learning_rate(
+                self.lineage_suite,
+                shape_id="n023",
+                runs_path=Path(directory).resolve(),
+            )
+            self.assertEqual(selected["schema_version"], 3)
+            self.assertEqual(
+                selected["study_lineage"]["origin_suite_id"],
+                "current_budget_isoflop_v2",
+            )
+            self.assertEqual(selected["selected_learning_rate"], 0.0010125)
+            self.assertTrue(selected["candidates"])
+            for candidate in selected["candidates"]:
+                self.assertEqual(len(candidate["result_sha256"]), 64)
+                self.assertEqual(len(candidate["run_manifest_sha256"]), 64)
+                self.assertEqual(
+                    candidate["lineage"]["point_id"], candidate["id"]
+                )
+
+    def test_lineage_artifact_cannot_be_shadowed_in_v3(self) -> None:
+        point = self.lineage_suite["calibrations"][0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / point["id"]).mkdir()
+            with self.assertRaisesRegex(ScalingError, "must not shadow"):
+                _read_run(self.lineage_suite, point, root)
+
+    def test_new_v3_run_manifest_exposes_study_lineage(self) -> None:
+        point = next(
+            item
+            for item in self.lineage_suite["calibrations"]
+            if item["shape_id"] == "n065" and item["learning_rate"] == 0.0002
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            _write_fake_run(root, self.lineage_suite, point, 4.0)
+            measured = _read_run(self.lineage_suite, point, root)
+            self.assertNotIn("lineage", measured)
+            manifest = json.loads(
+                (root / point["id"] / "run-manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["schema_version"], 4)
+            self.assertEqual(
+                manifest["study_lineage"]["allowlisted_artifact_count"], 24
+            )
+
+    def test_lineage_result_hash_is_release_gating(self) -> None:
+        point = self.lineage_suite["calibrations"][0]
+        entry = self.lineage_suite["lineage"]["artifacts_by_point"][point["id"]]
+        original = entry["result_sha256"]
+        entry["result_sha256"] = "0" * 64
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(ScalingError, "exact allowlisted bytes"):
+                    _read_run(self.lineage_suite, point, Path(directory).resolve())
+        finally:
+            entry["result_sha256"] = original
+
+    def test_lineage_result_must_remain_at_canonical_artifact_path(self) -> None:
+        point = self.lineage_suite["calibrations"][0]
+        name = point["id"]
+        source_root = Path(
+            self.lineage_suite["lineage"]["origin"]["runs_root"]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory).resolve()
+            origin_root = temporary / "v2"
+            point_root = origin_root / name
+            canonical = point_root / "artifacts" / "result.json"
+            canonical.parent.mkdir(parents=True)
+            shutil.copyfile(
+                source_root / name / "run-manifest.json",
+                point_root / "run-manifest.json",
+            )
+            shutil.copyfile(
+                source_root / name / "artifacts" / "result.json", canonical
+            )
+            fallback = point_root / "result.json"
+            canonical.replace(fallback)
+            self.assertEqual(
+                fallback.read_bytes(),
+                (source_root / name / "artifacts" / "result.json").read_bytes(),
+            )
+
+            origin = self.lineage_suite["lineage"]["origin"]
+            with patch.dict(origin, {"runs_root": str(origin_root)}):
+                with self.assertRaisesRegex(
+                    ScalingError, "must be a regular, non-symlink file"
+                ):
+                    _read_run(self.lineage_suite, point, temporary / "v3")
+
+    def test_lineage_run_manifest_hash_is_release_gating(self) -> None:
+        point = self.lineage_suite["calibrations"][0]
+        entry = self.lineage_suite["lineage"]["artifacts_by_point"][point["id"]]
+        original = entry["run_manifest_sha256"]
+        entry["run_manifest_sha256"] = "0" * 64
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(ScalingError, "not allowlisted"):
+                    _read_run(self.lineage_suite, point, Path(directory).resolve())
+        finally:
+            entry["run_manifest_sha256"] = original
+
+    def test_v3_n051_continues_with_mandatory_then_reserve_lr(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            mandatory = _next_adaptive_calibration(
+                self.lineage_suite, "n051", "upper", root
+            )
+            self.assertEqual(mandatory["id"], "c025_n051_lr3417_adaptive")
+            self.assertEqual(mandatory["learning_rate"], 0.0034171875)
+            result = root / mandatory["id"] / "artifacts" / "result.json"
+            result.parent.mkdir(parents=True)
+            result.touch()
+            reserve = _next_adaptive_calibration(
+                self.lineage_suite, "n051", "upper", root
+            )
+            self.assertEqual(reserve["id"], "c025_n051_lr5126_adaptive")
+            self.assertEqual(reserve["learning_rate"], 0.00512578125)
+
+    def test_v3_rejects_noncontiguous_reserve_completion(self) -> None:
+        reserve = next(
+            item
+            for item in self.lineage_suite["adaptive_calibrations"]
+            if item["id"] == "c025_n051_lr5126_adaptive"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            result = root / reserve["id"] / "artifacts" / "result.json"
+            result.parent.mkdir(parents=True)
+            result.touch()
+            with self.assertRaisesRegex(ScalingError, "noncontiguous upper"):
+                _validate_adaptive_completion_prefix(
+                    self.lineage_suite, "n051", root
+                )
+
+    def test_direct_variant_cannot_launch_adaptive_lr(self) -> None:
+        point = next(
+            item
+            for item in self.lineage_suite["adaptive_calibrations"]
+            if item["id"] == "c025_n051_lr3417_adaptive"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            with self.assertRaisesRegex(ScalingError, "only be launched by --staged"):
+                run_variants(
+                    self.lineage_suite,
+                    names=[point["id"]],
+                    data_path=Path("/does/not/matter"),
+                    runs_path=root,
+                    seed=1337,
+                    color="never",
+                    downstream_manifest=Path("/does/not/matter"),
+                    downstream_root=Path("/does/not/matter"),
+                    attention_tuning_cache=None,
+                    autotune_attention=False,
+                    resume=False,
+                )
+
+    def test_v3_output_root_must_be_disjoint_from_v2(self) -> None:
+        origin = Path(self.lineage_suite["lineage"]["origin"]["runs_root"])
+        for path in (origin, origin / "v3", origin.parent):
+            with self.subTest(path=path):
+                with self.assertRaisesRegex(ScalingError, "must be disjoint"):
+                    _validate_lineage_output_root(
+                        self.lineage_suite, path, label="test output"
+                    )
+
+    def test_fit_cli_rejects_lineage_output_before_fit_work(self) -> None:
+        origin = Path(self.lineage_suite["lineage"]["origin"]["runs_root"])
+        forbidden = (origin / "fit.json", origin, origin.parent)
+        for output in forbidden:
+            with self.subTest(output=output), patch(
+                "speedrun.scaling.load_suite", return_value=self.lineage_suite
+            ), patch("speedrun.scaling.fit_results") as fit, patch(
+                "speedrun.scaling.write_fit"
+            ) as write, patch("sys.stderr"):
+                self.assertEqual(
+                    main(
+                        [
+                            "fit",
+                            "--runs",
+                            str(DEFAULT_RUNS),
+                            "--output",
+                            str(output),
+                        ]
+                    ),
+                    1,
+                )
+                fit.assert_not_called()
+                write.assert_not_called()
+
+    def test_fit_cli_accepts_disjoint_v3_output(self) -> None:
+        output = DEFAULT_RUNS / "fit.json"
+        result = {"suite_id": self.lineage_suite["suite_id"]}
+        with patch(
+            "speedrun.scaling.load_suite", return_value=self.lineage_suite
+        ), patch("speedrun.scaling.fit_results", return_value=result) as fit, patch(
+            "speedrun.scaling.write_fit",
+            return_value=(output.resolve(), output.with_suffix(".md").resolve()),
+        ) as write:
+            self.assertEqual(main(["fit", "--output", str(output)]), 0)
+        fit.assert_called_once_with(self.lineage_suite, DEFAULT_RUNS)
+        write.assert_called_once_with(result, output)
+
+    def test_lineage_manifest_hash_and_origin_source_are_release_gating(self) -> None:
+        suite_path = DEFAULT_SUITE.resolve()
+        suite_payload = yaml.safe_load(suite_path.read_text(encoding="utf-8"))
+        declaration = dict(suite_payload["lineage"])
+        declaration["sha256"] = "0" * 64
+        with self.assertRaisesRegex(ScalingError, "differs from its pin"):
+            _load_lineage_contract(
+                self.lineage_suite,
+                declaration=declaration,
+                suite_directory=suite_path.parent,
+            )
+
+        current_snapshot = dict(self.lineage_suite["source_snapshot"])
+        current_snapshot["submissions/reference/train.py"] = "0" * 64
+        with patch("speedrun.scaling._source_snapshot", return_value=current_snapshot):
+            with self.assertRaisesRegex(ScalingError, "execution source differs"):
+                _load_lineage_contract(
+                    self.lineage_suite,
+                    declaration=suite_payload["lineage"],
+                    suite_directory=suite_path.parent,
+                )
 
     def test_exact_builder_manifest_contract_rejects_inventory_drift(self) -> None:
         payload = _fake_manifest(self.suite)
@@ -733,8 +1031,9 @@ def _write_fake_run(
     result.write_text(
         json.dumps(_fake_result(suite, point, loss)), encoding="utf-8"
     )
+    study_lineage = _lineage_summary(suite)
     run_manifest = {
-        "schema_version": 3,
+        "schema_version": 4 if study_lineage is not None else 3,
         "classification": "diagnostic_noncompetition_isoflop",
         "suite_id": suite["suite_id"],
         "suite_sha256": suite["suite_sha256"],
@@ -751,6 +1050,8 @@ def _write_fake_run(
         "runtime": _fake_runtime(suite),
         "seed": 1337,
     }
+    if study_lineage is not None:
+        run_manifest["study_lineage"] = study_lineage
     (point_root / "run-manifest.json").write_text(
         json.dumps(run_manifest), encoding="utf-8"
     )

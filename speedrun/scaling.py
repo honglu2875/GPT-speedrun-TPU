@@ -56,10 +56,10 @@ from speedrun.fineweb_builder import (
 DEFAULT_SUITE = (
     Path(__file__).resolve().parent.parent
     / "sweeps"
-    / "current_budget_isoflop"
+    / "current_budget_isoflop_v3"
     / "suite.yaml"
 )
-DEFAULT_RUNS = Path("runs/scaling/current-budget-isoflop-v2")
+DEFAULT_RUNS = Path("runs/scaling/current-budget-isoflop-v3")
 _LLMC_MAGIC = 20_240_520
 _LLMC_VERSION = 1
 _SAFE_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,47}$")
@@ -69,6 +69,7 @@ _FINEWEB4B_TRAIN_NAMES = tuple(
 )
 _FINEWEB4B_VALIDATION_NAMES = ("fineweb_val_000000.bin",)
 _FINEWEB4B_NAMES = _FINEWEB4B_VALIDATION_NAMES + _FINEWEB4B_TRAIN_NAMES
+_ARCHIVED_SUITE_IDS = frozenset({"current_budget_isoflop_v2"})
 
 
 class ScalingError(ValueError):
@@ -837,6 +838,16 @@ def load_suite(path: Path = DEFAULT_SUITE) -> dict[str, Any]:
         if "learning_rate" in point:
             config_bytes = variant_config_bytes(suite, point)
             point["config_sha256"] = hashlib.sha256(config_bytes).hexdigest()
+    lineage_declaration = root.get("lineage")
+    suite["lineage"] = (
+        None
+        if lineage_declaration is None
+        else _load_lineage_contract(
+            suite,
+            declaration=lineage_declaration,
+            suite_directory=path.parent,
+        )
+    )
     repo = Path(__file__).resolve().parent.parent
     source_snapshot = _source_snapshot(repo)
     fingerprint_payload = {
@@ -940,6 +951,289 @@ def _public_point(point: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _canonical_mapping_sha256(value: Mapping[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _load_lineage_contract(
+    suite: Mapping[str, Any], *, declaration: Any, suite_directory: Path
+) -> dict[str, Any]:
+    """Load a pinned prior-study allowlist without reading mutable run results.
+
+    Planning remains possible when the ignored ``runs/`` tree is unavailable.
+    A result is admitted only later, when :func:`_read_run` verifies both exact
+    artifact hashes and the complete historical run/source/data/runtime contract.
+    """
+
+    declared = dict(_mapping(declaration, "lineage"))
+    if set(declared) != {"manifest", "sha256"}:
+        raise ScalingError("lineage must define exactly manifest and sha256")
+    manifest_name = declared["manifest"]
+    manifest_digest = declared["sha256"]
+    if (
+        not isinstance(manifest_name, str)
+        or not manifest_name
+        or Path(manifest_name).is_absolute()
+        or not isinstance(manifest_digest, str)
+        or _SHA256.fullmatch(manifest_digest) is None
+    ):
+        raise ScalingError("lineage manifest/path digest declaration is invalid")
+    unresolved_manifest_path = suite_directory / manifest_name
+    if unresolved_manifest_path.is_symlink():
+        raise ScalingError("lineage manifest must not be a symlink")
+    manifest_path = unresolved_manifest_path.resolve()
+    try:
+        manifest_path.relative_to(suite_directory.resolve())
+    except ValueError as exc:
+        raise ScalingError("lineage manifest escapes the suite directory") from exc
+    if (
+        not manifest_path.is_file()
+        or manifest_path.is_symlink()
+        or _sha256(manifest_path) != manifest_digest
+    ):
+        raise ScalingError("lineage manifest is missing, symlinked, or differs from its pin")
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ScalingError(f"invalid lineage JSON: {exc}") from exc
+    payload = dict(_mapping(payload, "lineage manifest"))
+    if set(payload) != {"schema_version", "lineage_id", "origin", "artifacts"}:
+        raise ScalingError("lineage manifest has unexpected or missing fields")
+    if payload["schema_version"] != 1:
+        raise ScalingError("lineage manifest schema_version must be 1")
+    lineage_id = _name(payload["lineage_id"], "lineage_id")
+
+    origin = dict(_mapping(payload["origin"], "lineage origin"))
+    expected_origin_fields = {
+        "runs_root",
+        "suite_path",
+        "template_path",
+        "git_commit",
+        "suite_id",
+        "suite_sha256",
+        "execution_fingerprint",
+        "template_sha256",
+        "source_snapshot",
+    }
+    if set(origin) != expected_origin_fields:
+        raise ScalingError("lineage origin has unexpected or missing fields")
+    origin_suite_id = _name(origin["suite_id"], "lineage origin suite_id")
+    if origin_suite_id == suite["suite_id"]:
+        raise ScalingError("lineage origin must be a distinct prior suite")
+    for field in ("suite_sha256", "execution_fingerprint", "template_sha256"):
+        if not isinstance(origin[field], str) or _SHA256.fullmatch(origin[field]) is None:
+            raise ScalingError(f"lineage origin {field} must be a lowercase SHA-256")
+    git_commit = origin["git_commit"]
+    if not isinstance(git_commit, str) or re.fullmatch(r"[0-9a-f]{40}", git_commit) is None:
+        raise ScalingError("lineage origin git_commit must be a full lowercase commit ID")
+
+    repo = Path(__file__).resolve().parent.parent
+
+    def resolve_repo_path(field: str, *, regular_file: bool) -> Path:
+        raw = origin[field]
+        if not isinstance(raw, str) or not raw or Path(raw).is_absolute():
+            raise ScalingError(f"lineage origin {field} must be a relative path")
+        unresolved = manifest_path.parent / raw
+        if unresolved.is_symlink():
+            raise ScalingError(f"lineage origin {field} must not be a symlink")
+        resolved = unresolved.resolve()
+        try:
+            resolved.relative_to(repo)
+        except ValueError as exc:
+            raise ScalingError(f"lineage origin {field} escapes the repository") from exc
+        if regular_file and (
+            not resolved.is_file() or resolved.is_symlink()
+        ):
+            raise ScalingError(f"lineage origin {field} must be a regular file")
+        if not regular_file and resolved.exists() and not resolved.is_dir():
+            raise ScalingError("lineage origin runs_root must be a directory")
+        return resolved
+
+    origin_suite_path = resolve_repo_path("suite_path", regular_file=True)
+    origin_template_path = resolve_repo_path("template_path", regular_file=True)
+    origin_runs_root = resolve_repo_path("runs_root", regular_file=False)
+    if _sha256(origin_suite_path) != origin["suite_sha256"]:
+        raise ScalingError("lineage origin suite bytes differ from their pin")
+    if _sha256(origin_template_path) != origin["template_sha256"]:
+        raise ScalingError("lineage origin template bytes differ from their pin")
+    origin_suite_yaml = _load_yaml(origin_suite_path, "lineage origin suite")
+    if origin_suite_yaml.get("suite_id") != origin_suite_id:
+        raise ScalingError("lineage origin suite ID differs from the pinned suite bytes")
+
+    commit_paths = {
+        origin_suite_path.relative_to(repo).as_posix(): origin["suite_sha256"],
+        origin_template_path.relative_to(repo).as_posix(): origin["template_sha256"],
+    }
+
+    source_snapshot = dict(
+        _mapping(origin["source_snapshot"], "lineage origin source_snapshot")
+    )
+    current_snapshot = _source_snapshot(repo)
+    commit_paths.update(source_snapshot)
+    for relative, expected_digest in commit_paths.items():
+        try:
+            completed = subprocess.run(
+                ["git", "cat-file", "blob", f"{git_commit}:{relative}"],
+                cwd=repo,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        except OSError as exc:
+            raise ScalingError("cannot validate lineage origin Git commit") from exc
+        if (
+            completed.returncode != 0
+            or hashlib.sha256(completed.stdout).hexdigest() != expected_digest
+        ):
+            raise ScalingError(
+                f"lineage origin Git commit does not pin expected bytes: {relative}"
+            )
+    if set(source_snapshot) != set(current_snapshot):
+        raise ScalingError("lineage origin source snapshot has an incomplete source set")
+    for relative, digest in source_snapshot.items():
+        if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
+            raise ScalingError(f"lineage origin source digest is invalid: {relative}")
+        # The lineage-aware scaling runner is necessarily newer. Every source
+        # that can affect trainer execution, data identity, or evaluation must
+        # remain byte-identical to v2; only this orchestration module may differ.
+        if relative != "speedrun/scaling.py" and current_snapshot[relative] != digest:
+            raise ScalingError(
+                f"current execution source differs from lineage origin: {relative}"
+            )
+    fingerprint_payload = {
+        "suite_sha256": origin["suite_sha256"],
+        "template_sha256": origin["template_sha256"],
+        "source_snapshot": source_snapshot,
+    }
+    if _canonical_mapping_sha256(fingerprint_payload) != origin["execution_fingerprint"]:
+        raise ScalingError("lineage origin execution fingerprint does not recompute")
+
+    raw_artifacts = payload["artifacts"]
+    if not isinstance(raw_artifacts, list) or not raw_artifacts:
+        raise ScalingError("lineage artifacts must be a nonempty list")
+    points_by_id = {str(point["id"]): point for point in suite["all_variants"]}
+    artifacts: list[dict[str, str]] = []
+    seen: set[str] = set()
+    calibration_slice = str(suite["compute_slices"][0]["id"])
+    for index, raw in enumerate(raw_artifacts):
+        entry = dict(_mapping(raw, f"lineage artifacts[{index}]"))
+        if set(entry) != {"point_id", "run_manifest_sha256", "result_sha256"}:
+            raise ScalingError(f"lineage artifacts[{index}] has unexpected fields")
+        point_id = _name(entry["point_id"], f"lineage artifacts[{index}].point_id")
+        if point_id in seen:
+            raise ScalingError(f"duplicate lineage point: {point_id}")
+        point = points_by_id.get(point_id)
+        if (
+            point is None
+            or point["slice"] != calibration_slice
+            or point["role"]
+            not in {
+                "learning_rate_calibration",
+                "learning_rate_search",
+                "extension_learning_rate_calibration",
+                "extension_learning_rate_search",
+            }
+            or "learning_rate" not in point
+            or "config_sha256" not in point
+        ):
+            raise ScalingError(
+                f"lineage point is not an explicit calibration in this suite: {point_id}"
+            )
+        for field in ("run_manifest_sha256", "result_sha256"):
+            digest = entry[field]
+            if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
+                raise ScalingError(f"lineage {point_id} {field} is invalid")
+        artifacts.append(entry)
+        seen.add(point_id)
+
+    normalized_origin = {
+        **origin,
+        "runs_root": str(origin_runs_root),
+        "suite_path": str(origin_suite_path),
+        "template_path": str(origin_template_path),
+        "source_snapshot": source_snapshot,
+        "source_snapshot_sha256": _canonical_mapping_sha256(source_snapshot),
+    }
+    return {
+        "schema_version": 1,
+        "lineage_id": lineage_id,
+        "manifest_path": str(manifest_path),
+        "manifest_repository_path": manifest_path.relative_to(repo).as_posix(),
+        "manifest_sha256": manifest_digest,
+        "origin": normalized_origin,
+        "artifacts": artifacts,
+        "artifacts_by_point": {entry["point_id"]: entry for entry in artifacts},
+    }
+
+
+def _lineage_summary(suite: Mapping[str, Any]) -> dict[str, Any] | None:
+    lineage = suite.get("lineage")
+    if not isinstance(lineage, Mapping):
+        return None
+    origin = _mapping(lineage["origin"], "lineage origin")
+    artifacts = lineage["artifacts"]
+    return {
+        "lineage_id": lineage["lineage_id"],
+        "manifest": lineage["manifest_repository_path"],
+        "manifest_sha256": lineage["manifest_sha256"],
+        "origin_suite_id": origin["suite_id"],
+        "origin_git_commit": origin["git_commit"],
+        "origin_suite_sha256": origin["suite_sha256"],
+        "origin_execution_fingerprint": origin["execution_fingerprint"],
+        "origin_source_snapshot_sha256": origin["source_snapshot_sha256"],
+        "allowlisted_artifact_count": len(artifacts),
+        "allowlisted_point_ids": [entry["point_id"] for entry in artifacts],
+        "allowlisted_artifacts": [dict(entry) for entry in artifacts],
+    }
+
+
+def _lineage_entry_for_point(
+    suite: Mapping[str, Any], point: Mapping[str, Any]
+) -> Mapping[str, Any] | None:
+    lineage = suite.get("lineage")
+    if not isinstance(lineage, Mapping):
+        return None
+    entries = _mapping(lineage["artifacts_by_point"], "lineage artifact index")
+    entry = entries.get(str(point["id"]))
+    return None if entry is None else _mapping(entry, "lineage artifact")
+
+
+def _point_has_result(
+    suite: Mapping[str, Any], point: Mapping[str, Any], runs_root: Path
+) -> bool:
+    if _lineage_entry_for_point(suite, point) is not None:
+        return True
+    return (runs_root / str(point["id"]) / "artifacts" / "result.json").is_file()
+
+
+def _validate_lineage_output_root(
+    suite: Mapping[str, Any], path: Path, *, label: str
+) -> Path:
+    """Reject equal, nested, and parent-confused output roots around v2."""
+
+    resolved = path.expanduser().resolve()
+    lineage = suite.get("lineage")
+    if not isinstance(lineage, Mapping):
+        return resolved
+    origin = _mapping(lineage["origin"], "lineage origin")
+    origin_root = Path(str(origin["runs_root"])).resolve()
+
+    def contains(parent: Path, child: Path) -> bool:
+        try:
+            child.relative_to(parent)
+        except ValueError:
+            return False
+        return True
+
+    if contains(origin_root, resolved) or contains(resolved, origin_root):
+        raise ScalingError(
+            f"{label} must be disjoint from immutable lineage root {origin_root}"
+        )
+    return resolved
+
+
 def print_plan(suite: Mapping[str, Any], *, as_json: bool = False) -> None:
     if as_json:
         print(
@@ -947,6 +1241,7 @@ def print_plan(suite: Mapping[str, Any], *, as_json: bool = False) -> None:
                 {
                     "suite_id": suite["suite_id"],
                     "execution_fingerprint": suite["execution_fingerprint"],
+                    "lineage": _lineage_summary(suite),
                     "anchor": suite["anchor"],
                     "seed": suite["seed"],
                     "dataset": suite["dataset"],
@@ -956,6 +1251,11 @@ def print_plan(suite: Mapping[str, Any], *, as_json: bool = False) -> None:
                         _public_point(item) for item in suite["fit_geometry"]
                     ],
                     "learning_rate_candidates": suite["learning_rate_candidates"],
+                    "learning_rate_search": suite["learning_rate_search"],
+                    "adaptive_calibration_runs": [
+                        _public_point(item)
+                        for item in suite["adaptive_calibrations"]
+                    ],
                     "calibration_runs": [
                         _public_point(item) for item in suite["calibrations"]
                     ],
@@ -974,6 +1274,13 @@ def print_plan(suite: Mapping[str, Any], *, as_json: bool = False) -> None:
         return
     print(f"IsoFLOP suite: {suite['suite_id']}")
     print(f"execution fingerprint: {suite['execution_fingerprint']}")
+    lineage = _lineage_summary(suite)
+    if lineage is not None:
+        print(
+            f"immutable lineage: {lineage['allowlisted_artifact_count']} exact artifacts "
+            f"from {lineage['origin_suite_id']} "
+            f"({lineage['manifest_sha256']})"
+        )
     print(f"baseline compute: {int(suite['anchor']['total_flops']):,} FLOPs")
     print(f"fixed seed: {int(suite['seed'])}")
     print(
@@ -1018,10 +1325,15 @@ def print_plan(suite: Mapping[str, Any], *, as_json: bool = False) -> None:
     rates = ", ".join(
         f"{float(item['value']):.2e}" for item in suite["learning_rate_candidates"]
     )
+    upper_rates = ", ".join(
+        f"{float(item['value']):.8g}"
+        for item in suite["learning_rate_search"]["upper"]
+    )
     print(
         f"\nlearning-rate calibration: {rates} at {suite['compute_slices'][0]['id']}; "
         "the lowest 100M-token validation loss per shape continues to later slices"
     )
+    print(f"bounded geometric upper LR schedule: {upper_rates}")
     print(f"\nplanned base cost: {total_multiplier:.2f} completed-baseline equivalents")
     print(
         "The exponent fit is emitted only if all three one-seed slice minima are "
@@ -1033,7 +1345,9 @@ def print_plan(suite: Mapping[str, Any], *, as_json: bool = False) -> None:
 def materialize_configs(
     suite: Mapping[str, Any], destination: Path, names: Sequence[str]
 ) -> tuple[Path, ...]:
-    root = destination.expanduser().resolve()
+    root = _validate_lineage_output_root(
+        suite, destination, label="materialized-config output"
+    )
     available = {str(item["id"]): item for item in suite["all_variants"]}
     unknown = sorted(set(names) - set(available))
     if unknown:
@@ -1124,13 +1438,23 @@ def _manifest_shard_contract(
 
 
 def _read_regular_json(path: Path, label: str) -> dict[str, Any]:
+    payload, _ = _read_regular_json_and_sha256(path, label)
+    return payload
+
+
+def _read_regular_json_and_sha256(
+    path: Path, label: str
+) -> tuple[dict[str, Any], str]:
+    """Read once so validation hashes and parsed JSON cover identical bytes."""
+
     if not path.is_file() or path.is_symlink():
         raise ScalingError(f"{label} must be a regular, non-symlink file: {path}")
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        raw = path.read_bytes()
+        payload = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ScalingError(f"cannot read {label} {path}: {exc}") from exc
-    return dict(_mapping(payload, label))
+    return dict(_mapping(payload, label)), hashlib.sha256(raw).hexdigest()
 
 
 def _validate_production_provenance(
@@ -1660,7 +1984,7 @@ def validate_runtime_environment(suite: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _write_immutable_bytes(path: Path, payload: bytes) -> None:
-    if path.exists():
+    if path.exists() or path.is_symlink():
         if path.is_symlink() or not path.is_file() or path.read_bytes() != payload:
             raise ScalingError(f"existing immutable file differs: {path}")
         return
@@ -1671,7 +1995,7 @@ def _write_immutable_bytes(path: Path, payload: bytes) -> None:
 
 
 def _copy_immutable(source: Path, destination: Path) -> None:
-    if destination.exists():
+    if destination.exists() or destination.is_symlink():
         if (
             destination.is_symlink()
             or not destination.is_file()
@@ -1765,7 +2089,8 @@ def _resolve_point_learning_rate(
         suite, shape_id=shape_id, runs_path=runs_root
     )
     if (
-        selection.get("schema_version") != 2
+        selection.get("schema_version")
+        != (3 if _lineage_summary(suite) is not None else 2)
         or selection.get("suite_id") != suite["suite_id"]
         or selection.get("suite_sha256") != suite["suite_sha256"]
         or selection.get("execution_fingerprint") != suite["execution_fingerprint"]
@@ -1820,9 +2145,42 @@ def run_variants(
     data_inventory: Mapping[str, Any] | None = None,
     fresh10_inventory: Mapping[str, Any] | None = None,
     runtime_inventory: Mapping[str, Any] | None = None,
+    allow_adaptive: bool = False,
 ) -> None:
     if seed != suite["seed"]:
         raise ScalingError(f"sweep seed must be exactly {suite['seed']}; got {seed}")
+    runs_root = _validate_lineage_output_root(suite, runs_path, label="--runs")
+    available = {str(item["id"]): item for item in suite["all_variants"]}
+    unknown = sorted(set(names) - set(available))
+    if unknown:
+        raise ScalingError(f"unknown point(s): {', '.join(unknown)}")
+    adaptive_roles = {
+        "learning_rate_search",
+        "extension_learning_rate_search",
+    }
+    adaptive = [available[name] for name in names if available[name]["role"] in adaptive_roles]
+    if adaptive and not allow_adaptive:
+        raise ScalingError(
+            "adaptive learning-rate variants may only be launched by --staged; "
+            "resume the staged study to preserve geometric ordering"
+        )
+    for shape_id in sorted({str(point["shape_id"]) for point in adaptive}):
+        _validate_adaptive_completion_prefix(suite, shape_id, runs_root)
+    initial_rates = [float(item["value"]) for item in suite["learning_rate_candidates"]]
+    for point in adaptive:
+        side = (
+            "lower"
+            if float(point["learning_rate"]) < min(initial_rates)
+            else "upper"
+        )
+        next_point = _next_adaptive_calibration(
+            suite, str(point["shape_id"]), side, runs_root
+        )
+        if next_point is None or next_point["id"] != point["id"]:
+            expected = "none" if next_point is None else str(next_point["id"])
+            raise ScalingError(
+                f"{point['id']}: adaptive LR launch is out of order; expected {expected}"
+            )
     inventory = (
         validate_data_directory(data_path, suite)
         if data_inventory is None
@@ -1856,13 +2214,15 @@ def run_variants(
     runtime = _validated_runtime_provenance(
         runtime, suite, label="prelaunch runtime provenance"
     )
+    _validate_prelaunch_lineage_coherence(
+        suite,
+        runs_root=runs_root,
+        dataset=_dataset_provenance(inventory),
+        fresh10=_fresh10_provenance(downstream),
+        runtime=runtime,
+    )
     repo = Path(__file__).resolve().parent.parent
     trainer_source = repo / "submissions" / "reference" / "train.py"
-    available = {str(item["id"]): item for item in suite["all_variants"]}
-    unknown = sorted(set(names) - set(available))
-    if unknown:
-        raise ScalingError(f"unknown point(s): {', '.join(unknown)}")
-    runs_root = runs_path.expanduser().resolve()
     runs_root.mkdir(parents=True, exist_ok=True)
     dataset_id = str(suite["dataset"]["id"])
 
@@ -1871,6 +2231,19 @@ def run_variants(
             suite, available[name], runs_root
         )
         point_root = runs_root / name
+        lineage_entry = _lineage_entry_for_point(suite, point)
+        if lineage_entry is not None:
+            if point_root.exists() or point_root.is_symlink():
+                raise ScalingError(
+                    f"{name}: local artifacts must not shadow an immutable lineage input"
+                )
+            measurement = _read_run(suite, point, runs_root)
+            print(
+                f"reuse {name}: exact {measurement['lineage']['lineage_id']} lineage "
+                f"({measurement['result_sha256']})",
+                flush=True,
+            )
+            continue
         work = point_root / "work"
         output = point_root / "artifacts"
         result_path = output / "result.json"
@@ -1905,8 +2278,9 @@ def run_variants(
         work_snapshot = {
             path.relative_to(work).as_posix(): _sha256(path) for path in work_files
         }
+        study_lineage = _lineage_summary(suite)
         manifest = {
-            "schema_version": 3,
+            "schema_version": 4 if study_lineage is not None else 3,
             "classification": "diagnostic_noncompetition_isoflop",
             "suite_id": suite["suite_id"],
             "suite_sha256": suite["suite_sha256"],
@@ -1923,6 +2297,8 @@ def run_variants(
             "runtime": runtime,
             "seed": seed,
         }
+        if study_lineage is not None:
+            manifest["study_lineage"] = study_lineage
         manifest_path = point_root / "run-manifest.json"
         _write_immutable_bytes(
             manifest_path,
@@ -2084,10 +2460,11 @@ def _validated_fresh10_provenance(
     }
     if set(provenance) != expected_fields:
         raise ScalingError(f"{label} has unexpected or missing fields")
+    manifest_path = provenance["manifest_path"]
     if (
         provenance["name"] != suite["fresh10"]["name"]
-        or provenance["manifest_path"]
-        != str(suite["fresh10"]["manifest_path"])
+        or not isinstance(manifest_path, str)
+        or not Path(manifest_path).is_absolute()
         or provenance["manifest_raw_sha256"]
         != suite["fresh10"]["manifest_raw_sha256"]
         or provenance["manifest_canonical_sha256"]
@@ -2172,18 +2549,53 @@ def _validated_runtime_provenance(
     return runtime
 
 
-def _load_run_manifest(
-    suite: Mapping[str, Any], point: Mapping[str, Any], root: Path
-) -> tuple[dict[str, Any], Path]:
+def _load_lineage_run_manifest(
+    suite: Mapping[str, Any], point: Mapping[str, Any], entry: Mapping[str, Any]
+) -> tuple[dict[str, Any], Path, Path]:
+    """Validate one historical manifest against its byte allowlist and v2 pins."""
+
+    lineage = _mapping(suite.get("lineage"), "suite lineage")
+    origin = _mapping(lineage["origin"], "lineage origin")
     name = str(point["id"])
-    path = root / name / "run-manifest.json"
-    if not path.is_file() or path.is_symlink():
-        raise ScalingError(f"missing regular immutable run manifest for {name}: {path}")
+    if entry.get("point_id") != name:
+        raise ScalingError(f"{name}: lineage artifact index mismatch")
+    # Recheck the immutable checked-in origin bytes at admission time, not only
+    # at suite loading, so a long-lived runner cannot observe later path drift.
+    origin_suite_path = Path(str(origin["suite_path"]))
+    origin_template_path = Path(str(origin["template_path"]))
+    if (
+        not origin_suite_path.is_file()
+        or origin_suite_path.is_symlink()
+        or _sha256(origin_suite_path) != origin["suite_sha256"]
+        or not origin_template_path.is_file()
+        or origin_template_path.is_symlink()
+        or _sha256(origin_template_path) != origin["template_sha256"]
+    ):
+        raise ScalingError("lineage origin suite/template changed after suite loading")
+
+    root = Path(str(origin["runs_root"]))
+    point_root = root / name
+    artifacts = point_root / "artifacts"
+    if (
+        not root.is_dir()
+        or root.is_symlink()
+        or not point_root.is_dir()
+        or point_root.is_symlink()
+        or (artifacts.exists() and (not artifacts.is_dir() or artifacts.is_symlink()))
+    ):
+        raise ScalingError(f"{name}: lineage run directory structure is not regular")
+    path = point_root / "run-manifest.json"
+    expected_manifest_digest = entry.get("run_manifest_sha256")
     try:
-        manifest = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ScalingError(f"invalid run manifest JSON for {name}: {exc}") from exc
-    manifest = dict(_mapping(manifest, f"{name}.run_manifest"))
+        manifest, actual_manifest_digest = _read_regular_json_and_sha256(
+            path, f"{name}.lineage_run_manifest"
+        )
+    except ScalingError as exc:
+        raise ScalingError(
+            f"{name}: lineage run manifest is missing, symlinked, or not allowlisted"
+        ) from exc
+    if actual_manifest_digest != expected_manifest_digest:
+        raise ScalingError(f"{name}: lineage run manifest is not allowlisted")
     expected_fields = {
         "schema_version",
         "classification",
@@ -2203,9 +2615,105 @@ def _load_run_manifest(
         "seed",
     }
     if set(manifest) != expected_fields:
-        raise ScalingError(f"{name}: run manifest has unexpected or missing fields")
+        raise ScalingError(f"{name}: lineage run manifest has unexpected fields")
     expected_identity = {
         "schema_version": 3,
+        "classification": "diagnostic_noncompetition_isoflop",
+        "suite_id": origin["suite_id"],
+        "suite_sha256": origin["suite_sha256"],
+        "execution_fingerprint": origin["execution_fingerprint"],
+        "template_sha256": origin["template_sha256"],
+        "source_snapshot": origin["source_snapshot"],
+        "point": _public_point(point),
+        "config_sha256": point["config_sha256"],
+        "checkpoint_policy": "omit_research_checkpoint",
+    }
+    for field, expected in expected_identity.items():
+        if manifest.get(field) != expected:
+            raise ScalingError(
+                f"{name}: lineage run manifest {field} differs from its pinned origin"
+            )
+    if manifest.get("seed") != suite["seed"]:
+        raise ScalingError(f"{name}: lineage run seed differs from the suite")
+    trainer_digest = manifest.get("trainer_sha256")
+    if not isinstance(trainer_digest, str) or _SHA256.fullmatch(trainer_digest) is None:
+        raise ScalingError(f"{name}: lineage trainer_sha256 is invalid")
+    source_snapshot = _mapping(origin["source_snapshot"], "lineage source snapshot")
+    expected_work_snapshot = {
+        "train.py": source_snapshot["submissions/reference/train.py"],
+        "config.yaml": point["config_sha256"],
+        **{
+            source_path: digest
+            for source_path, digest in source_snapshot.items()
+            if source_path == "speedrun/__init__.py"
+            or source_path.startswith("speedrun/kernels/")
+        },
+    }
+    if manifest.get("work_snapshot") != expected_work_snapshot:
+        raise ScalingError(f"{name}: lineage copied work snapshot differs from origin")
+    repo = Path(__file__).resolve().parent.parent
+    for relative, expected_digest in expected_work_snapshot.items():
+        if relative == "config.yaml":
+            actual_digest = hashlib.sha256(
+                variant_config_bytes(suite, point)
+            ).hexdigest()
+        else:
+            source_relative = (
+                "submissions/reference/train.py" if relative == "train.py" else relative
+            )
+            source = repo / source_relative
+            if not source.is_file() or source.is_symlink():
+                raise ScalingError(
+                    f"{name}: tracked lineage source is missing: {source_relative}"
+                )
+            actual_digest = _sha256(source)
+        if actual_digest != expected_digest:
+            raise ScalingError(f"{name}: lineage work source differs: {relative}")
+    if trainer_digest != expected_work_snapshot["train.py"]:
+        raise ScalingError(f"{name}: lineage trainer hash differs from copied source")
+    manifest["dataset"] = _validated_dataset_provenance(
+        manifest.get("dataset"), suite, label=f"{name}.lineage_run_manifest.dataset"
+    )
+    manifest["fresh10"] = _validated_fresh10_provenance(
+        manifest.get("fresh10"), suite, label=f"{name}.lineage_run_manifest.fresh10"
+    )
+    manifest["runtime"] = _validated_runtime_provenance(
+        manifest.get("runtime"), suite, label=f"{name}.lineage_run_manifest.runtime"
+    )
+    return manifest, path, root
+
+
+def _load_run_manifest(
+    suite: Mapping[str, Any], point: Mapping[str, Any], root: Path
+) -> tuple[dict[str, Any], Path]:
+    name = str(point["id"])
+    path = root / name / "run-manifest.json"
+    manifest, _ = _read_regular_json_and_sha256(path, f"{name}.run_manifest")
+    study_lineage = _lineage_summary(suite)
+    expected_fields = {
+        "schema_version",
+        "classification",
+        "suite_id",
+        "suite_sha256",
+        "execution_fingerprint",
+        "template_sha256",
+        "source_snapshot",
+        "work_snapshot",
+        "point",
+        "trainer_sha256",
+        "config_sha256",
+        "checkpoint_policy",
+        "dataset",
+        "fresh10",
+        "runtime",
+        "seed",
+    }
+    if study_lineage is not None:
+        expected_fields.add("study_lineage")
+    if set(manifest) != expected_fields:
+        raise ScalingError(f"{name}: run manifest has unexpected or missing fields")
+    expected_identity = {
+        "schema_version": 4 if study_lineage is not None else 3,
         "classification": "diagnostic_noncompetition_isoflop",
         "suite_id": suite["suite_id"],
         "suite_sha256": suite["suite_sha256"],
@@ -2216,6 +2724,8 @@ def _load_run_manifest(
         "config_sha256": point["config_sha256"],
         "checkpoint_policy": "omit_research_checkpoint",
     }
+    if study_lineage is not None:
+        expected_identity["study_lineage"] = study_lineage
     for field, expected in expected_identity.items():
         if manifest.get(field) != expected:
             raise ScalingError(f"{name}: run manifest {field} differs from the suite")
@@ -2326,14 +2836,41 @@ def _read_run(
 ) -> dict[str, Any]:
     point = _resolve_point_learning_rate(suite, point, root)
     name = str(point["id"])
-    run_manifest, run_manifest_path = _load_run_manifest(suite, point, root)
-    result_path = root / name / "artifacts" / "result.json"
-    if not result_path.is_file() or result_path.is_symlink():
-        raise ScalingError(f"missing completed result for {name}: {result_path}")
-    try:
-        result = json.loads(result_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ScalingError(f"invalid result JSON for {name}: {exc}") from exc
+    lineage_entry = _lineage_entry_for_point(suite, point)
+    artifact_root = root
+    lineage_public: dict[str, Any] | None = None
+    if lineage_entry is None:
+        run_manifest, run_manifest_path = _load_run_manifest(suite, point, root)
+    else:
+        if (root / name).exists() or (root / name).is_symlink():
+            raise ScalingError(
+                f"{name}: local artifacts must not shadow an immutable lineage input"
+            )
+        run_manifest, run_manifest_path, artifact_root = _load_lineage_run_manifest(
+            suite, point, lineage_entry
+        )
+        lineage = _mapping(suite["lineage"], "suite lineage")
+        origin = _mapping(lineage["origin"], "lineage origin")
+        lineage_public = {
+            "kind": "exact_immutable_prior_study_artifact",
+            "lineage_id": lineage["lineage_id"],
+            "lineage_manifest_sha256": lineage["manifest_sha256"],
+            "origin_suite_id": origin["suite_id"],
+            "origin_suite_sha256": origin["suite_sha256"],
+            "origin_execution_fingerprint": origin["execution_fingerprint"],
+            "point_id": name,
+            "run_manifest_sha256": lineage_entry["run_manifest_sha256"],
+            "result_sha256": lineage_entry["result_sha256"],
+        }
+    result_path = artifact_root / name / "artifacts" / "result.json"
+    result, result_sha256 = _read_regular_json_and_sha256(
+        result_path, f"{name}.result"
+    )
+    if (
+        lineage_entry is not None
+        and result_sha256 != lineage_entry["result_sha256"]
+    ):
+        raise ScalingError(f"{name}: lineage result is not the exact allowlisted bytes")
     metrics = _mapping(result.get("metrics"), f"{name}.metrics")
     if (
         result.get("schema_version") != 1
@@ -2508,7 +3045,7 @@ def _read_run(
     fresh10_result = _validated_fresh10_result(
         evaluations["fresh10"], suite, label=f"{name}.evaluations.fresh10"
     )
-    return {
+    measurement = {
         "id": name,
         "slice": point["slice"],
         "role": point["role"],
@@ -2528,13 +3065,17 @@ def _read_run(
         "dataset_manifest_sha256": run_manifest["dataset"][
             "manifest_canonical_sha256"
         ],
-        "run_manifest": str(run_manifest_path),
+        "run_manifest": f"{name}/run-manifest.json",
         "run_manifest_sha256": _sha256(run_manifest_path),
-        "result": str(result_path),
+        "result": f"{name}/artifacts/result.json",
+        "result_sha256": result_sha256,
         "_dataset_provenance": run_manifest["dataset"],
         "_fresh10_provenance": run_manifest["fresh10"],
         "_runtime_provenance": run_manifest["runtime"],
     }
+    if lineage_public is not None:
+        measurement["lineage"] = lineage_public
+    return measurement
 
 
 def select_learning_rate(
@@ -2543,6 +3084,8 @@ def select_learning_rate(
     """Select one shape's LR by its completed c025 canonical validation loss."""
 
     root = runs_path.expanduser().resolve()
+    _validate_lineage_output_root(suite, root, label="learning-rate selection root")
+    _validate_adaptive_completion_prefix(suite, shape_id, root)
     initial_candidates = [
         point
         for point in suite["calibrations"] + suite["extension_calibrations"]
@@ -2560,18 +3103,16 @@ def select_learning_rate(
         key=lambda point: float(point["learning_rate"]),
     )
     for point in initial_candidates:
-        if not (root / point["id"] / "artifacts" / "result.json").is_file():
+        if not _point_has_result(suite, point, root):
             raise ScalingError(f"{shape_id}: initial learning-rate grid is incomplete")
     completed = [
         point
         for point in candidates
-        if (root / point["id"] / "artifacts" / "result.json").is_file()
+        if _point_has_result(suite, point, root)
     ]
     measured = [_read_run(suite, point, root) for point in completed]
     dataset_identity = _coherent_dataset_identity(measured)
-    fresh10_identity = _coherent_auxiliary_identity(
-        measured, "_fresh10_provenance", "Fresh10 identity"
-    )
+    fresh10_identity = _coherent_fresh10_identity(measured)
     runtime_identity = _coherent_auxiliary_identity(
         measured, "_runtime_provenance", "runtime identity"
     )
@@ -2586,7 +3127,7 @@ def select_learning_rate(
             shape_id, side, float(selected["learning_rate"])
         )
     payload = {
-        "schema_version": 2,
+        "schema_version": 3 if _lineage_summary(suite) is not None else 2,
         "suite_id": suite["suite_id"],
         "suite_sha256": suite["suite_sha256"],
         "execution_fingerprint": suite["execution_fingerprint"],
@@ -2603,10 +3144,21 @@ def select_learning_rate(
         ),
         "edge_policy": "geometric expansion exhausted only after an interior winner",
         "seed_count": 1,
+        "study_lineage": _lineage_summary(suite),
         "candidates": [
             {
-                key: item[key]
-                for key in ("id", "learning_rate", "validation_loss", "result")
+                **{
+                    key: item[key]
+                    for key in (
+                        "id",
+                        "learning_rate",
+                        "validation_loss",
+                        "result",
+                        "result_sha256",
+                        "run_manifest_sha256",
+                    )
+                },
+                **({"lineage": item["lineage"]} if "lineage" in item else {}),
             }
             for item in measured
         ],
@@ -2615,6 +3167,10 @@ def select_learning_rate(
         "selected_validation_loss": selected["validation_loss"],
     }
     selection_path = _learning_rate_selection_path(root, shape_id)
+    if selection_path.is_symlink():
+        raise ScalingError(
+            f"learning-rate selection must not be a symlink: {selection_path}"
+        )
     _write_immutable_bytes(
         selection_path,
         (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8"),
@@ -2698,6 +3254,87 @@ def _coherent_auxiliary_identity(
         if json.dumps(value, sort_keys=True, separators=(",", ":")) != canonical:
             raise ScalingError(f"completed measurements do not share one {label}")
     return values[0]
+
+
+def _coherent_fresh10_identity(
+    measurements: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Compare Fresh10 content while treating absolute locations as observations."""
+
+    if not measurements:
+        raise ScalingError("cannot establish Fresh10 identity without measurements")
+    provenances = [
+        dict(
+            _mapping(
+                item.get("_fresh10_provenance"), "measurement Fresh10 provenance"
+            )
+        )
+        for item in measurements
+    ]
+
+    def content_identity(provenance: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in provenance.items()
+            if key not in {"root", "manifest_path"}
+        }
+
+    identity = content_identity(provenances[0])
+    canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    for provenance in provenances[1:]:
+        candidate = json.dumps(
+            content_identity(provenance), sort_keys=True, separators=(",", ":")
+        )
+        if candidate != canonical:
+            raise ScalingError(
+                "completed measurements do not share one Fresh10 content identity"
+            )
+    identity["observed_roots"] = sorted(
+        {str(provenance["root"]) for provenance in provenances}
+    )
+    identity["observed_manifest_paths"] = sorted(
+        {str(provenance["manifest_path"]) for provenance in provenances}
+    )
+    return identity
+
+
+def _validate_prelaunch_lineage_coherence(
+    suite: Mapping[str, Any],
+    *,
+    runs_root: Path,
+    dataset: Mapping[str, Any],
+    fresh10: Mapping[str, Any],
+    runtime: Mapping[str, Any],
+) -> None:
+    """Prove current inputs match historical measurements before TPU launch."""
+
+    lineage = suite.get("lineage")
+    if not isinstance(lineage, Mapping):
+        return
+    entries = lineage["artifacts"]
+    if not entries:
+        raise ScalingError("lineage study has no historical inputs to compare")
+    first_id = str(entries[0]["point_id"])
+    point = next(
+        item for item in suite["all_variants"] if str(item["id"]) == first_id
+    )
+    historical = _read_run(suite, point, runs_root)
+    current = {
+        "_dataset_provenance": _validated_dataset_provenance(
+            dataset, suite, label="prelaunch lineage dataset"
+        ),
+        "_fresh10_provenance": _validated_fresh10_provenance(
+            fresh10, suite, label="prelaunch lineage Fresh10"
+        ),
+        "_runtime_provenance": _validated_runtime_provenance(
+            runtime, suite, label="prelaunch lineage runtime"
+        ),
+    }
+    _coherent_dataset_identity((historical, current))
+    _coherent_fresh10_identity((historical, current))
+    _coherent_auxiliary_identity(
+        (historical, current), "_runtime_provenance", "runtime identity"
+    )
 
 
 def _public_measurement(item: Mapping[str, Any]) -> dict[str, Any]:
@@ -2835,7 +3472,9 @@ def _warrants_high_side_extension(fitted: Mapping[str, Any]) -> bool:
 
 
 def fit_results(suite: Mapping[str, Any], runs_path: Path) -> dict[str, Any]:
-    root = runs_path.expanduser().resolve(strict=True)
+    root = _validate_lineage_output_root(suite, runs_path, label="fit --runs")
+    if not root.is_dir() or root.is_symlink():
+        raise ScalingError(f"fit --runs must be a regular directory: {root}")
     measured_fit = [
         _selected_calibration_run(suite, shape["shape_id"], root)
         for shape in suite["fit_shapes"]
@@ -2861,9 +3500,7 @@ def fit_results(suite: Mapping[str, Any], runs_path: Path) -> dict[str, Any]:
             completed_controls.append(_read_run(suite, point, root))
     all_measurements = measured_fit + completed_extensions + completed_controls
     dataset_identity = _coherent_dataset_identity(all_measurements)
-    fresh10_identity = _coherent_auxiliary_identity(
-        all_measurements, "_fresh10_provenance", "Fresh10 identity"
-    )
+    fresh10_identity = _coherent_fresh10_identity(all_measurements)
     runtime_identity = _coherent_auxiliary_identity(
         all_measurements, "_runtime_provenance", "runtime identity"
     )
@@ -2961,6 +3598,7 @@ def fit_results(suite: Mapping[str, Any], runs_path: Path) -> dict[str, Any]:
         "schema_version": 1,
         "suite_id": suite["suite_id"],
         "suite_sha256": suite["suite_sha256"],
+        "study_lineage": _lineage_summary(suite),
         "fit_kind": "three-slice-local-isoflop",
         "dataset": dataset_identity,
         "fresh10": fresh10_identity,
@@ -3099,9 +3737,40 @@ def _initial_calibrations(
     ]
 
 
+def _validate_adaptive_completion_prefix(
+    suite: Mapping[str, Any], shape_id: str, runs_root: Path
+) -> None:
+    """Fail if either geometric LR side contains a completed-point hole."""
+
+    points = [
+        item
+        for item in suite["adaptive_calibrations"]
+        if item["shape_id"] == shape_id
+    ]
+    by_rate = {float(item["learning_rate"]): item for item in points}
+    for side in ("lower", "upper"):
+        gap = False
+        for candidate in suite["learning_rate_search"][side]:
+            rate = float(candidate["value"])
+            point = by_rate.get(rate)
+            if point is None:
+                raise ScalingError(
+                    f"{shape_id}: missing declared {side} adaptive LR point {rate:.8g}"
+                )
+            complete = _point_has_result(suite, point, runs_root)
+            if complete and gap:
+                raise ScalingError(
+                    f"{shape_id}: noncontiguous {side} learning-rate completion at "
+                    f"{rate:.8g}; refusing to skip a mandatory geometric point"
+                )
+            if not complete:
+                gap = True
+
+
 def _next_adaptive_calibration(
     suite: Mapping[str, Any], shape_id: str, side: str, runs_root: Path
 ) -> dict[str, Any] | None:
+    _validate_adaptive_completion_prefix(suite, shape_id, runs_root)
     all_points = _initial_calibrations(suite, shape_id) + [
         item
         for item in suite["adaptive_calibrations"]
@@ -3110,7 +3779,7 @@ def _next_adaptive_calibration(
     completed = [
         item
         for item in all_points
-        if (runs_root / item["id"] / "artifacts" / "result.json").is_file()
+        if _point_has_result(suite, item, runs_root)
     ]
     if not completed:
         raise ScalingError(f"{shape_id}: cannot expand an empty learning-rate grid")
@@ -3119,7 +3788,7 @@ def _next_adaptive_calibration(
         item
         for item in suite["adaptive_calibrations"]
         if item["shape_id"] == shape_id
-        and not (runs_root / item["id"] / "artifacts" / "result.json").is_file()
+        and not _point_has_result(suite, item, runs_root)
     ]
     if side == "lower":
         candidates = [
@@ -3324,6 +3993,7 @@ def _revisit_extension_fixed_point(
 def run_staged(suite: Mapping[str, Any], args: argparse.Namespace) -> None:
     """Run low-to-high compute with bounded LR and model-grid adaptation."""
 
+    _validate_lineage_output_root(suite, args.runs, label="--runs")
     # These expensive/TPU-sensitive gates happen exactly once before any run;
     # their byte-exact identities are then copied into every run manifest.
     runtime_inventory = validate_runtime_environment(suite)
@@ -3337,6 +4007,7 @@ def run_staged(suite: Mapping[str, Any], args: argparse.Namespace) -> None:
         fresh10_inventory=fresh10_inventory,
         runtime_inventory=runtime_inventory,
     )
+    run_options["allow_adaptive"] = True
     runs_root = args.runs.expanduser().resolve()
     for shape in suite["fit_shapes"]:
         shape_id = str(shape["shape_id"])
@@ -3493,6 +4164,11 @@ def main(argv: Iterable[str] | None = None) -> int:
             ):
                 print(path)
         elif args.command == "run":
+            if suite["suite_id"] in _ARCHIVED_SUITE_IDS:
+                raise ScalingError(
+                    f"{suite['suite_id']} is an immutable archived study; use the "
+                    "versioned continuation suite"
+                )
             if args.seed != suite["seed"]:
                 raise ScalingError(
                     f"this one-seed suite pins --seed {suite['seed']}; got {args.seed}"
@@ -3508,6 +4184,9 @@ def main(argv: Iterable[str] | None = None) -> int:
                 names = args.variant
                 run_variants(suite, names=names, **_run_kwargs(args))
         elif args.command == "fit":
+            # ``fit_results`` may materialize derived learning-rate selections,
+            # so reject a hostile explicit output before doing any fit work.
+            _validate_lineage_output_root(suite, args.output, label="fit --output")
             result = fit_results(suite, args.runs)
             json_path, markdown_path = write_fit(result, args.output)
             print(f"wrote {json_path}")

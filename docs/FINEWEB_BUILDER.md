@@ -188,9 +188,21 @@ upload `.cache`, `.fineweb-build`, logs, or credentials. The exact frozen
 builder and entrypoint are uploaded separately under `provenance/`. Xet
 high-performance mode is enabled and identical prefix bytes are expected to be
 content-deduplicated by the Hub. Each variant then receives a separate manifest
-whose file URLs pin the immutable shard commit. The publisher writes
-per-variant commit receipts after every completed variant, so re-running after
-an interruption resumes against Hub content.
+whose file URLs pin the immutable shard commit. The publisher writes a
+cumulative per-variant ledger after every completed variant; for a public
+repository, it does so only after anonymous verification. A later hero-only
+publication validates and retains the exact 2B, 4B, and 8B rows before making
+any Hub request, then adds or replaces only the hero row. Consequently, the
+hero-only command refuses to run when the prior cumulative plan, any of those
+three verified receipts, or any receipt's complete staged production manifest
+is missing or changed; publish the smaller nested chain first.
+
+The ledger is an audit record, not an upload cursor: it does not skip a
+requested upload after interruption. Re-run the same command; Hub/Xet content
+deduplication makes repeated identical content efficient. The interrupted
+variant receives no new trusted receipt until its manifest and all anonymous
+verification gates finish, while receipts from earlier completed variants stay
+unchanged.
 
 For a public repo it finally verifies without authentication:
 
