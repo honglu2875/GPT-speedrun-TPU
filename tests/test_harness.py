@@ -243,6 +243,31 @@ class HarnessRunTests(unittest.TestCase):
         )
         self.assertEqual(outcome.record["trainer_command"], outcome.record["command"])
 
+    def test_interrupted_multi_host_run_cleans_exact_remote_workers(self) -> None:
+        with (
+            mock.patch(
+                "harness.runner.build_distributed_launch_command",
+                return_value=["pdsh", "synthetic"],
+            ),
+            mock.patch("harness.runner._run_process", side_effect=KeyboardInterrupt),
+            mock.patch(
+                "harness.runner.terminate_distributed_workers", return_value=True
+            ) as terminate,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                run_submission(
+                    self.config(
+                        tpu_vm_count=4,
+                        tpu_vm_hosts="slice-w-[0-3]",
+                    )
+                )
+
+        arguments = terminate.call_args.kwargs
+        self.assertEqual(arguments["host_expression"], "slice-w-[0-3]")
+        self.assertEqual(arguments["host_count"], 4)
+        self.assertEqual(arguments["script"].name, "train.py")
+        self.assertIn("runs", arguments["output_dir"].parts)
+
     def test_rejects_reserved_passthrough_flags_but_not_prefixes(self) -> None:
         for flag in ("--config", "--output-dir", "--seed", "--track", "--profile"):
             for arguments in ((flag, "value"), (f"{flag}=value",), ("--", flag, "value")):

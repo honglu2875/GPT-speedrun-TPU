@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import socket
@@ -488,6 +489,57 @@ def build_distributed_launch_command(
     return _pdsh_command(host_expression, host_count, rendered, labels=False)
 
 
+def terminate_distributed_workers(
+    *,
+    host_expression: str,
+    host_count: int,
+    executable: Path,
+    script: Path,
+    output_dir: Path,
+    environment: Mapping[str, str] | None = None,
+) -> bool:
+    """Best-effort teardown for one exact failed or interrupted distributed run.
+
+    Killing the local ``pdsh`` process group is insufficient when an SSH channel
+    disappears while TPU execution is inside XLA: the remote Python processes
+    can survive as orphans. Match the immutable executable, trainer path, and
+    run directory so cleanup cannot affect another submission or run.
+    """
+
+    if host_count <= 1:
+        return True
+    try:
+        _require_program("pdsh")
+        expression = _validate_host_expression(host_expression)
+    except ClusterError:
+        return False
+    pattern = (
+        "^"
+        + re.escape(str(executable))
+        + "[[:space:]]+"
+        + re.escape(str(script))
+        + ".*[[:space:]]--output-dir[[:space:]]+"
+        + re.escape(str(output_dir))
+        + "([[:space:]]|$)"
+    )
+    remote_command = (
+        f"pkill -KILL -f -- {shlex.quote(pattern)} >/dev/null 2>&1 || true"
+    )
+    try:
+        completed = subprocess.run(
+            _pdsh_command(expression, host_count, remote_command, labels=False),
+            env=pdsh_environment(environment),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
 def _pdsh_command(
     host_expression: str,
     host_count: int,
@@ -625,4 +677,5 @@ __all__ = [
     "run_pdsh",
     "seal_ram_cache_command",
     "sync_workspace",
+    "terminate_distributed_workers",
 ]

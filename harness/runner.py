@@ -21,7 +21,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO, TextIO
 
-from .cluster import build_distributed_launch_command, pdsh_environment
+from .cluster import (
+    build_distributed_launch_command,
+    pdsh_environment,
+    terminate_distributed_workers,
+)
 from .errors import ConfigurationError, ResultValidationError, SubmissionError
 from .models import Evaluator, RunConfig, RunOutcome
 from .records import append_record
@@ -130,15 +134,39 @@ def run_submission(config: RunConfig, *, evaluator: Evaluator | None = None) -> 
         command = trainer_command
     started_at = datetime.now(timezone.utc)
     monotonic_start = time.perf_counter()
-    with stdout_path.open("wb") as stdout_handle, stderr_path.open("wb") as stderr_handle:
-        return_code, timed_out = _run_process(
-            command,
-            cwd=submission_dir,
+    def clean_distributed_workers() -> None:
+        if config.tpu_vm_count <= 1:
+            return
+        cleaned = terminate_distributed_workers(
+            host_expression=config.tpu_vm_hosts,
+            host_count=config.tpu_vm_count,
+            executable=Path(trainer_command[0]),
+            script=Path(trainer_command[1]),
+            output_dir=run_dir,
             environment=environment,
-            stdout_handle=stdout_handle,
-            stderr_handle=stderr_handle,
-            timeout_seconds=float(config.timeout_seconds),
         )
+        if not cleaned:
+            print(
+                "warning: could not verify distributed worker cleanup; check the "
+                "configured TPU VM hosts before starting another run",
+                file=sys.stderr,
+            )
+
+    try:
+        with stdout_path.open("wb") as stdout_handle, stderr_path.open("wb") as stderr_handle:
+            return_code, timed_out = _run_process(
+                command,
+                cwd=submission_dir,
+                environment=environment,
+                stdout_handle=stdout_handle,
+                stderr_handle=stderr_handle,
+                timeout_seconds=float(config.timeout_seconds),
+            )
+    except BaseException:
+        clean_distributed_workers()
+        raise
+    if timed_out or return_code != 0:
+        clean_distributed_workers()
     observed_seconds = time.perf_counter() - monotonic_start
     finished_at = datetime.now(timezone.utc)
     _discard_compilation_cache(run_dir / ".jax_cache")
