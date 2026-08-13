@@ -22,7 +22,9 @@ through `1.333e-4`/`8.889e-5` or up through `6.75e-4`, `1.0125e-3`,
 `1.51875e-3`, and `2.278125e-3`. The two higher points were preregistered after
 the first bounded pilot remained monotone through `1.0125e-3`; all pilot runs
 were archived and the fingerprinted study restarted rather than importing
-measurements across search policies. If the winner is still an edge at the new
+measurements across search policies. Those pilot artifacts remain under
+`runs/scaling/current-budget-isoflop-v1`; this final policy is versioned as
+`current_budget_isoflop_v2`. If the winner is still an edge at the new
 bound, the runner refuses selection and does not launch dependent runs. Warmup,
 validation cadence, and logging cadence preserve the completed baseline's
 fraction of total steps. All runs share seed 1337 because three-seed replication
@@ -90,7 +92,7 @@ review before TPU work. No long run is started while writing or testing the
 framework. Resolved
 `config.yaml`, copied `train.py`, `run-manifest.json`, result, curves, and final
 layer diagnostics are saved beneath
-`runs/scaling/current-budget-isoflop-v1/<point>/`. The runner deliberately uses
+`runs/scaling/current-budget-isoflop-v2/<point>/`. The runner deliberately uses
 the open/dev-only checkpoint-omission mode: final validation and metrics remain,
 but redundant FP32 parameter archives do not consume the 29 GB root disk. If
 retained, the base checkpoints would occupy about 4.70 GB (7.64 GB if both

@@ -59,7 +59,7 @@ DEFAULT_SUITE = (
     / "current_budget_isoflop"
     / "suite.yaml"
 )
-DEFAULT_RUNS = Path("runs/scaling/current-budget-isoflop-v1")
+DEFAULT_RUNS = Path("runs/scaling/current-budget-isoflop-v2")
 _LLMC_MAGIC = 20_240_520
 _LLMC_VERSION = 1
 _SAFE_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,47}$")

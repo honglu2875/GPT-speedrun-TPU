@@ -2,7 +2,7 @@
 # official competition submission. Every duration is nearest-step aligned to
 # the completed 19,073-step baseline's analytic FLOP budget.
 schema_version: 1
-suite_id: current_budget_isoflop_v1
+suite_id: current_budget_isoflop_v2
 config_template: template.yaml
 sequence_length: 1024
 batch_size: 32
