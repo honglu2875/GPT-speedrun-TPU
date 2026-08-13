@@ -57,10 +57,10 @@ from speedrun.fineweb_builder import (
 DEFAULT_SUITE = (
     Path(__file__).resolve().parent.parent
     / "sweeps"
-    / "current_budget_isoflop_v4"
+    / "current_budget_isoflop_v5"
     / "suite.yaml"
 )
-DEFAULT_RUNS = Path("runs/scaling/current-budget-isoflop-v4")
+DEFAULT_RUNS = Path("runs/scaling/current-budget-isoflop-v5")
 _LLMC_MAGIC = 20_240_520
 _LLMC_VERSION = 1
 _SAFE_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,47}$")
@@ -71,9 +71,17 @@ _FINEWEB4B_TRAIN_NAMES = tuple(
 _FINEWEB4B_VALIDATION_NAMES = ("fineweb_val_000000.bin",)
 _FINEWEB4B_NAMES = _FINEWEB4B_VALIDATION_NAMES + _FINEWEB4B_TRAIN_NAMES
 _ARCHIVED_SUITE_IDS = frozenset(
-    {"current_budget_isoflop_v2", "current_budget_isoflop_v3"}
+    {
+        "current_budget_isoflop_v2",
+        "current_budget_isoflop_v3",
+        "current_budget_isoflop_v4",
+    }
 )
 _DEFAULT_TRAINER_SOURCE_REPOSITORY_PATH = "submissions/reference/train.py"
+_LOWER_RECOVERY_STOP_AT_INELIGIBLE = "stop_at_first_ineligible"
+_LOWER_RECOVERY_DESCEND_TO_ADJACENT_STABLE = (
+    "descend_through_ineligible_until_two_adjacent_stable"
+)
 
 
 class ScalingError(ValueError):
@@ -479,6 +487,26 @@ def load_suite(path: Path = DEFAULT_SUITE) -> dict[str, Any]:
         raise ScalingError(
             "learning_rate_scope must be first_compute_slice_per_shape or "
             "per_compute_slice_and_shape"
+        )
+    lower_recovery_policy = root.get(
+        "lower_learning_rate_recovery",
+        _LOWER_RECOVERY_STOP_AT_INELIGIBLE,
+    )
+    if lower_recovery_policy not in {
+        _LOWER_RECOVERY_STOP_AT_INELIGIBLE,
+        _LOWER_RECOVERY_DESCEND_TO_ADJACENT_STABLE,
+    }:
+        raise ScalingError(
+            "lower_learning_rate_recovery must be stop_at_first_ineligible or "
+            "descend_through_ineligible_until_two_adjacent_stable"
+        )
+    if (
+        lower_recovery_policy == _LOWER_RECOVERY_DESCEND_TO_ADJACENT_STABLE
+        and learning_rate_scope != "per_compute_slice_and_shape"
+    ):
+        raise ScalingError(
+            "descending through ineligible lower learning rates requires "
+            "per_compute_slice_and_shape scope"
         )
     stability_raw = root.get("stability_admission")
     stability_admission: dict[str, Any] | None = None
@@ -998,6 +1026,7 @@ def load_suite(path: Path = DEFAULT_SUITE) -> dict[str, Any]:
         "schedule": schedule,
         "optimizer": optimizer,
         "learning_rate_scope": learning_rate_scope,
+        "lower_learning_rate_recovery": lower_recovery_policy,
         "stability_admission": stability_admission,
         "learning_rate_candidates": learning_rates,
         "learning_rate_search": {
@@ -1567,6 +1596,10 @@ def print_plan(suite: Mapping[str, Any], *, as_json: bool = False) -> None:
         f"{float(item['value']):.8g}"
         for item in suite["learning_rate_search"]["upper"]
     )
+    lower_rates = ", ".join(
+        f"{float(item['value']):.8g}"
+        for item in suite["learning_rate_search"]["lower"]
+    )
     if suite["learning_rate_scope"] == "per_compute_slice_and_shape":
         print(
             f"\nlearning-rate calibration: {rates} independently at every "
@@ -1578,6 +1611,39 @@ def print_plan(suite: Mapping[str, Any], *, as_json: bool = False) -> None:
             "the lowest 100M-token validation loss per shape continues to later slices"
         )
     print(f"bounded geometric upper LR schedule: {upper_rates}")
+    print(f"bounded geometric lower LR schedule: {lower_rates}")
+    if suite["learning_rate_scope"] == "per_compute_slice_and_shape":
+        group_count = len(suite["fit_shapes"]) + len(
+            suite["optional_extension_shapes"]
+        )
+        maximum_trials_per_group = len(suite["learning_rate_candidates"]) + max(
+            len(suite["learning_rate_search"]["lower"]),
+            len(suite["learning_rate_search"]["upper"]),
+        )
+        maximum_staged_multiplier = (
+            group_count
+            * maximum_trials_per_group
+            * sum(float(item["multiplier"]) for item in suite["compute_slices"])
+            + sum(
+                float(suite["slices_by_id"][item["slice"]]["multiplier"])
+                for item in suite["controls"]
+            )
+        )
+        maximum_staged_runs = (
+            group_count
+            * maximum_trials_per_group
+            * len(suite["compute_slices"])
+            + len(suite["controls"])
+        )
+        print(
+            "lower LR recovery: "
+            f"{suite['lower_learning_rate_recovery'].replace('_', ' ')}"
+        )
+        print(
+            "prospective staged ceiling if every optional shape is warranted: "
+            f"{maximum_staged_runs} "
+            f"runs / {maximum_staged_multiplier:.2f} completed-baseline equivalents"
+        )
     print(f"\nplanned base cost: {total_multiplier:.2f} completed-baseline equivalents")
     print(
         "The exponent fit is emitted only if all three one-seed slice minima are "
@@ -2463,16 +2529,19 @@ def run_variants(
     if unknown:
         raise ScalingError(f"unknown point(s): {', '.join(unknown)}")
     if _per_slice_learning_rates(suite) and not allow_adaptive:
-        v4_calibration_roles = {
+        per_slice_calibration_roles = {
             "learning_rate_calibration",
             "learning_rate_search",
             "extension_learning_rate_calibration",
             "extension_learning_rate_search",
         }
-        if any(available[name]["role"] in v4_calibration_roles for name in names):
+        if any(
+            available[name]["role"] in per_slice_calibration_roles
+            for name in names
+        ):
             raise ScalingError(
-                "v4 learning-rate trials may only be launched by --staged to "
-                "preserve the low-to-high instability frontier"
+                "per-slice learning-rate trials may only be launched by --staged "
+                "to preserve the declared instability frontiers"
             )
     adaptive_roles = {
         "learning_rate_search",
@@ -2496,6 +2565,11 @@ def run_variants(
         raise ScalingError(
             "this lineage suite is read-only because its pinned trainer differs "
             "from the promoted reference; start a new versioned suite"
+        )
+    if suite["suite_id"] in _ARCHIVED_SUITE_IDS:
+        raise ScalingError(
+            f"{suite['suite_id']} is an immutable archived study and is read-only; "
+            "use the versioned continuation suite"
         )
     adaptive_groups = sorted(
         {
@@ -5061,7 +5135,7 @@ def _validate_adaptive_completion_prefix(
     *,
     slice_id: str | None = None,
 ) -> None:
-    """Fail on completion holes or any run beyond an ineligible LR frontier."""
+    """Fail on completion holes or evidence beyond a declared LR frontier."""
 
     calibration_slice = _calibration_slice_id(suite, slice_id)
     points = [
@@ -5119,20 +5193,26 @@ def _validate_adaptive_completion_prefix(
         if _point_has_result(suite, point, runs_root):
             measured.append(_read_run(suite, point, runs_root))
     by_id = {str(item["id"]): item for item in measured}
-    lower_rates = {
-        float(item["value"]) for item in suite["learning_rate_search"]["lower"]
-    }
-    for point in points:
-        measurement = by_id.get(str(point["id"]))
-        if (
-            float(point["learning_rate"]) in lower_rates
-            and measurement is not None
-            and measurement["stability_admission"]["classification"] != "stable"
-        ):
-            raise ScalingError(
-                f"{calibration_slice}/{shape_id}: lower LR expansion is ineligible; "
-                "refusing to search beyond it"
-            )
+    if (
+        suite["lower_learning_rate_recovery"]
+        == _LOWER_RECOVERY_STOP_AT_INELIGIBLE
+    ):
+        lower_rates = {
+            float(item["value"])
+            for item in suite["learning_rate_search"]["lower"]
+        }
+        for point in points:
+            measurement = by_id.get(str(point["id"]))
+            if (
+                float(point["learning_rate"]) in lower_rates
+                and measurement is not None
+                and measurement["stability_admission"]["classification"]
+                != "stable"
+            ):
+                raise ScalingError(
+                    f"{calibration_slice}/{shape_id}: lower LR expansion is "
+                    "ineligible; refusing to search beyond it"
+                )
     initial_and_upper = [
         point
         for point in all_points
@@ -5247,9 +5327,9 @@ def _calibrate_shape(
     _validate_adaptive_completion_prefix(
         suite, shape_id, runs_root, slice_id=slice_id
     )
-    # V4 launches low-to-high, validates each completed curve immediately, and
-    # never crosses the first ineligible high-LR frontier.  Legacy suites retain
-    # their original all-at-once initial grid behavior.
+    # Per-slice suites launch low-to-high, validate each completed curve
+    # immediately, and never cross the first ineligible high-LR frontier.
+    # Legacy suites retain their original all-at-once initial-grid behavior.
     if _per_slice_learning_rates(suite):
         frontier = False
         first_initial_classification: str | None = None
@@ -5271,8 +5351,9 @@ def _calibrate_shape(
                     first_initial_classification = str(stability["classification"])
                 break
         # If even the lowest initial LR is ineligible, move only toward safer
-        # (lower) declared rates until a stable point appears or the bounded
-        # table is exhausted. Never try lr300/lr450 beyond the lr200 frontier.
+        # (lower) declared rates until the versioned recovery criterion is met
+        # or the bounded table is exhausted. Never try lr300/lr450 beyond the
+        # lr200 frontier.
         if first_initial_classification is not None:
             lower_completed = [
                 point
@@ -5283,15 +5364,30 @@ def _calibrate_shape(
                 < float(initial[0]["learning_rate"])
                 and _point_has_result(suite, point, runs_root)
             ]
-            stable_lower_count = sum(
-                _read_run(suite, point, runs_root)["stability_admission"][
-                    "classification"
-                ]
-                == "stable"
-                for point in lower_completed
-            )
             while True:
-                if stable_lower_count >= 2:
+                lower_classifications = [
+                    _read_run(suite, point, runs_root)["stability_admission"][
+                        "classification"
+                    ]
+                    for point in lower_completed
+                ]
+                if (
+                    suite["lower_learning_rate_recovery"]
+                    == _LOWER_RECOVERY_DESCEND_TO_ADJACENT_STABLE
+                ):
+                    recovery_complete = any(
+                        left == right == "stable"
+                        for left, right in zip(
+                            lower_classifications,
+                            lower_classifications[1:],
+                            strict=False,
+                        )
+                    )
+                else:
+                    recovery_complete = (
+                        lower_classifications.count("stable") >= 2
+                    )
+                if recovery_complete:
                     break
                 next_lower = _next_adaptive_calibration(
                     suite,
@@ -5301,19 +5397,23 @@ def _calibrate_shape(
                     slice_id=slice_id,
                 )
                 if next_lower is None:
+                    requirement = (
+                        "two adjacent stable candidates"
+                        if suite["lower_learning_rate_recovery"]
+                        == _LOWER_RECOVERY_DESCEND_TO_ADJACENT_STABLE
+                        else "a stable candidate"
+                    )
                     raise ScalingError(
                         f"{group_label}: bounded lower LR recovery exhausted "
-                        "without a stable candidate"
+                        f"without {requirement}"
                     )
                 run_variants(
                     suite, names=[str(next_lower["id"])], **run_options
                 )
-                recovery = _read_run(suite, next_lower, runs_root)
-                if (
-                    recovery["stability_admission"]["classification"]
-                    == "stable"
-                ):
-                    stable_lower_count += 1
+                # Validate the completed curve immediately before it can affect
+                # either the recovery frontier or selection.
+                _read_run(suite, next_lower, runs_root)
+                lower_completed.append(next_lower)
     else:
         run_variants(
             suite,

@@ -74,6 +74,13 @@ PINNED_TRAINER_PATH = (
     / "current_budget_isoflop_v4"
     / "trainer.py"
 )
+V4_SUITE_PATH = PINNED_TRAINER_PATH.with_name("suite.yaml")
+V5_TRAINER_PATH = (
+    Path(__file__).parents[1]
+    / "sweeps"
+    / "current_budget_isoflop_v5"
+    / "trainer.py"
+)
 PINNED_TRAINER_SPEC = importlib.util.spec_from_file_location(
     "scaling_v4_pinned_train", PINNED_TRAINER_PATH
 )
@@ -294,7 +301,8 @@ def _write_v4_stability_fixture(root: Path, suite: dict) -> tuple[dict, dict, di
 class ScalingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.v4_suite = load_suite(DEFAULT_SUITE)
+        cls.v5_suite = load_suite(DEFAULT_SUITE)
+        cls.v4_suite = load_suite(V4_SUITE_PATH)
         cls.lineage_suite = load_suite(
             Path(__file__).parents[1]
             / "sweeps"
@@ -346,6 +354,85 @@ class ScalingTests(unittest.TestCase):
             for point in suite["controls"]
         )
         self.assertEqual(base_cost, 27.25)
+
+    def test_v5_is_fresh_bounded_and_uses_the_pinned_legacy_trainer(self) -> None:
+        suite = self.v5_suite
+        self.assertEqual(suite["suite_id"], "current_budget_isoflop_v5")
+        self.assertEqual(DEFAULT_RUNS, Path("runs/scaling/current-budget-isoflop-v5"))
+        self.assertIsNone(suite["lineage"])
+        self.assertEqual(
+            suite["lower_learning_rate_recovery"],
+            "descend_through_ineligible_until_two_adjacent_stable",
+        )
+        self.assertEqual(
+            [item["id"] for item in suite["learning_rate_search"]["lower"]],
+            ["lr133", "lr089", "lr059", "lr040", "lr026", "lr018"],
+        )
+        self.assertEqual(
+            [item["value"] for item in suite["learning_rate_search"]["lower"]],
+            [
+                0.00013333333333333334,
+                0.00008888888888888889,
+                0.00005925925925925926,
+                0.00003950617283950617,
+                0.000026337448559670783,
+                0.00001755829903978052,
+            ],
+        )
+        self.assertEqual(len(suite["calibrations"]), 45)
+        self.assertEqual(len(suite["extension_calibrations"]), 18)
+        self.assertEqual(len(suite["adaptive_calibrations"]), 252)
+        self.assertEqual(len(suite["all_variants"]), 316)
+        self.assertEqual(
+            suite["trainer_source_repository_path"],
+            "sweeps/current_budget_isoflop_v5/trainer.py",
+        )
+        self.assertEqual(V5_TRAINER_PATH.read_bytes(), PINNED_TRAINER_PATH.read_bytes())
+        self.assertEqual(
+            _sha256_test(V5_TRAINER_PATH),
+            "b99dd38fe3a47b6b82e8d2c82649b53070f40de99838545ea18a5c2bccd7aea7",
+        )
+        self.assertEqual(
+            suite["suite_sha256"],
+            "629c6ff950b8e126882331b1a02d110f4f1988b104bd918764e477500c3806f6",
+        )
+        self.assertEqual(
+            suite["execution_fingerprint"],
+            "695013df27e2aad51de13cea79e140c08218fc7ef7dd0f40bc4b738ee594bbb1",
+        )
+
+        base_cost = sum(
+            suite["slices_by_id"][point["slice"]]["multiplier"]
+            for point in suite["calibrations"]
+        ) + sum(
+            suite["slices_by_id"][point["slice"]]["multiplier"]
+            for point in suite["controls"]
+        )
+        self.assertEqual(base_cost, 27.25)
+        shapes_per_slice = len(suite["fit_shapes"]) + len(
+            suite["optional_extension_shapes"]
+        )
+        maximum_trials_per_group = len(suite["learning_rate_candidates"]) + max(
+            len(suite["learning_rate_search"]["lower"]),
+            len(suite["learning_rate_search"]["upper"]),
+        )
+        reachable_runs = (
+            shapes_per_slice
+            * len(suite["compute_slices"])
+            * maximum_trials_per_group
+            + len(suite["controls"])
+        )
+        reachable_cost = (
+            shapes_per_slice
+            * maximum_trials_per_group
+            * sum(item["multiplier"] for item in suite["compute_slices"])
+            + sum(
+                suite["slices_by_id"][item["slice"]]["multiplier"]
+                for item in suite["controls"]
+            )
+        )
+        self.assertEqual(reachable_runs, 190)
+        self.assertEqual(reachable_cost, 111.25)
 
     def test_v4_trainer_is_exact_pre_promotion_blob(self) -> None:
         completed = subprocess.run(
@@ -429,7 +516,7 @@ class ScalingTests(unittest.TestCase):
         with patch(
             "speedrun.scaling._sha256", side_effect=promoted_reference_hash
         ):
-            reloaded = load_suite(DEFAULT_SUITE)
+            reloaded = load_suite(V4_SUITE_PATH)
         self.assertFalse(reference_hashed)
         self.assertEqual(
             reloaded["execution_fingerprint"],
@@ -544,9 +631,24 @@ class ScalingTests(unittest.TestCase):
                     autotune_attention=False,
                     resume=False,
                 )
+            with self.assertRaisesRegex(ScalingError, "immutable archived study"):
+                run_variants(
+                    self.v4_suite,
+                    names=[point["id"]],
+                    data_path=Path("/not/reached"),
+                    runs_path=root / "runs",
+                    seed=1337,
+                    color="never",
+                    downstream_manifest=Path("/not/reached"),
+                    downstream_root=Path("/not/reached"),
+                    attention_tuning_cache=None,
+                    autotune_attention=False,
+                    resume=False,
+                    allow_adaptive=True,
+                )
 
-    def test_v4_run_copies_pinned_trainer_and_records_actual_source_path(self) -> None:
-        point = self.v4_suite["calibrations"][0]
+    def test_v5_run_copies_pinned_trainer_and_records_actual_source_path(self) -> None:
+        point = self.v5_suite["calibrations"][0]
 
         class LaunchObserved(RuntimeError):
             pass
@@ -557,21 +659,21 @@ class ScalingTests(unittest.TestCase):
             fresh_root = root / "fresh"
             data_root.mkdir()
             fresh_root.mkdir()
-            data_provenance = _fake_dataset_provenance(self.v4_suite)
+            data_provenance = _fake_dataset_provenance(self.v5_suite)
             data_provenance["root"] = str(data_root)
             data_provenance["manifest_path"] = str(data_root / "manifest.json")
             data_inventory = {
                 **data_provenance,
                 "dataset_name": data_provenance.pop("name"),
             }
-            fresh_inventory = _fake_fresh10_provenance(self.v4_suite)
+            fresh_inventory = _fake_fresh10_provenance(self.v5_suite)
             fresh_inventory["root"] = str(fresh_root)
-            downstream_manifest = Path(self.v4_suite["fresh10"]["manifest_path"])
+            downstream_manifest = Path(self.v5_suite["fresh10"]["manifest_path"])
 
             def observe_launch(*_args, **_kwargs):
                 point_root = root / "runs" / point["id"]
                 copied = point_root / "work" / "train.py"
-                self.assertEqual(copied.read_bytes(), PINNED_TRAINER_PATH.read_bytes())
+                self.assertEqual(copied.read_bytes(), V5_TRAINER_PATH.read_bytes())
                 self.assertNotEqual(copied.read_bytes(), TRAINER_PATH.read_bytes())
                 manifest = json.loads(
                     (point_root / "run-manifest.json").read_text(encoding="utf-8")
@@ -579,7 +681,7 @@ class ScalingTests(unittest.TestCase):
                 self.assertEqual(manifest["schema_version"], 5)
                 self.assertEqual(
                     manifest["trainer_source_repository_path"],
-                    "sweeps/current_budget_isoflop_v4/trainer.py",
+                    "sweeps/current_budget_isoflop_v5/trainer.py",
                 )
                 self.assertEqual(
                     manifest["trainer_sha256"],
@@ -595,7 +697,7 @@ class ScalingTests(unittest.TestCase):
                 "speedrun.scaling.subprocess.run", side_effect=observe_launch
             ), self.assertRaises(LaunchObserved):
                 run_variants(
-                    self.v4_suite,
+                    self.v5_suite,
                     names=[point["id"]],
                     data_path=data_root,
                     runs_path=root / "runs",
@@ -608,7 +710,7 @@ class ScalingTests(unittest.TestCase):
                     resume=False,
                     data_inventory=data_inventory,
                     fresh10_inventory=fresh_inventory,
-                    runtime_inventory=_fake_runtime(self.v4_suite),
+                    runtime_inventory=_fake_runtime(self.v5_suite),
                     allow_adaptive=True,
                 )
 
@@ -710,6 +812,274 @@ class ScalingTests(unittest.TestCase):
             )
         self.assertEqual(result, selected)
         launch.assert_not_called()
+
+    def _exercise_v5_lower_recovery(
+        self,
+        *,
+        precompleted: dict[str, str] | None = None,
+        launched_classifications: dict[str, str],
+        selected: dict | None = None,
+    ) -> tuple[list[str], dict[str, str], dict]:
+        suite = self.v5_suite
+        launched: list[str] = []
+        completed = dict(precompleted or {})
+
+        def run_fake(_suite, *, names, **_kwargs):
+            for name in names:
+                launched.append(name)
+                rate_id = next(
+                    rate
+                    for rate in (
+                        "lr200",
+                        "lr300",
+                        "lr450",
+                        "lr133",
+                        "lr089",
+                        "lr059",
+                        "lr040",
+                        "lr026",
+                        "lr018",
+                    )
+                    if rate in name
+                )
+                completed[name] = launched_classifications[rate_id]
+
+        def read_fake(_suite, point, _root):
+            return {
+                "id": point["id"],
+                "learning_rate": point["learning_rate"],
+                "validation_loss": 4.0,
+                "stability_admission": {
+                    "classification": completed[point["id"]]
+                },
+            }
+
+        selected = selected or {"selected_learning_rate": 0.00008888888888888889}
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "speedrun.scaling.run_variants", side_effect=run_fake
+        ), patch(
+            "speedrun.scaling._point_has_result",
+            side_effect=lambda _suite, point, _root: point["id"] in completed,
+        ), patch(
+            "speedrun.scaling._read_run", side_effect=read_fake
+        ), patch(
+            "speedrun.scaling.select_learning_rate", return_value=selected
+        ):
+            result = _calibrate_shape(
+                suite, "n023", Path(directory), {}, slice_id="c050"
+            )
+        return launched, completed, result
+
+    def test_v5_descends_across_rejected_lower_points_to_adjacent_stable_pair(self) -> None:
+        launched, _completed, result = self._exercise_v5_lower_recovery(
+            launched_classifications={
+                "lr200": "rejected",
+                "lr133": "rejected",
+                "lr089": "stable",
+                "lr059": "stable",
+            }
+        )
+        self.assertEqual(
+            launched,
+            [
+                "c050_n023_lr200",
+                "c050_n023_lr133_adaptive",
+                "c050_n023_lr089_adaptive",
+                "c050_n023_lr059_adaptive",
+            ],
+        )
+        self.assertEqual(result["selected_learning_rate"], 0.00008888888888888889)
+        self.assertNotIn("c050_n023_lr300", launched)
+        self.assertNotIn("c050_n023_lr450", launched)
+
+    def test_v5_resume_after_rejected_lr133_continues_at_lr089(self) -> None:
+        launched, _completed, _result = self._exercise_v5_lower_recovery(
+            precompleted={
+                "c050_n023_lr200": "rejected",
+                "c050_n023_lr133_adaptive": "rejected",
+            },
+            launched_classifications={"lr089": "stable", "lr059": "stable"},
+        )
+        self.assertEqual(
+            launched,
+            [
+                "c050_n023_lr089_adaptive",
+                "c050_n023_lr059_adaptive",
+            ],
+        )
+
+    def test_v5_nonadjacent_stable_lower_points_do_not_stop_recovery(self) -> None:
+        launched, _completed, _result = self._exercise_v5_lower_recovery(
+            precompleted={
+                "c050_n023_lr200": "rejected",
+                "c050_n023_lr133_adaptive": "stable",
+                "c050_n023_lr089_adaptive": "rejected",
+                "c050_n023_lr059_adaptive": "stable",
+            },
+            launched_classifications={"lr040": "stable"},
+            selected={"selected_learning_rate": 0.00005925925925925926},
+        )
+        self.assertEqual(launched, ["c050_n023_lr040_adaptive"])
+
+    def test_v5_resume_with_adjacent_stable_lower_pair_launches_nothing(self) -> None:
+        launched, _completed, result = self._exercise_v5_lower_recovery(
+            precompleted={
+                "c050_n023_lr200": "rejected",
+                "c050_n023_lr133_adaptive": "rejected",
+                "c050_n023_lr089_adaptive": "stable",
+                "c050_n023_lr059_adaptive": "stable",
+            },
+            launched_classifications={},
+        )
+        self.assertEqual(launched, [])
+        self.assertEqual(result["selected_learning_rate"], 0.00008888888888888889)
+
+    def test_v5_lower_recovery_exhaustion_fails_before_selection(self) -> None:
+        suite = self.v5_suite
+        completed = {
+            "c050_n023_lr200": "rejected",
+            **{
+                f"c050_n023_{rate}_adaptive": "rejected"
+                for rate in ("lr133", "lr089", "lr059", "lr040", "lr026", "lr018")
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "speedrun.scaling._point_has_result",
+            side_effect=lambda _suite, point, _root: point["id"] in completed,
+        ), patch(
+            "speedrun.scaling._read_run",
+            side_effect=lambda _suite, point, _root: {
+                "id": point["id"],
+                "stability_admission": {
+                    "classification": completed[point["id"]]
+                },
+            },
+        ), patch("speedrun.scaling.run_variants") as launch, patch(
+            "speedrun.scaling.select_learning_rate"
+        ) as select:
+            with self.assertRaisesRegex(
+                ScalingError, "exhausted without two adjacent stable candidates"
+            ):
+                _calibrate_shape(
+                    suite, "n023", Path(directory), {}, slice_id="c050"
+                )
+        launch.assert_not_called()
+        select.assert_not_called()
+
+    def test_v5_resume_rejects_lower_hole(self) -> None:
+        suite = self.v5_suite
+        completed = {
+            "c050_n023_lr200",
+            "c050_n023_lr133_adaptive",
+            "c050_n023_lr059_adaptive",
+        }
+        with patch(
+            "speedrun.scaling._point_has_result",
+            side_effect=lambda _suite, point, _root: point["id"] in completed,
+        ), self.assertRaisesRegex(ScalingError, "noncontiguous lower"):
+            _validate_adaptive_completion_prefix(
+                suite, "n023", Path("/unused"), slice_id="c050"
+            )
+
+    def test_v5_selection_preserves_immediate_neighbor_semantics_across_rejects(self) -> None:
+        suite = self.v5_suite
+        points = {
+            point["id"]: point
+            for point in suite["calibrations"] + suite["adaptive_calibrations"]
+            if point["slice"] == "c050" and point["shape_id"] == "n023"
+        }
+        completed = [
+            points["c050_n023_lr059_adaptive"],
+            points["c050_n023_lr089_adaptive"],
+            points["c050_n023_lr133_adaptive"],
+            points["c050_n023_lr200"],
+        ]
+        classifications = {
+            "c050_n023_lr059_adaptive": "stable",
+            "c050_n023_lr089_adaptive": "stable",
+            "c050_n023_lr133_adaptive": "rejected",
+            "c050_n023_lr200": "rejected",
+        }
+        losses = {
+            "c050_n023_lr059_adaptive": 4.2,
+            "c050_n023_lr089_adaptive": 4.0,
+            "c050_n023_lr133_adaptive": 4.5,
+            "c050_n023_lr200": 4.6,
+        }
+
+        def measured(point):
+            return {
+                "id": point["id"],
+                "learning_rate": point["learning_rate"],
+                "validation_loss": losses[point["id"]],
+                "result": f"{point['id']}/artifacts/result.json",
+                "result_sha256": "a" * 64,
+                "run_manifest_sha256": "b" * 64,
+                "stability_admission_path": (
+                    f"{point['id']}/artifacts/stability-admission.json"
+                ),
+                "stability_admission_sha256": "c" * 64,
+                "stability_admission": {
+                    "classification": classifications[point["id"]]
+                },
+                "_dataset_provenance": {"manifest_canonical_sha256": "d" * 64},
+                "_fresh10_provenance": {"manifest_canonical_sha256": "e" * 64},
+                "_runtime_provenance": {"runtime": "same"},
+            }
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "speedrun.scaling._point_has_result",
+            side_effect=lambda _suite, point, _root: point in completed,
+        ), patch(
+            "speedrun.scaling._read_run",
+            side_effect=lambda _suite, point, _root: measured(point),
+        ), patch(
+            "speedrun.scaling._coherent_dataset_identity",
+            return_value={"manifest_canonical_sha256": "d" * 64},
+        ), patch(
+            "speedrun.scaling._coherent_fresh10_identity",
+            return_value={"manifest_canonical_sha256": "e" * 64},
+        ), patch(
+            "speedrun.scaling._coherent_auxiliary_identity",
+            return_value={"runtime": "same"},
+        ):
+            selected = select_learning_rate(
+                suite,
+                shape_id="n023",
+                slice_id="c050",
+                runs_path=Path(directory),
+            )
+        self.assertEqual(selected["selected_point_id"], "c050_n023_lr089_adaptive")
+        self.assertEqual(
+            selected["lower_boundary_point_id"], "c050_n023_lr059_adaptive"
+        )
+        self.assertEqual(
+            selected["upper_boundary_point_id"], "c050_n023_lr133_adaptive"
+        )
+        self.assertEqual(selected["upper_boundary_classification"], "rejected")
+
+    def test_v5_high_ineligible_frontier_is_unchanged(self) -> None:
+        suite = self.v5_suite
+        completed = {
+            "c050_n023_lr200": "stable",
+            "c050_n023_lr300": "rejected",
+            "c050_n023_lr450": "stable",
+        }
+        with patch(
+            "speedrun.scaling._point_has_result",
+            side_effect=lambda _suite, point, _root: point["id"] in completed,
+        ), patch(
+            "speedrun.scaling._read_run",
+            side_effect=lambda _suite, point, _root: {
+                "id": point["id"],
+                "stability_admission": {
+                    "classification": completed[point["id"]]
+                },
+            },
+        ), self.assertRaisesRegex(ScalingError, "ineligible frontier"):
+            _validate_adaptive_completion_prefix(
+                suite, "n023", Path("/unused"), slice_id="c050"
+            )
 
     def test_suite_matches_exact_current_budget_and_cost(self) -> None:
         suite = self.suite
@@ -1056,6 +1426,25 @@ class ScalingTests(unittest.TestCase):
         ]
         with patch(
             "speedrun.scaling.load_suite", return_value=self.lineage_suite
+        ), patch("speedrun.scaling.run_staged") as launch, patch("sys.stderr"):
+            self.assertEqual(main(argv), 1)
+        launch.assert_not_called()
+
+    def test_run_cli_rejects_archived_v4_before_launch(self) -> None:
+        argv = [
+            "run",
+            "--data-path",
+            "/does/not/matter",
+            "--downstream-manifest",
+            "/does/not/matter",
+            "--downstream-root",
+            "/does/not/matter",
+            "--confirm-execution-fingerprint",
+            self.v4_suite["execution_fingerprint"],
+            "--staged",
+        ]
+        with patch(
+            "speedrun.scaling.load_suite", return_value=self.v4_suite
         ), patch("speedrun.scaling.run_staged") as launch, patch("sys.stderr"):
             self.assertEqual(main(argv), 1)
         launch.assert_not_called()

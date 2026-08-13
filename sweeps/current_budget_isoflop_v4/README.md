@@ -1,5 +1,10 @@
 # Current-budget IsoFLOP v4
 
+> **Archived incomplete study.** V4 stopped after 42 trials at `c050/n023`:
+> `lr200` and `lr133` were rejected by the frozen stability gate, and `lr089`
+> was never launched. It produced no three-slice scaling-law claim. Its files
+> and raw run evidence must remain unchanged; new work starts fresh in v5.
+
 V4 is a fresh, fail-closed rerun. It independently calibrates learning rate for
 every `(compute slice, model shape)` pair. A selected calibration run is itself
 the equal-FLOP model-size measurement, so no short-horizon learning rate is
@@ -90,12 +95,15 @@ there is no c050 selection, c100/control evidence, global fit, or scaling-law
 claim. The schema-v2 `--stopped-study` evidence mode documents and verifies this
 inconclusive negative result; it does not reinterpret it as a completed law.
 
-## Run
+## Archived evidence
 
-```bash
-uv run --frozen --no-sync python -m speedrun.scaling plan
-uv run --frozen --no-sync python -m speedrun.scaling run --staged --data-path /dev/shm/fineweb-scaled/4B --downstream-manifest data/manifests/fresh10.json --downstream-root /dev/shm --runs runs/scaling/current-budget-isoflop-v4 --confirm-execution-fingerprint DIGEST_FROM_PLAN --resume --color always
-```
+Do not launch or resume this suite, and do not write into
+`runs/scaling/current-budget-isoflop-v4`. The scaling CLI rejects new v4 runs.
+Use the explicit `--stopped-study` workflow in
+[`docs/SCALING_EVIDENCE.md`](../../docs/SCALING_EVIDENCE.md) to build, verify,
+and publish a read-only archive of the exact terminal evidence. New execution
+belongs to the fresh [v5 continuation](../current_budget_isoflop_v5/README.md)
+and its separate run root.
 
 Any law from a future versioned continuation would remain a one-seed local law,
 not a universal Chinchilla estimate. The stopped v4 result contains no exponent.

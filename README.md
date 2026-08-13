@@ -209,11 +209,14 @@ resumes pending points. No chart is rendered yet. See
 [the Complete(d)P contract](docs/COMPLETEP.md) and the
 [versioned suite](studies/complete_d_p_lr_v1/suite.yaml).
 
-The legacy-baseline v4 IsoFLOP study has a dedicated fail-closed evidence
-publisher. It archives every raw curve and derived decision and then repeats the
-full semantic verification from an anonymous immutable download. Its explicit
-schema-v2 stopped-study mode records the exact 42-run inconclusive terminal
-state as a negative result without making a scaling-law claim. See the
+The legacy-baseline v4 IsoFLOP study is an immutable incomplete archive: its
+bounded lower-LR recovery stopped after 42 trials before a three-slice law could
+be fitted. Its dedicated fail-closed publisher archives every raw curve and
+derived decision, repeats semantic verification from an anonymous immutable
+download, and records the result as negative evidence without making a
+scaling-law claim. The fresh
+[v5 continuation](sweeps/current_budget_isoflop_v5/README.md) extends the
+prospective lower bound without reusing v4 measurements. See the
 [v4 scaling-evidence release gate](docs/SCALING_EVIDENCE.md).
 
 The harness creates a unique persistent run directory, captures stdout/stderr,
