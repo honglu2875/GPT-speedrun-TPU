@@ -18,6 +18,13 @@ improvement. It does not yet meet the 3.28 qualification target.
 The recorded run is
 `20260813T065901.850451Z-modern_rope_gelu_b128_vocab50257_lr15e3_min0600-2c446191`.
 
+A seed-1338 replication trained in 383.294 seconds and reached canonical loss
+3.6081 plus Fresh10 loss 3.7036. Against the seed-matched `3e-5` floor control
+(383.727 seconds, 3.6119, 3.7083), the higher floor reproduced improvements of
+0.433 seconds, 0.0038 canonical loss, and 0.0047 Fresh10 loss. The replication
+run is
+`20260813T073519.260353Z-modern_rope_gelu_b128_vocab50257_lr15e3_min0600-295fe79a`.
+
 ```bash
 make run TARGET=modern_rope_gelu_b128_vocab50257_lr15e3_min0600
 ```
