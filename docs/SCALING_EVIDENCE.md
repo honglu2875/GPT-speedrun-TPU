@@ -1,5 +1,10 @@
 # Publishing v4 scaling evidence
 
+> V4 is now an immutable incomplete archive and has no scaling-law claim. This
+> publisher remains pinned to its launch protocol; its closed-study release
+> gate intentionally refuses the partial v4 run set. Do not use it for v5 or
+> publish v5 evidence under a v4 prefix or receipt.
+
 `scripts/publish_scaling_evidence.py` builds a closed, independently verifiable
 archive for `current_budget_isoflop_v4`. It is intentionally specific to the
 study launched from Git commit

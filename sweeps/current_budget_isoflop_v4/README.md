@@ -1,5 +1,10 @@
 # Current-budget IsoFLOP v4
 
+> **Archived incomplete study.** V4 stopped after 42 trials at `c050/n023`:
+> `lr200` and `lr133` were rejected by the frozen stability gate, and `lr089`
+> was never launched. It produced no three-slice scaling-law claim. Its files
+> and raw run evidence must remain unchanged; new work starts fresh in v5.
+
 V4 is a fresh, fail-closed rerun. It independently calibrates learning rate for
 every `(compute slice, model shape)` pair. A selected calibration run is itself
 the equal-FLOP model-size measurement, so no short-horizon learning rate is
