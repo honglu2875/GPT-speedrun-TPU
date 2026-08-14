@@ -37,18 +37,29 @@ LR varies.
 
 Best base LR per configuration, and the margin over its nearest neighbour:
 
-| Study | Tier | Params | m_N | m_L | Best | Margin | Complete |
-|---|---|---:|---:|---:|---|---:|---|
-| `lr_v3` | 60m | 59,918,208 | 1 | 1 | **2^-8** | 0.043 | 7/7 |
-| `lr_v3` | 125m | 123,456,640 | 5/3 | 1 | **2^-8** | 0.057 | 7/7 |
-| `lr_v3` | 250m | 244,444,032 | 7/3 | 4/3 | **2^-7** | 0.021 | 7/7 |
-| `depth_l16` | 60m/L16 | 67,012,992 | 1 | 4/3 | **2^-8** | 0.032 | 7/7 |
-| `depth_l24` | 60m/L24 | 81,202,560 | 1 | 2 | **2^-8** | 0.027 | 7/7 |
-| `lr_large` | 500m | 502,602,240 | 10/3 | 19/12 | 2^-8 only | — | 2/6 |
-| `lr_large` | 1b | 989,943,808 | 14/3 | 7/4 | 2^-8 only | — | 2/6 |
+| Study | Tier | Params | m_N | m_L | Corpus | Best | Margin | Complete |
+|---|---|---:|---:|---:|---|---|---:|---|
+| `lr_v3` | 60m | 59,918,208 | 1 | 1 | 4B | **2^-8** | 0.043 | 7/7 |
+| `lr_v3` | 125m | 123,456,640 | 5/3 | 1 | 4B | **2^-8** | 0.057 | 7/7 |
+| `lr_v3` | 250m | 244,444,032 | 7/3 | 4/3 | 4B | **2^-7** | 0.021 | 7/7 |
+| `depth_l16` | 60m/L16 | 67,012,992 | 1 | 4/3 | 8B | **2^-8** | 0.032 | 7/7 |
+| `depth_l24` | 60m/L24 | 81,202,560 | 1 | 2 | 8B | **2^-8** | 0.027 | 7/7 |
+| `lr_large` | 500m | 502,602,240 | 10/3 | 19/12 | 8B | 2^-8 only | — | 2/6 |
+| `lr_large` | 1b | 989,943,808 | 14/3 | 7/4 | 8B | 2^-8 only | — | 2/6 |
 
 `depth_l16` and `depth_l24` are depth forks of the 60M anchor: width stays 384,
 only layer count changes, so they isolate `m_L` at `m_N = 1`.
+
+**Corpus.** `lr_v3` ran on `fineweb-4b-gpt2`; everything after it ran on
+`fineweb-8b-gpt2`, because the saved `training_tokens` budget moved past 3.9B
+and re-routed. The two are nested prefixes of one globally shuffled stream, but
+the sampler permutes over different capacity, so token order differs and
+**absolute losses are not comparable across the boundary.** Nothing below
+compares them: every "best" is an arg-min within a single study, and the
+finding that matters -- 250M differing from 60M and 125M -- is entirely inside
+`lr_v3` on one corpus. Reading the depth forks as evidence about `m_L` does
+assume the optimal LR is not strongly corpus-dependent between two prefixes of
+the same stream.
 
 ## Findings
 
@@ -75,6 +86,8 @@ only layer count changes, so they isolate `m_L` at `m_N = 1`.
   everything-else are valid; the absolute losses are not official results.
 - **One seed.** Seed 1337 only. Finding 4 needs at least three seeds near the
   optimum before the 250m shift means anything.
+- **Two corpora.** See the note under Results: `lr_v3` used the 4B prefix and
+  everything since used the 8B one, so absolute losses do not cross that line.
 - **One horizon.** 5 TPP only. Complete(d)P's `sqrt(m_D)` correction is meant to
   carry the base LR to other horizons, but that was not measured here.
 - **500m and 1b are unbracketed.** Only the `2^-8` center completed; both
