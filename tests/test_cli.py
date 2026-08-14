@@ -415,10 +415,15 @@ class CliTests(unittest.TestCase):
             self.assertIn("profiles/test/xprof", remote)
             sync.assert_called_once()
 
-    def test_report_admission_has_no_customization_surface(self) -> None:
+    def test_report_qualification_is_fixed_with_narrow_dev_diagnostic_flag(self) -> None:
         self.assertEqual(REPORT_ADMISSION_QUALIFICATION_LOSS, 3.76)
         report = cli.build_parser().parse_args(["report"])
         self.assertFalse(hasattr(report, "admission_loss"))
+        self.assertFalse(report.include_dev)
+        diagnostic_report = cli.build_parser().parse_args(
+            ["report", "--include-dev"]
+        )
+        self.assertTrue(diagnostic_report.include_dev)
         self.assertFalse(hasattr(LocalConfig(), "report_admission_loss"))
         prepare = cli.build_parser().parse_args(["prepare"])
         target_action = next(

@@ -85,10 +85,65 @@ class TrainerStaticTests(unittest.TestCase):
                 self.assertEqual(config.declared_parameters, parameters)
                 self.assertEqual((config.layers, config.d_model, config.heads), (layers, width, heads))
                 self.assertEqual(config.d_model // config.heads, 64)
+                self.assertEqual(config.attention_scale, "inverse_head_dim")
+                self.assertAlmostEqual(
+                    trainer.attention_softmax_scale(config), 1.0 / 64.0
+                )
                 self.assertAlmostEqual(config.tokens_per_parameter, 20.0, places=3)
                 self.assertEqual(
                     config.steps * config.batch_size * config.seq_len,
                     round(parameters * config.tokens_per_parameter),
+                )
+
+    def test_depth_ablation_candidates_retain_the_reference_anchor(self) -> None:
+        parser = trainer.build_parser()
+        candidates = {
+            "reference-l16": (67_012_992, 16, 4 / 3),
+            "reference-l24": (81_202_560, 24, 2.0),
+        }
+        for name, (parameters, layers, depth_multiplier) in candidates.items():
+            with self.subTest(candidate=name):
+                candidate_dir = TRAINER_PATH.parents[1] / name
+                self.assertEqual(
+                    (candidate_dir / "train.py").read_bytes(),
+                    TRAINER_PATH.read_bytes(),
+                )
+                with patch.object(trainer, "CONFIG_PATH", candidate_dir / "config.yaml"):
+                    experiment = trainer.load_experiment_profile("dev", tier="60m")
+                config = trainer.resolve_config(
+                    parser.parse_args(
+                        [
+                            "--profile",
+                            "dev",
+                            "--tier",
+                            "60m",
+                            "--tokens-per-parameter",
+                            "5",
+                        ]
+                    ),
+                    "tpu",
+                    50_304,
+                    experiment,
+                )
+                self.assertEqual(config.declared_parameters, parameters)
+                self.assertEqual((config.layers, config.d_model, config.heads), (layers, 384, 6))
+                self.assertEqual((config.base_depth, config.base_width), (12, 384))
+                self.assertEqual(config.width_multiplier, 1.0)
+                self.assertAlmostEqual(config.depth_multiplier, depth_multiplier)
+                self.assertEqual(config.data_multiplier, 1.0)
+                self.assertEqual(config.diagnostics_every, 10)
+
+                params = {
+                    "token_embedding": np.zeros((1, 1), dtype=np.float32),
+                    "blocks": [{"qkv_w": np.zeros((1, 1), dtype=np.float32)}],
+                    "final_ln_scale": np.ones((1,), dtype=np.float32),
+                    "output_embedding": np.zeros((1, 1), dtype=np.float32),
+                }
+                _lr, epsilon, _decay = trainer.optimizer_hyperparameter_trees(
+                    params, config
+                )
+                self.assertAlmostEqual(
+                    epsilon["blocks"][0]["qkv_w"], depth_multiplier**-1
                 )
 
     def test_complete_d_p_tensor_and_horizon_multipliers(self) -> None:
@@ -437,9 +492,10 @@ class TrainerStaticTests(unittest.TestCase):
         development = trainer.resolve_config(
             parser.parse_args(["--profile", "dev"]), "tpu", 50_304
         )
-        for config in (smoke, development):
-            self.assertEqual(config.val_every, 0)
-            self.assertEqual(config.diagnostics_every, 0)
+        self.assertEqual(smoke.val_every, 0)
+        self.assertEqual(smoke.diagnostics_every, 0)
+        self.assertEqual(development.val_every, 0)
+        self.assertEqual(development.diagnostics_every, 10)
 
         overridden = trainer.resolve_config(
             parser.parse_args(

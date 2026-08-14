@@ -62,6 +62,55 @@ class ReportTests(unittest.TestCase):
         self.assertIn("open run is incomplete", summary.skipped["partial-open"])
         self.assertEqual(payload["meta"]["admissionQualificationLoss"], 3.76)
 
+    def test_include_dev_is_a_narrow_diagnostic_escape_hatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "runs"
+            cases = {
+                "dev-diagnostic": ("open", "dev", 20, 9.0),
+                "official-rejected": ("sample_efficiency", "official", 20, 3.8),
+                "official-valid": ("sample_efficiency", "official", 20, 3.7),
+                "smoke-run": ("sample_efficiency", "smoke", 20, 3.0),
+            }
+            for name, (track, profile, tokens, validation_loss) in cases.items():
+                run = runs / name
+                run.mkdir(parents=True)
+                (run / "training.csv").write_text(
+                    "step,tokens_processed,train_loss\n1,10,4.5\n2,20,4.0\n",
+                    encoding="utf-8",
+                )
+                _write_result(
+                    run,
+                    validation_artifact=False,
+                    track=track,
+                    profile=profile,
+                    tokens=tokens,
+                    validation_loss=validation_loss,
+                )
+
+            summary = build_report(
+                runs,
+                root / "report.html",
+                include_dev=True,
+            )
+            payload = _payload((root / "report.html").read_text(encoding="utf-8"))
+
+        self.assertEqual(summary.included, ("dev-diagnostic", "official-valid"))
+        self.assertIn("profile='official'", summary.skipped["smoke-run"])
+        self.assertIn(
+            "does not meet the baseline report admission qualification",
+            summary.skipped["official-rejected"],
+        )
+        self.assertTrue(payload["meta"]["includeDev"])
+        classifications = {
+            run["id"]: run["classification"] for run in payload["runs"]
+        }
+        self.assertEqual(classifications["dev-diagnostic"], "diagnostic")
+        self.assertEqual(classifications["official-valid"], "official")
+        self.assertTrue(
+            any("not official or qualifying" in notice for notice in payload["notices"])
+        )
+
     def test_long_form_diagnostics_build_all_family_and_final_scope_charts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -99,11 +148,22 @@ class ReportTests(unittest.TestCase):
         )
         self.assertEqual(
             [point[2] for point in parameter_mean["series"][0]["points"]],
-            ["embeddings", "block 0", "final norm"],
+            ["embeddings", "block 0", "final norm", "unembedding"],
         )
         self.assertIn('id="family-control"', html)
         self.assertIn('id="focus-dialog"', html)
-        self.assertIn("c.onwheel=e=>zoom(e,item)", html)
+        self.assertIn('id="smoothing-control"', html)
+        self.assertIn('id="x-scale-control"', html)
+        self.assertIn('name="x-scale" value="log" checked', html)
+        self.assertIn('name="x-scale" value="linear"', html)
+        self.assertIn("Math.log10(x)", html)
+        self.assertIn('name="smoothing" value="ema"', html)
+        self.assertIn('name="smoothing" value="mean"', html)
+        self.assertIn('name="smoothing" value="median"', html)
+        self.assertIn("function finishBox(e,item)", html)
+        self.assertIn("Raw sample:", html)
+        self.assertNotIn("onwheel", html)
+        self.assertNotIn("function zoom(", html)
         self.assertNotIn("setInterval", html)
 
     def test_incomplete_diagnostics_grid_excludes_run(self) -> None:
@@ -160,6 +220,8 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(summary.included, ("complete-run",))
         self.assertFalse(summary.skipped)
         self.assertEqual(payload["meta"]["defaultXAxis"], "flops")
+        self.assertEqual(payload["meta"]["defaultXScale"], "log")
+        self.assertEqual(payload["meta"]["maxChartPoints"], 64)
         self.assertTrue(payload["runs"][0]["selected"])
         self.assertEqual(payload["runs"][0]["classification"], "official")
         self.assertEqual(payload["runs"][0]["flopSource"], "derived: result metrics.flops_per_token × tokens_processed")
@@ -511,8 +573,9 @@ def _write_diagnostics(path: Path) -> None:
         "fourth_moment",
     )
     scopes = (
-        ("overall", "", 6),
+        ("overall", "", 8),
         ("embeddings", "", 2),
+        ("unembedding", "", 2),
         ("block", "0", 3),
         ("final_norm", "", 1),
     )

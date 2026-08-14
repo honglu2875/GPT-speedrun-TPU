@@ -71,7 +71,9 @@ _DIAGNOSTIC_REQUIRED = (
     "value",
     "element_count",
 )
-_DIAGNOSTIC_SCOPES = frozenset({"overall", "embeddings", "block", "final_norm"})
+_DIAGNOSTIC_SCOPES = frozenset(
+    {"overall", "embeddings", "unembedding", "block", "final_norm"}
+)
 _DIAGNOSTIC_FAMILIES = ("grad", "update", "param")
 _DIAGNOSTIC_STATS = (
     "l1_norm",
@@ -127,17 +129,21 @@ def build_report(
     output_path: Path,
     *,
     max_chart_points: int = _MAX_CHART_POINTS,
+    include_dev: bool = False,
 ) -> ReportSummary:
     """Scan ``runs_dir`` and write one portable report HTML file.
 
     ``max_chart_points`` bounds the embedded data and canvas work per series.  The
-    first and last points are always retained.
+    first and last points are always retained.  ``include_dev`` is an explicit
+    diagnostic-only escape hatch; it never relaxes admission for official runs.
     """
 
     runs_dir = Path(runs_dir).expanduser().resolve()
     output_path = Path(output_path).expanduser().resolve()
     if isinstance(max_chart_points, bool) or max_chart_points < 32:
         raise ReportError("max_chart_points must be an integer of at least 32")
+    if not isinstance(include_dev, bool):
+        raise ReportError("include_dev must be a boolean")
     if not runs_dir.is_dir():
         raise ReportError(f"runs directory does not exist: {runs_dir}")
     if output_path.exists() and (output_path.is_dir() or output_path.is_symlink()):
@@ -161,7 +167,10 @@ def build_report(
             )
             continue
         try:
-            admission_reason = _report_admission_reason(candidate)
+            admission_reason = _report_admission_reason(
+                candidate,
+                include_dev=include_dev,
+            )
         except (OSError, ReportError, json.JSONDecodeError) as exc:
             skipped[candidate.name] = str(exc)
             continue
@@ -176,8 +185,19 @@ def build_report(
         included.append(run)
 
     notices = list(ledger_notices)
+    if include_dev:
+        notices.append(
+            "Development-profile runs were explicitly included as diagnostics; "
+            "they are not official or qualifying results."
+        )
     notices.extend(notice for run in included for notice in run.notices)
-    payload = _report_payload(included, skipped, notices)
+    payload = _report_payload(
+        included,
+        skipped,
+        notices,
+        max_chart_points=max_chart_points,
+        include_dev=include_dev,
+    )
     html = _render_html(payload)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(html, encoding="utf-8")
@@ -189,7 +209,11 @@ def build_report(
     )
 
 
-def _report_admission_reason(run_dir: Path) -> str | None:
+def _report_admission_reason(
+    run_dir: Path,
+    *,
+    include_dev: bool = False,
+) -> str | None:
     """Apply the cheap, versioned report filter before hashing large artifacts."""
 
     result_path = _regular_file(run_dir, "result.json")
@@ -201,7 +225,8 @@ def _report_admission_reason(run_dir: Path) -> str | None:
     if result.get("schema_version") != 1 or result.get("status") != "ok":
         raise ReportError("result.json is not a successful schema-v1 result")
     profile = result.get("profile")
-    if profile != "official":
+    dev_diagnostic = include_dev and profile == "dev"
+    if profile != "official" and not dev_diagnostic:
         return (
             "baseline report admission qualification requires "
             f"profile='official'; found {profile!r}"
@@ -211,12 +236,14 @@ def _report_admission_reason(run_dir: Path) -> str | None:
         raise ReportError("result track is invalid")
     metrics = _object(result.get("metrics"), "result metrics")
     tokens = _positive_int(metrics.get("tokens_processed"), "tokens_processed")
+    validation_loss = _finite(metrics.get("validation_loss"), "validation_loss")
+    if dev_diagnostic:
+        return None
     if track == "open" and tokens != _OFFICIAL_OPEN_TOKENS:
         return (
             "open run is incomplete: expected exactly "
             f"{_OFFICIAL_OPEN_TOKENS:,} training tokens, found {tokens:,}"
         )
-    validation_loss = _finite(metrics.get("validation_loss"), "validation_loss")
     if validation_loss > REPORT_ADMISSION_QUALIFICATION_LOSS:
         return (
             "run does not meet the baseline report admission qualification: "
@@ -981,6 +1008,9 @@ def _report_payload(
     runs: Sequence[_Run],
     skipped: Mapping[str, str],
     notices: Sequence[str],
+    *,
+    max_chart_points: int,
+    include_dev: bool,
 ) -> dict[str, Any]:
     run_rows: list[dict[str, Any]] = []
     for index, run in enumerate(runs):
@@ -1111,7 +1141,10 @@ def _report_payload(
             "included": len(runs),
             "skipped": len(skipped),
             "defaultXAxis": "flops",
+            "defaultXScale": "log",
             "flopsLabel": "Estimated cumulative FLOPs",
+            "maxChartPoints": max_chart_points,
+            "includeDev": include_dev,
             "admissionQualificationLoss": REPORT_ADMISSION_QUALIFICATION_LOSS,
             "profile": "official",
             "openTrainingTokens": _OFFICIAL_OPEN_TOKENS,
@@ -1212,7 +1245,7 @@ def _overall_diagnostic_charts(runs: Sequence[_Run]) -> list[dict[str, Any]]:
 
 
 def _final_diagnostic_charts(runs: Sequence[_Run]) -> list[dict[str, Any]]:
-    """Build final-step embeddings/block/final-norm plots for each family."""
+    """Build final-step embeddings/block/final-norm/unembedding plots."""
 
     charts: list[dict[str, Any]] = []
     for family in _DIAGNOSTIC_FAMILIES:
@@ -1259,6 +1292,7 @@ def _diagnostic_scope_points(rows: Sequence[Mapping[str, Any]]) -> list[list[Any
     positions = {
         "embeddings": (-1, "embeddings"),
         "final_norm": (final_position, "final norm"),
+        "unembedding": (final_position + 1, "unembedding"),
     }
     points: list[list[Any]] = []
     for row in rows:
@@ -1549,7 +1583,7 @@ _HTML = r'''<!doctype html>
 <style>
 :root{--bg:#080b12;--panel:#101521;--panel2:#151b29;--line:#273247;--text:#edf4ff;--muted:#91a0b8;--accent:#7dd3fc;--good:#86efac;--warn:#fde047;--bad:#fca5a5;--radius:14px;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--text);background:var(--bg);font-synthesis:none}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 75% -10%,#17233a 0,transparent 35rem),var(--bg);min-height:100vh}button,input{font:inherit}.shell{display:grid;grid-template-columns:280px minmax(0,1fr);min-height:100vh}.sidebar{position:sticky;top:0;height:100vh;overflow:auto;border-right:1px solid var(--line);background:rgba(10,14,23,.94);backdrop-filter:blur(16px);padding:20px}.brand{font-weight:800;letter-spacing:.02em;font-size:17px}.brand b{color:var(--accent)}.subtle{color:var(--muted);font-size:12px;line-height:1.5}.side-actions{display:flex;gap:7px;margin:18px 0 10px}.ghost{border:1px solid var(--line);color:var(--muted);background:var(--panel);border-radius:8px;padding:6px 9px;cursor:pointer}.ghost:hover{color:var(--text);border-color:#41516d}.search{width:100%;border:1px solid var(--line);background:#090d16;color:var(--text);padding:9px 10px;border-radius:9px;outline:none}.search:focus{border-color:var(--accent)}.run-list{display:grid;gap:7px;margin-top:12px}.run-toggle{display:grid;grid-template-columns:auto 10px 1fr;gap:9px;align-items:start;padding:9px;border:1px solid transparent;border-radius:10px;cursor:pointer}.run-toggle:hover{background:var(--panel);border-color:var(--line)}.run-toggle input{margin-top:3px;accent-color:var(--accent)}.dot{width:9px;height:9px;border-radius:50%;margin-top:4px;box-shadow:0 0 14px currentColor}.run-name{font-size:12px;font-weight:650;overflow-wrap:anywhere}.run-meta{display:block;color:var(--muted);font-size:10px;margin-top:3px}.main{min-width:0;padding:26px 28px 60px}.top{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:20px}.eyebrow{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent);font-weight:750}.top h1{font-size:clamp(25px,3vw,42px);letter-spacing:-.04em;margin:5px 0 7px}.stats{display:flex;gap:8px;flex-wrap:wrap}.pill{border:1px solid var(--line);background:rgba(16,21,33,.8);border-radius:999px;padding:7px 10px;color:var(--muted);font-size:12px}.pill strong{color:var(--text)}.axis-control{flex:none;border:1px solid var(--line);border-radius:11px;padding:4px;background:#090d16;display:flex}.axis-control label{cursor:pointer}.axis-control input{position:absolute;opacity:0;pointer-events:none}.axis-control span{display:block;padding:8px 11px;border-radius:7px;color:var(--muted);font-size:12px;font-weight:700}.axis-control input:checked+span{background:var(--panel2);color:var(--text);box-shadow:0 1px 5px #0008}.axis-hint{text-align:right;color:var(--muted);font-size:10px;margin-top:6px}.notice-wrap{display:grid;gap:7px;margin:16px 0}.notice{padding:10px 12px;border:1px solid #3d3940;background:#18161c;color:#c6b9c6;border-radius:10px;font-size:12px}.section-title{margin:30px 0 12px;font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,410px),1fr));gap:12px}.chart{background:linear-gradient(145deg,rgba(20,27,42,.92),rgba(12,17,27,.92));border:1px solid var(--line);border-radius:var(--radius);padding:15px;min-width:0}.chart-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:7px}.chart h2{font-size:14px;margin:0;letter-spacing:-.01em}.chart-unit{color:var(--muted);font-size:10px}.canvas-wrap{height:270px;position:relative}.chart canvas{display:block;width:100%;height:100%;touch-action:none}.tooltip{position:fixed;z-index:20;pointer-events:none;background:#070a11ec;border:1px solid #36435b;border-radius:8px;padding:7px 9px;box-shadow:0 12px 30px #000a;font-size:11px;line-height:1.45;display:none;max-width:270px}.empty{border:1px dashed var(--line);border-radius:var(--radius);padding:30px;color:var(--muted);text-align:center}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:var(--radius);background:var(--panel)}table{border-collapse:collapse;width:100%;font-size:12px;white-space:nowrap}th,td{text-align:right;padding:10px 12px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em}th:first-child,td:first-child{text-align:left}tbody tr:last-child td{border-bottom:0}.status{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:7px}.footer{color:var(--muted);font-size:11px;margin-top:26px}.mobile-runs{display:none}.skip details{color:var(--muted);font-size:12px}.skip summary{cursor:pointer}.skip code{color:var(--bad);white-space:normal;overflow-wrap:anywhere}@media(max-width:850px){.shell{grid-template-columns:1fr}.sidebar{display:none;position:fixed;z-index:30;width:min(88vw,320px);box-shadow:20px 0 70px #000;height:100vh}.sidebar.open{display:block}.main{padding:20px 14px 50px}.mobile-runs{display:inline-flex}.top{align-items:stretch;flex-direction:column}.axis-control{align-self:flex-start}.axis-hint{text-align:left}.canvas-wrap{height:240px}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
-.chart-head{align-items:center}.chart-tools{display:flex;align-items:center;gap:5px}.icon-button{border:1px solid transparent;background:transparent;color:var(--muted);border-radius:7px;padding:4px 7px;cursor:pointer;line-height:1}.icon-button:hover,.icon-button:focus-visible{border-color:var(--line);color:var(--text);outline:none}.chart canvas{cursor:crosshair}.chart canvas.dragging{cursor:grabbing}.chart.family-hidden{display:none}.family-control{display:flex;gap:5px;margin:12px 0;flex-wrap:wrap}.family-control button{border:1px solid var(--line);background:#090d16;color:var(--muted);border-radius:8px;padding:7px 11px;cursor:pointer;font-weight:700;font-size:12px}.family-control button.active{background:var(--panel2);color:var(--text);border-color:#49617f}.tooltip{z-index:60}.focus-dialog{width:min(96vw,1500px);height:min(94vh,980px);padding:0;border:1px solid #43516a;border-radius:16px;background:var(--panel);color:var(--text);box-shadow:0 30px 100px #000d}.focus-dialog::backdrop{background:#03050ae8;backdrop-filter:blur(4px)}.focus-shell{height:100%;display:flex;flex-direction:column;padding:16px}.focus-head{display:flex;justify-content:space-between;align-items:center;gap:12px}.focus-head h2{font-size:17px;margin:0}.focus-canvas{flex:1;min-height:0;margin-top:8px}.focus-canvas canvas{display:block;width:100%;height:100%;touch-action:none;cursor:crosshair}.interaction-hint{color:var(--muted);font-size:10px;margin-top:7px}@media(max-width:850px){.focus-dialog{width:100vw;height:100vh;max-width:none;max-height:none;border-radius:0}}
+.analysis-controls{display:flex;align-items:center;gap:10px 14px;flex-wrap:wrap;border:1px solid var(--line);background:rgba(9,13,22,.82);border-radius:12px;padding:10px 12px;margin:0 0 18px}.control-title{font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}.smoothing-control{border:1px solid var(--line);border-radius:9px;padding:3px;background:#070b13;display:flex;flex-wrap:wrap}.smoothing-control label{cursor:pointer}.smoothing-control input{position:absolute;opacity:0;pointer-events:none}.smoothing-control span{display:block;padding:6px 9px;border-radius:6px;color:var(--muted);font-size:11px;font-weight:700}.smoothing-control input:checked+span{background:var(--panel2);color:var(--text);box-shadow:0 1px 4px #0008}.smooth-level{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:11px;font-weight:700}.smooth-level input{width:76px;border:1px solid var(--line);border-radius:7px;background:#070b13;color:var(--text);padding:6px 7px;outline:none}.smooth-level input:focus{border-color:var(--accent)}.smooth-level input:disabled{opacity:.45}.smoothing-hint{flex:1 1 100%;color:var(--muted);font-size:10px;line-height:1.45}.chart-head{align-items:center}.chart-tools{display:flex;align-items:center;gap:5px}.icon-button{border:1px solid transparent;background:transparent;color:var(--muted);border-radius:7px;padding:4px 7px;cursor:pointer;line-height:1}.icon-button:hover,.icon-button:focus-visible{border-color:var(--line);color:var(--text);outline:none}.chart canvas{cursor:crosshair}.chart canvas.dragging{cursor:crosshair}.chart.family-hidden{display:none}.family-control{display:flex;gap:5px;margin:12px 0;flex-wrap:wrap}.family-control button{border:1px solid var(--line);background:#090d16;color:var(--muted);border-radius:8px;padding:7px 11px;cursor:pointer;font-weight:700;font-size:12px}.family-control button.active{background:var(--panel2);color:var(--text);border-color:#49617f}.tooltip{z-index:60}.focus-dialog{width:min(96vw,1500px);height:min(94vh,980px);padding:0;border:1px solid #43516a;border-radius:16px;background:var(--panel);color:var(--text);box-shadow:0 30px 100px #000d}.focus-dialog::backdrop{background:#03050ae8;backdrop-filter:blur(4px)}.focus-shell{height:100%;display:flex;flex-direction:column;padding:16px}.focus-head{display:flex;justify-content:space-between;align-items:center;gap:12px}.focus-head h2{font-size:17px;margin:0}.focus-canvas{flex:1;min-height:0;margin-top:8px}.focus-canvas canvas{display:block;width:100%;height:100%;touch-action:none;cursor:crosshair}.interaction-hint{color:var(--muted);font-size:10px;margin-top:7px}@media(max-width:850px){.focus-dialog{width:100vw;height:100vh;max-width:none;max-height:none;border-radius:0}.analysis-controls{align-items:flex-start}.smoothing-control{width:100%}.smoothing-control label{flex:1;text-align:center}}
 </style>
 </head>
 <body>
@@ -1566,13 +1600,29 @@ _HTML = r'''<!doctype html>
     <div><div class="eyebrow">Static performance dossier</div><h1>Training, at a glance.</h1><div class="stats" id="stats"></div></div>
     <div><button class="ghost mobile-runs" id="open-runs">Choose runs</button><div class="axis-control" role="radiogroup" aria-label="Time-series x-axis"><label><input type="radio" name="axis" value="flops" checked><span>equi-FLOP</span></label><label><input type="radio" name="axis" value="step"><span>equi-step</span></label></div><div class="axis-hint" id="axis-hint">Estimated cumulative FLOPs</div></div>
   </div>
+  <div class="analysis-controls" aria-label="Scientific chart controls">
+    <span class="control-title">Timeline x scale</span>
+    <div class="smoothing-control" id="x-scale-control" role="radiogroup" aria-label="Timeline x-axis scale">
+      <label><input type="radio" name="x-scale" value="log" checked><span>Log</span></label>
+      <label><input type="radio" name="x-scale" value="linear"><span>Linear</span></label>
+    </div>
+    <span class="control-title">Timeline smoothing</span>
+    <div class="smoothing-control" id="smoothing-control" role="radiogroup" aria-label="Smoothing method">
+      <label><input type="radio" name="smoothing" value="raw" checked><span>Raw</span></label>
+      <label><input type="radio" name="smoothing" value="ema"><span>EMA</span></label>
+      <label><input type="radio" name="smoothing" value="mean"><span>Centered mean</span></label>
+      <label><input type="radio" name="smoothing" value="median"><span>Centered median</span></label>
+    </div>
+    <label class="smooth-level" for="smoothing-level"><span id="smoothing-level-label">Span</span><input id="smoothing-level" type="number" min="1" max="1400" step="1" value="21" inputmode="numeric" disabled><span>samples</span></label>
+    <div class="smoothing-hint" id="smoothing-hint" aria-live="polite"></div>
+  </div>
   <div class="notice-wrap" id="notices"></div>
   <div class="section-title">Run summary</div><div id="summary"></div>
   <div class="section-title">Training timeline</div><div class="charts" id="time-charts"></div>
   <div class="section-title">Overall diagnostics timeline</div>
   <div class="family-control" id="family-control" role="group" aria-label="Diagnostic family"></div>
   <div class="charts" id="diagnostic-charts"></div>
-  <div class="section-title">Final diagnostic snapshot · x = model scope / logical layer</div><div class="charts" id="layer-charts"></div>
+  <div class="section-title">Final diagnostic snapshot · categorical model scope / logical layer remains linear</div><div class="charts" id="layer-charts"></div>
   <div class="skip" id="skipped"></div>
   <div class="footer" id="footer"></div>
 </main>
@@ -1581,7 +1631,7 @@ _HTML = r'''<!doctype html>
 <dialog class="focus-dialog" id="focus-dialog" aria-labelledby="focus-title">
   <div class="focus-shell">
     <div class="focus-head"><h2 id="focus-title"></h2><div><button class="ghost" id="focus-reset">Reset view</button> <button class="ghost" id="focus-close">Close</button></div></div>
-    <div class="interaction-hint">Wheel to zoom · drag to pan · double-click to reset · Esc to close</div>
+    <div class="interaction-hint">Drag a rectangle to zoom both axes · double-click to reset · wheel does not zoom · Esc to close</div>
     <div class="focus-canvas"><canvas id="focus-canvas"></canvas></div>
   </div>
 </dialog>
@@ -1590,15 +1640,24 @@ _HTML = r'''<!doctype html>
 (()=>{'use strict';
 const D=JSON.parse(document.getElementById('report-data').textContent), runMap=new Map(D.runs.map(r=>[r.id,r]));
 const visible=new Set(D.runs.filter(r=>r.selected).map(r=>r.id)), families=['grad','update','param'];
-let axis='flops', family='grad', charts=[], frame=0, focusItem=null;
+const smoothCache=new WeakMap();
+let axis='flops', xScale='log', family='grad', smoothing='raw', charts=[], frame=0, focusItem=null;
 const $=id=>document.getElementById(id), esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt=(n,d=3)=>{if(n==null||!Number.isFinite(+n))return '—';n=+n;const a=Math.abs(n);if(a>=1e18)return (n/1e18).toFixed(2)+' EF';if(a>=1e15)return (n/1e15).toFixed(2)+' PF';if(a>=1e12)return (n/1e12).toFixed(2)+' T';if(a>=1e9)return (n/1e9).toFixed(2)+' B';if(a>=1e6)return (n/1e6).toFixed(2)+' M';if(a>=1e3)return (n/1e3).toFixed(2)+' k';if(a>0&&a<.001)return n.toExponential(2);const f=n.toFixed(d);return d?f.replace(/(\.\d*?[1-9])0+$|\.0+$/,'$1'):f};
+function effectiveSpan(normalize=false){const input=$('smoothing-level'),maximum=D.meta.maxChartPoints;let span=Math.round(Number(input.value));if(!Number.isFinite(span))span=21;span=Math.max(1,Math.min(maximum,span));if((smoothing==='mean'||smoothing==='median')&&span%2===0)span=span===maximum?Math.max(1,span-1):span+1;if(normalize)input.value=String(span);return span}
+function smoothingName(){const span=effectiveSpan();return smoothing==='ema'?`EMA (span ${span})`:smoothing==='mean'?`centered mean (${span})`:smoothing==='median'?`centered median (${span})`:'raw'}
+function updateSmoothingControls(normalize=false){const input=$('smoothing-level'),span=effectiveSpan(normalize);input.disabled=smoothing==='raw';$('smoothing-level-label').textContent=smoothing==='ema'?'Span':smoothing==='raw'?'Span':'Window';let detail;if(smoothing==='raw')detail='Exact recorded samples; no display smoothing.';else if(smoothing==='ema'){const alpha=2/(span+1);detail=`Causal EMA initialized at the first point; span ${span} gives α = 2/(span + 1) = ${alpha.toPrecision(4)}.`}else if(smoothing==='mean')detail=`Centered ${span}-sample arithmetic mean, with truncated endpoint windows; this avoids EMA phase lag but blurs peaks and is sensitive to outliers.`;else detail=`Centered ${span}-sample median, with truncated endpoint windows; this rejects isolated spikes and preserves step edges, but is not an amplitude average.`;$('smoothing-hint').textContent=detail+' Smoothing is display-only: a faint raw trace remains underneath and tooltips retain the raw sample. The learning-rate schedule and layer snapshots stay raw. Timeline x axes default to logarithmic; non-positive samples are hidden until Linear is selected. Categorical layer-snapshot axes remain linear. Span/window counts embedded plot samples. Drag a rectangle to zoom both axes; double-click or ↺ resets; the wheel never changes chart axes.'}
+function updateAxisHint(){$('axis-hint').textContent=(axis==='flops'?'Estimated cumulative FLOPs':'Optimizer step')+(xScale==='log'?' · logarithmic':' · linear')}
 function init(){
- $('stats').innerHTML=`<span class="pill"><strong>${D.meta.included}</strong> included</span><span class="pill"><strong>${D.meta.skipped}</strong> excluded</span><span class="pill">baseline report admission qualification · val ≤ <strong>${fmt(D.meta.admissionQualificationLoss,4)}</strong></span><span class="pill">default <strong>equi-FLOP</strong></span>`;
+ $('smoothing-level').max=String(D.meta.maxChartPoints);
+ $('stats').innerHTML=`<span class="pill"><strong>${D.meta.included}</strong> included</span><span class="pill"><strong>${D.meta.skipped}</strong> excluded</span><span class="pill">official admission qualification · val ≤ <strong>${fmt(D.meta.admissionQualificationLoss,4)}</strong></span>${D.meta.includeDev?'<span class="pill"><strong>development diagnostics included</strong></span>':''}<span class="pill">default <strong>equi-FLOP · log x</strong></span>`;
  $('notices').innerHTML=D.notices.map(n=>`<div class="notice">${esc(n)}</div>`).join('');
- buildRuns(); buildSummary(); buildCharts(); buildSkipped();
+ buildRuns(); buildSummary(); buildCharts(); buildSkipped(); updateSmoothingControls(true); updateAxisHint();
  $('footer').textContent=`Generated ${new Date(D.meta.generatedAt).toLocaleString()} · portable HTML · no network or external JavaScript`;
- document.querySelectorAll('input[name=axis]').forEach(r=>r.addEventListener('change',()=>{axis=r.value;resetViews();$('axis-hint').textContent=axis==='flops'?'Estimated cumulative FLOPs':'Optimizer step';schedule()}));
+ document.querySelectorAll('input[name=axis]').forEach(r=>r.addEventListener('change',()=>{if(!r.checked)return;axis=r.value;resetViews();updateAxisHint();schedule()}));
+ document.querySelectorAll('input[name=x-scale]').forEach(r=>r.addEventListener('change',()=>{if(!r.checked)return;xScale=r.value;resetViews();updateAxisHint();schedule()}));
+ document.querySelectorAll('input[name=smoothing]').forEach(r=>r.addEventListener('change',()=>{if(!r.checked)return;smoothing=r.value;updateSmoothingControls(true);schedule()}));
+ $('smoothing-level').oninput=()=>{updateSmoothingControls();schedule()}; $('smoothing-level').onchange=()=>{updateSmoothingControls(true);schedule()};
  $('all-runs').onclick=()=>{D.runs.forEach(r=>visible.add(r.id));syncChecks();resetViews();schedule()}; $('no-runs').onclick=()=>{visible.clear();syncChecks();resetViews();schedule()};
  $('run-search').oninput=e=>{const q=e.target.value.toLowerCase();document.querySelectorAll('.run-toggle').forEach(x=>x.hidden=!x.dataset.search.includes(q))};
  $('open-runs').onclick=()=>{$('sidebar').classList.add('open')}; $('close-runs').onclick=()=>{$('sidebar').classList.remove('open')};
@@ -1609,25 +1668,45 @@ function init(){
 }
 function buildRuns(){$('run-list').innerHTML=D.runs.map(r=>`<label class="run-toggle" data-search="${esc((r.label+' '+r.id+' '+r.classification).toLowerCase())}"><input type="checkbox" data-run="${esc(r.id)}" ${r.selected?'checked':''}><span class="dot" style="color:${r.color};background:${r.color}"></span><span class="run-name">${esc(r.label)}<small class="run-meta">${esc(r.classification)} · step ${fmt(r.finalStep,0)} · val ${fmt(r.validationLoss,4)}${r.ledger?' · ledger ✓':' · unledgered'}</small></span></label>`).join('')||'<p class="subtle">No plot-able runs found.</p>';document.querySelectorAll('[data-run]').forEach(x=>x.onchange=()=>{x.checked?visible.add(x.dataset.run):visible.delete(x.dataset.run);resetViews();schedule()})}
 function syncChecks(){document.querySelectorAll('[data-run]').forEach(x=>x.checked=visible.has(x.dataset.run))}
-function buildSummary(){if(!D.runs.length){$('summary').innerHTML=`<div class="empty">No complete official run met the baseline report admission qualification (validation loss ≤ ${fmt(D.meta.admissionQualificationLoss,4)}).</div>`;return}$('summary').innerHTML=`<div class="table-wrap"><table><thead><tr><th>Run</th><th>Class</th><th>Steps</th><th>Tokens</th><th>Train s</th><th>Train loss</th><th>Val loss</th><th>Fresh10</th><th>FLOP x</th><th>Final scopes</th></tr></thead><tbody>${D.runs.map(r=>`<tr><td><span class="status" style="background:${r.color}"></span>${esc(r.label)}</td><td>${esc(r.classification)}</td><td>${fmt(r.finalStep,0)}</td><td>${fmt(r.tokens,0)}</td><td>${fmt(r.trainSeconds,2)}</td><td>${fmt(r.trainLoss,4)}</td><td>${fmt(r.validationLoss,4)}</td><td>${fmt(r.fresh10Loss,4)}</td><td title="${esc(r.flopSource)}">${r.flopSource.startsWith('derived:')?'derived':'logged'}</td><td>${r.hasLayerStats?'yes':'—'}</td></tr>`).join('')}</tbody></table></div>`}
+function buildSummary(){if(!D.runs.length){$('summary').innerHTML='<div class="empty">No eligible run passed the report completeness, profile, and qualification checks.</div>';return}$('summary').innerHTML=`<div class="table-wrap"><table><thead><tr><th>Run</th><th>Class</th><th>Steps</th><th>Tokens</th><th>Train s</th><th>Train loss</th><th>Val loss</th><th>Fresh10</th><th>FLOP x</th><th>Final scopes</th></tr></thead><tbody>${D.runs.map(r=>`<tr><td><span class="status" style="background:${r.color}"></span>${esc(r.label)}</td><td>${esc(r.classification)}</td><td>${fmt(r.finalStep,0)}</td><td>${fmt(r.tokens,0)}</td><td>${fmt(r.trainSeconds,2)}</td><td>${fmt(r.trainLoss,4)}</td><td>${fmt(r.validationLoss,4)}</td><td>${fmt(r.fresh10Loss,4)}</td><td title="${esc(r.flopSource)}">${r.flopSource.startsWith('derived:')?'derived':'logged'}</td><td>${r.hasLayerStats?'yes':'—'}</td></tr>`).join('')}</tbody></table></div>`}
 function buildCharts(){charts=[];makeGroup($('time-charts'),D.timeCharts,'time');makeGroup($('diagnostic-charts'),D.diagnosticCharts,'time');makeGroup($('layer-charts'),D.layerCharts,'layer');buildFamilies();if(!D.diagnosticCharts.length)$('diagnostic-charts').innerHTML='<div class="empty">No included run recorded overall diagnostics.</div>';if(!D.layerCharts.length)$('layer-charts').innerHTML='<div class="empty">No included run recorded final model-scope diagnostics or retained compatible layer arrays.</div>'}
 function makeGroup(root,data,type){root.innerHTML=data.map(c=>`<article class="chart" data-family="${esc(c.family||'')}"><div class="chart-head"><h2>${esc(c.title)}</h2><div class="chart-tools"><span class="chart-unit">${esc(c.yLabel)}</span><button class="icon-button reset-chart" title="Reset view" aria-label="Reset ${esc(c.title)} view">↺</button><button class="icon-button expand-chart" title="Open full panel" aria-label="Enlarge ${esc(c.title)}">⛶</button></div></div><div class="canvas-wrap"><canvas aria-label="${esc(c.title)}"></canvas></div></article>`).join('');[...root.querySelectorAll('.chart')].forEach((article,i)=>{const item={canvas:article.querySelector('canvas'),article,data:data[i],type,view:null,drag:null};article.querySelector('.reset-chart').onclick=()=>{item.view=null;redraw(item)};article.querySelector('.expand-chart').onclick=()=>openFocus(item);attachCanvas(item);charts.push(item)})}
 function buildFamilies(){const available=new Set([...D.diagnosticCharts,...D.layerCharts].map(c=>c.family));family=families.find(x=>available.has(x))||'grad';$('family-control').innerHTML=families.map(x=>`<button data-family-button="${x}" aria-pressed="false" ${available.has(x)?'':'disabled'}>${x==='param'?'Parameter':x[0].toUpperCase()+x.slice(1)}</button>`).join('');document.querySelectorAll('[data-family-button]').forEach(b=>b.onclick=()=>{family=b.dataset.familyButton;applyFamily()});applyFamily()}
 function applyFamily(){document.querySelectorAll('[data-family-button]').forEach(b=>{const active=b.dataset.familyButton===family;b.classList.toggle('active',active);b.setAttribute('aria-pressed',String(active))});charts.forEach(item=>{if(item.data.family)item.article.classList.toggle('family-hidden',item.data.family!==family)});setFamilyEmpty($('diagnostic-charts'),D.diagnosticCharts,'No overall '+family+' diagnostics were recorded.');setFamilyEmpty($('layer-charts'),D.layerCharts,'No final model-scope '+family+' diagnostics were recorded.');schedule()}
 function setFamilyEmpty(root,data,message){let empty=root.querySelector('.family-empty');const missing=!data.some(c=>c.family===family);if(missing&&!empty){empty=document.createElement('div');empty.className='empty family-empty';root.appendChild(empty)}if(empty){empty.textContent=message;empty.hidden=!missing}}
-function buildSkipped(){if(!D.skipped.length)return;$('skipped').innerHTML=`<div class="section-title">Excluded by official profile / completeness / baseline report admission qualification / integrity scan</div>${D.skipped.map(x=>`<details><summary>${esc(x.run)}</summary><code>${esc(x.reason)}</code></details>`).join('')}`}
+function buildSkipped(){if(!D.skipped.length)return;$('skipped').innerHTML=`<div class="section-title">Excluded by profile / completeness / official admission qualification / integrity scan</div>${D.skipped.map(x=>`<details><summary>${esc(x.run)}</summary><code>${esc(x.reason)}</code></details>`).join('')}`}
 function schedule(){cancelAnimationFrame(frame);frame=requestAnimationFrame(()=>{charts.forEach(item=>{if(!item.article.classList.contains('family-hidden'))draw(item)});if(focusItem&&$('focus-dialog').open)draw(focusItem)})}
 function redraw(item){cancelAnimationFrame(item._frame||0);item._frame=requestAnimationFrame(()=>draw(item))}
 function resetViews(){charts.forEach(item=>item.view=null);if(focusItem)focusItem.view=null}
 function xOf(item,p){return item.type==='layer'?p[0]:p[axis==='flops'?1:0]}function yOf(item,p){return item.type==='layer'?p[1]:p[2]}
-function dataBounds(item){let x0=Infinity,x1=-Infinity,y0=Infinity,y1=-Infinity,count=0;for(const s of item.data.series){if(!visible.has(s.run))continue;for(const p of s.points){const x=xOf(item,p),y=yOf(item,p);if(Number.isFinite(x)&&Number.isFinite(y)){x0=Math.min(x0,x);x1=Math.max(x1,x);y0=Math.min(y0,y);y1=Math.max(y1,y);count++}}}if(!count)return null;if(x0===x1){x0-=.5;x1+=.5}if(y0===y1){const q=Math.abs(y0)*.05||.5;y0-=q;y1+=q}else{const q=(y1-y0)*.08;y0-=q;y1+=q}return{x0,x1,y0,y1}}
+function chartXScale(item){return item.type==='layer'?'linear':xScale}
+function validX(item,x){return Number.isFinite(x)&&(chartXScale(item)==='linear'||x>0)}
+function transformX(item,x){return chartXScale(item)==='log'?Math.log10(x):x}
+function untransformX(item,x){return chartXScale(item)==='log'?10**x:x}
+function dataBounds(item){let x0=Infinity,x1=-Infinity,y0=Infinity,y1=-Infinity,count=0;for(const s of item.data.series){if(!visible.has(s.run))continue;for(const p of s.points){const x=xOf(item,p),y=yOf(item,p);if(validX(item,x)&&Number.isFinite(y)){x0=Math.min(x0,x);x1=Math.max(x1,x);y0=Math.min(y0,y);y1=Math.max(y1,y);count++}}}if(!count)return null;if(x0===x1){if(chartXScale(item)==='log'){const q=Math.sqrt(10);x0/=q;x1*=q}else{x0-=.5;x1+=.5}}if(y0===y1){const q=Math.abs(y0)*.05||.5;y0-=q;y1+=q}else{const q=(y1-y0)*.08;y0-=q;y1+=q}return{x0,x1,y0,y1}}
 function bounds(item){const base=dataBounds(item);return base?(item.view||base):null}
-function draw(item){const c=item.canvas,rect=c.getBoundingClientRect(),dpr=Math.min(devicePixelRatio||1,2),w=Math.max(1,rect.width),h=Math.max(1,rect.height);if(c.width!==Math.round(w*dpr)||c.height!==Math.round(h*dpr)){c.width=Math.round(w*dpr);c.height=Math.round(h*dpr)}const g=c.getContext('2d');g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,w,h);const m={l:54,r:14,t:12,b:31},b=bounds(item);if(!b){g.fillStyle='#91a0b8';g.font='12px system-ui';g.textAlign='center';g.fillText('No selected run has this metric',w/2,h/2);item._plot=null;return}const X=x=>m.l+(x-b.x0)/(b.x1-b.x0)*(w-m.l-m.r),Y=y=>m.t+(b.y1-y)/(b.y1-b.y0)*(h-m.t-m.b);g.strokeStyle='#253047';g.lineWidth=1;g.fillStyle='#7e8da6';g.font='10px ui-monospace,monospace';for(let i=0;i<=4;i++){const y=m.t+(h-m.t-m.b)*i/4,v=b.y1-(b.y1-b.y0)*i/4;g.beginPath();g.moveTo(m.l,y);g.lineTo(w-m.r,y);g.stroke();g.textAlign='right';g.fillText(fmt(v,3),m.l-7,y+3)}for(let i=0;i<=4;i++){const x=m.l+(w-m.l-m.r)*i/4,v=b.x0+(b.x1-b.x0)*i/4;g.textAlign=i===0?'left':i===4?'right':'center';g.fillText(fmt(v,item.type==='layer'?0:2),x,h-9)}g.save();g.beginPath();g.rect(m.l,m.t,w-m.l-m.r,h-m.t-m.b);g.clip();for(const s of item.data.series){if(!visible.has(s.run))continue;const r=runMap.get(s.run);g.strokeStyle=r.color;g.fillStyle=r.color;g.lineWidth=1.7;g.globalAlpha=.9;g.beginPath();let n=0;for(const p of s.points){const x=xOf(item,p),y=yOf(item,p);if(!Number.isFinite(x)||!Number.isFinite(y))continue;n?g.lineTo(X(x),Y(y)):g.moveTo(X(x),Y(y));n++}g.stroke();if(n<=20)for(const p of s.points){const x=xOf(item,p),y=yOf(item,p);g.beginPath();g.arc(X(x),Y(y),2.3,0,Math.PI*2);g.fill()}}g.restore();g.globalAlpha=1;item._plot={b,m,w,h,X,Y}}
-function attachCanvas(item){const c=item.canvas;c.onwheel=e=>zoom(e,item);c.ondblclick=()=>{item.view=null;redraw(item)};c.onpointerdown=e=>{if(e.button!==0||!item._plot)return;item.drag={x:e.clientX,y:e.clientY,b:{...item._plot.b}};c.setPointerCapture(e.pointerId);c.classList.add('dragging');hideTip()};c.onpointermove=e=>{if(item.drag){pan(e,item);return}tip(e,item)};c.onpointerup=c.onpointercancel=e=>{item.drag=null;c.classList.remove('dragging');if(c.hasPointerCapture(e.pointerId))c.releasePointerCapture(e.pointerId)};c.onpointerleave=()=>{if(!item.drag)hideTip()}}
-function zoom(e,item){if(!item._plot)return;e.preventDefault();const p=item._plot,base=dataBounds(item);if(!base)return;const rect=item.canvas.getBoundingClientRect(),fx=Math.max(0,Math.min(1,(e.clientX-rect.left-p.m.l)/(p.w-p.m.l-p.m.r))),fy=Math.max(0,Math.min(1,(e.clientY-rect.top-p.m.t)/(p.h-p.m.t-p.m.b))),factor=Math.exp(Math.max(-1,Math.min(1,e.deltaY*.0015))),bx=base.x1-base.x0,by=base.y1-base.y0,sx=Math.max(bx*1e-9,Math.min(bx*100,(p.b.x1-p.b.x0)*factor)),sy=Math.max(by*1e-9,Math.min(by*100,(p.b.y1-p.b.y0)*factor)),cx=p.b.x0+(p.b.x1-p.b.x0)*fx,cy=p.b.y1-(p.b.y1-p.b.y0)*fy;item.view={x0:cx-sx*fx,x1:cx+sx*(1-fx),y0:cy-sy*(1-fy),y1:cy+sy*fy};redraw(item)}
-function pan(e,item){const d=item.drag,p=item._plot,dx=e.clientX-d.x,dy=e.clientY-d.y,sx=-dx/(p.w-p.m.l-p.m.r)*(d.b.x1-d.b.x0),sy=dy/(p.h-p.m.t-p.m.b)*(d.b.y1-d.b.y0);item.view={x0:d.b.x0+sx,x1:d.b.x1+sx,y0:d.b.y0+sy,y1:d.b.y1+sy};redraw(item)}
-function nearest(series,item,target){let lo=0,hi=series.length;while(lo<hi){const mid=(lo+hi)>>1;if(xOf(item,series[mid])<target)lo=mid+1;else hi=mid}let best=null;for(const i of [lo-1,lo])if(i>=0&&i<series.length){const p=series[i],dist=Math.abs(xOf(item,p)-target);if(!best||dist<best.dist)best={p,dist}}return best}
-function tip(e,item){if(!item._plot)return;const rect=item.canvas.getBoundingClientRect(),px=e.clientX-rect.left,py=e.clientY-rect.top,target=item._plot.b.x0+(px-item._plot.m.l)/(item._plot.w-item._plot.m.l-item._plot.m.r)*(item._plot.b.x1-item._plot.b.x0);let best=null;for(const s of item.data.series){if(!visible.has(s.run))continue;const found=nearest(s.points,item,target);if(!found)continue;const x=xOf(item,found.p),y=yOf(item,found.p),dx=item._plot.X(x)-px,dy=item._plot.Y(y)-py,dist=Math.hypot(dx,dy);if(!best||dist<best.dist)best={dist,p:found.p,x,y,run:runMap.get(s.run)}}if(!best||best.dist>42){hideTip();return}const xname=item.type==='layer'?(best.p[2]||'model scope'):axis==='flops'?'estimated FLOPs':'step',xline=item.type==='layer'?esc(xname):esc(xname)+': '+fmt(best.x,axis==='step'?0:2),t=$('tooltip');t.innerHTML=`<b style="color:${best.run.color}">${esc(best.run.label)}</b><br>${xline}<br>${esc(item.data.title)}: ${fmt(best.y,5)}`;t.style.display='block';t.style.left=Math.max(4,Math.min(innerWidth-285,e.clientX+13))+'px';t.style.top=Math.max(4,Math.min(innerHeight-90,e.clientY+13))+'px'}
+function smoothingApplies(item){return smoothing!=='raw'&&effectiveSpan()>1&&item.type==='time'&&item.data.key!=='learning_rate'}
+function displayPoints(item,series){const source=series.points;if(!smoothingApplies(item)||source.length<2)return source;const span=effectiveSpan(),key=smoothing+':'+span;let cache=smoothCache.get(series);if(!cache){cache=new Map();smoothCache.set(series,cache)}if(cache.has(key))return cache.get(key);let result;if(smoothing==='ema'){const alpha=2/(span+1);let value=source[0][2];result=source.map((point,index)=>{if(index)value=alpha*point[2]+(1-alpha)*value;return[point[0],point[1],value]})}else{const half=(span-1)>>1;if(smoothing==='mean'){const prefix=[0];for(const point of source)prefix.push(prefix[prefix.length-1]+point[2]);result=source.map((point,index)=>{const lo=Math.max(0,index-half),hi=Math.min(source.length-1,index+half);return[point[0],point[1],(prefix[hi+1]-prefix[lo])/(hi-lo+1)]})}else result=source.map((point,index)=>{const lo=Math.max(0,index-half),hi=Math.min(source.length-1,index+half),values=[];for(let i=lo;i<=hi;i++)values.push(source[i][2]);values.sort((a,b)=>a-b);const middle=values.length>>1,value=values.length%2?values[middle]:(values[middle-1]+values[middle])/2;return[point[0],point[1],value]})}cache.set(key,result);return result}
+function draw(item){
+ const c=item.canvas,rect=c.getBoundingClientRect(),dpr=Math.min(devicePixelRatio||1,2),w=Math.max(1,rect.width),h=Math.max(1,rect.height);
+ if(c.width!==Math.round(w*dpr)||c.height!==Math.round(h*dpr)){c.width=Math.round(w*dpr);c.height=Math.round(h*dpr)}
+ const g=c.getContext('2d');g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,w,h);const m={l:54,r:14,t:12,b:31},b=bounds(item);
+ if(!b){g.fillStyle='#91a0b8';g.font='12px system-ui';g.textAlign='center';g.fillText('No selected run has this metric',w/2,h/2);item._plot=null;return}
+ const tx0=transformX(item,b.x0),tx1=transformX(item,b.x1),X=x=>m.l+(transformX(item,x)-tx0)/(tx1-tx0)*(w-m.l-m.r),Y=y=>m.t+(b.y1-y)/(b.y1-b.y0)*(h-m.t-m.b),IX=x=>untransformX(item,tx0+(x-m.l)/(w-m.l-m.r)*(tx1-tx0)),IY=y=>b.y1-(y-m.t)/(h-m.t-m.b)*(b.y1-b.y0);
+ g.strokeStyle='#253047';g.lineWidth=1;g.fillStyle='#7e8da6';g.font='10px ui-monospace,monospace';
+ for(let i=0;i<=4;i++){const y=m.t+(h-m.t-m.b)*i/4,v=b.y1-(b.y1-b.y0)*i/4;g.beginPath();g.moveTo(m.l,y);g.lineTo(w-m.r,y);g.stroke();g.textAlign='right';g.fillText(fmt(v,3),m.l-7,y+3)}
+ for(let i=0;i<=4;i++){const x=m.l+(w-m.l-m.r)*i/4,v=untransformX(item,tx0+(tx1-tx0)*i/4);g.textAlign=i===0?'left':i===4?'right':'center';g.fillText(fmt(v,item.type==='layer'?0:2),x,h-9)}
+ g.save();g.beginPath();g.rect(m.l,m.t,w-m.l-m.r,h-m.t-m.b);g.clip();
+ for(const s of item.data.series){if(!visible.has(s.run))continue;const r=runMap.get(s.run),shown=displayPoints(item,s),smoothed=shown!==s.points;const stroke=(points,alpha,width)=>{g.strokeStyle=r.color;g.lineWidth=width;g.globalAlpha=alpha;g.beginPath();let count=0;for(const point of points){const x=xOf(item,point),y=yOf(item,point);if(!validX(item,x)||!Number.isFinite(y))continue;count?g.lineTo(X(x),Y(y)):g.moveTo(X(x),Y(y));count++}g.stroke();return count};if(smoothed)stroke(s.points,.22,1);const count=stroke(shown,.92,smoothed?2.2:1.7);if(count<=20){g.fillStyle=r.color;for(const point of shown){const x=xOf(item,point),y=yOf(item,point);if(!validX(item,x)||!Number.isFinite(y))continue;g.beginPath();g.arc(X(x),Y(y),2.3,0,Math.PI*2);g.fill()}}}
+ g.restore();g.globalAlpha=1;item._plot={b,m,w,h,X,Y,IX,IY};
+ if(item.drag){const d=item.drag,left=Math.min(d.x0,d.x1),top=Math.min(d.y0,d.y1),width=Math.abs(d.x1-d.x0),height=Math.abs(d.y1-d.y0);g.save();g.fillStyle='rgba(125,211,252,.13)';g.strokeStyle='#7dd3fc';g.lineWidth=1.25;g.setLineDash([5,3]);g.fillRect(left,top,width,height);g.strokeRect(left+.5,top+.5,Math.max(0,width-1),Math.max(0,height-1));g.restore()}
+}
+function eventPoint(e,item,clampToPlot=false){const p=item._plot,rect=item.canvas.getBoundingClientRect();let x=e.clientX-rect.left,y=e.clientY-rect.top;if(clampToPlot){x=Math.max(p.m.l,Math.min(p.w-p.m.r,x));y=Math.max(p.m.t,Math.min(p.h-p.m.b,y))}return{x,y}}
+function attachCanvas(item){const c=item.canvas;c.ondblclick=()=>{item.view=null;redraw(item)};c.onpointerdown=e=>{if(e.button!==0||!item._plot)return;const q=eventPoint(e,item);if(q.x<item._plot.m.l||q.x>item._plot.w-item._plot.m.r||q.y<item._plot.m.t||q.y>item._plot.h-item._plot.m.b)return;e.preventDefault();item.drag={x0:q.x,y0:q.y,x1:q.x,y1:q.y};c.setPointerCapture(e.pointerId);c.classList.add('dragging');hideTip()};c.onpointermove=e=>{if(item.drag){const q=eventPoint(e,item,true);item.drag.x1=q.x;item.drag.y1=q.y;redraw(item);return}tip(e,item)};c.onpointerup=e=>finishBox(e,item);c.onpointercancel=e=>cancelBox(e,item);c.onpointerleave=()=>{if(!item.drag)hideTip()}}
+function finishBox(e,item){const c=item.canvas,d=item.drag;if(!d)return;const q=eventPoint(e,item,true);d.x1=q.x;d.y1=q.y;item.drag=null;c.classList.remove('dragging');if(c.hasPointerCapture(e.pointerId))c.releasePointerCapture(e.pointerId);if(Math.abs(d.x1-d.x0)>=8&&Math.abs(d.y1-d.y0)>=8&&item._plot){const p=item._plot,left=Math.min(d.x0,d.x1),right=Math.max(d.x0,d.x1),top=Math.min(d.y0,d.y1),bottom=Math.max(d.y0,d.y1),xa=p.IX(left),xb=p.IX(right),ya=p.IY(top),yb=p.IY(bottom);item.view={x0:Math.min(xa,xb),x1:Math.max(xa,xb),y0:Math.min(ya,yb),y1:Math.max(ya,yb)}}redraw(item)}
+function cancelBox(e,item){const c=item.canvas;item.drag=null;c.classList.remove('dragging');if(c.hasPointerCapture(e.pointerId))c.releasePointerCapture(e.pointerId);redraw(item)}
+function nearest(series,item,target){let lo=0,hi=series.length;while(lo<hi){const mid=(lo+hi)>>1;if(xOf(item,series[mid])<target)lo=mid+1;else hi=mid}let best=null;for(const index of [lo-1,lo])if(index>=0&&index<series.length){const point=series[index],x=xOf(item,point);if(!validX(item,x))continue;const dist=Math.abs(transformX(item,x)-transformX(item,target));if(!best||dist<best.dist)best={p:point,dist,index}}return best}
+function tip(e,item){if(!item._plot)return;const rect=item.canvas.getBoundingClientRect(),px=e.clientX-rect.left,py=e.clientY-rect.top,target=item._plot.IX(px);let best=null;for(const s of item.data.series){if(!visible.has(s.run))continue;const shown=displayPoints(item,s),found=nearest(shown,item,target);if(!found)continue;const x=xOf(item,found.p),y=yOf(item,found.p),dx=item._plot.X(x)-px,dy=item._plot.Y(y)-py,dist=Math.hypot(dx,dy),raw=s.points[found.index];if(!best||dist<best.dist)best={dist,p:found.p,x,y,rawY:raw?yOf(item,raw):null,smoothed:shown!==s.points,run:runMap.get(s.run)}}if(!best||best.dist>42){hideTip();return}const xname=item.type==='layer'?(best.p[2]||'model scope'):axis==='flops'?'estimated FLOPs':'step',xline=item.type==='layer'?esc(xname):esc(xname)+': '+fmt(best.x,axis==='step'?0:2),valueLine=best.smoothed?`${esc(item.data.title)} · ${esc(smoothingName())}: ${fmt(best.y,5)}<br>Raw sample: ${fmt(best.rawY,5)}`:`${esc(item.data.title)}: ${fmt(best.y,5)}`,t=$('tooltip');t.innerHTML=`<b style="color:${best.run.color}">${esc(best.run.label)}</b><br>${xline}<br>${valueLine}`;t.style.display='block';t.style.left=Math.max(4,Math.min(innerWidth-285,e.clientX+13))+'px';t.style.top=Math.max(4,Math.min(innerHeight-105,e.clientY+13))+'px'}
 function hideTip(){$('tooltip').style.display='none'}
 function openFocus(source){const dialog=$('focus-dialog'),title=(source.data.family?source.data.family.toUpperCase()+' · ':'')+source.data.title;$('focus-title').textContent=title;$('focus-canvas').setAttribute('aria-label',title);focusItem={canvas:$('focus-canvas'),data:source.data,type:source.type,view:source.view?{...source.view}:null,drag:null,source};attachCanvas(focusItem);dialog.showModal();requestAnimationFrame(()=>draw(focusItem))}
 function closeFocus(){const dialog=$('focus-dialog');if(dialog.open)dialog.close()}

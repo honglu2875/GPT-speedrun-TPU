@@ -12,7 +12,9 @@ family:
     base_depth: 12
     depth_alpha: 1.0
     init_std: 0.02
-    attention_scale: inverse_model_width
+    # Match the official nanoGPT-mup implementation: each head contracts over
+    # its own fixed 64-wide q/k coordinate, independent of the number of heads.
+    attention_scale: inverse_head_dim
     embeddings: untied
   tiers:
     60m:
@@ -141,7 +143,7 @@ profiles:
       val_every: 0
       val_probe_batches: 8
     logging:
-      diagnostics_every: 0
+      diagnostics_every: 10
       log_every: 10
 
   official:

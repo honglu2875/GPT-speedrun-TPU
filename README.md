@@ -35,7 +35,7 @@ make report
 | `make run` | verify every configured TPU VM and its data, then run the 125M reference tier using the saved profile |
 | `make baseline` | compatibility alias for `make run` |
 | `make run TARGET=name TIER=250m` | run one tier from the model family in `submissions/name/` |
-| `make sweep-lr` | run or resume the CSV-first 60M–500M Complete(d)P LR study |
+| `make sweep-lr` | run or resume the CSV-first 60M–250M Complete(d)P log-LR study |
 | `make profile` | run a distributed, validation-free 100-step diagnostic, capture worker 0 steps 11–20, then serve XProf on port 8791 |
 | `make report` | integrity-check completed runs and rebuild the standalone `report.html` dashboard |
 
@@ -203,11 +203,19 @@ uv run --frozen --no-sync speedrun run reference --profile dev -- \
 
 The first family study is `make sweep-lr`. It holds batch, schedule, weight
 decay, architecture rules, and 5 TPP fixed while sweeping only the normalized
-base learning rate for 60M, 125M, 250M, and 500M. It writes and atomically
-updates `runs/studies/complete_d_p_lr_v1/results.csv`; rerunning the command
-resumes pending points. No chart is rendered yet. See
+base learning rate for 60M, 125M, and 250M. Its seven points are the paper's
+logarithmic powers-of-two grid, `2^-10` through `2^-4`. It writes and atomically
+updates `runs/studies/complete_d_p_lr_v3/results.csv`; rerunning the command
+resumes pending points. See
 [the Complete(d)P contract](docs/COMPLETEP.md) and the
-[versioned suite](studies/complete_d_p_lr_v1/suite.yaml).
+[versioned suite](studies/complete_d_p_lr_v3/suite.yaml).
+
+After the admission-tier curve is established, `make sweep-lr-large` applies
+the transferred center LR and its two immediate log-space neighbors at 5 TPP
+to 500M and 1B using the published 8B corpus. Its resumable CSV is
+`runs/studies/complete_d_p_lr_large_v1/results.csv`. A queued campaign may run
+an exact point first with `speedrun.family_study run --only-point POINT`; the
+point keeps the suite hash and is reconciled by the subsequent full sweep.
 
 The harness creates a unique persistent run directory, captures stdout/stderr,
 validates the final result event and checkpoint, hashes artifacts, and appends a
@@ -311,6 +319,11 @@ partial, and runs that do not meet it are omitted with a reported reason. The
 baseline report admission qualification is intentionally not configurable and
 is distinct from the official competition qualification of 3.28.
 
+For local diagnosis only, `make report INCLUDE_DEV=1` also admits successful
+`dev`-profile runs and labels them as diagnostics. This opt-in does not admit
+`smoke` runs and does not relax the token-budget or loss checks applied to any
+official run.
+
 One global selector switches every time-series chart
 between **equi-FLOP** (the default, using analytic cumulative estimated FLOPs)
 and **equi-step**. Official reference runs record `diagnostics.csv` at step 1,
@@ -325,9 +338,14 @@ as a legacy fallback for runs that predate `diagnostics.csv`.
 
 Charts render into bounded, downsampled canvases only after an input or resize
 event—there is no animation loop or idle redraw. Hover inspects the nearest
-curve, the wheel zooms, pointer dragging pans, and reset/double-click restores
-the full extent. The expand button opens any chart in a temporary full-panel
-dialog; Escape closes it. All code and data remain inside the static HTML.
+curve. Pointer dragging draws a selection rectangle and rescales both axes to
+that rectangle; reset/double-click restores the full extent, and the wheel does
+not modify chart axes. Timeline traces can remain raw or use a configurable EMA,
+centered moving mean, or centered moving median. Smoothing is display-only: a
+faint raw trace remains visible and hover reports the raw sample as well as the
+smoothed value. Learning-rate schedules and layer snapshots remain raw. The
+expand button opens any chart in a temporary full-panel dialog; Escape closes
+it. All code and data remain inside the static HTML.
 
 ### Fresh-domain diagnostic
 

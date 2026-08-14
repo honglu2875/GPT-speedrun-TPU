@@ -6,9 +6,9 @@ RUNS_PATH ?= runs
 TARGET ?= reference
 TIER ?= 125m
 REPORT ?= report.html
-# Enough distinct train data for the largest 500m × 5-TPP LR-study point.
-# The preparation router selects the immutable 4B corpus for this budget.
-TRAIN_TOKENS ?= 2600000000
+INCLUDE_DEV ?= 0
+# The 8B prefix covers the 1B × 5-TPP learning-rate confirmation.
+TRAIN_TOKENS ?= 5000000000
 
 XPROF_VERSION ?= 2.22.3
 XPROF_PORT ?= 8791
@@ -18,15 +18,21 @@ PROFILE_ID ?= $(shell date -u +%Y%m%dT%H%M%SZ)
 PROFILE_ID := $(PROFILE_ID)
 PROFILE_OUTPUT ?= $(CURDIR)/profiles/$(PROFILE_ID)-$(TARGET)
 PROFILE_OUTPUT := $(PROFILE_OUTPUT)
-LR_SUITE ?= studies/complete_d_p_lr_v1/suite.yaml
-LR_RESULTS ?= runs/studies/complete_d_p_lr_v1/results.csv
+LR_SUITE ?= studies/complete_d_p_lr_v3/suite.yaml
+LR_RESULTS ?= runs/studies/complete_d_p_lr_v3/results.csv
+LR_LARGE_SUITE ?= studies/complete_d_p_lr_large_v1/suite.yaml
+LR_LARGE_RESULTS ?= runs/studies/complete_d_p_lr_large_v1/results.csv
+DEPTH_L16_SUITE ?= studies/complete_d_p_depth_l16_lr_v1/suite.yaml
+DEPTH_L16_RESULTS ?= runs/studies/complete_d_p_depth_l16_lr_v1/results.csv
+DEPTH_L24_SUITE ?= studies/complete_d_p_depth_l24_lr_v1/suite.yaml
+DEPTH_L24_RESULTS ?= runs/studies/complete_d_p_depth_l24_lr_v1/results.csv
 TARGET_DIR := $(CURDIR)/submissions/$(TARGET)
 TARGET_ENTRY := $(TARGET_DIR)/train.py
 
 UV_BASE = $(UV) --cache-dir "$(UV_CACHE_DIR)"
 UV_RUN = $(UV_BASE) run --frozen --no-sync
 
-.PHONY: help prepare require-prepare validate-target preflight run baseline profile sweep-lr sweep-lr-60m-extend sweep-lr-60m-refine sweep-lr-local-transfer report
+.PHONY: help prepare require-prepare validate-target preflight run baseline profile sweep-lr sweep-lr-large sweep-depth-lr report
 
 help:
 	@printf '%s\n' \
@@ -36,13 +42,12 @@ help:
 	  '  make baseline  compatibility alias for make run' \
 	  '  make run TARGET=name TIER=250m  run one tier from a model family' \
 	  '  make profile   run a distributed XProf diagnostic, then serve it on :8791' \
-	  '  make sweep-lr  run/resume the CSV-first 60m-500m 0.25-OT LR study' \
-	  '  make sweep-lr-60m-extend  bracket the 60m optimum above the first grid' \
-	  '  make sweep-lr-60m-refine  refine the bracket around the 60m optimum' \
-	  '  make sweep-lr-local-transfer  apply that local grid to 125m, 250m, 500m' \
+	  '  make sweep-lr  run/resume the CSV-first 60m-250m log-LR study' \
+	  '  make sweep-lr-large  run/resume the 500m-1b three-point LR confirmation' \
+	  '  make sweep-depth-lr  run/resume the L16 then L24 depth-ablation sweeps' \
 	  '  make report    rebuild report.html from integrity-checked run logs' \
 	  '' \
-	  'Useful overrides: TIER=125m TRAIN_TOKENS=2600000000 TARGET=reference PROFILE_OUTPUT=... REPORT=report.html' \
+	  'Useful overrides: TIER=125m TRAIN_TOKENS=5000000000 TARGET=reference PROFILE_OUTPUT=... REPORT=report.html' \
 	  'TRAIN_TOKENS selects the immutable corpus prefix used by non-smoke runs.'
 
 # This is intentionally interactive: the wizard owns personal paths and defaults.
@@ -98,17 +103,23 @@ sweep-lr: validate-target preflight
 	  --results "$(LR_RESULTS)" \
 	  --color always
 
-sweep-lr-60m-extend: LR_SUITE := studies/complete_d_p_lr_60m_extension_v1/suite.yaml
-sweep-lr-60m-extend: LR_RESULTS := runs/studies/complete_d_p_lr_60m_extension_v1/results.csv
-sweep-lr-60m-extend: sweep-lr
+sweep-lr-large: validate-target preflight
+	$(UV_RUN) python -m speedrun.family_study run \
+	  --suite "$(LR_LARGE_SUITE)" \
+	  --results "$(LR_LARGE_RESULTS)" \
+	  --color always
 
-sweep-lr-60m-refine: LR_SUITE := studies/complete_d_p_lr_60m_refine_v1/suite.yaml
-sweep-lr-60m-refine: LR_RESULTS := runs/studies/complete_d_p_lr_60m_refine_v1/results.csv
-sweep-lr-60m-refine: sweep-lr
-
-sweep-lr-local-transfer: LR_SUITE := studies/complete_d_p_lr_local_transfer_v1/suite.yaml
-sweep-lr-local-transfer: LR_RESULTS := runs/studies/complete_d_p_lr_local_transfer_v1/results.csv
-sweep-lr-local-transfer: sweep-lr
+# Run the cleanest constant-width comparison first, then the stronger depth
+# extrapolation. Both suites are atomic and resumable independently.
+sweep-depth-lr: preflight
+	$(UV_RUN) python -m speedrun.family_study run \
+	  --suite "$(DEPTH_L16_SUITE)" \
+	  --results "$(DEPTH_L16_RESULTS)" \
+	  --color always
+	$(UV_RUN) python -m speedrun.family_study run \
+	  --suite "$(DEPTH_L24_SUITE)" \
+	  --results "$(DEPTH_L24_RESULTS)" \
+	  --color always
 
 # Diagnostic, not a leaderboard attempt. Compilation precedes tracing; steps 11-20
 # are captured by default so the trace stays small while the run still exercises 100
@@ -128,4 +139,4 @@ profile: validate-target preflight
 	  --port="$(XPROF_PORT)" "$(PROFILE_OUTPUT)/xprof"
 
 report:
-	$(UV_RUN) speedrun report --runs "$(RUNS_PATH)" --output "$(REPORT)"
+	$(UV_RUN) speedrun report --runs "$(RUNS_PATH)" --output "$(REPORT)" $(if $(filter 1 true yes,$(INCLUDE_DEV)),--include-dev,)

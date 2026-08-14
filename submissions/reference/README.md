@@ -62,14 +62,17 @@ Every accepted run writes:
 - `training.csv`: every optimizer step, cumulative tokens/FLOPs, train loss,
   effective global LR, and gradient norm;
 - `validation.csv`: deterministic probes and canonical final validation;
-- `diagnostics.csv` when enabled: sparse parameter/gradient/update statistics;
+- `diagnostics.csv`: sparse parameter, gradient, and update statistics for every
+  supported model scope and statistic;
 - `checkpoint.npz`, except for explicit open/dev study runs using
   `--omit-checkpoint`;
 - `metrics.json`, with the resolved tier, exact parameter count, Complete(d)P
   multipliers, data-sharding rule, system topology, and result protocol.
 
 Curves accumulate on device and move to the host after synchronized training,
-so per-step CSV capture does not add a host synchronization. Official probes
+so per-step CSV capture does not add a host synchronization. Dev and official
+runs enable all diagnostics by default, every 10 and 500 steps respectively
+(plus the first and final steps); smoke runs keep them disabled. Official probes
 run every 500 steps and count inside `train_seconds`; canonical final FineWeb
 and Fresh10 evaluation run outside it.
 
@@ -84,5 +87,5 @@ Use the harness rather than invoking `train.py` directly:
 uv run --frozen --no-sync speedrun run reference --profile smoke
 make run                         # official, 125M, 20 TPP
 make run TIER=250m
-make sweep-lr                    # resumable 60M–500M, 5 TPP, CSV first
+make sweep-lr                    # resumable 60M–250M, 5 TPP, log-LR, CSV first
 ```

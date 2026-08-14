@@ -10,20 +10,27 @@ from speedrun import family_study
 
 
 REPO = Path(__file__).parents[1]
-SUITE = REPO / "studies" / "complete_d_p_lr_v1" / "suite.yaml"
+SUITE = REPO / "studies" / "complete_d_p_lr_v3" / "suite.yaml"
+LARGE_SUITE = REPO / "studies" / "complete_d_p_lr_large_v1" / "suite.yaml"
+DEPTH_SUITES = {
+    "l16": REPO / "studies" / "complete_d_p_depth_l16_lr_v1" / "suite.yaml",
+    "l24": REPO / "studies" / "complete_d_p_depth_l24_lr_v1" / "suite.yaml",
+}
 
 
 class FamilyStudyTests(unittest.TestCase):
     def test_checked_in_suite_expands_to_immutable_csv_plan(self) -> None:
         suite = family_study.load_suite(SUITE, REPO)
         rows = family_study.planned_rows(suite)
-        self.assertEqual(len(rows), 4 * 7)
+        self.assertEqual(len(rows), 3 * 7)
         self.assertEqual(rows[0]["point_id"], "60m-lr00-s1337")
-        self.assertEqual(rows[-1]["point_id"], "500m-lr06-s1337")
+        self.assertEqual(rows[-1]["point_id"], "250m-lr06-s1337")
+        self.assertEqual(rows[0]["base_learning_rate"], "0.0009765625")
+        self.assertEqual(rows[-1]["base_learning_rate"], "0.0625")
         self.assertEqual(rows[0]["planned_steps"], 2286)
         self.assertEqual(rows[0]["planned_train_tokens"], 299_630_592)
-        self.assertEqual(rows[-1]["planned_steps"], 19_173)
-        self.assertEqual(rows[-1]["planned_train_tokens"], 2_513_043_456)
+        self.assertEqual(rows[-1]["planned_steps"], 9_325)
+        self.assertEqual(rows[-1]["planned_train_tokens"], 1_222_246_400)
         self.assertTrue(all(row["suite_sha256"] == suite["suite_sha256"] for row in rows))
 
     def test_resume_rejects_any_change_to_plan_fields(self) -> None:
@@ -37,6 +44,47 @@ class FamilyStudyTests(unittest.TestCase):
             family_study._write_csv(path, rows)
             with self.assertRaisesRegex(family_study.StudyError, "immutable field"):
                 family_study._read_existing(path, planned)
+
+    def test_large_suite_covers_both_confirmation_tiers(self) -> None:
+        suite = family_study.load_suite(LARGE_SUITE, REPO)
+        rows = family_study.planned_rows(suite)
+        self.assertEqual(len(rows), 2 * 3)
+        self.assertEqual(rows[0]["point_id"], "500m-lr00-s1337")
+        self.assertEqual(rows[-1]["point_id"], "1b-lr02-s1337")
+        self.assertEqual(rows[1]["point_id"], "500m-lr01-s1337")
+        self.assertEqual(rows[4]["point_id"], "1b-lr01-s1337")
+        self.assertEqual(rows[1]["base_learning_rate"], "0.00390625")
+        self.assertEqual(rows[4]["base_learning_rate"], "0.00390625")
+        self.assertGreater(int(rows[-1]["planned_train_tokens"]), 3_900_000_000)
+
+    def test_depth_ablation_suites_reuse_the_reference_lr_protocol(self) -> None:
+        expected = {
+            "l16": (67_012_992, 2_556, 335_020_032),
+            "l24": (81_202_560, 3_098, 406_061_056),
+        }
+        for name, path in DEPTH_SUITES.items():
+            with self.subTest(candidate=name):
+                suite = family_study.load_suite(path, REPO)
+                rows = family_study.planned_rows(suite)
+                parameters, steps, tokens = expected[name]
+                self.assertEqual(len(rows), 7)
+                self.assertEqual(rows[0]["base_learning_rate"], "0.0009765625")
+                self.assertEqual(rows[-1]["base_learning_rate"], "0.0625")
+                self.assertEqual(rows[0]["declared_parameters"], parameters)
+                self.assertEqual(rows[0]["planned_steps"], steps)
+                self.assertEqual(rows[0]["planned_train_tokens"], tokens)
+
+    def test_only_point_rejects_unknown_identity_before_loading_config(self) -> None:
+        suite = family_study.load_suite(SUITE, REPO)
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(family_study.StudyError, "unknown point"):
+                family_study.run_study(
+                    suite,
+                    repo=REPO,
+                    results=Path(directory) / "results.csv",
+                    color="never",
+                    only_point="not-a-point",
+                )
 
     def test_record_identity_includes_suite_hash(self) -> None:
         record = {

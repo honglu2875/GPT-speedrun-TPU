@@ -958,7 +958,7 @@ def _parse_experiment_profile(
     attention_scale = _config_choice(
         parameterization["attention_scale"],
         "family.parameterization.attention_scale",
-        ("inverse_model_width",),
+        ("inverse_head_dim",),
     )
     embeddings = _config_choice(
         parameterization["embeddings"],
@@ -992,13 +992,10 @@ def _parse_experiment_profile(
                 f"but this trainer counts {counted:,}"
             )
         parsed_tiers[tier_name] = (declared, tier_model)
-    # Scaling multipliers are anchored to the smallest declared tier; the
-    # independently validated default controls selection, not parameterization.
-    base_model = parsed_tiers["60m"][1]
-    if base_width != base_model["d_model"] or base_depth != base_model["layers"]:
-        raise ValueError(
-            "config.yaml Complete(d)P base_width/base_depth must match the 60m tier"
-        )
+    # The explicit width/depth anchor normally matches the smallest tier, but
+    # controlled aspect-ratio candidates may retain the reference anchor while
+    # changing that tier. The data-horizon anchor remains the candidate's own
+    # 60m parameter count below, keeping fixed-TPP comparisons well defined.
 
     profiles = _config_keys(top["profiles"], "profiles", set(_VALID_PROFILES))
     selected = _config_keys(
@@ -2324,8 +2321,8 @@ AttentionCallable = Callable[[jax.Array, jax.Array, jax.Array], jax.Array]
 
 
 def attention_softmax_scale(config: Config) -> float:
-    if config.attention_scale == "inverse_model_width":
-        return 1.0 / float(config.d_model)
+    if config.attention_scale == "inverse_head_dim":
+        return 1.0 / float(config.d_model // config.heads)
     if config.attention_scale == "inverse_sqrt_head_dim":
         return (config.d_model // config.heads) ** -0.5
     raise ValueError(f"unsupported attention scale {config.attention_scale!r}")

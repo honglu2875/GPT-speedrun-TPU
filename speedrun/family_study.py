@@ -395,9 +395,19 @@ def _populate(
 
 
 def run_study(
-    suite: Mapping[str, Any], *, repo: Path, results: Path, color: str
+    suite: Mapping[str, Any],
+    *,
+    repo: Path,
+    results: Path,
+    color: str,
+    only_point: str | None = None,
 ) -> None:
     planned = planned_rows(suite)
+    point_ids = {str(row["point_id"]) for row in planned}
+    if only_point is not None and only_point not in point_ids:
+        raise StudyError(
+            f"unknown point {only_point!r}; expected one of {', '.join(sorted(point_ids))}"
+        )
     local = load_config(repo)
     artifacts = resolve_path(local.artifacts_path, repo)
     route = preparation_route(local.data_profile, local.training_tokens)
@@ -416,6 +426,8 @@ def run_study(
     _write_csv(results, rows)  # CSV exists before the first accelerator launch.
     records_path = artifacts / "records.jsonl"
     for row in rows:
+        if only_point is not None and row["point_id"] != only_point:
+            continue
         if row["status"] == "complete":
             continue
         recorded = _record_for_point(
@@ -490,6 +502,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--suite", type=Path, required=True)
     parser.add_argument("--results", type=Path, required=True)
     parser.add_argument("--color", choices=("auto", "always", "never"), default="auto")
+    parser.add_argument(
+        "--only-point",
+        help="run or reconcile one exact point before resuming the full suite",
+    )
     return parser
 
 
@@ -502,11 +518,20 @@ def main(argv: Iterable[str] | None = None) -> int:
         suite = load_suite(suite_path.resolve(), repo)
         planned = planned_rows(suite)
         if args.command == "plan":
+            if args.only_point is not None:
+                raise StudyError("--only-point is valid only with the run command")
             _write_csv(results.resolve(), planned)
             print(f"wrote {len(planned)} planned points to {results.resolve()}")
         else:
-            run_study(suite, repo=repo, results=results.resolve(), color=args.color)
-            print(f"completed {len(planned)} points in {results.resolve()}")
+            run_study(
+                suite,
+                repo=repo,
+                results=results.resolve(),
+                color=args.color,
+                only_point=args.only_point,
+            )
+            scope = f"point {args.only_point}" if args.only_point else f"{len(planned)} points"
+            print(f"completed {scope} in {results.resolve()}")
     except (OSError, StudyError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

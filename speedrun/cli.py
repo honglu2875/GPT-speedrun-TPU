@@ -286,6 +286,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=1_400,
         help="maximum embedded points per run and scalar series",
     )
+    report.add_argument(
+        "--include-dev",
+        action="store_true",
+        help=(
+            "include successful development-profile runs as clearly labeled "
+            "diagnostics; official admission remains strict"
+        ),
+    )
 
     clone = commands.add_parser("clone", help="clone one submission into a new algorithm folder")
     clone.add_argument("source", nargs="?", default="reference")
@@ -1015,7 +1023,12 @@ def command_report(args: argparse.Namespace) -> int:
     root = repo_root()
     runs = args.runs if args.runs.is_absolute() else root / args.runs
     output = args.output if args.output.is_absolute() else root / args.output
-    summary = build_report(runs, output, max_chart_points=args.max_points)
+    summary = build_report(
+        runs,
+        output,
+        max_chart_points=args.max_points,
+        include_dev=args.include_dev,
+    )
     relative = (
         summary.output_path.relative_to(root)
         if summary.output_path.is_relative_to(root)
@@ -1025,6 +1038,7 @@ def command_report(args: argparse.Namespace) -> int:
         f"report {relative}: {len(summary.included)} run(s) plotted, "
         f"{len(summary.skipped)} skipped; baseline report admission qualification: "
         f"validation loss <= {REPORT_ADMISSION_QUALIFICATION_LOSS:.4f}"
+        + ("; development diagnostics included" if args.include_dev else "")
     )
     for run_id, reason in summary.skipped.items():
         print(f"  skipped {run_id}: {reason}")

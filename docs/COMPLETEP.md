@@ -20,6 +20,7 @@ Primary sources:
 - [Scaling Exponents Across Parameterizations and Optimizers](https://proceedings.mlr.press/v235/everett24a.html)
 - [u-µP: The Unit-Scaled Maximal Update Parametrization](https://arxiv.org/abs/2407.17465)
 - [Don't be lazy: CompleteP enables compute-efficient deep transformers](https://arxiv.org/abs/2505.01618)
+- [Official nanoGPT-mup CompleteP implementation](https://github.com/EleutherAI/nanoGPT-mup/tree/completep)
 - [How to set AdamW's weight decay as you scale model and dataset size](https://proceedings.mlr.press/v267/wang25b.html)
 - [Completed Hyperparameter Transfer across Modules, Width, Depth, Batch & Duration](https://arxiv.org/abs/2512.22382)
 - [Weight Decay may matter more than µP for Learning Rate Transfer in Practice](https://arxiv.org/abs/2510.19093)
@@ -34,7 +35,8 @@ so a profiling override does not silently alter the optimizer.
 
 The model uses pre-RMSNorm, RoPE, GELU, a 4× MLP, untied embeddings, and a
 fixed 64-dimensional attention head. Scaling width therefore adds heads rather
-than changing head dimension.
+than changing head dimension. Attention follows the official nanoGPT-mup
+implementation and divides each head's QK contraction by its own head dimension.
 
 | Quantity | Complete(d)P multiplier |
 |---|---:|
@@ -42,7 +44,7 @@ than changing head dimension.
 | input embedding init std | `1` |
 | hidden matrix init variance | `mN^-1` |
 | unembedding init variance | `mN^-2` |
-| attention logits | `1 / d_model` |
+| attention logits | `1 / d_head` |
 | input embedding learning rate | `1` |
 | hidden matrix learning rate | `mN^-1 mL^(α-1)` |
 | hidden vector learning rate | `mL^(α-1)` |
@@ -73,8 +75,8 @@ These are approximate finite-step transfer rules. They do not imply identical
 training trajectories, and a fitted optimum at 60M is not accepted as proof of
 transfer. Complete(d)P itself reports a small penalty when transferring from a
 58M proxy and nearly stabilized optima from about 136M upward. This is why the
-admission decision uses 60M, 125M, and 250M trends, while 500M is a reproduction
-point.
+admission decision uses 60M, 125M, and 250M trends. The active first-pass study
+stops there; 500M and 1B are reserved for later reproduction or hero runs.
 
 ## Deliberately held fixed
 
@@ -83,6 +85,10 @@ point.
 - QK normalization is not mixed into this first reproduction. The latest paper
   reports improved stability with it but also reports that removing it does not
   break transfer. It can be tested later as a family-level candidate.
+- The fixed-head attention temperature follows nanoGPT-mup's executable
+  `1 / d_head` rule. The conflicting `1 / d_model` sentence in the CompleteP
+  paper is not used; with width scaled by adding heads it would introduce an
+  extra inverse-head-count factor.
 - We do not combine Complete(d)P with u-µP, Adam-atan2, GQA-specific µP, Muon,
   or per-module learning-rate tuning in the baseline. Each is a meaningful
   alternative, not a free patch that can be layered on without a control.
@@ -97,40 +103,39 @@ point.
 | 125M | 12 | 640 | 10 | 123,456,640 | 4,709 | 617,218,048 |
 | 250M | 16 | 896 | 14 | 244,444,032 | 9,325 | 1,222,246,400 |
 | 500M | 19 | 1,280 | 20 | 502,602,240 | 19,173 | 2,513,043,456 |
-| 1B | 21 | 1,792 | 28 | 989,943,808 | — | — |
+| 1B | 21 | 1,792 | 28 | 989,943,808 | 37,763 | 4,949,671,936 |
 
-The first sweep is intentionally one-dimensional: seven normalized base LRs,
-spaced by √2 from `4e-4` through `3.2e-3`, one seed, batch 128, and 5 TPP
-(0.25× the 20-TPP ladder). All results go to an atomic, resumable CSV before any
-chart is designed. An optimum on a grid edge is an unbracketed result, not a
-winner. Once a common interior neighborhood appears, it should be rerun with at
-least three seeds. Only then should batch size vary, using the SDE rules above
-and keeping the selected normalized base LR fixed.
+The active v3 sweep is intentionally one-dimensional: the seven normalized
+base LRs `2^-10`, `2^-9`, `2^-8`, `2^-7`, `2^-6`, `2^-5`, and `2^-4`, one
+seed, batch 128, and 5 TPP (0.25× the 20-TPP ladder). This matches the
+powers-of-two LR grid visible in the paper's Figures 2 and 3 while retaining our
+compute-limited horizon. The same grid runs independently and in sequence at
+60M, 125M, and 250M; the narrow v2 reconnaissance and its 500M tail are not
+part of the active study.
 
-The initial 60M and 125M curves were still descending at the `3.2e-3` upper
-boundary. Before resuming the expensive tiers, the separate
-`complete_d_p_lr_60m_extension_v1` suite continues the same √2 grid at
-`4.525e-3`, `6.4e-3`, and `9.051e-3`. Keeping this extension separate preserves
-the original suite hash and accepted results. If the 60M minimum is still on the
-right edge, another extension is required; larger-tier sweeps should not infer
-an optimum from a censored curve.
+The first two tiers both have the 12-layer base depth, so `mL = 1` and
+CompleteP is identical to ordinary muP there. Only 250M, at 16 layers, exercises
+the depth-specific rules: both residual branches and residual-block AdamW
+epsilon receive `mL^-1 = 3/4`. Consequently this is primarily a width-transfer
+test with one modest depth-transfer point, not a reproduction of the paper's
+2-to-128-layer experiment.
 
-That extension bracketed the best observed 60M region: validation loss was
-`4.0621` at `3.2e-3`, `4.0539` at `4.525e-3`, and `4.2817` at `6.4e-3`.
-The `complete_d_p_lr_60m_refine_v1` suite interleaves four new rates inside
-that bracket. Together with the existing points, this gives local `2^(1/8)`
-log spacing without paying to repeat deterministic runs.
+All results go to an atomic, resumable CSV before any chart is designed. An
+optimum on a grid edge is an unbracketed result, not a winner. Once a common
+interior neighborhood appears, it should be rerun with at least three seeds.
+Only then should batch size vary, using the SDE rules above and keeping the
+selected normalized base LR fixed.
 
-After the refinement, `complete_d_p_lr_local_transfer_v1` applies the same
-seven-point local grid, including both bracket endpoints, independently and in
-sequence to 125M, 250M, and 500M. A transferred optimum must be interior for
-each tier; matching only the best tested boundary does not count as evidence.
+The active suite lives in
+[`studies/complete_d_p_lr_v3/suite.yaml`](../studies/complete_d_p_lr_v3/suite.yaml).
+Its SHA-256 is attached to each immutable run record and every CSV row. The v1
+and v2 exploratory suites and their local artifacts have been removed.
 
-The suite lives in [`studies/complete_d_p_lr_v1/suite.yaml`](../studies/complete_d_p_lr_v1/suite.yaml).
-Its SHA-256 is attached to each immutable run record and every CSV row.
-The 60M bracketing extension lives in
-[`studies/complete_d_p_lr_60m_extension_v1/suite.yaml`](../studies/complete_d_p_lr_60m_extension_v1/suite.yaml).
-The local refinement lives in
-[`studies/complete_d_p_lr_60m_refine_v1/suite.yaml`](../studies/complete_d_p_lr_60m_refine_v1/suite.yaml).
-The sequential larger-tier reproduction lives in
-[`studies/complete_d_p_lr_local_transfer_v1/suite.yaml`](../studies/complete_d_p_lr_local_transfer_v1/suite.yaml).
+The follow-on
+[`complete_d_p_lr_large_v1`](../studies/complete_d_p_lr_large_v1/suite.yaml)
+uses the identical seed, batch, and 5-TPP horizon for 500M and 1B, but narrows
+the LR set to the transferred center `2^-8` and its immediate neighbors `2^-9`
+and `2^-7`. It is routed to the published 8B corpus because the 1B point needs
+about 4.95B unique training tokens. The center is prioritized once per tier;
+the four neighboring points then resume around those recorded centers. The
+20-TPP ladder is deliberately not queued by this study.
