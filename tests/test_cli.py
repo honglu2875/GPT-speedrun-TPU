@@ -5,17 +5,17 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from speedrun import cli
-from speedrun.config import ConfigError, LocalConfig
-from speedrun.data import DataError, Fresh10Domain, PreparedDataset, PreparedFresh10
-from speedrun.doctor import check_prepared_data
-from speedrun.report import REPORT_ADMISSION_QUALIFICATION_LOSS
+from rig import cli
+from rig.config import ConfigError, LocalConfig
+from rig.data import DataError, Fresh10Domain, PreparedDataset, PreparedFresh10
+from rig.doctor import check_prepared_data
+from rig.report import REPORT_ADMISSION_QUALIFICATION_LOSS
 
 
 class CliTests(unittest.TestCase):
     def test_requested_data_diagnostics_fail_when_cache_is_missing(self) -> None:
         with patch(
-            "speedrun.doctor.verify_dataset",
+            "rig.doctor.verify_dataset",
             side_effect=DataError("missing dataset shard"),
         ):
             result = check_prepared_data(Path("/dev/shm"), "official")
@@ -72,7 +72,7 @@ class CliTests(unittest.TestCase):
             (source / "README.md").write_text("# Source\n", encoding="utf-8")
             args = cli.build_parser().parse_args(["clone", "source", "variant"])
 
-            with patch("speedrun.cli.repo_root", return_value=root):
+            with patch("rig.cli.repo_root", return_value=root):
                 self.assertEqual(cli.command_clone(args), 0)
 
             destination = root / "submissions" / "variant"
@@ -91,7 +91,7 @@ class CliTests(unittest.TestCase):
             (source / "train.py").write_text("print('train')\n", encoding="utf-8")
             args = cli.build_parser().parse_args(["clone", "source", "variant"])
 
-            with patch("speedrun.cli.repo_root", return_value=root):
+            with patch("rig.cli.repo_root", return_value=root):
                 with self.assertRaisesRegex(ConfigError, "configuration does not exist"):
                     cli.command_clone(args)
 
@@ -199,16 +199,16 @@ class CliTests(unittest.TestCase):
                 ]
             )
             with (
-                patch("speedrun.cli.repo_root", return_value=root),
+                patch("rig.cli.repo_root", return_value=root),
                 patch(
-                    "speedrun.cli.resolve_preparation_manifest",
+                    "rig.cli.resolve_preparation_manifest",
                     return_value=manifest,
                 ),
-                patch("speedrun.cli.environment_checks", return_value=[]) as checks,
-                patch("speedrun.cli.run_doctor", return_value=[]),
-                patch("speedrun.cli.doctor_ok", return_value=True),
-                patch("speedrun.cli.verify_dataset", return_value=prepared) as verify,
-                patch("speedrun.cli.verify_fresh10", return_value=fresh10) as fresh,
+                patch("rig.cli.environment_checks", return_value=[]) as checks,
+                patch("rig.cli.run_doctor", return_value=[]),
+                patch("rig.cli.doctor_ok", return_value=True),
+                patch("rig.cli.verify_dataset", return_value=prepared) as verify,
+                patch("rig.cli.verify_fresh10", return_value=fresh10) as fresh,
             ):
                 self.assertEqual(cli.command_prepare(args), 0)
             self.assertFalse(checks.call_args.kwargs["check_data"])
@@ -232,7 +232,7 @@ class CliTests(unittest.TestCase):
             },
         )
         args = cli.build_parser().parse_args(["prepare", "--non-interactive"])
-        with patch("speedrun.cli.run_pdsh") as run:
+        with patch("rig.cli.run_pdsh") as run:
             cli._run_cluster_prepare(config, args, inventory, root=Path("/repo"))
         remote = run.call_args.args[1]
         self.assertIn("--training-tokens 3900000000", remote)
@@ -273,10 +273,10 @@ class CliTests(unittest.TestCase):
                     "74900000001",
                 ]
             )
-            with patch("speedrun.cli.repo_root", return_value=root):
+            with patch("rig.cli.repo_root", return_value=root):
                 with self.assertRaisesRegex(DataError, "largest prepared corpus"):
                     cli.command_prepare(args)
-            self.assertFalse((root / ".speedrun.toml").exists())
+            self.assertFalse((root / ".rig.toml").exists())
 
     def test_scaled_budget_rejects_manual_shard_truncation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -298,7 +298,7 @@ class CliTests(unittest.TestCase):
                     "1",
                 ]
             )
-            with patch("speedrun.cli.repo_root", return_value=root):
+            with patch("rig.cli.repo_root", return_value=root):
                 with self.assertRaisesRegex(ConfigError, "cannot truncate"):
                     cli.command_prepare(args)
 
@@ -306,7 +306,7 @@ class CliTests(unittest.TestCase):
         answers = ["", "", "", "4"] + [""] * 10
         with (
             patch("builtins.input", side_effect=answers),
-            patch("speedrun.cli.infer_host_expression", return_value="slice-w-[0-3]"),
+            patch("rig.cli.infer_host_expression", return_value="slice-w-[0-3]"),
         ):
             result, *_ = cli._prepare_wizard(
                 LocalConfig(),
@@ -333,12 +333,12 @@ class CliTests(unittest.TestCase):
                 f"slice-w-{index}": f"slice-w-{index}" for index in range(4)
             },
         )
-        with patch("speedrun.cli.run_pdsh") as run:
+        with patch("rig.cli.run_pdsh") as run:
             cli._run_cluster_prepare(config, args, inventory, root=Path("/repo"))
 
         self.assertEqual(run.call_args.args[0], inventory.hosts)
         remote = run.call_args.args[1]
-        self.assertIn("SPEEDRUN_CLUSTER_WORKER=1", remote)
+        self.assertIn("RIG_CLUSTER_WORKER=1", remote)
         self.assertIn("--profile official", remote)
         self.assertIn("--path /repo/shm", remote)
         self.assertIn("sudo -n chown -R", remote)
@@ -359,7 +359,7 @@ class CliTests(unittest.TestCase):
             submission.mkdir(parents=True)
             (submission / "train.py").write_text("pass\n", encoding="utf-8")
             (submission / "config.yaml").write_text("schema_version: 1\n", encoding="utf-8")
-            (root / ".speedrun.toml").write_text("[speedrun]\n", encoding="utf-8")
+            (root / ".rig.toml").write_text("[rig]\n", encoding="utf-8")
             config = LocalConfig(
                 data_path="shm",
                 default_profile="dev",
@@ -396,20 +396,20 @@ class CliTests(unittest.TestCase):
                 ]
             )
             with (
-                patch("speedrun.cli.repo_root", return_value=root),
-                patch("speedrun.cli.load_config", return_value=config),
-                patch("speedrun.cli.data_selection", return_value=("dev", 1)),
-                patch("speedrun.cli.verify_dataset", return_value=prepared),
-                patch("speedrun.cli._probe_configured_cluster", return_value=inventory),
-                patch("speedrun.cli.sync_workspace") as sync,
-                patch("speedrun.cli.run_pdsh") as run,
+                patch("rig.cli.repo_root", return_value=root),
+                patch("rig.cli.load_config", return_value=config),
+                patch("rig.cli.data_selection", return_value=("dev", 1)),
+                patch("rig.cli.verify_dataset", return_value=prepared),
+                patch("rig.cli._probe_configured_cluster", return_value=inventory),
+                patch("rig.cli.sync_workspace") as sync,
+                patch("rig.cli.run_pdsh") as run,
             ):
                 self.assertEqual(cli.command_profile(args), 0)
 
             self.assertEqual(run.call_args.args[0], inventory.hosts)
             remote = run.call_args.args[1]
-            self.assertIn("SPEEDRUN_DISTRIBUTED=1", remote)
-            self.assertIn("SPEEDRUN_CONTROLLER_HOSTNAME=slice-w-0", remote)
+            self.assertIn("RIG_DISTRIBUTED=1", remote)
+            self.assertIn("RIG_CONTROLLER_HOSTNAME=slice-w-0", remote)
             self.assertIn("--profile dev", remote)
             self.assertIn("--xprof-dir", remote)
             self.assertIn("profiles/test/xprof", remote)

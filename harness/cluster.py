@@ -25,7 +25,7 @@ SSH_SETUP_GUIDANCE = (
     "Cannot reach every configured TPU VM with non-interactive SSH. Add a public "
     "key from this controller to the same user's ~/.ssh/authorized_keys on every "
     "TPU VM, verify that `pdsh -R ssh -w HOSTS hostname` succeeds, and rerun "
-    "`make prepare`; speedrun never creates or distributes SSH keys."
+    "`make prepare`; rig never creates or distributes SSH keys."
 )
 RAM_CACHE_SETUP_GUIDANCE = (
     "/dev/shm must be a writable tmpfs or ramfs on every configured TPU VM. "
@@ -40,7 +40,7 @@ RAM_CACHE_PROTECTION_GUIDANCE = (
     "its dedicated /dev/shm/.speedrun-cache directory, so systemd-logind "
     "RemoveIPC cannot erase the dataset when a pdsh SSH session ends. Configure "
     "passwordless sudo for those cache ownership commands, then rerun "
-    "`make prepare`; speedrun does not change the host-wide RemoveIPC policy."
+    "`make prepare`; rig does not change the host-wide RemoveIPC policy."
 )
 RSYNC_SETUP_GUIDANCE = (
     "rsync is required on every configured TPU VM. Automatic installation with "
@@ -60,13 +60,16 @@ _SSH_OPTIONS = (
     # key exchanges at the TPU VM sshd.
     "ControlMaster=auto",
     "ControlPersist=600",
-    f"ControlPath=/tmp/speedrun-ssh-{os.getuid()}-%C",
+    f"ControlPath=/tmp/rig-ssh-{os.getuid()}-%C",
     "ServerAliveInterval=15",
     "ServerAliveCountMax=3",
     "StrictHostKeyChecking=accept-new",
 )
 _DEFAULT_SSH_ARGS = " ".join(f"-o {option}" for option in _SSH_OPTIONS)
 _PROBE_ATTEMPTS = 4
+# Deliberately keeps its pre-rename name: this directory holds the prepared
+# corpus already installed on every TPU VM. Renaming it here would orphan that
+# cache and force a full re-download on each host.
 RAM_CACHE_ROOT = Path("/dev/shm/.speedrun-cache")
 _COMMON_RSYNC_EXCLUDES = (
     ".git/",

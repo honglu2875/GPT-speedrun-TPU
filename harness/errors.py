@@ -1,4 +1,4 @@
-"""Errors raised by the speedrun competition harness."""
+"""Errors raised by the rig competition harness."""
 
 from __future__ import annotations
 

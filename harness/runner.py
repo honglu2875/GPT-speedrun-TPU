@@ -96,10 +96,10 @@ def run_submission(config: RunConfig, *, evaluator: Evaluator | None = None) -> 
         str(key): str(value) for key, value in config.environment.items()
     }
     managed_environment = {
-        "SPEEDRUN_RUN_ID": run_id,
-        "SPEEDRUN_OUTPUT_DIR": str(run_dir),
-        "SPEEDRUN_TRACK": config.track,
-        "SPEEDRUN_PROFILE": config.profile,
+        "RIG_RUN_ID": run_id,
+        "RIG_OUTPUT_DIR": str(run_dir),
+        "RIG_TRACK": config.track,
+        "RIG_PROFILE": config.profile,
         # Every attempt receives a fresh persistent cache. This keeps cold
         # compilation reproducible and prevents run order from advantaging
         # later submissions.
@@ -116,11 +116,11 @@ def run_submission(config: RunConfig, *, evaluator: Evaluator | None = None) -> 
             **managed_environment,
             # Peer filesystems are independent. Keep their fresh compilation
             # caches ephemeral instead of leaving shadow run directories.
-            "JAX_COMPILATION_CACHE_DIR": f"/tmp/speedrun-jax-cache-{run_id}",
-            "SPEEDRUN_CLUSTER_WORKER": "1",
-            "SPEEDRUN_CONTROLLER_HOSTNAME": socket.gethostname(),
-            "SPEEDRUN_DISTRIBUTED": "1",
-            "SPEEDRUN_PROCESS_COUNT": str(config.tpu_vm_count),
+            "JAX_COMPILATION_CACHE_DIR": f"/tmp/rig-jax-cache-{run_id}",
+            "RIG_CLUSTER_WORKER": "1",
+            "RIG_CONTROLLER_HOSTNAME": socket.gethostname(),
+            "RIG_DISTRIBUTED": "1",
+            "RIG_PROCESS_COUNT": str(config.tpu_vm_count),
         }
         command = build_distributed_launch_command(
             host_expression=config.tpu_vm_hosts,
@@ -643,7 +643,7 @@ def _python_tree_provenance(repo_root: Path) -> dict[str, Any]:
     """Hash shared Python dependencies, including dirty working-tree bytes."""
 
     paths: list[Path] = []
-    for package in ("speedrun", "harness"):
+    for package in ("rig", "harness"):
         package_root = repo_root / package
         if package_root.is_dir():
             paths.extend(path for path in package_root.rglob("*.py") if path.is_file())

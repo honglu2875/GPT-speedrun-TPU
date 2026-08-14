@@ -24,7 +24,6 @@ templates:
 make prepare
 make run
 make baseline
-make sweep-lr
 make profile
 make report
 ```
@@ -35,7 +34,6 @@ make report
 | `make run` | verify every configured TPU VM and its data, then run the 125M reference tier using the saved profile |
 | `make baseline` | compatibility alias for `make run` |
 | `make run TARGET=name TIER=250m` | run one tier from the model family in `submissions/name/` |
-| `make sweep-lr` | run or resume the CSV-first 60M–250M Complete(d)P log-LR study |
 | `make profile` | run a distributed, validation-free 100-step diagnostic, capture worker 0 steps 11–20, then serve XProf on port 8791 |
 | `make report` | integrity-check completed runs and rebuild the standalone `report.html` dashboard |
 
@@ -43,7 +41,7 @@ make report
 
 ```bash
 uv --cache-dir /tmp/uv-cache sync --frozen
-uv --cache-dir /tmp/uv-cache run --frozen --no-sync speedrun prepare \
+uv --cache-dir /tmp/uv-cache run --frozen --no-sync rig prepare \
   --training-tokens 2600000000
 ```
 
@@ -56,7 +54,7 @@ Training duration is independently specified by each family profile (20 TPP in
 the reference official profile) or by an explicit research study.
 The wizard can then probe JAX/TPU health and prepare the selected dataset;
 only the explicit CLI flag `--no-download` skips data preparation. Personal
-choices are stored in the gitignored `.speedrun.toml`; official constants
+choices are stored in the gitignored `.rig.toml`; official constants
 remain versioned in Git. The personal loss target applies only to
 smoke/development work; the official target is fixed at 3.28 and may only be
 tightened explicitly.
@@ -69,16 +67,16 @@ with 60M, 125M, 250M, 500M, and 1B tiers; `TIER` defaults to `125m`.
 
 For a multi-host run using the conventional `shm` cache, preparation requires
 `/dev/shm` to be a writable `tmpfs` or `ramfs` on every VM and creates
-`shm -> /dev/shm/.speedrun-cache` in each checkout. It uses `sudo -n` to make
+`shm -> /dev/shm/.rig-cache` in each checkout. It uses `sudo -n` to make
 that dedicated directory and completed entries root-owned but writable by the
 caller's primary group. This is necessary because systemd-logind defaults to
 `RemoveIPC=yes` and recursively removes user-owned `/dev/shm` entries after the
-last SSH session for that user ends. Speedrun does not alter that host-wide
+last SSH session for that user ends. Rig does not alter that host-wide
 policy. If any VM lacks the mount or non-interactive cache ownership access,
 preparation stops with a short instruction before downloading data:
 
 ```bash
-uv run --frozen --no-sync speedrun prepare --path shm/ --profile official
+uv run --frozen --no-sync rig prepare --path shm/ --profile official
 ```
 
 The cache path is always explicit. The tool supports symlinks, resumable
@@ -99,7 +97,7 @@ t1v-n-a09f5679-w-[0-3]
 
 The expression is ordinary `pdsh` host-list syntax; a comma-separated explicit
 list also works. The controller needs `pdsh`, `rsync`, and non-interactive SSH to
-itself and every peer. Speedrun tests that access, but it never creates, copies,
+itself and every peer. Rig tests that access, but it never creates, copies,
 or modifies SSH keys. If the probe fails, add this controller's public key to the
 same user's `~/.ssh/authorized_keys` on the TPU VMs, verify
 `pdsh -R ssh -w HOSTS hostname`, and rerun preparation.
@@ -131,7 +129,7 @@ needs a hybrid ICI/DCN mesh and is a distinct scaling mode.
 For automation on a four-host v4-32, bypass the questions:
 
 ```bash
-uv run --frozen --no-sync speedrun prepare \
+uv run --frozen --no-sync rig prepare \
   --non-interactive --path shm/ --profile official \
   --run-profile official --track open --checkpoints qualifying \
   --tpu-vm-count 4 --tpu-vm-hosts 't1v-n-a09f5679-w-[0-3]'
@@ -188,44 +186,25 @@ make run TIER=250m
 make run TARGET=dense_control TIER=125m
 
 # Fast end-to-end check
-uv run --frozen --no-sync speedrun prepare --non-interactive \
+uv run --frozen --no-sync rig prepare --non-interactive \
   --path shm/ --profile smoke --run-profile smoke --no-doctor
-uv run --frozen --no-sync speedrun run reference --profile smoke
+uv run --frozen --no-sync rig run reference --profile smoke
 
 # Run the versioned official configuration (compare timings on like hardware)
-uv run --frozen --no-sync speedrun run reference \
+uv run --frozen --no-sync rig run reference \
   --track open --profile official
 
 # Short diagnostic overrides follow --; experiment settings stay in config.yaml
-uv run --frozen --no-sync speedrun run reference --profile dev -- \
+uv run --frozen --no-sync rig run reference --profile dev -- \
   --steps 100
 ```
 
-The first family study is `make sweep-lr`. It holds batch, schedule, weight
-decay, architecture rules, and 5 TPP fixed while sweeping only the normalized
-base learning rate for 60M, 125M, and 250M. Its seven points are the paper's
-logarithmic powers-of-two grid, `2^-10` through `2^-4`. It writes and atomically
-updates `runs/studies/complete_d_p_lr_v3/results.csv`; rerunning the command
-resumes pending points. See
-[the Complete(d)P contract](docs/COMPLETEP.md) and the
-[versioned suite](studies/complete_d_p_lr_v3/suite.yaml).
-
-After the admission-tier curve is established, `make sweep-lr-large` applies
-the transferred center LR and its two immediate log-space neighbors at 5 TPP
-to 500M and 1B using the published 8B corpus. Its resumable CSV is
-`runs/studies/complete_d_p_lr_large_v1/results.csv`. A queued campaign may run
-an exact point first with `speedrun.family_study run --only-point POINT`; the
-point keeps the suite hash and is reconciled by the subsequent full sweep.
-
-The legacy-baseline v4 IsoFLOP study is an immutable incomplete archive: its
-bounded lower-LR recovery stopped after 42 trials before a three-slice law could
-be fitted. Its dedicated fail-closed publisher archives every raw curve and
-derived decision, repeats semantic verification from an anonymous immutable
-download, and records the result as negative evidence without making a
-scaling-law claim. The fresh
-[v5 continuation](sweeps/current_budget_isoflop_v5/README.md) extends the
-prospective lower bound without reusing v4 measurements. See the
-[v4 scaling-evidence release gate](docs/SCALING_EVIDENCE.md).
+Sweeping a hyperparameter across the ladder is deliberately not built in. One
+run is one command, so a study is an ordinary shell loop over `rig run` with
+the tiers and overrides you care about, and each point lands in `runs/` as a
+normal recorded run. The parameterization rules that make a tier's learning
+rate comparable across sizes are in
+[the Complete(d)P contract](docs/COMPLETEP.md).
 
 The harness creates a unique persistent run directory, captures stdout/stderr,
 validates the final result event and checkpoint, hashes artifacts, and appends a
@@ -283,9 +262,9 @@ and change the clone's `attention_backend` field instead of hiding an algorithm
 change in a long launch command:
 
 ```bash
-uv run --frozen --no-sync speedrun clone reference dense_control
+uv run --frozen --no-sync rig clone reference dense_control
 # edit submissions/dense_control/config.yaml
-uv run --frozen --no-sync speedrun run dense_control --profile official
+uv run --frozen --no-sync rig run dense_control --profile official
 ```
 
 The custom attention kernel includes forward, dQ, and dK/dV kernels, uses a
@@ -380,11 +359,11 @@ pretokenized documents outside the canonical set.
 Useful commands:
 
 ```bash
-uv run --frozen --no-sync speedrun doctor --require-tpu
-uv run --frozen --no-sync speedrun settings
-uv run --frozen --no-sync speedrun verify RUN_ID
-uv run --frozen --no-sync speedrun leaderboard --track open
-uv run --frozen --no-sync speedrun leaderboard --track sample_efficiency
+uv run --frozen --no-sync rig doctor --require-tpu
+uv run --frozen --no-sync rig settings
+uv run --frozen --no-sync rig verify RUN_ID
+uv run --frozen --no-sync rig leaderboard --track open
+uv run --frozen --no-sync rig leaderboard --track sample_efficiency
 ```
 
 ## Create an algorithm
@@ -399,7 +378,7 @@ submissions/<algorithm>/config.yaml
 Clone the current reference without overwriting anything:
 
 ```bash
-uv run --frozen --no-sync speedrun clone reference my_experiment
+uv run --frozen --no-sync rig clone reference my_experiment
 ```
 
 The clone copies both files byte-for-byte. Keep the implementation visible in
@@ -438,10 +417,10 @@ The full timing, qualification, checkpoint, and human-review rules are in
 ```text
 data/manifests/          pinned datasets and hashes
 harness/                 execution, validation, records, scoring
-speedrun/                CLI, wizard, doctor, and shared data preparation
-speedrun/kernels/        shared TPU attention, loss, and autotuning primitives
+rig/                     CLI, wizard, doctor, and shared data preparation
+rig/kernels/             shared TPU attention, loss, and autotuning primitives
+scripts/                 corpus builder and publisher tooling
 submissions/reference/   JAX entry trainer + versioned experiment config
-sweeps/                  versioned non-competition IsoFLOP study definitions
 tests/                   CPU-only infrastructure tests
 runs/                    gitignored persistent run artifacts
 ```

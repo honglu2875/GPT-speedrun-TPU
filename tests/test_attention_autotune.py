@@ -6,7 +6,7 @@ import tempfile
 import unittest
 import warnings
 
-from speedrun.kernels.autotune import (
+from rig.kernels.autotune import (
     AttentionTilePlan,
     AutotuneCacheError,
     AutotuneKey,

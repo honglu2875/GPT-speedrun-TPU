@@ -27,13 +27,14 @@ from scripts.publish_fineweb import (
     validate_closed_directory,
     validate_remote_tree_entries,
 )
-from speedrun.fineweb_builder import (
+import rig.frozen  # noqa: F401  (registers the frozen builder's legacy import name)
+from rig.fineweb_builder import (
     FineWebBuildError,
     canonical_json_bytes,
     canonical_json_sha256,
 )
-from speedrun.data import DataError, load_manifest as load_data_manifest
-from speedrun.data_routing import (
+from rig.data import DataError, load_manifest as load_data_manifest
+from rig.data_routing import (
     SCALED_CORE_SHA256,
     SCALED_EXCLUSION_POLICY_SHA256,
     SCALED_SOURCE_INVENTORY_SHA256,

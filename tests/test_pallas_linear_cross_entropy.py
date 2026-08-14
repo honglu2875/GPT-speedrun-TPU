@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from speedrun.kernels.pallas_linear_cross_entropy import (
+from rig.kernels.pallas_linear_cross_entropy import (
     pallas_tied_cross_entropy_backward,
     pallas_tied_cross_entropy_forward,
 )

@@ -24,7 +24,7 @@ from harness.cluster import (
     terminate_distributed_workers,
 )
 from harness.cluster import _rsync_to_hosts
-from speedrun.config import ConfigError, LocalConfig, load_config, save_config
+from rig.config import ConfigError, LocalConfig, load_config, save_config
 
 
 class ClusterTests(unittest.TestCase):
@@ -267,8 +267,8 @@ class ClusterConfigTests(unittest.TestCase):
             save_config(configured, root)
             self.assertEqual(load_config(root), configured)
 
-            (root / ".speedrun.toml").write_text(
-                "[speedrun]\ndata_path = \"shm\"\nartifacts_path = \"runs\"\n",
+            (root / ".rig.toml").write_text(
+                "[rig]\ndata_path = \"shm\"\nartifacts_path = \"runs\"\n",
                 encoding="utf-8",
             )
             self.assertEqual(load_config(root).tpu_vm_count, 1)

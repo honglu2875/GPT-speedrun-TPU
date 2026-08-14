@@ -8,8 +8,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from speedrun import data as data_module
-from speedrun.data import (
+from rig import data as data_module
+from rig.data import (
     DataError,
     FORMAT_VERSION,
     FRESH10_DOMAINS,
@@ -447,7 +447,7 @@ class Fresh10Tests(unittest.TestCase):
             def open_fixture(*_: object, **__: object) -> FakeResponse:
                 return FakeResponse([payload])
 
-            with patch("speedrun.data.urlopen", side_effect=open_fixture) as opener:
+            with patch("rig.data.urlopen", side_effect=open_fixture) as opener:
                 prepared = prepare_fresh10(root, manifest)
             self.assertEqual(opener.call_count, 10)
             self.assertEqual(tuple(domain.name for domain in prepared.domains), FRESH10_DOMAINS)
@@ -477,7 +477,7 @@ class SmokeTests(unittest.TestCase):
     def test_warm_prepare_hashes_each_existing_shard_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             prepare_smoke(directory)
-            with patch("speedrun.data.sha256_file", wraps=sha256_file) as digest:
+            with patch("rig.data.sha256_file", wraps=sha256_file) as digest:
                 prepare_smoke(directory)
             self.assertEqual(digest.call_count, 2)
 
@@ -656,7 +656,7 @@ class DownloadTests(unittest.TestCase):
                     },
                 )
 
-            with patch("speedrun.data.urlopen", side_effect=open_range):
+            with patch("rig.data.urlopen", side_effect=open_range):
                 result = prepare(root, manifest)
             self.assertEqual((root / "train.bin").read_bytes(), payload)
             self.assertEqual(result.train_tokens, 2)
@@ -674,7 +674,7 @@ class DownloadTests(unittest.TestCase):
             manifest = self.manifest(val_fixture, train_fixture)
             response = FakeResponse([b"partial", IncompleteRead(b"", 100)])
 
-            with patch("speedrun.data.urlopen", return_value=response):
+            with patch("rig.data.urlopen", return_value=response):
                 with self.assertRaisesRegex(DataError, "download interrupted for val.bin"):
                     prepare(root, manifest)
             self.assertEqual((root / "val.bin.part").read_bytes(), b"partial")

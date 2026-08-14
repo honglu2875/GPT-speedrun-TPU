@@ -1,6 +1,6 @@
 # Data
 
-No training corpus is stored in Git, and importing `speedrun.data` never
+No training corpus is stored in Git, and importing `rig.data` never
 downloads or generates anything. Only explicit preparation—through the command
 or its programmatic API—performs network access.
 
@@ -32,7 +32,7 @@ The data root is always explicit. For example, on a machine where the
 repository's `shm` symlink points at a large RAM filesystem:
 
 ```console
-uv run speedrun prepare --path shm/
+uv run --frozen --no-sync rig prepare --path shm/
 ```
 
 The path is treated as the exact cache root; it is not silently namespaced and
@@ -50,7 +50,7 @@ requested.
 For scripts and the competition harness, the equivalent programmatic API is:
 
 ```python
-from speedrun.data import prepare
+from rig.data import prepare
 
 dataset = prepare(
     path="shm/",
@@ -70,7 +70,7 @@ and hash exactly like a downloaded shard.
 
 ### Budget-routed scaled preparation
 
-The `speedrun prepare --training-tokens N` setting selects the corpus prepared
+The `rig prepare --training-tokens N` setting selects the corpus prepared
 for the `official` data profile and used by subsequent non-smoke runs. Requests
 through 900M training tokens retain
 the classic nine-shard selection. Larger requests route to the smallest scaled
@@ -85,7 +85,7 @@ The routing layer trusts only a checked-in manifest under
 repository and commit, provide an immutable URL and SHA-256 for every exact
 100M-token shard, and match the builder's source, tokenizer, temporal cutoff,
 and document-disjoint validation contract. Until publication produces that
-real manifest, scaled `speedrun prepare` fails with an explicit message; it
+real manifest, scaled `rig prepare` fails with an explicit message; it
 never manufactures a placeholder or treats a cache-local build plan as a
 download contract. The standalone builder remains the way to create the local
 bytes before publication.

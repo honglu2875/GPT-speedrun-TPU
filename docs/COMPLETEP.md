@@ -75,7 +75,7 @@ These are approximate finite-step transfer rules. They do not imply identical
 training trajectories, and a fitted optimum at 60M is not accepted as proof of
 transfer. Complete(d)P itself reports a small penalty when transferring from a
 58M proxy and nearly stabilized optima from about 136M upward. This is why the
-admission decision uses 60M, 125M, and 250M trends. The active first-pass study
+admission decision uses 60M, 125M, and 250M trends. The first-pass protocol
 stops there; 500M and 1B are reserved for later reproduction or hero runs.
 
 ## Deliberately held fixed
@@ -95,7 +95,7 @@ stops there; 500M and 1B are reserved for later reproduction or hero runs.
 - Warmup is 10% of each run and cosine decay ends at 10% of peak. Schedule shape,
   weight decay, and batch remain fixed during the learning-rate study.
 
-## Tiers and first study
+## Tiers and the learning-rate protocol
 
 | Tier | Layers | Width | Heads | Exact parameters | 5-TPP steps | 5-TPP tokens |
 |---|---:|---:|---:|---:|---:|---:|
@@ -105,13 +105,12 @@ stops there; 500M and 1B are reserved for later reproduction or hero runs.
 | 500M | 19 | 1,280 | 20 | 502,602,240 | 19,173 | 2,513,043,456 |
 | 1B | 21 | 1,792 | 28 | 989,943,808 | 37,763 | 4,949,671,936 |
 
-The active v3 sweep is intentionally one-dimensional: the seven normalized
+The learning-rate sweep is intentionally one-dimensional: the seven normalized
 base LRs `2^-10`, `2^-9`, `2^-8`, `2^-7`, `2^-6`, `2^-5`, and `2^-4`, one
 seed, batch 128, and 5 TPP (0.25× the 20-TPP ladder). This matches the
 powers-of-two LR grid visible in the paper's Figures 2 and 3 while retaining our
 compute-limited horizon. The same grid runs independently and in sequence at
-60M, 125M, and 250M; the narrow v2 reconnaissance and its 500M tail are not
-part of the active study.
+60M, 125M, and 250M.
 
 The first two tiers both have the 12-layer base depth, so `mL = 1` and
 CompleteP is identical to ordinary muP there. Only 250M, at 16 layers, exercises
@@ -120,22 +119,15 @@ epsilon receive `mL^-1 = 3/4`. Consequently this is primarily a width-transfer
 test with one modest depth-transfer point, not a reproduction of the paper's
 2-to-128-layer experiment.
 
-All results go to an atomic, resumable CSV before any chart is designed. An
-optimum on a grid edge is an unbracketed result, not a winner. Once a common
-interior neighborhood appears, it should be rerun with at least three seeds.
-Only then should batch size vary, using the SDE rules above and keeping the
-selected normalized base LR fixed.
+Collect every point before any chart is designed. An optimum on a grid edge is
+an unbracketed result, not a winner. Once a common interior neighborhood
+appears, it should be rerun with at least three seeds. Only then should batch
+size vary, using the SDE rules above and keeping the selected normalized base
+LR fixed.
 
-The active suite lives in
-[`studies/complete_d_p_lr_v3/suite.yaml`](../studies/complete_d_p_lr_v3/suite.yaml).
-Its SHA-256 is attached to each immutable run record and every CSV row. The v1
-and v2 exploratory suites and their local artifacts have been removed.
-
-The follow-on
-[`complete_d_p_lr_large_v1`](../studies/complete_d_p_lr_large_v1/suite.yaml)
-uses the identical seed, batch, and 5-TPP horizon for 500M and 1B, but narrows
-the LR set to the transferred center `2^-8` and its immediate neighbors `2^-9`
-and `2^-7`. It is routed to the published 8B corpus because the 1B point needs
-about 4.95B unique training tokens. The center is prioritized once per tier;
-the four neighboring points then resume around those recorded centers. The
-20-TPP ladder is deliberately not queued by this study.
+The one-off suites that produced the results above have been removed along with
+the study runner; the rules on this page are the durable part. To repeat this
+kind of measurement, loop `rig run` over the tiers and learning rates you want
+and read the recorded runs back out of `runs/records.jsonl` — every run already
+carries the resolved parameterization, so a study is a query over run records
+rather than a separate execution framework.

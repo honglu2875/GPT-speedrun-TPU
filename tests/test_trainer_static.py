@@ -95,57 +95,6 @@ class TrainerStaticTests(unittest.TestCase):
                     round(parameters * config.tokens_per_parameter),
                 )
 
-    def test_depth_ablation_candidates_retain_the_reference_anchor(self) -> None:
-        parser = trainer.build_parser()
-        candidates = {
-            "reference-l16": (67_012_992, 16, 4 / 3),
-            "reference-l24": (81_202_560, 24, 2.0),
-        }
-        for name, (parameters, layers, depth_multiplier) in candidates.items():
-            with self.subTest(candidate=name):
-                candidate_dir = TRAINER_PATH.parents[1] / name
-                self.assertEqual(
-                    (candidate_dir / "train.py").read_bytes(),
-                    TRAINER_PATH.read_bytes(),
-                )
-                with patch.object(trainer, "CONFIG_PATH", candidate_dir / "config.yaml"):
-                    experiment = trainer.load_experiment_profile("dev", tier="60m")
-                config = trainer.resolve_config(
-                    parser.parse_args(
-                        [
-                            "--profile",
-                            "dev",
-                            "--tier",
-                            "60m",
-                            "--tokens-per-parameter",
-                            "5",
-                        ]
-                    ),
-                    "tpu",
-                    50_304,
-                    experiment,
-                )
-                self.assertEqual(config.declared_parameters, parameters)
-                self.assertEqual((config.layers, config.d_model, config.heads), (layers, 384, 6))
-                self.assertEqual((config.base_depth, config.base_width), (12, 384))
-                self.assertEqual(config.width_multiplier, 1.0)
-                self.assertAlmostEqual(config.depth_multiplier, depth_multiplier)
-                self.assertEqual(config.data_multiplier, 1.0)
-                self.assertEqual(config.diagnostics_every, 10)
-
-                params = {
-                    "token_embedding": np.zeros((1, 1), dtype=np.float32),
-                    "blocks": [{"qkv_w": np.zeros((1, 1), dtype=np.float32)}],
-                    "final_ln_scale": np.ones((1,), dtype=np.float32),
-                    "output_embedding": np.zeros((1, 1), dtype=np.float32),
-                }
-                _lr, epsilon, _decay = trainer.optimizer_hyperparameter_trees(
-                    params, config
-                )
-                self.assertAlmostEqual(
-                    epsilon["blocks"][0]["qkv_w"], depth_multiplier**-1
-                )
-
     def test_complete_d_p_tensor_and_horizon_multipliers(self) -> None:
         parser = trainer.build_parser()
         args = parser.parse_args(
@@ -458,8 +407,8 @@ class TrainerStaticTests(unittest.TestCase):
         controller_guard = source.rfind("if is_controller:", 0, start_trace)
         self.assertGreater(controller_guard, 0)
         self.assertLess(start_trace - controller_guard, 1_000)
-        self.assertIn("speedrun-xprof-capture-started", source)
-        self.assertIn("speedrun-xprof-capture-finished", source)
+        self.assertIn("rig-xprof-capture-started", source)
+        self.assertIn("rig-xprof-capture-finished", source)
 
     def test_diagnostic_main_omits_competition_result(self) -> None:
         stdout = StringIO()
@@ -1377,7 +1326,7 @@ class TrainerStaticTests(unittest.TestCase):
         with (
             patch.dict(
                 trainer.os.environ,
-                {"SPEEDRUN_CONTROLLER_HOSTNAME": "slice-w-0"},
+                {"RIG_CONTROLLER_HOSTNAME": "slice-w-0"},
                 clear=False,
             ),
             patch.object(trainer.socket, "gethostname", return_value="slice-w-0"),
@@ -1386,7 +1335,7 @@ class TrainerStaticTests(unittest.TestCase):
         with (
             patch.dict(
                 trainer.os.environ,
-                {"SPEEDRUN_CONTROLLER_HOSTNAME": "slice-w-0"},
+                {"RIG_CONTROLLER_HOSTNAME": "slice-w-0"},
                 clear=False,
             ),
             patch.object(trainer.socket, "gethostname", return_value="slice-w-2"),

@@ -16,8 +16,9 @@ from scripts.publish_fineweb import (
     read_token_file,
     validate_remote_tree_entries,
 )
-from speedrun.data import HEADER_BYTES, verify_dataset
-from speedrun.fineweb_builder import (
+from rig.data import HEADER_BYTES, verify_dataset
+import rig.frozen  # noqa: F401  (registers the frozen builder's legacy import name)
+from rig.fineweb_builder import (
     BuildConfig,
     DocumentBatch,
     ExclusionPolicy,
@@ -424,7 +425,7 @@ class FineWebBuilderTests(unittest.TestCase):
             cache = SourceFileCache(source_root, inventory)
             with (
                 patch(
-                    "speedrun.fineweb_builder.urlopen", return_value=BrokenResponse()
+                    "rig.fineweb_builder.urlopen", return_value=BrokenResponse()
                 ),
                 self.assertRaisesRegex(FineWebBuildError, "cannot cache source file"),
             ):

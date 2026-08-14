@@ -24,7 +24,7 @@ layout and memory constraints.
 
 ## TPU FlashAttention
 
-[`speedrun.kernels.tpu_flash_attention`](../speedrun/kernels/tpu_flash_attention.py)
+[`rig.kernels.tpu_flash_attention`](../rig/kernels/tpu_flash_attention.py)
 uses logical `[batch, heads, sequence, head_dim]` inputs and returns the same
 shape. It currently implements dense causal self-attention with matching q/k/v
 shapes, `head_dim <= 128`, and a head dimension divisible by 8. Sequence lengths
@@ -34,7 +34,7 @@ length.
 The public factory API is:
 
 ```python
-from speedrun.kernels import AttentionConfig, make_causal_attention
+from rig.kernels import AttentionConfig, make_causal_attention
 
 attention = make_causal_attention(
     AttentionConfig(backend="tpu_flash")
@@ -62,12 +62,12 @@ shape heuristic without benchmarking.
 
 ## Tiled tied cross entropy
 
-[`speedrun.kernels.linear_cross_entropy`](../speedrun/kernels/linear_cross_entropy.py)
+[`rig.kernels.linear_cross_entropy`](../rig/kernels/linear_cross_entropy.py)
 combines the tied output projection, online log-sum-exp, target selection, and
 cross entropy without constructing `[batch, sequence, vocabulary]` logits:
 
 ```python
-from speedrun.kernels import (
+from rig.kernels import (
     tiled_tied_cross_entropy,
     tiled_tied_cross_entropy_losses,
 )
@@ -105,7 +105,7 @@ therefore an open-track algorithm experiment. `vocab_tile_size=2_048` is the
 measured v4 seed.
 
 The explicit Pallas experiment in
-[`pallas_linear_cross_entropy.py`](../speedrun/kernels/pallas_linear_cross_entropy.py)
+[`pallas_linear_cross_entropy.py`](../rig/kernels/pallas_linear_cross_entropy.py)
 is not exported as a production kernel: it is correctness checked, but its
 current value-plus-backward microbenchmark is slower than the pure-JAX tiled
 custom VJP.
@@ -149,8 +149,8 @@ training step:
 ```python
 import jax.numpy as jnp
 
-from speedrun.kernels import AttentionConfig, make_causal_attention
-from speedrun.kernels.autotune import (
+from rig.kernels import AttentionConfig, make_causal_attention
+from rig.kernels.autotune import (
     autotune_attention,
     make_runtime_key,
 )

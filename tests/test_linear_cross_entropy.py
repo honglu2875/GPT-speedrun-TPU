@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from speedrun.kernels import (
+from rig.kernels import (
     tiled_tied_cross_entropy,
     tiled_tied_cross_entropy_losses,
 )

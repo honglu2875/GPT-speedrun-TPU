@@ -55,8 +55,9 @@ initialization during the run and may use only the selected immutable training
 split.
 
 The older 624,984,064-token records remain an explicitly historical v4-8 timing
-series. The existing `make report` dashboard continues to render that series;
-it is not the charting path for the new family studies.
+series, and the `make report` dashboard continues to render it. That admission
+gate is deliberately narrow, so runs from the 20-TPP ladder are reported as
+skipped rather than charted alongside it.
 
 The leaderboard displays validation loss and tokens consumed alongside the
 score. Parameter count, throughput, compilation time, and FLOP estimates remain
@@ -134,7 +135,7 @@ algorithm-specific modules.
 A completed run emits the versioned machine-readable result required by the
 harness and writes a portable parameter checkpoint beneath its assigned output
 directory. Human-oriented colored output must not corrupt the result record.
-The last non-empty stdout line is `SPEEDRUN_RESULT=<json>`; human output belongs
+The last non-empty stdout line is `RIG_RESULT=<json>`; human output belongs
 on stderr. Version one requires `track`, `profile`, `seed`, a contained relative
 `checkpoint`, and finite `metrics.train_seconds`, `metrics.tokens_processed`,
 and `metrics.validation_loss`. Official results must additionally report

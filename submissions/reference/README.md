@@ -39,8 +39,8 @@ not from an assumed `RANK` environment variable or hostname suffix. Model and
 optimizer state remain replicated; this is data sharding, not model sharding.
 
 The stream starts a newly seeded shuffled epoch if a requested horizon exceeds
-the prepared distinct-token capacity. The checked-in LR suite refuses that
-condition up front because its first reproduction is explicitly no-replacement.
+the prepared distinct-token capacity. Prepare a corpus large enough for the
+horizon you want when a study needs to stay no-replacement.
 
 ## Optimizer and kernels
 
@@ -84,8 +84,7 @@ still require a checkpoint.
 Use the harness rather than invoking `train.py` directly:
 
 ```bash
-uv run --frozen --no-sync speedrun run reference --profile smoke
+uv run --frozen --no-sync rig run reference --profile smoke
 make run                         # official, 125M, 20 TPP
 make run TIER=250m
-make sweep-lr                    # resumable 60M–250M, 5 TPP, log-LR, CSV first
 ```

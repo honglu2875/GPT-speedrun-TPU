@@ -14,7 +14,7 @@ from .errors import ResultValidationError
 from .models import Evaluator, ReferenceContract, ValidationResult
 
 
-RESULT_PREFIX = "SPEEDRUN_RESULT="
+RESULT_PREFIX = "RIG_RESULT="
 SCHEMA_VERSION = 1
 MAX_RESULT_BYTES = 1_000_000
 _ARTIFACT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")

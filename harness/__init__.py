@@ -1,4 +1,4 @@
-"""Public API for the TPU speedrun competition harness."""
+"""Public API for the TPU rig competition harness."""
 
 from .doctor import CheckResult, doctor_ok, render_doctor, run_doctor
 from .errors import (

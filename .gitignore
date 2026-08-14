@@ -9,7 +9,7 @@ __pycache__/
 /data/cache/
 /runs/
 /report.html
-/.speedrun.toml
+/.rig.toml
 /.env*
 
 # JAX compilation/profile artifacts.

@@ -10,8 +10,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from speedrun.kernels.autotune import AttentionTilePlan
-from speedrun.kernels.tpu_flash_attention import (
+from rig.kernels.autotune import AttentionTilePlan
+from rig.kernels.tpu_flash_attention import (
     AttentionConfig,
     attention_tile_candidates,
     make_causal_attention,

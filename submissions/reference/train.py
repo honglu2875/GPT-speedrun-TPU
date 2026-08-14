@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A compact, dependency-light GPT trainer for the GPT TPU speedrun.
+"""A compact, dependency-light GPT trainer for the GPT TPU rig.
 
 Everything involved in training lives in this file.  The default model is sized
 for a TPU v4-8 and uses pure JAX: model state is replicated while the global
@@ -40,7 +40,7 @@ from jax.experimental import multihost_utils
 import yaml
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from speedrun.kernels import (
+from rig.kernels import (
     AttentionConfig,
     AttentionTiles,
     make_causal_attention,
@@ -48,7 +48,7 @@ from speedrun.kernels import (
     tiled_tied_cross_entropy,
     tiled_tied_cross_entropy_losses,
 )
-from speedrun.kernels.autotune import (
+from rig.kernels.autotune import (
     autotune_attention,
     make_runtime_key,
     padded_sequence_length,
@@ -56,7 +56,7 @@ from speedrun.kernels.autotune import (
 )
 
 
-RESULT_PREFIX = "SPEEDRUN_RESULT="
+RESULT_PREFIX = "RIG_RESULT="
 CHECKPOINT_NAME = "checkpoint.npz"
 TRAINING_CSV_NAME = "training.csv"
 VALIDATION_CSV_NAME = "validation.csv"
@@ -79,9 +79,9 @@ _DIAGNOSTIC_STATS = (
     "third_moment",
     "fourth_moment",
 )
-_DISTRIBUTED_ENV = "SPEEDRUN_DISTRIBUTED"
-_PROCESS_COUNT_ENV = "SPEEDRUN_PROCESS_COUNT"
-_CONTROLLER_HOST_ENV = "SPEEDRUN_CONTROLLER_HOSTNAME"
+_DISTRIBUTED_ENV = "RIG_DISTRIBUTED"
+_PROCESS_COUNT_ENV = "RIG_PROCESS_COUNT"
+_CONTROLLER_HOST_ENV = "RIG_CONTROLLER_HOSTNAME"
 
 
 # A deliberately small, original corpus for offline and smoke-test use.  The
@@ -1295,7 +1295,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--output-dir", type=Path, default=Path("runs/reference"))
     run.add_argument("--seed", type=int, default=1337)
-    environment_tier = os.environ.get("SPEEDRUN_TIER", "125m")
+    environment_tier = os.environ.get("RIG_TIER", "125m")
     if environment_tier not in _VALID_TIERS:
         environment_tier = "125m"
     run.add_argument(
@@ -1318,10 +1318,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="research budget rounded to the nearest complete global step",
     )
-    environment_track = os.environ.get("SPEEDRUN_TRACK", "open")
+    environment_track = os.environ.get("RIG_TRACK", "open")
     if environment_track not in _VALID_TRACKS:
         environment_track = "open"
-    environment_profile = os.environ.get("SPEEDRUN_PROFILE")
+    environment_profile = os.environ.get("RIG_PROFILE")
     if environment_profile not in _VALID_PROFILES:
         environment_profile = None
     run.add_argument("--track", choices=_VALID_TRACKS, default=environment_track)
@@ -4059,7 +4059,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     validation_rows: list[ValidationRow] = []
     validation_probe_seconds = 0.0
     if process_count > 1:
-        multihost_utils.sync_global_devices("speedrun-training-start")
+        multihost_utils.sync_global_devices("rig-training-start")
     train_started = time.perf_counter()
     xprof_dir = (
         args.xprof_dir.expanduser().resolve() if capture_window is not None else None
@@ -4091,7 +4091,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                     trace_active = True
                 if process_count > 1:
                     multihost_utils.sync_global_devices(
-                        "speedrun-xprof-capture-started"
+                        "rig-xprof-capture-started"
                     )
 
             annotation = (
@@ -4197,7 +4197,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             if capture_window is not None and step_index == capture_window[1]:
                 if process_count > 1:
                     multihost_utils.sync_global_devices(
-                        "speedrun-xprof-capture-finished"
+                        "rig-xprof-capture-finished"
                     )
                 if trace_active:
                     jax.profiler.stop_trace()
@@ -4205,7 +4205,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                     console.phase("XProf capture saved", str(xprof_dir))
                 if process_count > 1:
                     multihost_utils.sync_global_devices(
-                        "speedrun-xprof-capture-stopped"
+                        "rig-xprof-capture-stopped"
                     )
     finally:
         if trace_active:
@@ -4219,7 +4219,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     # result branch is otherwise independent of the next optimizer state.
     sync_tree((params, optimizer, last_metrics, diagnostic_device_points))
     if process_count > 1:
-        multihost_utils.sync_global_devices("speedrun-training-finished")
+        multihost_utils.sync_global_devices("rig-training-finished")
     train_seconds = max(time.perf_counter() - train_started, 1.0e-12)
     final_train = local_device_get(last_metrics)
     training_history = np.asarray(
@@ -4269,7 +4269,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             ),
         )
         if process_count > 1:
-            multihost_utils.sync_global_devices("speedrun-profile-artifacts-written")
+            multihost_utils.sync_global_devices("rig-profile-artifacts-written")
         return None
 
     console.phase(
@@ -4541,7 +4541,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         write_result(output_dir, result)
     console.success(validation_loss, train_seconds, final_validation_seconds)
     if process_count > 1:
-        multihost_utils.sync_global_devices("speedrun-final-artifacts-written")
+        multihost_utils.sync_global_devices("rig-final-artifacts-written")
     return result if is_controller else None
 
 
@@ -4554,7 +4554,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         # A concise colored-ish error is useful interactively; a traceback can be
         # requested naturally via Python's exception chaining during development.
         print(f"\nerror: {error}", file=sys.stderr)
-        if os.environ.get("SPEEDRUN_DEBUG") == "1":
+        if os.environ.get("RIG_DEBUG") == "1":
             raise
         return 1
     if result is not None:

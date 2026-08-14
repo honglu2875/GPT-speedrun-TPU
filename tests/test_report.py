@@ -7,7 +7,7 @@ import re
 import tempfile
 import unittest
 
-from speedrun.report import (
+from rig.report import (
     REPORT_ADMISSION_QUALIFICATION_LOSS,
     ReportError,
     _attach_flops,

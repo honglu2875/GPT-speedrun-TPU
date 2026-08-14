@@ -97,7 +97,7 @@ result = {
 if args.evaluations_json is not None:
     result["evaluations"] = json.loads(args.evaluations_json)
 print("human log output")
-print("SPEEDRUN_RESULT=" + json.dumps(result, separators=(",", ":")))
+print("RIG_RESULT=" + json.dumps(result, separators=(",", ":")))
 '''
 
 
@@ -235,14 +235,14 @@ class HarnessRunTests(unittest.TestCase):
             )
 
         remote_environment = build.call_args.kwargs["environment"]
-        self.assertEqual(remote_environment["SPEEDRUN_DISTRIBUTED"], "1")
-        self.assertEqual(remote_environment["SPEEDRUN_PROCESS_COUNT"], "4")
+        self.assertEqual(remote_environment["RIG_DISTRIBUTED"], "1")
+        self.assertEqual(remote_environment["RIG_PROCESS_COUNT"], "4")
         self.assertEqual(
-            remote_environment["SPEEDRUN_CONTROLLER_HOSTNAME"], "slice-w-0"
+            remote_environment["RIG_CONTROLLER_HOSTNAME"], "slice-w-0"
         )
         self.assertEqual(
             remote_environment["JAX_COMPILATION_CACHE_DIR"],
-            f"/tmp/speedrun-jax-cache-{outcome.run_id}",
+            f"/tmp/rig-jax-cache-{outcome.run_id}",
         )
         self.assertEqual(outcome.record["trainer_command"], outcome.record["command"])
 
@@ -456,7 +456,7 @@ class HarnessRunTests(unittest.TestCase):
             run_submission(self.config())
 
     def test_shared_python_provenance_changes_with_dependency_bytes(self) -> None:
-        shared = self.root / "speedrun" / "kernels"
+        shared = self.root / "rig" / "kernels"
         shared.mkdir(parents=True)
         dependency = shared / "attention.py"
         dependency.write_text("PLAN = 128\n", encoding="utf-8")
@@ -748,9 +748,9 @@ class ProtocolAndScoringTests(unittest.TestCase):
 
     def test_result_must_be_final_line_and_finite(self) -> None:
         with self.assertRaises(ResultValidationError):
-            parse_result_line('SPEEDRUN_RESULT={"schema_version":1}\nlate log\n')
+            parse_result_line('RIG_RESULT={"schema_version":1}\nlate log\n')
         with self.assertRaises(ResultValidationError):
-            parse_result_line("SPEEDRUN_RESULT={not json}\n")
+            parse_result_line("RIG_RESULT={not json}\n")
 
     def test_optional_implementation_provenance_must_be_an_object(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

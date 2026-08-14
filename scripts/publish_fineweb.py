@@ -30,9 +30,9 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from speedrun.data import DataError, load_manifest, validate_shard  # noqa: E402
-from speedrun.data import FORMAT_VERSION, HEADER_BYTES, MAGIC  # noqa: E402
-from speedrun.data_routing import (  # noqa: E402
+from rig.data import DataError, load_manifest, validate_shard  # noqa: E402
+from rig.data import FORMAT_VERSION, HEADER_BYTES, MAGIC  # noqa: E402
+from rig.data_routing import (  # noqa: E402
     SCALED_BUILDER_SHA256,
     SCALED_CORE_SHA256,
     SCALED_ENTRYPOINT_SHA256,
@@ -41,7 +41,8 @@ from speedrun.data_routing import (  # noqa: E402
     scaled_variant_named,
     validate_scaled_manifest_contract,
 )
-from speedrun.fineweb_builder import (  # noqa: E402
+import rig.frozen  # noqa: F401  (registers the frozen builder's legacy import name)
+from rig.fineweb_builder import (  # noqa: E402
     FineWebBuildError,
     canonical_json_bytes,
     canonical_json_sha256,
@@ -55,7 +56,7 @@ TOKEN_PATTERN = re.compile(r"hf_[A-Za-z0-9]{20,}\Z")
 METADATA_FILENAMES = ("BUILD_PLAN.json", "exclusions.json", "source.json")
 PROVENANCE_FILES = (
     (
-        REPOSITORY_ROOT / "speedrun" / "fineweb_builder.py",
+        REPOSITORY_ROOT / "rig" / "fineweb_builder.py",
         "provenance/fineweb_builder.py",
         SCALED_BUILDER_SHA256,
     ),
@@ -907,7 +908,7 @@ def anonymous_verify_variant(
         raw_manifest, _headers, _status = request_bytes(
             Request(
                 manifest_url,
-                headers={"User-Agent": "gpt-tpu-speedrun-publish/1"},
+                headers={"User-Agent": "gpt-tpu-rig-publish/1"},
             ),
             timeout=timeout,
             maximum_bytes=MAX_JSON_BYTES,
@@ -945,7 +946,7 @@ def anonymous_verify_variant(
                 headers={
                     "Accept-Encoding": "identity",
                     "Range": f"bytes=0-{HEADER_BYTES - 1}",
-                    "User-Agent": "gpt-tpu-speedrun-publish/1",
+                    "User-Agent": "gpt-tpu-rig-publish/1",
                 },
             ),
             timeout=timeout,
@@ -993,7 +994,7 @@ def fetch_tree_pages(
         seen_urls.add(url)
         try:
             raw, headers, _status = request_bytes(
-                Request(url, headers={"User-Agent": "gpt-tpu-speedrun-publish/1"}),
+                Request(url, headers={"User-Agent": "gpt-tpu-rig-publish/1"}),
                 timeout=timeout,
                 maximum_bytes=MAX_JSON_BYTES,
                 label=f"anonymous tree verification for {variant}",

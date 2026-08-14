@@ -5,8 +5,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from speedrun.data import DataError, HEADER_BYTES
-from speedrun.data_routing import (
+from rig.data import DataError, HEADER_BYTES
+from rig.data_routing import (
     CLASSIC_TRAIN_CAPACITY,
     MAX_SCALED_TRAIN_CAPACITY,
     SCALED_BUILDER_SHA256,
