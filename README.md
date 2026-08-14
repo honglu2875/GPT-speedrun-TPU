@@ -104,10 +104,16 @@ same user's `~/.ssh/authorized_keys` on the TPU VMs, verify
 
 After the SSH and RAM-cache probes succeed, preparation attempts a
 non-interactive `apt-get` installation wherever `rsync` is missing. It then
-incrementally copies the current checkout—including dirty and untracked
+incrementally mirrors the current checkout—including dirty and untracked
 experiment files, but excluding Git metadata, the virtual environment,
 `shm/`, data, caches, profiles, and run artifacts—to the same absolute path on
-every peer. It installs `uv` there if needed, synchronizes the frozen
+every peer. The mirror is authoritative: a file you delete or rename in the
+checkout is removed from the peers on the next synchronization, so stale
+modules cannot linger there and shadow current code. Excluded paths are never
+deleted, and removal is deferred until the transfer succeeds, so an interrupted
+synchronization cannot strip a peer. Keep working notes outside the checkout or
+in Git; an untracked file that exists only on a peer will not survive.
+It installs `uv` there if needed, synchronizes the frozen
 environment, then uses one `pdsh` launch to prepare the selected dataset and
 validations concurrently in every VM's local protected RAM cache. Before each
 worker's SSH command exits, it protects the completed entries from logout

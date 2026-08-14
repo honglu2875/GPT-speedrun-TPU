@@ -71,18 +71,27 @@ _PROBE_ATTEMPTS = 4
 # corpus already installed on every TPU VM. Renaming it here would orphan that
 # cache and force a full re-download on each host.
 RAM_CACHE_ROOT = Path("/dev/shm/.speedrun-cache")
-_COMMON_RSYNC_EXCLUDES = (
+# Peer-local state: not copied, and never removed by the mirror.
+_PROTECTED_RSYNC_EXCLUDES = (
     ".git/",
     ".venv/",
-    ".mypy_cache/",
-    ".pytest_cache/",
-    ".ruff_cache/",
-    "__pycache__/",
     "shm",
     "runs/",
     "profiles/",
     "report.html",
 )
+# Derived caches: not worth copying, but a peer should not keep them once the
+# sources that produced them are gone. rsync protects excluded paths from
+# --delete by default, so without marking these "risk" a deleted package
+# directory survives on the peer as a bytecode-only directory -- which Python
+# still imports as an empty namespace package.
+_DERIVED_CACHE_EXCLUDES = (
+    ".mypy_cache/",
+    ".pytest_cache/",
+    ".ruff_cache/",
+    "__pycache__/",
+)
+_COMMON_RSYNC_EXCLUDES = _PROTECTED_RSYNC_EXCLUDES + _DERIVED_CACHE_EXCLUDES
 
 
 class ClusterError(RuntimeError):
@@ -237,7 +246,14 @@ def sync_workspace(
     data_path: Path | None = None,
     environment: Mapping[str, str] | None = None,
 ) -> None:
-    """Incrementally copy source/config bytes without deleting peer-only files."""
+    """Mirror source/config bytes onto every peer VM.
+
+    The copy is incremental but authoritative: files that no longer exist in the
+    controller's checkout are removed from the peers, so peer state is a
+    function of the current checkout rather than of every sync that came before
+    it. Excluded paths — Git metadata, the virtual environment, ``shm``, the
+    data cache, caches, profiles, and run artifacts — are never deleted.
+    """
 
     if not inventory.remote_hosts:
         return
@@ -264,6 +280,7 @@ def sync_workspace(
         root,
         inventory.remote_hosts,
         tuple(sorted(excluded)),
+        risk=_DERIVED_CACHE_EXCLUDES,
         environment=environment,
     )
 
@@ -623,6 +640,7 @@ def _rsync_to_hosts(
     hosts: Sequence[str],
     exclusions: Sequence[str],
     *,
+    risk: Sequence[str] = (),
     environment: Mapping[str, str] | None,
 ) -> None:
     _require_program("rsync")
@@ -633,7 +651,26 @@ def _rsync_to_hosts(
     ssh_command = shlex.join(ssh_arguments)
 
     def copy(host: str) -> tuple[str, subprocess.CompletedProcess[str]]:
-        command = ["rsync", "-az", "--protect-args", "--quiet"]
+        # --delete makes a peer a mirror of the controller instead of an
+        # accumulation of every checkout it has ever received: a renamed or
+        # deleted module would otherwise survive on the peers indefinitely and
+        # stay importable there. --delete-after defers removal until the
+        # transfer succeeds, so an interrupted sync never strips a peer.
+        # --delete-excluded is deliberately NOT passed, which is what keeps
+        # runs/, .venv/, .git/, profiles/, shm, and the data cache — all listed
+        # in `exclusions` — from being touched.
+        command = [
+            "rsync",
+            "-az",
+            "--delete",
+            "--delete-after",
+            "--protect-args",
+            "--quiet",
+        ]
+        # Risk rules must precede the exclusions: rsync takes the first
+        # matching rule, and an --exclude would otherwise protect the pattern.
+        for pattern in risk:
+            command.extend(("--filter", f"R {pattern}"))
         for exclusion in exclusions:
             command.extend(("--exclude", exclusion))
         command.extend(

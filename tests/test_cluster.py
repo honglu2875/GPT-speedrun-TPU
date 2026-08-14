@@ -23,7 +23,12 @@ from rig.harness.cluster import (
     seal_ram_cache_command,
     terminate_distributed_workers,
 )
-from rig.harness.cluster import _rsync_to_hosts
+from rig.harness.cluster import (
+    _COMMON_RSYNC_EXCLUDES,
+    _DERIVED_CACHE_EXCLUDES,
+    _PROTECTED_RSYNC_EXCLUDES,
+    _rsync_to_hosts,
+)
 from rig.config import ConfigError, LocalConfig, load_config, save_config
 
 
@@ -173,7 +178,9 @@ class ClusterTests(unittest.TestCase):
         self.assertIn("candidate/train\\.py", command[-1])
         self.assertIn("run\\-123", command[-1])
 
-    def test_workspace_copy_uses_parallel_incremental_rsync_without_delete(self) -> None:
+    def test_workspace_copy_mirrors_in_parallel_and_never_deletes_excluded_paths(
+        self,
+    ) -> None:
         completed = subprocess.CompletedProcess([], 0, "", "")
         with (
             patch("rig.harness.cluster.shutil.which", return_value="/usr/bin/rsync"),
@@ -182,18 +189,52 @@ class ClusterTests(unittest.TestCase):
             _rsync_to_hosts(
                 Path("/repo"),
                 ("slice-w-1", "slice-w-2"),
-                (".git/", "/runs/"),
+                (".git/", "/runs/", "__pycache__/"),
+                risk=("__pycache__/",),
                 environment={},
             )
         self.assertEqual(run.call_count, 2)
         commands = [call.args[0] for call in run.call_args_list]
         self.assertTrue(all(command[0] == "rsync" for command in commands))
-        self.assertTrue(all("--delete" not in command for command in commands))
+        # A peer mirrors the controller, so files deleted or renamed there stop
+        # existing on the peers instead of lingering as importable stale code.
+        self.assertTrue(all("--delete" in command for command in commands))
+        # Deferred until the transfer succeeds: an interrupted sync must never
+        # leave a peer stripped of source.
+        self.assertTrue(all("--delete-after" in command for command in commands))
+        # The critical safety property: excluded paths are protected from
+        # deletion, which is exactly what --delete-excluded would undo.
+        self.assertTrue(all("--delete-excluded" not in command for command in commands))
         self.assertTrue(all(".git/" in command and "/runs/" in command for command in commands))
+        # Derived caches are excluded from transfer but marked "risk" so they
+        # can still be deleted. Without this, a package directory deleted on
+        # the controller survives on the peer as a bytecode-only directory that
+        # Python happily imports as an empty namespace package. The risk rule
+        # must come before the matching --exclude, because rsync takes the
+        # first matching rule.
+        for command in commands:
+            self.assertIn("--filter", command)
+            self.assertIn("R __pycache__/", command)
+            self.assertLess(
+                command.index("--filter"), command.index("--exclude")
+            )
         self.assertEqual(
             {command[-1] for command in commands},
             {"slice-w-1:/repo/", "slice-w-2:/repo/"},
         )
+
+    def test_protected_and_derived_exclusions_are_disjoint_and_complete(self) -> None:
+        # Peer-local state must never appear in the deletable set.
+        self.assertEqual(
+            set(_PROTECTED_RSYNC_EXCLUDES) & set(_DERIVED_CACHE_EXCLUDES), set()
+        )
+        self.assertEqual(
+            set(_COMMON_RSYNC_EXCLUDES),
+            set(_PROTECTED_RSYNC_EXCLUDES) | set(_DERIVED_CACHE_EXCLUDES),
+        )
+        for critical in (".git/", ".venv/", "runs/", "shm", "profiles/"):
+            self.assertIn(critical, _PROTECTED_RSYNC_EXCLUDES)
+            self.assertNotIn(critical, _DERIVED_CACHE_EXCLUDES)
 
     def test_ram_cache_preflight_checks_mount_then_creates_link_on_all_hosts(self) -> None:
         inventory = ClusterInventory(
