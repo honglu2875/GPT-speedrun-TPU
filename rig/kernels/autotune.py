@@ -4,23 +4,28 @@ Attention tile sizes are static compilation parameters.  Consequently, a
 kernel cannot benchmark alternatives *while* XLA is compiling that same
 program.  This module implements the useful two-stage version instead:
 
-* ordinary runs resolve a deterministic result from a local cache, a shipped
-  lookup table, or a conservative shape heuristic; and
-* an explicit bootstrap run AOT-compiles a small set of candidates against
+* ordinary runs resolve a deterministic result from a shipped lookup table or
+  a conservative shape heuristic, both pure functions of the key, so every
+  process in a multi-host job derives identical tiles without communicating; and
+* an explicit offline bootstrap AOT-compiles a small set of candidates against
   synthetic tensors, warms each executable, measures synchronized executions,
-  and atomically caches the fastest robust median.
+  and reports the fastest robust median for promotion into the lookup table.
+
+There is deliberately no on-disk cache. A per-host cache file was the one way
+two processes could select different tiles for the same SPMD program.
 
 No dataset or model parameters are accepted by the tuning API.  The batch in
 ``AutotuneKey`` is the per-device batch seen by the attention kernel, not the
-global data-parallel batch.  Cache keys include the complete runtime and shape
-fingerprint because a result from a different TPU generation, JAX/libtpu
-runtime, dtype, topology, or forward/backward mode is not safely reusable.
+global data-parallel batch.  Keys include the complete runtime and shape
+Keys include the complete runtime and shape fingerprint because a result from a
+different TPU generation, JAX/libtpu runtime, dtype, topology, or
+forward/backward mode is not safely reusable.
 
 The tile names intentionally follow JAX SplashAttention's public ``BlockSizes``
 vocabulary, with two explicit inner-compute fields needed to represent the
 older JAX FlashAttention kernel losslessly.  ``AttentionTilePlan`` remains
-independent of the Pallas kernel so the cache and its CPU tests do not import
-TPU-only implementation details.
+independent of the Pallas kernel so its CPU tests do not import TPU-only
+implementation details.
 """
 
 from __future__ import annotations
@@ -28,22 +33,16 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-import fcntl
 import hashlib
 from importlib import metadata as importlib_metadata
 import json
 import math
-import os
 from pathlib import Path
-import stat
 import statistics
-import tempfile
 import time
 from typing import Any, Literal, Protocol
-import warnings
 
 
-CACHE_SCHEMA_VERSION = 1
 KERNEL_REVISION = "tpu_flash_attention_v1"
 # Refreshed for the speedrun -> rig package rename. The only change to
 # tpu_flash_attention.py was two docstring references to the package name, so
@@ -67,8 +66,8 @@ class AutotuneError(RuntimeError):
     """Base class for attention autotuning failures."""
 
 
-class AutotuneCacheError(AutotuneError):
-    """Raised when a cache exists but does not satisfy the cache schema."""
+class AutotuneSchemaError(AutotuneError):
+    """Raised when a serialized tile plan, key, or record violates the schema."""
 
 
 class NoSuccessfulCandidateError(AutotuneError):
@@ -141,7 +140,7 @@ class AttentionTilePlan:
             "block_kv_dq_compute",
         }
         if set(value) != expected:
-            raise AutotuneCacheError(
+            raise AutotuneSchemaError(
                 "tile plan fields do not match schema: "
                 f"expected {sorted(expected)}, found {sorted(value)}"
             )
@@ -149,7 +148,7 @@ class AttentionTilePlan:
         for name in expected:
             item = value[name]
             if item is not None and (isinstance(item, bool) or not isinstance(item, int)):
-                raise AutotuneCacheError(f"tile field {name!r} must be an integer or null")
+                raise AutotuneSchemaError(f"tile field {name!r} must be an integer or null")
             converted[name] = item
         return cls(**converted)  # type: ignore[arg-type]
 
@@ -285,14 +284,14 @@ class AutotuneKey:
             "conditional_rescale",
         }
         if set(value) != expected:
-            raise AutotuneCacheError(
+            raise AutotuneSchemaError(
                 "autotune key fields do not match schema: "
                 f"expected {sorted(expected)}, found {sorted(value)}"
             )
         try:
             return cls(**dict(value))
         except (TypeError, ValueError) as exc:
-            raise AutotuneCacheError(f"invalid autotune key: {exc}") from exc
+            raise AutotuneSchemaError(f"invalid autotune key: {exc}") from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,10 +358,10 @@ class CandidateMeasurement:
             "error",
         }
         if set(value) != expected:
-            raise AutotuneCacheError("candidate measurement fields do not match schema")
+            raise AutotuneSchemaError("candidate measurement fields do not match schema")
         status = value["status"]
         if status not in ("ok", "error"):
-            raise AutotuneCacheError(f"invalid candidate status: {status!r}")
+            raise AutotuneSchemaError(f"invalid candidate status: {status!r}")
         try:
             samples = tuple(float(sample) for sample in value["samples_seconds"])
             compile_seconds = float(value["compile_seconds"])
@@ -383,7 +382,7 @@ class CandidateMeasurement:
                 error=error,
             )
         except (TypeError, ValueError, KeyError) as exc:
-            raise AutotuneCacheError(f"invalid candidate measurement: {exc}") from exc
+            raise AutotuneSchemaError(f"invalid candidate measurement: {exc}") from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,9 +421,9 @@ class AutotuneRecord:
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> AutotuneRecord:
         if set(value) != {"key", "winner", "measurements", "recorded_at"}:
-            raise AutotuneCacheError("autotune record fields do not match schema")
+            raise AutotuneSchemaError("autotune record fields do not match schema")
         if not isinstance(value["recorded_at"], str):
-            raise AutotuneCacheError("recorded_at must be a string")
+            raise AutotuneSchemaError("recorded_at must be a string")
         try:
             measurements = tuple(
                 CandidateMeasurement.from_dict(item) for item in value["measurements"]
@@ -437,7 +436,7 @@ class AutotuneRecord:
             )
             return record
         except (TypeError, ValueError, KeyError) as exc:
-            raise AutotuneCacheError(f"invalid autotune record: {exc}") from exc
+            raise AutotuneSchemaError(f"invalid autotune record: {exc}") from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -954,167 +953,16 @@ def lookup_shipped_tuning(key: AutotuneKey) -> AttentionTilePlan | None:
     return None
 
 
-def _parse_cache_document(document: Any) -> dict[str, AutotuneRecord]:
-    if not isinstance(document, dict):
-        raise AutotuneCacheError("cache root must be a JSON object")
-    if set(document) != {"schema_version", "entries"}:
-        raise AutotuneCacheError("cache root fields do not match schema")
-    if document["schema_version"] != CACHE_SCHEMA_VERSION:
-        raise AutotuneCacheError(
-            "unsupported cache schema version: "
-            f"{document['schema_version']!r} (expected {CACHE_SCHEMA_VERSION})"
-        )
-    entries = document["entries"]
-    if not isinstance(entries, dict):
-        raise AutotuneCacheError("cache entries must be a JSON object")
-    records: dict[str, AutotuneRecord] = {}
-    for digest, value in entries.items():
-        if not isinstance(digest, str) or not isinstance(value, dict):
-            raise AutotuneCacheError("cache entry keys/values have invalid types")
-        record = AutotuneRecord.from_dict(value)
-        if digest != record.key.digest:
-            raise AutotuneCacheError(
-                f"cache digest mismatch for entry {digest[:12]}"
-            )
-        for measurement in record.measurements:
-            if not is_legal_attention_tile_plan(
-                measurement.tiles,
-                sequence=record.key.sequence,
-                head_dim=record.key.head_dim,
-                mode=record.key.mode,
-                buffer_count=record.key.buffer_count,
-            ):
-                raise AutotuneCacheError(
-                    f"cache entry {digest[:12]} contains an illegal tile plan"
-                )
-        records[digest] = record
-    return records
+def resolve_attention_tile_plan(key: AutotuneKey) -> ResolvedTilePlan:
+    """Resolve the exact shipped LUT, else the shape heuristic.
 
+    Both tiers are pure functions of the key, which is what lets every process
+    in a multi-host job arrive at identical tile constants without
+    communicating. A per-host cache file was the one thing that could break
+    that: two hosts measuring near-equal candidates could persist different
+    winners and then compile divergent HLO for the same SPMD program.
+    """
 
-def load_autotune_cache(path: str | Path) -> dict[str, AutotuneRecord]:
-    """Load and validate a cache; a missing file is an empty cache."""
-
-    cache_path = Path(path)
-    try:
-        info = cache_path.lstat()
-    except FileNotFoundError:
-        return {}
-    except OSError as exc:
-        raise AutotuneCacheError(f"cannot inspect {cache_path}: {exc}") from exc
-    if stat.S_ISLNK(info.st_mode):
-        raise AutotuneCacheError(f"cache file must not be a symlink: {cache_path}")
-    if not stat.S_ISREG(info.st_mode):
-        raise AutotuneCacheError(f"cache path is not a regular file: {cache_path}")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(cache_path, flags)
-        with os.fdopen(descriptor, "r", encoding="utf-8") as source:
-            opened_info = os.fstat(source.fileno())
-            if not stat.S_ISREG(opened_info.st_mode):
-                raise AutotuneCacheError(
-                    f"cache path is not a regular file: {cache_path}"
-                )
-            document = json.load(source)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise AutotuneCacheError(f"cannot read {cache_path}: {exc}") from exc
-    return _parse_cache_document(document)
-
-
-def find_cached_tuning(
-    path: str | Path, key: AutotuneKey
-) -> AutotuneRecord | None:
-    return load_autotune_cache(path).get(key.digest)
-
-
-def _cache_document(records: Mapping[str, AutotuneRecord]) -> dict[str, Any]:
-    return {
-        "schema_version": CACHE_SCHEMA_VERSION,
-        "entries": {
-            digest: records[digest].to_dict() for digest in sorted(records)
-        },
-    }
-
-
-def _atomic_write_json(path: Path, document: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_name: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as temporary:
-            temp_name = temporary.name
-            json.dump(
-                document,
-                temporary,
-                indent=2,
-                sort_keys=True,
-                allow_nan=False,
-            )
-            temporary.write("\n")
-            temporary.flush()
-            os.fsync(temporary.fileno())
-        os.replace(temp_name, path)
-        temp_name = None
-    finally:
-        if temp_name is not None:
-            try:
-                Path(temp_name).unlink()
-            except FileNotFoundError:
-                pass
-
-
-def save_autotune_record(path: str | Path, record: AutotuneRecord) -> None:
-    """Merge one record under an advisory lock and atomically replace JSON."""
-
-    cache_path = Path(path)
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = cache_path.with_name(f"{cache_path.name}.lock")
-    flags = (
-        os.O_RDWR
-        | os.O_CREAT
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    try:
-        descriptor = os.open(lock_path, flags, 0o600)
-    except OSError as exc:
-        raise AutotuneCacheError(f"cannot safely open cache lock {lock_path}: {exc}") from exc
-    with os.fdopen(descriptor, "a+", encoding="utf-8") as lock:
-        lock_info = os.fstat(lock.fileno())
-        if not stat.S_ISREG(lock_info.st_mode):
-            raise AutotuneCacheError(f"cache lock is not a regular file: {lock_path}")
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        records = load_autotune_cache(cache_path)
-        records[record.key.digest] = record
-        _atomic_write_json(cache_path, _cache_document(records))
-        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-
-
-def resolve_attention_tile_plan(
-    key: AutotuneKey,
-    *,
-    cache_path: str | Path | None = None,
-    strict_cache: bool = False,
-) -> ResolvedTilePlan:
-    """Resolve cache -> exact shipped LUT -> heuristic, without benchmarking."""
-
-    if cache_path is not None:
-        try:
-            if record := find_cached_tuning(cache_path, key):
-                return ResolvedTilePlan(record.winner, "cache", record)
-        except AutotuneCacheError as exc:
-            if strict_cache:
-                raise
-            warnings.warn(
-                f"ignoring invalid attention autotune cache: {exc}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
     if shipped := lookup_shipped_tuning(key):
         return ResolvedTilePlan(shipped, "shipped")
     return ResolvedTilePlan(heuristic_attention_tile_plan(key), "heuristic")
@@ -1347,18 +1195,18 @@ def autotune_attention(
     key: AutotuneKey,
     attention_factory: AttentionFactory,
     candidates: Iterable[AttentionTilePlan] | None = None,
-    cache_path: str | Path | None = None,
     device: Any | None = None,
     warmup_runs: int = 2,
     measured_runs: int = 7,
-    force: bool = False,
     seed: int = 17,
 ) -> AutotuneRecord:
-    """Explicitly bootstrap one workload and optionally persist its winner."""
+    """Measure one workload offline and return the winning tile plan.
 
-    if cache_path is not None and not force:
-        if cached := find_cached_tuning(cache_path, key):
-            return cached
+    Deliberately not wired into the trainer: use it to establish a plan for a
+    new topology, then promote the winner to ``_SHIPPED_TUNINGS`` so every
+    process derives it identically from the key.
+    """
+
     if candidates is None:
         candidates = generate_attention_tile_candidates(
             sequence=key.sequence,
@@ -1393,25 +1241,21 @@ def autotune_attention(
         measured_runs=measured_runs,
         head_dim=key.head_dim,
     )
-    record = AutotuneRecord(
+    return AutotuneRecord(
         key=key,
         winner=winner,
         measurements=measurements,
         recorded_at=datetime.now(timezone.utc).isoformat(),
     )
-    if cache_path is not None:
-        save_autotune_record(cache_path, record)
-    return record
 
 
 __all__ = (
     "AttentionTilePlan",
-    "AutotuneCacheError",
+    "AutotuneSchemaError",
     "AutotuneError",
     "AutotuneKey",
     "AutotuneMode",
     "AutotuneRecord",
-    "CACHE_SCHEMA_VERSION",
     "DEFAULT_MAX_VMEM_FRACTION",
     "JAX_FLASH_REVISION",
     "JAX_FLASH_SOURCE_SHA256",
@@ -1423,17 +1267,14 @@ __all__ = (
     "TPU_V4_VMEM_BYTES",
     "autotune_attention",
     "benchmark_tile_candidates",
-    "find_cached_tuning",
     "estimate_attention_vmem_bytes",
     "generate_attention_tile_candidates",
     "heuristic_attention_tile_plan",
     "is_legal_attention_tile_plan",
     "kernel_implementation_hash",
-    "load_autotune_cache",
     "lookup_shipped_tuning",
     "make_jax_attention_compiler",
     "make_runtime_key",
     "padded_sequence_length",
     "resolve_attention_tile_plan",
-    "save_autotune_record",
 )

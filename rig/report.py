@@ -23,8 +23,6 @@ from typing import Any, Iterable, Mapping, Sequence
 _MAX_JSON_BYTES = 4 * 1024 * 1024
 _MAX_CSV_BYTES = 128 * 1024 * 1024
 _MAX_CHART_POINTS = 1_400
-_OFFICIAL_OPEN_TOKENS = 624_984_064
-REPORT_ADMISSION_QUALIFICATION_LOSS = 3.76
 _LAYER_KEY = re.compile(r"(?:^|/)(?:blocks?|layers?|h)(?:/|_)(\d+)(?:/|$)")
 _COLORS = (
     "#7dd3fc",
@@ -129,21 +127,18 @@ def build_report(
     output_path: Path,
     *,
     max_chart_points: int = _MAX_CHART_POINTS,
-    include_dev: bool = False,
 ) -> ReportSummary:
     """Scan ``runs_dir`` and write one portable report HTML file.
 
-    ``max_chart_points`` bounds the embedded data and canvas work per series.  The
-    first and last points are always retained.  ``include_dev`` is an explicit
-    diagnostic-only escape hatch; it never relaxes admission for official runs.
+    Every successful run is plotted, whatever its profile, token budget, or
+    loss. ``max_chart_points`` bounds the embedded data and canvas work per
+    series; the first and last points are always retained.
     """
 
     runs_dir = Path(runs_dir).expanduser().resolve()
     output_path = Path(output_path).expanduser().resolve()
     if isinstance(max_chart_points, bool) or max_chart_points < 32:
         raise ReportError("max_chart_points must be an integer of at least 32")
-    if not isinstance(include_dev, bool):
-        raise ReportError("include_dev must be a boolean")
     if not runs_dir.is_dir():
         raise ReportError(f"runs directory does not exist: {runs_dir}")
     if output_path.exists() and (output_path.is_dir() or output_path.is_symlink()):
@@ -167,10 +162,7 @@ def build_report(
             )
             continue
         try:
-            admission_reason = _report_admission_reason(
-                candidate,
-                include_dev=include_dev,
-            )
+            admission_reason = _report_admission_reason(candidate)
         except (OSError, ReportError, json.JSONDecodeError) as exc:
             skipped[candidate.name] = str(exc)
             continue
@@ -185,18 +177,16 @@ def build_report(
         included.append(run)
 
     notices = list(ledger_notices)
-    if include_dev:
-        notices.append(
-            "Development-profile runs were explicitly included as diagnostics; "
-            "they are not official or qualifying results."
-        )
+    notices.append(
+        "Every successful run is plotted. Profile and token budget are shown "
+        "per run; qualification is decided by `rig leaderboard`, not here."
+    )
     notices.extend(notice for run in included for notice in run.notices)
     payload = _report_payload(
         included,
         skipped,
         notices,
         max_chart_points=max_chart_points,
-        include_dev=include_dev,
     )
     html = _render_html(payload)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -209,12 +199,18 @@ def build_report(
     )
 
 
-def _report_admission_reason(
-    run_dir: Path,
-    *,
-    include_dev: bool = False,
-) -> str | None:
-    """Apply the cheap, versioned report filter before hashing large artifacts."""
+def _report_admission_reason(run_dir: Path) -> str | None:
+    """Admit any successful run; the dashboard is for looking at all of them.
+
+    There is deliberately no token-budget, loss, or profile gate. Those once
+    restricted the report to the historical 624,984,064-token v4-8 baseline,
+    which silently excluded every run of the current tiered family. Whether a
+    run *qualifies* is a leaderboard question, answered by ``rig leaderboard``
+    against the target in docs/RULES.md; it is not a reason to hide a curve.
+
+    Structural integrity is still enforced: a malformed, unsuccessful, or
+    wrong-schema result is an error rather than a silent omission.
+    """
 
     result_path = _regular_file(run_dir, "result.json")
     if result_path.stat().st_size > _MAX_JSON_BYTES:
@@ -224,32 +220,13 @@ def _report_admission_reason(
         raise ReportError("result.json is not an object")
     if result.get("schema_version") != 1 or result.get("status") != "ok":
         raise ReportError("result.json is not a successful schema-v1 result")
-    profile = result.get("profile")
-    dev_diagnostic = include_dev and profile == "dev"
-    if profile != "official" and not dev_diagnostic:
-        return (
-            "baseline report admission qualification requires "
-            f"profile='official'; found {profile!r}"
-        )
-    track = result.get("track")
-    if track not in {"open", "sample_efficiency"}:
+    if result.get("profile") not in {"smoke", "dev", "official"}:
+        raise ReportError("result profile is invalid")
+    if result.get("track") not in {"open", "sample_efficiency"}:
         raise ReportError("result track is invalid")
     metrics = _object(result.get("metrics"), "result metrics")
-    tokens = _positive_int(metrics.get("tokens_processed"), "tokens_processed")
-    validation_loss = _finite(metrics.get("validation_loss"), "validation_loss")
-    if dev_diagnostic:
-        return None
-    if track == "open" and tokens != _OFFICIAL_OPEN_TOKENS:
-        return (
-            "open run is incomplete: expected exactly "
-            f"{_OFFICIAL_OPEN_TOKENS:,} training tokens, found {tokens:,}"
-        )
-    if validation_loss > REPORT_ADMISSION_QUALIFICATION_LOSS:
-        return (
-            "run does not meet the baseline report admission qualification: "
-            f"validation loss {validation_loss:.6g} > "
-            f"{REPORT_ADMISSION_QUALIFICATION_LOSS:.6g}"
-        )
+    _positive_int(metrics.get("tokens_processed"), "tokens_processed")
+    _finite(metrics.get("validation_loss"), "validation_loss")
     return None
 
 
@@ -1010,7 +987,6 @@ def _report_payload(
     notices: Sequence[str],
     *,
     max_chart_points: int,
-    include_dev: bool,
 ) -> dict[str, Any]:
     run_rows: list[dict[str, Any]] = []
     for index, run in enumerate(runs):
@@ -1024,9 +1000,7 @@ def _report_payload(
             if isinstance(run.record, dict) and isinstance(run.record.get("submission"), str)
             else _submission_from_run_id(run.run_id)
         )
-        _, classification = _default_run_selection(
-            str(result["track"]), str(result["profile"]), int(metrics["tokens_processed"])
-        )
+        _, classification = _default_run_selection(str(result["profile"]))
         qualified = run.record.get("qualified") if run.record else None
         if not isinstance(qualified, bool):
             qualified = None
@@ -1144,10 +1118,7 @@ def _report_payload(
             "defaultXScale": "log",
             "flopsLabel": "Estimated cumulative FLOPs",
             "maxChartPoints": max_chart_points,
-            "includeDev": include_dev,
-            "admissionQualificationLoss": REPORT_ADMISSION_QUALIFICATION_LOSS,
             "profile": "official",
-            "openTrainingTokens": _OFFICIAL_OPEN_TOKENS,
         },
         "runs": run_rows,
         "timeCharts": time_charts,
@@ -1465,18 +1436,20 @@ def _overall_metric_label(identity: tuple[str, str]) -> str:
     return f"{family_label} {statistic_label}"
 
 
-def _default_run_selection(track: str, profile: str, tokens: int) -> tuple[bool, str]:
-    """Return the initial visibility and honest display classification."""
+def _default_run_selection(profile: str) -> tuple[bool, str]:
+    """Return the initial visibility and an honest display classification.
 
-    if profile == "official" and track == "sample_efficiency":
+    Everything starts visible: comparing runs is the point of the dashboard,
+    and defaulting them to hidden behind a historical token budget is what made
+    it render nothing. The classification still says what each run is, so an
+    official result is never mistaken for a smoke test.
+    """
+
+    if profile == "official":
         return True, "official"
-    if profile == "official" and track == "open":
-        if tokens == _OFFICIAL_OPEN_TOKENS:
-            return True, "official"
-        return False, "partial"
-    if profile in {"smoke", "dev"}:
-        return False, "diagnostic"
-    return False, "partial"
+    if profile == "dev":
+        return True, "diagnostic"
+    return True, "smoke"
 
 
 def _metric_sort_key(name: str) -> tuple[int, str]:
@@ -1650,7 +1623,7 @@ function updateSmoothingControls(normalize=false){const input=$('smoothing-level
 function updateAxisHint(){$('axis-hint').textContent=(axis==='flops'?'Estimated cumulative FLOPs':'Optimizer step')+(xScale==='log'?' · logarithmic':' · linear')}
 function init(){
  $('smoothing-level').max=String(D.meta.maxChartPoints);
- $('stats').innerHTML=`<span class="pill"><strong>${D.meta.included}</strong> included</span><span class="pill"><strong>${D.meta.skipped}</strong> excluded</span><span class="pill">official admission qualification · val ≤ <strong>${fmt(D.meta.admissionQualificationLoss,4)}</strong></span>${D.meta.includeDev?'<span class="pill"><strong>development diagnostics included</strong></span>':''}<span class="pill">default <strong>equi-FLOP · log x</strong></span>`;
+ $('stats').innerHTML=`<span class="pill"><strong>${D.meta.included}</strong> included</span><span class="pill"><strong>${D.meta.skipped}</strong> excluded</span><span class="pill">default <strong>equi-FLOP · log x</strong></span>`;
  $('notices').innerHTML=D.notices.map(n=>`<div class="notice">${esc(n)}</div>`).join('');
  buildRuns(); buildSummary(); buildCharts(); buildSkipped(); updateSmoothingControls(true); updateAxisHint();
  $('footer').textContent=`Generated ${new Date(D.meta.generatedAt).toLocaleString()} · portable HTML · no network or external JavaScript`;

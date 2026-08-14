@@ -6,7 +6,6 @@ RUNS_PATH ?= runs
 TARGET ?= reference
 TIER ?= 125m
 REPORT ?= report.html
-INCLUDE_DEV ?= 0
 # The 8B prefix covers the 1B × 5-TPP learning-rate confirmation.
 TRAIN_TOKENS ?= 5000000000
 
@@ -24,11 +23,12 @@ TARGET_ENTRY := $(TARGET_DIR)/train.py
 UV_BASE = $(UV) --cache-dir "$(UV_CACHE_DIR)"
 UV_RUN = $(UV_BASE) run --frozen --no-sync
 
-.PHONY: help prepare require-prepare validate-target preflight run baseline profile report
+.PHONY: help check prepare require-prepare validate-target preflight run baseline profile report
 
 help:
 	@printf '%s\n' \
 	  'GPT TPU rig workflows:' \
+	  '  make check     run every CPU-only check; no TPU needed (~1 min)' \
 	  '  make prepare   sync the frozen environment and open the setup wizard' \
 	  '  make run       validate configured hosts/data and run the 125m reference tier' \
 	  '  make baseline  compatibility alias for make run' \
@@ -38,6 +38,27 @@ help:
 	  '' \
 	  'Useful overrides: TIER=125m TRAIN_TOKENS=5000000000 TARGET=reference PROFILE_OUTPUT=... REPORT=report.html' \
 	  'TRAIN_TOKENS selects the immutable corpus prefix used by non-smoke runs.'
+
+# Everything that can be verified without an accelerator. There is no hosted CI,
+# so this is the gate: run it before committing and before any TPU time. It is
+# CPU-only by construction -- tests/conftest.py pins JAX_PLATFORMS=cpu, which
+# also keeps it from wedging on a multi-host slice a single process cannot init.
+check:
+	@printf '\n== test suite ==\n'
+	$(UV_RUN) --with pytest python -m pytest tests/ -q
+	@printf '\n== the CLI is importable and its surface is intact ==\n'
+	$(UV_RUN) rig --help >/dev/null && printf 'rig --help ok\n'
+	$(UV_RUN) rig settings >/dev/null && printf 'rig settings ok\n'
+	@printf '\n== every submission still parses and resolves its profiles ==\n'
+	@for entry in $(CURDIR)/submissions/*/train.py; do \
+	  name=$$(basename $$(dirname $$entry)); \
+	  JAX_PLATFORMS=cpu $(UV_RUN) python $$entry --help >/dev/null \
+	    && printf 'submissions/%s ok\n' "$$name" || exit 1; \
+	done
+	@printf '\n== the report builds from the recorded runs ==\n'
+	$(UV_RUN) rig report --runs "$(RUNS_PATH)" --output "$(CURDIR)/.check-report.html" | tail -1
+	@rm -f "$(CURDIR)/.check-report.html"
+	@printf '\nall checks passed\n\n'
 
 # This is intentionally interactive: the wizard owns personal paths and defaults.
 prepare:
@@ -102,4 +123,4 @@ profile: validate-target preflight
 	  --port="$(XPROF_PORT)" "$(PROFILE_OUTPUT)/xprof"
 
 report:
-	$(UV_RUN) rig report --runs "$(RUNS_PATH)" --output "$(REPORT)" $(if $(filter 1 true yes,$(INCLUDE_DEV)),--include-dev,)
+	$(UV_RUN) rig report --runs "$(RUNS_PATH)" --output "$(REPORT)"

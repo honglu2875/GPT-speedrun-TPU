@@ -8,7 +8,6 @@ import tempfile
 import unittest
 
 from rig.report import (
-    REPORT_ADMISSION_QUALIFICATION_LOSS,
     ReportError,
     _attach_flops,
     _checkpoint_layer_stats,
@@ -21,15 +20,19 @@ from rig.report import (
 
 
 class ReportTests(unittest.TestCase):
-    def test_report_strictly_admits_only_complete_official_runs_at_3_76(self) -> None:
+    def test_every_successful_run_is_plotted_whatever_its_profile_or_loss(self) -> None:
+        # The report once admitted only official runs at the historical
+        # 624,984,064-token budget with loss <= 3.76, which excluded the entire
+        # current tiered family. Qualification is a leaderboard question now.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runs = root / "runs"
             cases = {
-                "admitted-boundary": ("sample_efficiency", "official", 20, 3.76),
-                "not-admitted": ("sample_efficiency", "official", 20, 3.76001),
-                "development": ("sample_efficiency", "dev", 20, 3.0),
-                "partial-open": ("open", "official", 20, 3.0),
+                "official-good": ("sample_efficiency", "official", 20, 3.0),
+                "official-poor": ("sample_efficiency", "official", 20, 9.9),
+                "open-partial": ("open", "official", 20, 3.0),
+                "development": ("sample_efficiency", "dev", 20, 7.4),
+                "smoke-run": ("sample_efficiency", "smoke", 20, 10.5),
             }
             for name, (track, profile, tokens, validation_loss) in cases.items():
                 run = runs / name
@@ -50,66 +53,39 @@ class ReportTests(unittest.TestCase):
             summary = build_report(runs, root / "report.html")
             payload = _payload((root / "report.html").read_text(encoding="utf-8"))
 
-        self.assertEqual(REPORT_ADMISSION_QUALIFICATION_LOSS, 3.76)
-        self.assertEqual(summary.included, ("admitted-boundary",))
-        self.assertIn(
-            "does not meet the baseline report admission qualification",
-            summary.skipped["not-admitted"],
-        )
-        self.assertIn(
-            "requires profile='official'", summary.skipped["development"]
-        )
-        self.assertIn("open run is incomplete", summary.skipped["partial-open"])
-        self.assertEqual(payload["meta"]["admissionQualificationLoss"], 3.76)
-
-    def test_include_dev_is_a_narrow_diagnostic_escape_hatch(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            runs = root / "runs"
-            cases = {
-                "dev-diagnostic": ("open", "dev", 20, 9.0),
-                "official-rejected": ("sample_efficiency", "official", 20, 3.8),
-                "official-valid": ("sample_efficiency", "official", 20, 3.7),
-                "smoke-run": ("sample_efficiency", "smoke", 20, 3.0),
-            }
-            for name, (track, profile, tokens, validation_loss) in cases.items():
-                run = runs / name
-                run.mkdir(parents=True)
-                (run / "training.csv").write_text(
-                    "step,tokens_processed,train_loss\n1,10,4.5\n2,20,4.0\n",
-                    encoding="utf-8",
-                )
-                _write_result(
-                    run,
-                    validation_artifact=False,
-                    track=track,
-                    profile=profile,
-                    tokens=tokens,
-                    validation_loss=validation_loss,
-                )
-
-            summary = build_report(
-                runs,
-                root / "report.html",
-                include_dev=True,
-            )
-            payload = _payload((root / "report.html").read_text(encoding="utf-8"))
-
-        self.assertEqual(summary.included, ("dev-diagnostic", "official-valid"))
-        self.assertIn("profile='official'", summary.skipped["smoke-run"])
-        self.assertIn(
-            "does not meet the baseline report admission qualification",
-            summary.skipped["official-rejected"],
-        )
-        self.assertTrue(payload["meta"]["includeDev"])
+        self.assertEqual(summary.included, tuple(sorted(cases)))
+        self.assertEqual(summary.skipped, {})
         classifications = {
             run["id"]: run["classification"] for run in payload["runs"]
         }
-        self.assertEqual(classifications["dev-diagnostic"], "diagnostic")
-        self.assertEqual(classifications["official-valid"], "official")
-        self.assertTrue(
-            any("not official or qualifying" in notice for notice in payload["notices"])
-        )
+        self.assertEqual(classifications["official-good"], "official")
+        self.assertEqual(classifications["official-poor"], "official")
+        self.assertEqual(classifications["development"], "diagnostic")
+        self.assertEqual(classifications["smoke-run"], "smoke")
+
+    def test_structurally_invalid_results_are_still_rejected(self) -> None:
+        # Removing the qualification gates must not weaken integrity checks.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "runs"
+            run = runs / "bad-track"
+            run.mkdir(parents=True)
+            (run / "training.csv").write_text(
+                "step,tokens_processed,train_loss\n1,10,4.5\n2,20,4.0\n",
+                encoding="utf-8",
+            )
+            _write_result(
+                run,
+                validation_artifact=False,
+                track="not_a_track",
+                profile="official",
+                tokens=20,
+                validation_loss=3.0,
+            )
+            summary = build_report(runs, root / "report.html")
+
+        self.assertEqual(summary.included, ())
+        self.assertIn("track is invalid", summary.skipped["bad-track"])
 
     def test_long_form_diagnostics_build_all_family_and_final_scope_charts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -245,24 +221,12 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("Math.min(...xs)", html)
         self.assertIn("filter(r=>r.selected)", html)
 
-    def test_default_selection_distinguishes_official_diagnostic_and_partial(self) -> None:
-        budget = 624_984_064
-        self.assertEqual(
-            _default_run_selection("open", "official", budget),
-            (True, "official"),
-        )
-        self.assertEqual(
-            _default_run_selection("open", "official", budget - 1),
-            (False, "partial"),
-        )
-        self.assertEqual(
-            _default_run_selection("sample_efficiency", "official", 123),
-            (True, "official"),
-        )
-        self.assertEqual(
-            _default_run_selection("open", "dev", budget),
-            (False, "diagnostic"),
-        )
+    def test_every_run_starts_visible_but_keeps_an_honest_label(self) -> None:
+        # Visibility and classification are separate concerns: nothing is
+        # hidden, but a smoke run is never displayed as an official result.
+        self.assertEqual(_default_run_selection("official"), (True, "official"))
+        self.assertEqual(_default_run_selection("dev"), (True, "diagnostic"))
+        self.assertEqual(_default_run_selection("smoke"), (True, "smoke"))
 
     def test_explicit_cumulative_flops_take_precedence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

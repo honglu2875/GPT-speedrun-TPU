@@ -21,6 +21,7 @@ The top-level Makefile is the user interface and a set of copyable command
 templates:
 
 ```bash
+make check
 make prepare
 make run
 make baseline
@@ -30,12 +31,19 @@ make report
 
 | Target | Purpose |
 |---|---|
+| `make check` | run every CPU-only check: tests, CLI surface, submission parsing, report build |
 | `make prepare` | synchronize the frozen uv environment, then open the interactive setup wizard |
 | `make run` | verify every configured TPU VM and its data, then run the 125M reference tier using the saved profile |
 | `make baseline` | compatibility alias for `make run` |
 | `make run TARGET=name TIER=250m` | run one tier from the model family in `submissions/name/` |
 | `make profile` | run a distributed, validation-free 100-step diagnostic, capture worker 0 steps 11–20, then serve XProf on port 8791 |
 | `make report` | integrity-check completed runs and rebuild the standalone `report.html` dashboard |
+
+There is no hosted CI. `make check` is the gate instead — run it before
+committing and before spending TPU time. It needs no accelerator and takes
+about a minute; `tests/conftest.py` pins `JAX_PLATFORMS=cpu` for the whole
+suite, which also stops it from wedging on a multi-host slice that a single
+process cannot initialize.
 
 `make prepare` runs these two commands:
 
@@ -210,7 +218,8 @@ run is one command, so a study is an ordinary shell loop over `rig run` with
 the tiers and overrides you care about, and each point lands in `runs/` as a
 normal recorded run. The parameterization rules that make a tier's learning
 rate comparable across sizes are in
-[the Complete(d)P contract](docs/COMPLETEP.md).
+[the Complete(d)P contract](docs/COMPLETEP.md), and what one such sweep
+measured is in [the learning-rate transfer note](docs/LR_TRANSFER.md).
 
 The harness creates a unique persistent run directory, captures stdout/stderr,
 validates the final result event and checkpoint, hashes artifacts, and appends a
@@ -275,8 +284,11 @@ uv run --frozen --no-sync rig run dense_control --profile official
 
 The custom attention kernel includes forward, dQ, and dK/dV kernels, uses a
 shape-aware static tile plan, and safely pads non-128-aligned sequence lengths.
-An exact runtime/source lookup table supplies measured seeds; an explicit
-synthetic autotuner can populate a local cache before real compilation. The
+An exact runtime/source lookup table supplies measured seeds, falling back to a
+deterministic shape heuristic. Both are pure functions of the workload key, so
+every process in a multi-host job compiles identical tiles without
+communicating; measurement is a deliberate offline step, never part of a run.
+The
 tiled loss streams vocabulary blocks and recomputes them in backward instead of
 materializing full logits. Switching loss implementations keeps all 50,304
 storage classes by default; reducing `semantic_vocab_size` in a cloned YAML
@@ -306,18 +318,18 @@ the output or capture window with `PROFILE_OUTPUT`, `XPROF_START_STEP`, and
 `make report` scans completed folders beneath `runs/`, checks their recorded
 artifact hashes when an immutable record is available, and writes one
 self-contained static `report.html` with no CDN dependency. A multi-select run
-sidebar controls overlays. The baseline report admission qualification includes
-complete official open runs only when they use the exact 624,984,064-token
-budget and have validation loss at or below **3.76**; complete official
-sample-efficiency runs must meet the same qualification. Smoke, development,
-partial, and runs that do not meet it are omitted with a reported reason. The
-baseline report admission qualification is intentionally not configurable and
-is distinct from the official competition qualification of 3.28.
+sidebar controls overlays.
 
-For local diagnosis only, `make report INCLUDE_DEV=1` also admits successful
-`dev`-profile runs and labels them as diagnostics. This opt-in does not admit
-`smoke` runs and does not relax the token-budget or loss checks applied to any
-official run.
+Every successful run is plotted, whatever its profile, token budget, or loss,
+and all of them start visible. Each run keeps an honest label — `official`,
+`diagnostic`, or `smoke` — so a two-step smoke test is never mistaken for a
+record attempt, but nothing is hidden: comparing curves is the point. Whether a
+run *qualifies* is a separate question, answered by `rig leaderboard` against
+the target in [docs/RULES.md](docs/RULES.md).
+
+Structural integrity is still enforced. A result that is malformed,
+unsuccessful, or of the wrong schema is reported as skipped with its reason
+rather than silently dropped.
 
 One global selector switches every time-series chart
 between **equi-FLOP** (the default, using analytic cumulative estimated FLOPs)

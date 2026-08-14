@@ -1,14 +1,10 @@
 from __future__ import annotations
 
-import json
-from pathlib import Path
-import tempfile
 import unittest
-import warnings
 
 from rig.kernels.autotune import (
     AttentionTilePlan,
-    AutotuneCacheError,
+    AutotuneSchemaError,
     AutotuneKey,
     AutotuneRecord,
     CandidateMeasurement,
@@ -19,15 +15,12 @@ from rig.kernels.autotune import (
     TPU_FLASH_SOURCE_SHA256,
     benchmark_tile_candidates,
     estimate_attention_vmem_bytes,
-    find_cached_tuning,
     generate_attention_tile_candidates,
     heuristic_attention_tile_plan,
     is_legal_attention_tile_plan,
     kernel_implementation_hash,
-    load_autotune_cache,
     lookup_shipped_tuning,
     resolve_attention_tile_plan,
-    save_autotune_record,
 )
 
 
@@ -189,104 +182,22 @@ class AutotuneCacheTests(unittest.TestCase):
             key.digest, make_key(conditional_rescale=True).digest
         )
 
-    def test_round_trip_merges_records(self) -> None:
-        tiles = AttentionTilePlan(
-            128, 128, 128, 128, 128, 128, 128, 128, 128, 128
-        )
-        key_one = make_key(sequence=128)
-        key_two = make_key(sequence=256)
-        record_one = AutotuneRecord(
-            key_one, tiles, (measurement(tiles, 0.01),), "2026-08-12T00:00:00+00:00"
-        )
-        record_two = AutotuneRecord(
-            key_two, tiles, (measurement(tiles, 0.02),), "2026-08-12T00:00:01+00:00"
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "attention.json"
-            self.assertEqual(load_autotune_cache(path), {})
-            save_autotune_record(path, record_one)
-            save_autotune_record(path, record_two)
-            self.assertEqual(find_cached_tuning(path, key_one), record_one)
-            self.assertEqual(find_cached_tuning(path, key_two), record_two)
-            document = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(document["schema_version"], 1)
-            self.assertEqual(len(document["entries"]), 2)
-
-    def test_digest_tampering_is_rejected(self) -> None:
-        tiles = AttentionTilePlan(
-            128, 128, 128, 128, 128, 128, 128, 128, 128, 128
-        )
-        record = AutotuneRecord(
-            make_key(sequence=128),
-            tiles,
-            (measurement(tiles, 0.01),),
-            "2026-08-12T00:00:00+00:00",
-        )
-        document = {
-            "schema_version": 1,
-            "entries": {"not-the-digest": record.to_dict()},
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "attention.json"
-            path.write_text(json.dumps(document), encoding="utf-8")
-            with self.assertRaisesRegex(AutotuneCacheError, "digest mismatch"):
-                load_autotune_cache(path)
-
-    def test_cache_and_lock_symlinks_are_refused_without_touching_target(self) -> None:
-        tiles = AttentionTilePlan(
-            128, 128, 128, 128, 128, 128, 128, 128, 128, 128
-        )
-        record = AutotuneRecord(
-            make_key(sequence=128),
-            tiles,
-            (measurement(tiles, 0.01),),
-            "2026-08-12T00:00:00+00:00",
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            victim = root / "victim"
-            victim.write_text("do-not-touch", encoding="utf-8")
-            cache_link = root / "cache.json"
-            cache_link.symlink_to(victim)
-            with self.assertRaisesRegex(AutotuneCacheError, "symlink"):
-                load_autotune_cache(cache_link)
-            with self.assertRaisesRegex(AutotuneCacheError, "symlink"):
-                save_autotune_record(cache_link, record)
-            self.assertEqual(victim.read_text(encoding="utf-8"), "do-not-touch")
-
-            cache_link.unlink()
-            lock_link = root / "cache.json.lock"
-            lock_link.unlink(missing_ok=True)
-            lock_link.symlink_to(victim)
-            with self.assertRaisesRegex(AutotuneCacheError, "safely open"):
-                save_autotune_record(cache_link, record)
-            self.assertEqual(victim.read_text(encoding="utf-8"), "do-not-touch")
-
-    def test_resolve_priority_cache_then_shipped_then_heuristic(self) -> None:
+    def test_resolution_is_shipped_then_heuristic_and_purely_key_derived(self) -> None:
+        # Both tiers are pure functions of the key. That is what lets every
+        # process in a multi-host job derive identical tiles without talking to
+        # the others; a per-host cache used to be able to break it.
         key = make_key()
-        cached_tiles = AttentionTilePlan(
-            256, 512, 128, 256, 128, 512, 128, 128, 512, 128
-        )
-        record = AutotuneRecord(
-            key,
-            cached_tiles,
-            (measurement(cached_tiles, 0.01),),
-            "2026-08-12T00:00:00+00:00",
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "attention.json"
-            save_autotune_record(path, record)
-            resolved = resolve_attention_tile_plan(key, cache_path=path)
-            self.assertEqual(resolved.source, "cache")
-            self.assertEqual(resolved.tiles, cached_tiles)
-            path.write_text("broken", encoding="utf-8")
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always")
-                resolved = resolve_attention_tile_plan(key, cache_path=path)
-            self.assertEqual(resolved.source, "shipped")
-            self.assertTrue(caught)
-            with self.assertRaises(AutotuneCacheError):
-                resolve_attention_tile_plan(key, cache_path=path, strict_cache=True)
+        shipped = resolve_attention_tile_plan(key)
+        self.assertEqual(shipped.source, "shipped")
+        self.assertEqual(shipped.tiles, lookup_shipped_tuning(key))
+        self.assertEqual(resolve_attention_tile_plan(key), shipped)
+
+        unknown = make_key(device_count=999)
+        fallback = resolve_attention_tile_plan(unknown)
+        self.assertEqual(fallback.source, "heuristic")
+        self.assertIsNone(lookup_shipped_tuning(unknown))
+        self.assertEqual(fallback.tiles, heuristic_attention_tile_plan(unknown))
+        self.assertEqual(resolve_attention_tile_plan(unknown), fallback)
 
 
 class BenchmarkHarnessTests(unittest.TestCase):

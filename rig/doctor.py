@@ -94,6 +94,10 @@ def environment_checks(
     ]
     if compile_probe:
         checks.append(check_compilation)
+        # Runs after the compile probe, which is what establishes that the
+        # distributed backend can talk at all; a failure here is then
+        # unambiguously a source mismatch rather than a broken cluster.
+        checks.append(check_source_attestation)
     if data_path is not None:
         checks.append(lambda: check_storage(data_path))
         if profile and check_data:
@@ -247,6 +251,90 @@ def check_compilation() -> CheckResult:
     except Exception as exc:
         return CheckResult("compile probe", "error", str(exc))
     return CheckResult("compile probe", "ok", f"BF16 matmul/collective in {elapsed:.2f}s")
+
+
+def source_digest(repo: Path) -> tuple[str, int]:
+    """Digest the source every process must agree on.
+
+    Covers the shared package and every submission's entry program and config
+    -- exactly the bytes the workspace synchronization mirrors onto the peers.
+    Paths are relative and sorted so the digest depends only on content and
+    layout, never on where the checkout lives.
+    """
+
+    paths: list[Path] = []
+    package = repo / "rig"
+    if package.is_dir():
+        paths.extend(p for p in package.rglob("*.py") if p.is_file())
+    submissions = repo / "submissions"
+    if submissions.is_dir():
+        for name in ("train.py", "config.yaml"):
+            paths.extend(p for p in submissions.glob(f"*/{name}") if p.is_file())
+    paths.sort(key=lambda item: item.relative_to(repo).as_posix())
+    digest = hashlib.sha256()
+    for path in paths:
+        digest.update(path.relative_to(repo).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(path.read_bytes()).hexdigest().encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest(), len(paths)
+
+
+def check_source_attestation() -> CheckResult:
+    """Fail the preflight unless every process launched from identical source.
+
+    The run record's provenance -- train.py, the shared package, the lockfile,
+    the config -- is all hashed on the controller. Without this check a peer
+    running stale bytes would still produce a result attributed to the
+    controller's hashes, because the trainer's cross-process calls are
+    barriers, which synchronize without comparing anything.
+    """
+
+    name = "source attestation"
+    try:
+        digest, files = source_digest(repo_root())
+    except OSError as exc:
+        return CheckResult(name, "error", f"cannot read source tree: {exc}")
+    short = digest[:12]
+    try:
+        import jax
+
+        if jax.process_count() <= 1:
+            return CheckResult(
+                name, "ok", f"sha256:{short} over {files} files (single process)"
+            )
+        import numpy as np
+        from jax.experimental import multihost_utils
+
+        local = np.frombuffer(bytes.fromhex(digest), dtype=np.uint8)
+        gathered = np.asarray(multihost_utils.process_allgather(local))
+    except Exception as exc:
+        return CheckResult(name, "error", f"could not compare across hosts: {exc}")
+    if gathered.ndim != 2 or gathered.shape[0] != jax.process_count():
+        return CheckResult(
+            name, "error", f"unexpected attestation shape {gathered.shape}"
+        )
+    digests = [bytes(row).hex() for row in gathered]
+    disagreeing = sorted({d for d in digests if d != digests[0]})
+    if disagreeing:
+        groups: dict[str, list[int]] = {}
+        for index, value in enumerate(digests):
+            groups.setdefault(value, []).append(index)
+        detail = "; ".join(
+            f"sha256:{value[:12]} on process {indices}"
+            for value, indices in sorted(groups.items(), key=lambda kv: kv[1][0])
+        )
+        return CheckResult(
+            name,
+            "error",
+            f"processes launched from different source: {detail}",
+            hint="re-run `rig prepare` to mirror the checkout onto every TPU VM",
+        )
+    return CheckResult(
+        name,
+        "ok",
+        f"sha256:{short} identical across {len(digests)} processes ({files} files)",
+    )
 
 
 def check_storage(path: Path) -> CheckResult:

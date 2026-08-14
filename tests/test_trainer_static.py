@@ -630,12 +630,18 @@ class TrainerStaticTests(unittest.TestCase):
                         ),
                     )
 
-    def test_attention_autotune_cli_requires_cache_and_non_dense_backend(self) -> None:
+    def test_attention_backend_comes_from_the_profile_with_no_tuning_flags(self) -> None:
+        # The tuning cache and the runtime autotuner were removed: a per-host
+        # cache was the only way two processes in one SPMD job could select
+        # different tiles for the same program.
         parser = trainer.build_parser()
         defaults = parser.parse_args([])
         self.assertIsNone(defaults.attention_backend)
-        self.assertIsNone(defaults.attention_tuning_cache)
-        self.assertFalse(defaults.autotune_attention)
+        self.assertFalse(hasattr(defaults, "attention_tuning_cache"))
+        self.assertFalse(hasattr(defaults, "autotune_attention"))
+        for flag in ("--attention-tuning-cache", "--autotune-attention"):
+            with self.subTest(flag=flag), self.assertRaises(SystemExit):
+                parser.parse_args(["--profile", "official", flag, "x"])
 
         official = trainer.resolve_config(
             parser.parse_args(["--profile", "official"]), "tpu", 50_304
@@ -650,45 +656,9 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertEqual(smoke.attention_backend, "dense")
         self.assertEqual(development.attention_backend, "tpu_flash")
 
-        with self.assertRaisesRegex(ValueError, "requires --attention-tuning-cache"):
-            trainer.validate_args(
-                parser.parse_args(
-                    ["--profile", "official", "--autotune-attention"]
-                )
-            )
-        with self.assertRaisesRegex(ValueError, "non-dense attention_backend"):
-            trainer.validate_args(
-                parser.parse_args(
-                    [
-                        "--profile",
-                        "smoke",
-                        "--attention-tuning-cache",
-                        "attention-tuning.json",
-                    ]
-                )
-            )
-
-        valid = parser.parse_args(
-            [
-                "--profile",
-                "official",
-                "--attention-tuning-cache",
-                "attention-tuning.json",
-                "--autotune-attention",
-            ]
-        )
-        trainer.validate_args(valid)
-
     def test_ordinary_attention_resolution_uses_exact_local_shape(self) -> None:
         parser = trainer.build_parser()
-        args = parser.parse_args(
-            [
-                "--profile",
-                "official",
-                "--attention-tuning-cache",
-                "attention-tuning.json",
-            ]
-        )
+        args = parser.parse_args(["--profile", "official"])
         config = trainer.resolve_config(args, "tpu", 50_304)
         devices = [FakeDevice("tpu", "TPU v4") for _ in range(4)]
         tiles = trainer.AttentionTiles(
@@ -701,7 +671,6 @@ class TrainerStaticTests(unittest.TestCase):
             patch.object(
                 trainer, "resolve_attention_tile_plan", return_value=resolved
             ) as resolve,
-            patch.object(trainer, "autotune_attention") as autotune,
         ):
             runtime = trainer.prepare_attention_runtime(args, config, devices)
 
@@ -713,10 +682,8 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertEqual(key_arguments["head_dim"], 64)
         self.assertEqual(key_arguments["mode"], "forward_backward")
         self.assertIs(key_arguments["device"], devices[0])
-        resolve.assert_called_once_with(
-            key, cache_path=Path("attention-tuning.json").resolve()
-        )
-        autotune.assert_not_called()
+        # Resolved from the key alone: no path, no measurement, no I/O.
+        resolve.assert_called_once_with(key)
         self.assertEqual(runtime.key_digest, "a" * 64)
         self.assertEqual(runtime.resolution_source, "shipped")
         self.assertEqual(runtime.tiles, tiles)
@@ -735,57 +702,12 @@ class TrainerStaticTests(unittest.TestCase):
             ),
         )
 
-    def test_explicit_attention_autotune_is_synthetic_and_forced(self) -> None:
-        parser = trainer.build_parser()
-        args = parser.parse_args(
-            [
-                "--profile",
-                "official",
-                "--attention-tuning-cache",
-                "attention-tuning.json",
-                "--autotune-attention",
-            ]
-        )
-        experiment = replace(
-            trainer.load_experiment_profile("official"),
-            attention_backend="jax_flash",
-        )
-        config = trainer.resolve_config(args, "tpu", 50_304, experiment)
-        devices = [FakeDevice("tpu", "TPU v4") for _ in range(4)]
-        tiles = trainer.AttentionTiles(
-            512, 512, 256, 512, 256, 512, 256, 256, 512, 256
-        )
-        key = SimpleNamespace(digest="b" * 64)
-        record = SimpleNamespace(winner=tiles)
-        sentinel_attention = object()
-        with (
-            patch.object(trainer, "make_runtime_key", return_value=key),
-            patch.object(
-                trainer, "autotune_attention", return_value=record
-            ) as autotune,
-            patch.object(
-                trainer, "make_causal_attention", return_value=sentinel_attention
-            ) as make_attention,
-            patch.object(trainer.time, "perf_counter", side_effect=(10.0, 12.5)),
-        ):
-            runtime = trainer.prepare_attention_runtime(args, config, devices)
-            tune_arguments = autotune.call_args.kwargs
-            built_attention = tune_arguments["attention_factory"](tiles)
-
-        self.assertIs(built_attention, sentinel_attention)
-        attention_config = make_attention.call_args.args[0]
-        self.assertEqual(attention_config.backend, "jax_flash")
-        self.assertEqual(attention_config.tiles, tiles)
-        self.assertEqual(tune_arguments["key"], key)
-        self.assertEqual(
-            tune_arguments["cache_path"], Path("attention-tuning.json").resolve()
-        )
-        self.assertIs(tune_arguments["device"], devices[0])
-        self.assertTrue(tune_arguments["force"])
-        self.assertEqual(runtime.key_digest, "b" * 64)
-        self.assertEqual(runtime.resolution_source, "autotuned")
-        self.assertEqual(runtime.tiles, tiles)
-        self.assertEqual(runtime.tune_seconds, 2.5)
+    def test_trainer_never_benchmarks_kernels_at_runtime(self) -> None:
+        # Runtime measurement would reintroduce per-host tile selection.
+        source = TRAINER_PATH.read_text(encoding="utf-8")
+        for banned in ("autotune_attention", "attention_tuning_cache", "cache_path"):
+            with self.subTest(symbol=banned):
+                self.assertNotIn(banned, source)
 
     def test_mesh_attention_uses_pre_resolved_exact_plan(self) -> None:
         parser = trainer.build_parser()

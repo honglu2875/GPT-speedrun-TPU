@@ -49,7 +49,6 @@ from rig.kernels import (
     tiled_tied_cross_entropy_losses,
 )
 from rig.kernels.autotune import (
-    autotune_attention,
     make_runtime_key,
     padded_sequence_length,
     resolve_attention_tile_plan,
@@ -1475,23 +1474,6 @@ def build_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     model.add_argument(
-        "--attention-tuning-cache",
-        type=Path,
-        default=None,
-        help=(
-            "JSON cache for exact runtime-fingerprinted attention tile plans; "
-            "used only by non-dense attention"
-        ),
-    )
-    model.add_argument(
-        "--autotune-attention",
-        action="store_true",
-        help=(
-            "AOT-compile and benchmark synthetic attention candidates before "
-            "the real train-step compilation"
-        ),
-    )
-    model.add_argument(
         "--loss-backend",
         choices=("dense", "tiled"),
         default=None,
@@ -1562,18 +1544,6 @@ def validate_args(args: argparse.Namespace) -> ExperimentProfile:
         not math.isfinite(args.peak_tflops) or args.peak_tflops <= 0.0
     ):
         raise ValueError("--peak-tflops must be positive")
-    if args.autotune_attention and args.attention_tuning_cache is None:
-        raise ValueError(
-            "--autotune-attention requires --attention-tuning-cache PATH"
-        )
-    if (
-        args.attention_tuning_cache is not None
-        and experiment.attention_backend == "dense"
-    ):
-        raise ValueError(
-            "--attention-tuning-cache requires a non-dense attention_backend "
-            "in config.yaml"
-        )
     if args.downstream_root is not None and args.downstream_manifest is None:
         raise ValueError("--downstream-root requires --downstream-manifest")
     if args.downstream_manifest is not None and args.downstream_data:
@@ -2520,47 +2490,11 @@ def prepare_attention_runtime(
         mode="forward_backward",
         device=runtime_devices[0],
     )
-    cache_path: Path | None = None
-    if args.attention_tuning_cache is not None:
-        cache_argument = args.attention_tuning_cache.expanduser()
-        if not cache_argument.is_absolute():
-            cache_argument = Path.cwd() / cache_argument
-        # Resolve parent-directory aliases (including the user's shm/ symlink)
-        # without resolving the cache file itself; the cache layer must still
-        # be able to reject a final-component symlink safely.
-        cache_path = cache_argument.parent.resolve() / cache_argument.name
-    if args.autotune_attention:
-        if cache_path is None:  # validate_args establishes this for normal runs.
-            raise ValueError(
-                "--autotune-attention requires --attention-tuning-cache PATH"
-            )
-
-        def factory(tiles: AttentionTiles) -> AttentionCallable:
-            return make_causal_attention(
-                AttentionConfig(
-                    backend=config.attention_backend,
-                    tiles=tiles,
-                    softmax_scale=attention_softmax_scale(config),
-                )
-            )
-
-        started = time.perf_counter()
-        record = autotune_attention(
-            key=key,
-            attention_factory=factory,
-            cache_path=cache_path,
-            device=runtime_devices[0],
-            force=True,
-        )
-        tune_seconds = time.perf_counter() - started
-        return AttentionRuntime(
-            key.digest,
-            "autotuned",
-            record.winner,
-            tune_seconds,
-        )
-
-    resolved = resolve_attention_tile_plan(key, cache_path=cache_path)
+    # Resolution is a pure function of the key -- shipped lookup, else shape
+    # heuristic -- so every process in the job derives identical tile constants
+    # without communicating. Measuring per host instead could select different
+    # winners for near-equal candidates and compile divergent HLO.
+    resolved = resolve_attention_tile_plan(key)
     return AttentionRuntime(key.digest, resolved.source, resolved.tiles, 0.0)
 
 
@@ -3844,11 +3778,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     if config.attention_backend != "dense":
         console.phase(
             "Attention tile preflight",
-            (
-                "AOT-compiling synthetic forward/backward candidates"
-                if args.autotune_attention
-                else "resolving exact cache, shipped lookup, or shape heuristic"
-            ),
+            "resolving the shipped lookup or shape heuristic",
         )
     attention_runtime = prepare_attention_runtime(args, config, devices)
     if (

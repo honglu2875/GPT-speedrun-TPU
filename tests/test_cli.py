@@ -9,7 +9,6 @@ from rig import cli
 from rig.config import ConfigError, LocalConfig
 from rig.data import DataError, Fresh10Domain, PreparedDataset, PreparedFresh10
 from rig.doctor import check_prepared_data
-from rig.report import REPORT_ADMISSION_QUALIFICATION_LOSS
 
 
 class CliTests(unittest.TestCase):
@@ -415,15 +414,13 @@ class CliTests(unittest.TestCase):
             self.assertIn("profiles/test/xprof", remote)
             sync.assert_called_once()
 
-    def test_report_qualification_is_fixed_with_narrow_dev_diagnostic_flag(self) -> None:
-        self.assertEqual(REPORT_ADMISSION_QUALIFICATION_LOSS, 3.76)
+    def test_report_has_no_admission_knobs(self) -> None:
+        # Every successful run is plotted, so there is nothing to tune here.
         report = cli.build_parser().parse_args(["report"])
         self.assertFalse(hasattr(report, "admission_loss"))
-        self.assertFalse(report.include_dev)
-        diagnostic_report = cli.build_parser().parse_args(
-            ["report", "--include-dev"]
-        )
-        self.assertTrue(diagnostic_report.include_dev)
+        self.assertFalse(hasattr(report, "include_dev"))
+        with self.assertRaises(SystemExit):
+            cli.build_parser().parse_args(["report", "--include-dev"])
         self.assertFalse(hasattr(LocalConfig(), "report_admission_loss"))
         prepare = cli.build_parser().parse_args(["prepare"])
         target_action = next(

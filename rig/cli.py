@@ -65,7 +65,7 @@ from .doctor import (
     render_doctor,
     run_doctor,
 )
-from .report import REPORT_ADMISSION_QUALIFICATION_LOSS, build_report
+from .report import build_report
 
 
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -288,14 +288,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         default=1_400,
         help="maximum embedded points per run and scalar series",
-    )
-    report.add_argument(
-        "--include-dev",
-        action="store_true",
-        help=(
-            "include successful development-profile runs as clearly labeled "
-            "diagnostics; official admission remains strict"
-        ),
     )
 
     clone = commands.add_parser("clone", help="clone one submission into a new algorithm folder")
@@ -1030,7 +1022,6 @@ def command_report(args: argparse.Namespace) -> int:
         runs,
         output,
         max_chart_points=args.max_points,
-        include_dev=args.include_dev,
     )
     relative = (
         summary.output_path.relative_to(root)
@@ -1039,9 +1030,7 @@ def command_report(args: argparse.Namespace) -> int:
     )
     print(
         f"report {relative}: {len(summary.included)} run(s) plotted, "
-        f"{len(summary.skipped)} skipped; baseline report admission qualification: "
-        f"validation loss <= {REPORT_ADMISSION_QUALIFICATION_LOSS:.4f}"
-        + ("; development diagnostics included" if args.include_dev else "")
+        f"{len(summary.skipped)} skipped"
     )
     for run_id, reason in summary.skipped.items():
         print(f"  skipped {run_id}: {reason}")

@@ -130,7 +130,9 @@ profiles:
       loss_backend: tiled
       vocab_tile_size: 2048
     optimizer:
-      learning_rate: 0.001
+      # 2^-8, the optimum measured by the Complete(d)P learning-rate sweep at
+      # 60M/125M and by both depth ablations. See docs/LR_TRANSFER.md.
+      learning_rate: 0.00390625
       min_lr_ratio: 0.1
       warmup_ratio: 0.1
       weight_decay: 0.1
@@ -159,7 +161,9 @@ profiles:
       loss_backend: tiled
       vocab_tile_size: 2048
     optimizer:
-      learning_rate: 0.001
+      # 2^-8, the optimum measured by the Complete(d)P learning-rate sweep at
+      # 60M/125M and by both depth ablations. See docs/LR_TRANSFER.md.
+      learning_rate: 0.00390625
       min_lr_ratio: 0.1
       warmup_ratio: 0.1
       weight_decay: 0.1

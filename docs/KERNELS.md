@@ -120,15 +120,18 @@ versions of itself.
 Ordinary runs should resolve a plan before constructing the attention factory:
 
 ```text
-exact local JSON cache
-        ↓ miss
 exact shipped lookup-table entry
         ↓ miss
 deterministic shape heuristic
 ```
 
-`resolve_attention_tile_plan(key, cache_path=...)` implements this read-only
-policy and reports `source` as `cache`, `shipped`, or `heuristic`. Shipped
+`resolve_attention_tile_plan(key)` implements this read-only policy and reports
+`source` as `shipped` or `heuristic`. Both tiers are pure functions of the key,
+which is what lets every process in a multi-host job derive identical tile
+constants without communicating. There is deliberately no on-disk cache and no
+runtime autotuner: a per-host cache file was the one way two processes could
+persist different winners for near-equal candidates and then compile divergent
+HLO for the same SPMD program. Shipped
 entries match the entire runtime and source fingerprint; they are not loose
 shape recommendations. The current custom entry is a directly measured seed,
 not the result of an exhaustive custom-kernel sweep.
@@ -143,8 +146,11 @@ modeled VMEM and deterministic simpler tiles.
 
 ### Explicit synthetic bootstrap
 
-Run bootstrap as a separate preflight phase, before compiling or timing the
-training step:
+Bootstrapping is an **offline** activity, not part of a run. Measure a new
+topology or shape here, then promote the winner into `_SHIPPED_TUNINGS` so
+every process derives it from the key. On a multi-host slice remember that a
+single host cannot initialize the TPU at all -- the slice spans every VM -- so
+measurement has to happen inside a job that owns the whole slice.
 
 ```python
 import jax.numpy as jnp
@@ -173,7 +179,6 @@ def factory(tiles):
 record = autotune_attention(
     key=key,
     attention_factory=factory,
-    cache_path="/path/to/cache/kernel-autotune.json",
     warmup_runs=2,
     measured_runs=7,
 )
@@ -182,9 +187,8 @@ record = autotune_attention(
 The bootstrap creates deterministic synthetic q/k/v arrays and an output
 cotangent. For every candidate it calls `jax.jit(...).lower(...).compile()`
 once, warms the executable, synchronizes every forward-plus-VJP measurement,
-and records all samples. It never reads training or validation data. With
-`force=False`, an exact cache hit returns immediately; `force=True` repeats the
-measurement.
+and records all samples. It never reads training or validation data, and it
+never writes anything: the returned record is yours to inspect.
 
 Microkernel selection is only the first stage. Shortlist the best two or three
 candidates, compile a complete representative `train_step` for each, and choose
@@ -193,10 +197,10 @@ collectives, donation, and surrounding computation can erase or reverse a
 microbenchmark win. Record this whole-step confirmation alongside the selected
 tile plan.
 
-## Cache and run provenance
+## Key identity and run provenance
 
-The versioned JSON cache is advisory, atomically replaced under a file lock,
-and rejects cache-file or lock-file symlinks. Its canonical key includes:
+A tile plan is only reusable for an exactly matching workload, so the key
+covers:
 
 - kernel revision and SHA-256 of the implementation source;
 - backend, platform, device kind, global/local device counts;
@@ -206,13 +210,15 @@ and rejects cache-file or lock-file symlinks. Its canonical key includes:
 - backward strategy, q/k/v layouts, buffer count, lookahead, exponential mode,
   and conditional-rescale setting.
 
-Each local cache record retains the winning plan, compile time, synchronized samples,
-median, median absolute deviation, candidate failures, and UTC timestamp. A run
-preserves the full key digest, resolved source, winner, and tuning duration in
-its result/checkpoint provenance; retain the optional cache beside experimental
-notes when the raw candidate measurements or cache schema are needed.
-Autotuning and disposable synthetic compilation happen before `train_seconds`;
-the real timed run still starts from its declared initial state.
+A shipped entry must match all of it. That is why a plan measured on a v4-8
+(`device_count=4`) is correctly ignored on a v4-32 (`device_count=16`) even at
+the same model shape: the per-device batch differs.
+
+Every run preserves the key digest, resolved source, winner, and tuning
+duration in its result and checkpoint provenance, so the tiles a run compiled
+with are always recoverable from the record. Resolution is pure bookkeeping and
+happens before `train_seconds`; the timed run still starts from its declared
+initial state.
 
 ## Measured TPU v4 snapshots
 
