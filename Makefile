@@ -5,6 +5,8 @@ UV_CACHE_DIR ?= /tmp/uv-cache
 RUNS_PATH ?= runs
 TARGET ?= reference
 TIER ?= 125m
+# Optional run label. Left empty, `rig run` prompts for one on a terminal.
+NAME ?=
 REPORT ?= report.html
 # The 8B prefix covers the 1B × 5-TPP learning-rate confirmation.
 TRAIN_TOKENS ?= 5000000000
@@ -36,7 +38,7 @@ help:
 	  '  make profile   run a distributed XProf diagnostic, then serve it on :8791' \
 	  '  make report    rebuild report.html from integrity-checked run logs' \
 	  '' \
-	  'Useful overrides: TIER=125m TRAIN_TOKENS=5000000000 TARGET=reference PROFILE_OUTPUT=... REPORT=report.html' \
+	  'Useful overrides: TIER=125m NAME=my-run TRAIN_TOKENS=5000000000 TARGET=reference REPORT=report.html' \
 	  'TRAIN_TOKENS selects the immutable corpus prefix used by non-smoke runs.'
 
 # Everything that can be verified without an accelerator. There is no hosted CI,
@@ -99,7 +101,7 @@ preflight: require-prepare
 # The saved profile/track/data/checkpoint defaults come from make prepare. The
 # target's complete experiment definition lives in its sibling config.yaml.
 run: validate-target preflight
-	$(UV_RUN) rig run "$(TARGET)" --tier "$(TIER)" --color always
+	$(UV_RUN) rig run "$(TARGET)" --tier "$(TIER)" $(if $(NAME),--name "$(NAME)",) --color always
 
 # Preserve the original user-facing name while `run TARGET=name` is the more
 # general upstream interface.

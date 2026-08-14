@@ -221,6 +221,15 @@ rate comparable across sizes are in
 [the Complete(d)P contract](docs/COMPLETEP.md), and what one such sweep
 measured is in [the learning-rate transfer note](docs/LR_TRANSFER.md).
 
+Name your runs. `make run NAME=cosine-floor` folds a label into the run
+directory, turning `20260814T212706.356271Z-reference-9ff5c908` into
+`20260814T212706.356271Z-reference-cosine-floor-9ff5c908`. Omit it on a
+terminal and `rig run` asks, because a month later the timestamp will not tell
+you what you were testing; press enter to accept the unnamed default. The label
+is lowercased and reduced to alphanumerics and hyphens. Non-interactive
+callers — a study loop, a piped shell, a peer worker — are never prompted and
+silently stay unnamed, so scripts cannot hang on a question nobody can answer.
+
 The harness creates a unique persistent run directory, captures stdout/stderr,
 validates the final result event and checkpoint, hashes artifacts, and appends a
 JSONL record. The trainer's synchronized accelerator time is the open-track

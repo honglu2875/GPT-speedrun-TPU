@@ -70,7 +70,7 @@ def run_submission(config: RunConfig, *, evaluator: Evaluator | None = None) -> 
         submission_config,
         configured_provenance,
     )
-    run_id = _new_run_id(config.submission)
+    run_id = _new_run_id(config.submission, config.name)
     run_dir = runs_dir / run_id
     run_dir.mkdir(parents=False, exist_ok=False)
     stdout_path = run_dir / "stdout.log"
@@ -226,6 +226,7 @@ def run_submission(config: RunConfig, *, evaluator: Evaluator | None = None) -> 
         "status": "ok",
         "qualified": qualified,
         "submission": config.submission,
+        "name": config.name,
         "track": config.track,
         "profile": config.profile,
         "seed": config.seed,
@@ -758,9 +759,15 @@ def _resolve_managed_path(
     return resolved
 
 
-def _new_run_id(submission: str) -> str:
+def _new_run_id(submission: str, name: str = "") -> str:
+    """Compose a sortable, unique, and -- when named -- readable run directory."""
+
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-    return f"{timestamp}-{submission}-{secrets.token_hex(4)}"
+    parts = [timestamp, submission]
+    if name:
+        parts.append(name)
+    parts.append(secrets.token_hex(4))
+    return "-".join(parts)
 
 
 def _tail(text: str, limit: int = 240) -> str:

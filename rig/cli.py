@@ -16,6 +16,7 @@ from typing import Any, Callable, Iterable, Sequence
 
 from .harness import (
     HarnessError,
+    normalize_run_name,
     ReferenceContract,
     RunConfig,
     load_records,
@@ -226,6 +227,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--study-batch-size",
         type=_positive_int,
         help="research-only global batch override",
+    )
+    run.add_argument(
+        "--name",
+        help=(
+            "short label folded into the run directory name; prompted for when "
+            "omitted on a terminal"
+        ),
     )
     run.add_argument("--data-path", type=Path)
     run.add_argument("--seed", type=_nonnegative_int, default=1337)
@@ -538,6 +546,9 @@ def command_run(args: argparse.Namespace) -> int:
     profile = args.profile or config.default_profile
     color = args.color or config.color
     style = Style(color)
+    # Resolved first: an interactive prompt must not wait behind dataset
+    # verification and cluster synchronization.
+    run_name = _resolve_run_name(args, style)
     trainer_color = "always" if style.enabled else "never"
     target_loss = _effective_target_loss(
         profile, requested=args.target_loss, development_default=config.target_loss
@@ -666,6 +677,7 @@ def command_run(args: argparse.Namespace) -> int:
         RunConfig(
             repo_root=root,
             submission=args.submission,
+            name=run_name,
             runs_dir=artifacts,
             records_path=artifacts / "records.jsonl",
             track=track,
@@ -1388,6 +1400,39 @@ def _prepare_wizard(
         training_tokens=training_tokens,
     ).validate()
     return resolved, run_diagnostics, require_tpu, download, save
+
+
+def _resolve_run_name(args: argparse.Namespace, style: Style) -> str:
+    """Return the run label, prompting when one was not supplied.
+
+    Naming runs is worth a deliberate keystroke, so an interactive invocation
+    always asks. Everything non-interactive -- a study loop, a pdsh worker, a
+    piped shell -- silently keeps the unnamed default, because a prompt nobody
+    can answer is a hang.
+    """
+
+    if args.name is not None:
+        name = normalize_run_name(args.name)
+        if not name:
+            raise ConfigError(
+                f"--name {args.name!r} contains no letters or digits to name a run by"
+            )
+        return name
+    if _is_cluster_worker() or not sys.stdin.isatty():
+        return ""
+    while True:
+        answer = input(
+            f"  {style.text('Run name', 'bold')} "
+            f"{style.text('[enter for unnamed]', 'dim')}: "
+        ).strip()
+        if not answer:
+            return ""
+        name = normalize_run_name(answer)
+        if name:
+            if name != answer:
+                style.note(f"using {name}")
+            return name
+        style.note("a name needs at least one letter or digit; enter to skip")
 
 
 def _ask(prompt: str, default: str, style: Style) -> str:

@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 from typing import Any, Callable, Literal, Mapping, Sequence
 
+
+MAX_RUN_NAME = 40
+_RUN_NAME_STRIP = re.compile(r"[^a-z0-9]+")
 
 Track = Literal["open", "sample_efficiency"]
 CheckpointRetention = Literal["all", "qualifying", "none-after-validation"]
@@ -60,6 +64,7 @@ class RunConfig:
     python_executable: str | None = None
     environment: Mapping[str, str] = field(default_factory=dict)
     provenance: Mapping[str, Any] = field(default_factory=dict)
+    name: str = ""
     tpu_vm_count: int = 1
     tpu_vm_hosts: str = ""
     require_checkpoint: bool = True
@@ -91,3 +96,19 @@ class RunOutcome:
     record: Mapping[str, Any]
     record_path: Path
     checkpoint_path: Path | None
+
+
+def normalize_run_name(value: str) -> str:
+    """Reduce a human-typed run name to a safe run-directory segment.
+
+    Run IDs become directory names, are embedded in shell commands sent over
+    pdsh, and are compared as record keys, so the accepted alphabet is
+    deliberately narrow: lowercase alphanumerics joined by single hyphens.
+    Anything unusable reduces to the empty string, which means "no name" rather
+    than a silently mangled one.
+    """
+
+    if not isinstance(value, str):
+        raise TypeError("run name must be a string")
+    slug = _RUN_NAME_STRIP.sub("-", value.strip().lower()).strip("-")
+    return slug[:MAX_RUN_NAME].strip("-")

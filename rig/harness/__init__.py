@@ -13,7 +13,13 @@ from .errors import (
     ResultValidationError,
     SubmissionError,
 )
-from .models import ReferenceContract, RunConfig, RunOutcome, ValidationResult
+from .models import (
+    ReferenceContract,
+    RunConfig,
+    RunOutcome,
+    ValidationResult,
+    normalize_run_name,
+)
 from .records import append_record, load_records
 from .runner import run_submission
 from .scoring import rank_records, render_leaderboard
@@ -33,6 +39,7 @@ __all__ = [
     "ValidationResult",
     "append_record",
     "load_records",
+    "normalize_run_name",
     "parse_result_line",
     "rank_records",
     "render_leaderboard",
