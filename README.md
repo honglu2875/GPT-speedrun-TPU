@@ -217,6 +217,16 @@ to 500M and 1B using the published 8B corpus. Its resumable CSV is
 an exact point first with `speedrun.family_study run --only-point POINT`; the
 point keeps the suite hash and is reconciled by the subsequent full sweep.
 
+The legacy-baseline v4 IsoFLOP study is an immutable incomplete archive: its
+bounded lower-LR recovery stopped after 42 trials before a three-slice law could
+be fitted. Its dedicated fail-closed publisher archives every raw curve and
+derived decision, repeats semantic verification from an anonymous immutable
+download, and records the result as negative evidence without making a
+scaling-law claim. The fresh
+[v5 continuation](sweeps/current_budget_isoflop_v5/README.md) extends the
+prospective lower bound without reusing v4 measurements. See the
+[v4 scaling-evidence release gate](docs/SCALING_EVIDENCE.md).
+
 The harness creates a unique persistent run directory, captures stdout/stderr,
 validates the final result event and checkpoint, hashes artifacts, and appends a
 JSONL record. The trainer's synchronized accelerator time is the open-track

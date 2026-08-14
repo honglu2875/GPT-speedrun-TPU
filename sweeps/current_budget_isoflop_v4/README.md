@@ -1,5 +1,10 @@
 # Current-budget IsoFLOP v4
 
+> **Archived incomplete study.** V4 stopped after 42 trials at `c050/n023`:
+> `lr200` and `lr133` were rejected by the frozen stability gate, and `lr089`
+> was never launched. It produced no three-slice scaling-law claim. Its files
+> and raw run evidence must remain unchanged; new work starts fresh in v5.
+
 V4 is a fresh, fail-closed rerun. It independently calibrates learning rate for
 every `(compute slice, model shape)` pair. A selected calibration run is itself
 the equal-FLOP model-size measurement, so no short-horizon learning rate is
@@ -63,6 +68,8 @@ Admission hashes do not make missing raw curves independently auditable. Before
 any scaling-law claim, all v4 raw CSVs, run manifests, results, configs, and
 admission records will be archived together in an immutable Hugging Face or
 release bundle whose object/revision identity is recorded in the final report.
+The release gate and exact 15-file-per-run archive contract are documented in
+[`docs/SCALING_EVIDENCE.md`](../../docs/SCALING_EVIDENCE.md).
 
 The LR grid is launched low-to-high. No trial may be launched beyond the first
 suspect/rejected high-LR frontier. Selection requires an immediately adjacent
@@ -77,14 +84,29 @@ side. It stops at a bracketed or non-high-side fit. An interrupted warranted nex
 shape is an incomplete fit error; a no-law result is allowed only after that
 stopping rule fires or the declared `n102` grid is exhausted.
 
-## Run
+## Recorded terminal outcome
 
-```bash
-uv run --frozen --no-sync python -m speedrun.scaling plan
-uv run --frozen --no-sync python -m speedrun.scaling run --staged --data-path /dev/shm/fineweb-scaled/4B --downstream-manifest data/manifests/fresh10.json --downstream-root /dev/shm --runs runs/scaling/current-budget-isoflop-v4 --confirm-execution-fingerprint DIGEST_FROM_PLAN --resume --color always
-```
+The fresh execution stopped fail-closed after 42 trials. All six c025 LR groups
+completed and its n082-extended slice fit bracketed the local minimum. The first
+c050/n023 trial at lr200 was rejected; its first lower-recovery trial at lr133
+was also rejected. On replay, the frozen controller then raises `c050/n023:
+lower LR expansion is ineligible; refusing to search beyond it`. Consequently
+there is no c050 selection, c100/control evidence, global fit, or scaling-law
+claim. The schema-v2 `--stopped-study` evidence mode documents and verifies this
+inconclusive negative result; it does not reinterpret it as a completed law.
 
-This remains a one-seed local law, not a universal Chinchilla estimate. The same
-canonical FineWeb validation set is reused across the many LR candidates for
-selection and again as the model-size-fit outcome, so fit-only uncertainty does
-not include selection or multiple-comparison optimism.
+## Archived evidence
+
+Do not launch or resume this suite, and do not write into
+`runs/scaling/current-budget-isoflop-v4`. The scaling CLI rejects new v4 runs.
+Use the explicit `--stopped-study` workflow in
+[`docs/SCALING_EVIDENCE.md`](../../docs/SCALING_EVIDENCE.md) to build, verify,
+and publish a read-only archive of the exact terminal evidence. New execution
+belongs to the fresh [v5 continuation](../current_budget_isoflop_v5/README.md)
+and its separate run root.
+
+Any law from a future versioned continuation would remain a one-seed local law,
+not a universal Chinchilla estimate. The stopped v4 result contains no exponent.
+The same canonical FineWeb validation set was reused across the many LR
+candidates for selection and again for the c025 model-size fit, so its fit-only
+uncertainty does not include selection or multiple-comparison optimism.
