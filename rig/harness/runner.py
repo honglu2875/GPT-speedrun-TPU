@@ -643,7 +643,7 @@ def _python_tree_provenance(repo_root: Path) -> dict[str, Any]:
     """Hash shared Python dependencies, including dirty working-tree bytes."""
 
     paths: list[Path] = []
-    for package in ("rig", "harness"):
+    for package in ("rig",):
         package_root = repo_root / package
         if package_root.is_dir():
             paths.extend(path for path in package_root.rglob("*.py") if path.is_file())

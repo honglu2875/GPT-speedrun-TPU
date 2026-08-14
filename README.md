@@ -416,10 +416,9 @@ The full timing, qualification, checkpoint, and human-review rules are in
 
 ```text
 data/manifests/          pinned datasets and hashes
-harness/                 execution, validation, records, scoring
-rig/                     CLI, wizard, doctor, and shared data preparation
+rig/                     CLI, wizard, doctor, data preparation, report
+rig/harness/             execution, result protocol, records, scoring
 rig/kernels/             shared TPU attention, loss, and autotuning primitives
-scripts/                 corpus builder and publisher tooling
 submissions/reference/   JAX entry trainer + versioned experiment config
 tests/                   CPU-only infrastructure tests
 runs/                    gitignored persistent run artifacts

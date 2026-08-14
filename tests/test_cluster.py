@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from harness.cluster import (
+from rig.harness.cluster import (
     RAM_CACHE_ROOT,
     RAM_CACHE_SETUP_GUIDANCE,
     SSH_SETUP_GUIDANCE,
@@ -23,7 +23,7 @@ from harness.cluster import (
     seal_ram_cache_command,
     terminate_distributed_workers,
 )
-from harness.cluster import _rsync_to_hosts
+from rig.harness.cluster import _rsync_to_hosts
 from rig.config import ConfigError, LocalConfig, load_config, save_config
 
 
@@ -44,8 +44,8 @@ class ClusterTests(unittest.TestCase):
             "",
         )
         with (
-            patch("harness.cluster.shutil.which", return_value="/usr/bin/pdsh"),
-            patch("harness.cluster.subprocess.run", return_value=completed) as run,
+            patch("rig.harness.cluster.shutil.which", return_value="/usr/bin/pdsh"),
+            patch("rig.harness.cluster.subprocess.run", return_value=completed) as run,
         ):
             hosts = expand_host_expression("slice-w-[0-2]")
         self.assertEqual(hosts, ("slice-w-0", "slice-w-2", "slice-w-1"))
@@ -57,9 +57,9 @@ class ClusterTests(unittest.TestCase):
             subprocess.CompletedProcess([], 0, f"{host}\n", "") for host in hosts
         )
         with (
-            patch("harness.cluster.expand_host_expression", return_value=hosts),
-            patch("harness.cluster.subprocess.run", side_effect=completed) as run,
-            patch("harness.cluster.socket.gethostname", return_value="slice-w-0"),
+            patch("rig.harness.cluster.expand_host_expression", return_value=hosts),
+            patch("rig.harness.cluster.subprocess.run", side_effect=completed) as run,
+            patch("rig.harness.cluster.socket.gethostname", return_value="slice-w-0"),
         ):
             inventory = probe_cluster("slice-w-[0-3]", 4)
 
@@ -79,9 +79,9 @@ class ClusterTests(unittest.TestCase):
         hosts = ("slice-w-0", "slice-w-1")
         completed = subprocess.CompletedProcess([], 255, "", "permission denied")
         with (
-            patch("harness.cluster.expand_host_expression", return_value=hosts),
-            patch("harness.cluster.subprocess.run", return_value=completed),
-            patch("harness.cluster.time.sleep"),
+            patch("rig.harness.cluster.expand_host_expression", return_value=hosts),
+            patch("rig.harness.cluster.subprocess.run", return_value=completed),
+            patch("rig.harness.cluster.time.sleep"),
         ):
             with self.assertRaisesRegex(ClusterAccessError, "authorized_keys") as raised:
                 probe_cluster("slice-w-[0-1]", 2)
@@ -93,13 +93,13 @@ class ClusterTests(unittest.TestCase):
         first = subprocess.CompletedProcess([], 0, "slice-w-0\n", "")
         second = subprocess.CompletedProcess([], 0, "slice-w-1\n", "")
         with (
-            patch("harness.cluster.expand_host_expression", return_value=hosts),
+            patch("rig.harness.cluster.expand_host_expression", return_value=hosts),
             patch(
-                "harness.cluster.subprocess.run",
+                "rig.harness.cluster.subprocess.run",
                 side_effect=(failed, first, second),
             ) as run,
-            patch("harness.cluster.socket.gethostname", return_value="slice-w-0"),
-            patch("harness.cluster.time.sleep") as sleep,
+            patch("rig.harness.cluster.socket.gethostname", return_value="slice-w-0"),
+            patch("rig.harness.cluster.time.sleep") as sleep,
         ):
             inventory = probe_cluster("slice-w-[0-1]", 2)
 
@@ -111,12 +111,12 @@ class ClusterTests(unittest.TestCase):
         failed = subprocess.CompletedProcess([], 255, "", "key exchange failed")
         succeeded = subprocess.CompletedProcess([], 0, "", "")
         with (
-            patch("harness.cluster.shutil.which", return_value="/usr/bin/pdsh"),
+            patch("rig.harness.cluster.shutil.which", return_value="/usr/bin/pdsh"),
             patch(
-                "harness.cluster.subprocess.run",
+                "rig.harness.cluster.subprocess.run",
                 side_effect=(failed, succeeded),
             ) as run,
-            patch("harness.cluster.time.sleep") as sleep,
+            patch("rig.harness.cluster.time.sleep") as sleep,
         ):
             run_pdsh(("slice-w-0", "slice-w-1"), "hostname", labels=False)
         self.assertEqual(run.call_count, 2)
@@ -124,9 +124,9 @@ class ClusterTests(unittest.TestCase):
 
         remote_failure = subprocess.CompletedProcess([], 5, "", "setup failed")
         with (
-            patch("harness.cluster.shutil.which", return_value="/usr/bin/pdsh"),
-            patch("harness.cluster.subprocess.run", return_value=remote_failure) as run,
-            patch("harness.cluster.time.sleep") as sleep,
+            patch("rig.harness.cluster.shutil.which", return_value="/usr/bin/pdsh"),
+            patch("rig.harness.cluster.subprocess.run", return_value=remote_failure) as run,
+            patch("rig.harness.cluster.time.sleep") as sleep,
         ):
             with self.assertRaisesRegex(ClusterError, "setup failed"):
                 run_pdsh(("slice-w-0",), "false", labels=False)
@@ -134,7 +134,7 @@ class ClusterTests(unittest.TestCase):
         sleep.assert_not_called()
 
     def test_distributed_command_is_unlabelled_and_shell_quoted(self) -> None:
-        with patch("harness.cluster.shutil.which", return_value="/usr/bin/pdsh"):
+        with patch("rig.harness.cluster.shutil.which", return_value="/usr/bin/pdsh"):
             command = build_distributed_launch_command(
                 host_expression="slice-w-[0-3]",
                 host_count=4,
@@ -152,8 +152,8 @@ class ClusterTests(unittest.TestCase):
     def test_distributed_teardown_matches_one_exact_run(self) -> None:
         completed = subprocess.CompletedProcess([], 0, "", "")
         with (
-            patch("harness.cluster.shutil.which", return_value="/usr/bin/pdsh"),
-            patch("harness.cluster.subprocess.run", return_value=completed) as run,
+            patch("rig.harness.cluster.shutil.which", return_value="/usr/bin/pdsh"),
+            patch("rig.harness.cluster.subprocess.run", return_value=completed) as run,
         ):
             cleaned = terminate_distributed_workers(
                 host_expression="slice-w-[0-3]",
@@ -176,8 +176,8 @@ class ClusterTests(unittest.TestCase):
     def test_workspace_copy_uses_parallel_incremental_rsync_without_delete(self) -> None:
         completed = subprocess.CompletedProcess([], 0, "", "")
         with (
-            patch("harness.cluster.shutil.which", return_value="/usr/bin/rsync"),
-            patch("harness.cluster.subprocess.run", return_value=completed) as run,
+            patch("rig.harness.cluster.shutil.which", return_value="/usr/bin/rsync"),
+            patch("rig.harness.cluster.subprocess.run", return_value=completed) as run,
         ):
             _rsync_to_hosts(
                 Path("/repo"),
@@ -203,7 +203,7 @@ class ClusterTests(unittest.TestCase):
             local_host="slice-w-0",
             reported_hostnames={"slice-w-0": "slice-w-0", "slice-w-1": "slice-w-1"},
         )
-        with patch("harness.cluster.run_pdsh") as run:
+        with patch("rig.harness.cluster.run_pdsh") as run:
             prepare_ram_cache(Path("/repo"), inventory)
 
         self.assertEqual(run.call_count, 2)
@@ -232,7 +232,7 @@ class ClusterTests(unittest.TestCase):
             reported_hostnames={"slice-w-0": "slice-w-0", "slice-w-1": "slice-w-1"},
         )
         with (
-            patch("harness.cluster.run_pdsh", side_effect=ClusterError("mount failed")),
+            patch("rig.harness.cluster.run_pdsh", side_effect=ClusterError("mount failed")),
             self.assertRaisesRegex(ClusterError, "mount.*make prepare") as raised,
         ):
             prepare_ram_cache(Path("/repo"), inventory)
@@ -247,8 +247,8 @@ class ClusterTests(unittest.TestCase):
             reported_hostnames={"slice-w-0": "slice-w-0", "slice-w-1": "slice-w-1"},
         )
         with (
-            patch("harness.cluster.run_pdsh") as run,
-            patch("harness.cluster.shutil.which", return_value="/usr/bin/rsync"),
+            patch("rig.harness.cluster.run_pdsh") as run,
+            patch("rig.harness.cluster.shutil.which", return_value="/usr/bin/rsync"),
         ):
             bootstrap_rsync(inventory)
         self.assertEqual(run.call_args.args[0], inventory.hosts)

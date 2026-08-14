@@ -1,6 +1,11 @@
-"""Public API for the TPU rig competition harness."""
+"""Run execution, result protocol, records, and scoring.
 
-from .doctor import CheckResult, doctor_ok, render_doctor, run_doctor
+The trainer never imports this package. Its boundary with an entry program is
+the process itself: environment variables in, a final ``RIG_RESULT=`` line on
+stdout back. The doctor check protocol lives in :mod:`rig.doctor` beside the
+concrete checks that use it.
+"""
+
 from .errors import (
     ConfigurationError,
     HarnessError,
@@ -15,7 +20,6 @@ from .scoring import rank_records, render_leaderboard
 from .validation import RESULT_PREFIX, SCHEMA_VERSION, parse_result_line, validate_result, verify_run
 
 __all__ = [
-    "CheckResult",
     "ConfigurationError",
     "HarnessError",
     "RESULT_PREFIX",
@@ -28,13 +32,10 @@ __all__ = [
     "SubmissionError",
     "ValidationResult",
     "append_record",
-    "doctor_ok",
     "load_records",
     "parse_result_line",
     "rank_records",
-    "render_doctor",
     "render_leaderboard",
-    "run_doctor",
     "run_submission",
     "validate_result",
     "verify_run",

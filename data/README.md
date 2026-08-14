@@ -87,8 +87,7 @@ repository and commit, provide an immutable URL and SHA-256 for every exact
 and document-disjoint validation contract. Until publication produces that
 real manifest, scaled `rig prepare` fails with an explicit message; it
 never manufactures a placeholder or treats a cache-local build plan as a
-download contract. The standalone builder remains the way to create the local
-bytes before publication.
+download contract.
 
 Doctor, profiling, and runs resolve the same saved route, preventing accidental
 fallback to a different corpus. The setting does not determine trainer steps;
@@ -123,10 +122,11 @@ bytes are pinned exactly, but the prepared repository does not identify an
 immutable raw-corpus or preprocessing-code revision, so that earlier lineage is
 recorded as upstream-claimed rather than independently reconstructed here.
 
-For locally building nested 2B, 4B, 8B, and 75B prefixes from the newer,
-globally shuffled 100BT source—using a bounded SHM cache, exact Parquet-row
-checkpoints, a pre-2024 temporal filter, and defensive Fresh10 exclusions—see
-[Scaled FineWeb preparation](../docs/FINEWEB_BUILDER.md).
+The nested 2B, 4B, 8B, and 75B prefixes are already built and published, and
+each manifest pins an immutable URL and SHA-256 per shard, so `rig` downloads
+and verifies them without any local build step. The builder and its entrypoint
+that produced those bytes are published beside the data under `provenance/` in
+the dataset repository, and remain in this repository's history at `1d73eb5`.
 
 ## Fresh10 diagnostic
 

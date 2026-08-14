@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from harness import (
+from rig.harness import (
     ConfigurationError,
     ReferenceContract,
     ResultValidationError,
@@ -26,7 +26,7 @@ from harness import (
     validate_result,
     verify_run,
 )
-from harness.runner import _validate_payload_identity
+from rig.harness.runner import _validate_payload_identity
 
 
 FAKE_TRAINER = r'''from __future__ import annotations
@@ -222,10 +222,10 @@ class HarnessRunTests(unittest.TestCase):
 
         with (
             mock.patch(
-                "harness.runner.build_distributed_launch_command",
+                "rig.harness.runner.build_distributed_launch_command",
                 side_effect=localize,
             ) as build,
-            mock.patch("harness.runner.socket.gethostname", return_value="slice-w-0"),
+            mock.patch("rig.harness.runner.socket.gethostname", return_value="slice-w-0"),
         ):
             outcome = run_submission(
                 self.config(
@@ -249,12 +249,12 @@ class HarnessRunTests(unittest.TestCase):
     def test_interrupted_multi_host_run_cleans_exact_remote_workers(self) -> None:
         with (
             mock.patch(
-                "harness.runner.build_distributed_launch_command",
+                "rig.harness.runner.build_distributed_launch_command",
                 return_value=["pdsh", "synthetic"],
             ),
-            mock.patch("harness.runner._run_process", side_effect=KeyboardInterrupt),
+            mock.patch("rig.harness.runner._run_process", side_effect=KeyboardInterrupt),
             mock.patch(
-                "harness.runner.terminate_distributed_workers", return_value=True
+                "rig.harness.runner.terminate_distributed_workers", return_value=True
             ) as terminate,
         ):
             with self.assertRaises(KeyboardInterrupt):
@@ -493,7 +493,7 @@ class HarnessRunTests(unittest.TestCase):
             )
         )
 
-        with mock.patch("harness.runner.sys.stderr", captured):
+        with mock.patch("rig.harness.runner.sys.stderr", captured):
             thread = threading.Thread(target=lambda: result.append(run_submission(config)))
             thread.start()
             deadline = time.monotonic() + 2.0
@@ -509,7 +509,7 @@ class HarnessRunTests(unittest.TestCase):
 
     def test_large_stderr_does_not_deadlock_and_timeout_keeps_partial_log(self) -> None:
         captured = io.StringIO()
-        with mock.patch("harness.runner.sys.stderr", captured):
+        with mock.patch("rig.harness.runner.sys.stderr", captured):
             outcome = run_submission(
                 self.config(passthrough_args=("--stderr-bytes", str(512 * 1024)))
             )
@@ -524,7 +524,7 @@ class HarnessRunTests(unittest.TestCase):
             ),
             timeout_seconds=0.1,
         )
-        with mock.patch("harness.runner.sys.stderr", io.StringIO()):
+        with mock.patch("rig.harness.runner.sys.stderr", io.StringIO()):
             started = time.monotonic()
             with self.assertRaisesRegex(SubmissionError, "timed out"):
                 run_submission(timeout_config)

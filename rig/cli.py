@@ -14,20 +14,17 @@ import subprocess
 import sys
 from typing import Any, Callable, Iterable, Sequence
 
-from harness import (
+from .harness import (
     HarnessError,
     ReferenceContract,
     RunConfig,
-    doctor_ok,
     load_records,
     rank_records,
-    render_doctor,
     render_leaderboard,
-    run_doctor,
     run_submission,
     verify_run,
 )
-from harness.cluster import (
+from .harness.cluster import (
     ClusterError,
     ClusterInventory,
     bootstrap_uv,
@@ -61,7 +58,13 @@ from .data import (
     verify_fresh10,
 )
 from .data_routing import preparation_route, resolve_preparation_manifest
-from .doctor import data_selection, environment_checks
+from .doctor import (
+    data_selection,
+    doctor_ok,
+    environment_checks,
+    render_doctor,
+    run_doctor,
+)
 from .report import REPORT_ADMISSION_QUALIFICATION_LOSS, build_report
 
 
