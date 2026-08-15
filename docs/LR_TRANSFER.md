@@ -1,9 +1,9 @@
 # Learning-rate transfer under Complete(d)P
 
 Whether one normalized learning rate, tuned once at a small size, stays optimal
-as the model grows. Measured on the reference family at 5 TPP. **Width transfer
-and depth transfer each held at `2^-8`. The single tier that changed both at
-once landed one grid notch away, by a margin too small to call.**
+as the model grows. Measured on the reference family at 5 TPP. **Every
+configuration measured, including 250M re-run at three seeds, puts the optimum
+at `2^-8`. No transfer break was found.**
 
 ## Terms
 
@@ -71,21 +71,64 @@ the same stream.
    changes width *and* depth together, and the only one that shifted — to
    `2^-7`. Because 1 and 2 exonerate each axis alone, this is not attributable
    to the depth rule.
-4. **That shift is not established.** Its margin is 0.021 nats, the flattest in
-   the study but close behind `depth_l24` (0.027) and `depth_l16` (0.032),
-   which both kept `2^-8`. One grid notch at that margin, on a single seed,
-   does not distinguish a real break from noise.
+4. **That shift did not survive reseeding.** Its single-seed margin was 0.021
+   nats. Re-measured at three seeds it reversed: see below.
 5. **The shipped default is far below the optimum.** `config.yaml` ships
    `learning_rate: 0.001` (≈ `2^-9.97`), the leftmost edge of the grid. Against
    `2^-8` that cost 0.225 / 0.183 / 0.184 nats at 60m / 125m / 250m.
+
+## The 250M reseed
+
+Findings 3 and 4 were the open question, so 250M was re-measured over four
+learning rates x three seeds (1337, 1338, 1339) on `fineweb-8b-gpt2`, all other
+settings unchanged. Twelve runs.
+
+| base LR | mean | std | SEM | seed 1337 | seed 1338 | seed 1339 |
+|---|--:|--:|--:|--:|--:|--:|
+| 2^-6 | 3.48843 | 0.01091 | 0.00630 | 3.48473 | 3.50071 | 3.47985 |
+| 2^-7 | 3.44372 | 0.03263 | 0.01884 | 3.41767 | 3.43316 | 3.48032 |
+| **2^-8** | **3.42985** | 0.00938 | 0.00542 | 3.44069 | 3.42441 | 3.42447 |
+| 2^-9 | 3.47398 | 0.00260 | 0.00150 | 3.47342 | 3.47682 | 3.47172 |
+
+Welch's t against the best mean:
+
+| comparison | difference | SE | t | verdict |
+|---|--:|--:|--:|---|
+| 2^-8 vs 2^-9 | +0.04413 | 0.00562 | 7.85 | separated |
+| 2^-8 vs 2^-7 | +0.01386 | 0.01960 | 0.71 | **not separated** |
+| 2^-8 vs 2^-6 | +0.05858 | 0.00831 | 7.05 | separated |
+
+**No transfer break.** At three seeds 250M's best mean is `2^-8`, the same
+value as 60M, 125M, and both depth forks. The v3 single-seed result that put
+250M at `2^-7` did not reproduce as a mean; the ordering reversed. The optimum
+is properly bracketed -- significantly better than both `2^-9` and `2^-6` --
+and `2^-8` and `2^-7` remain statistically indistinguishable from each other,
+so the honest statement is that 250M's optimum lies in `{2^-8, 2^-7}` with
+`2^-8` favoured, and nothing here suggests it differs from the rest of the
+ladder.
+
+**Seed variance is not constant in LR.** The spread grows from 0.0026 at
+`2^-9` to 0.0326 at `2^-7`, an order of magnitude, and `2^-7`'s three seeds
+span 0.063 nats on their own. Noise is largest exactly where the optimum sits,
+which is why the original single-seed curve could rank `2^-7` first: one
+sample near the optimum carries far less information than one sample on the
+shoulder. Treat any single-seed comparison within about 0.05 nats of the best
+point as unresolved.
+
+**Corpus sensitivity, incidentally measured.** Seed 1337 was run on both
+corpora. At `2^-9`, `2^-8`, and `2^-7` the 4B-to-8B difference was -0.0005,
++0.0022, and +0.0001 -- an order of magnitude below seed noise. At `2^-6` it
+was +0.044, which is roughly 4x that LR's own seed spread, so the two effects
+are not cleanly separable at high learning rates.
 
 ## What this does not establish
 
 - **Not qualifying numbers.** Every run used the dev profile, so each loss is 8
   probe batches, not canonical validation. Rankings across LR at fixed
   everything-else are valid; the absolute losses are not official results.
-- **One seed.** Seed 1337 only. Finding 4 needs at least three seeds near the
-  optimum before the 250m shift means anything.
+- **One seed, except at 250M.** Every study above used seed 1337 alone. Only
+  the 250M reseed has three seeds; the 60M, 125M, and depth-fork optima rest on
+  one sample each and inherit the same variance problem the reseed exposed.
 - **Two corpora.** See the note under Results: `lr_v3` used the 4B prefix and
   everything since used the 8B one, so absolute losses do not cross that line.
 - **One horizon.** 5 TPP only. Complete(d)P's `sqrt(m_D)` correction is meant to
