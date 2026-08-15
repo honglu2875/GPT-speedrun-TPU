@@ -8,6 +8,8 @@ TIER ?= 125m
 # Optional run label. Left empty, `rig run` prompts for one on a terminal.
 NAME ?=
 REPORT ?= report.html
+# Steps kept per layer-snapshot chart. 0 = every recorded step (finest dragger).
+LAYER_SNAPSHOTS ?= 0
 # The 8B prefix covers the 1B × 5-TPP learning-rate confirmation.
 TRAIN_TOKENS ?= 5000000000
 
@@ -125,4 +127,4 @@ profile: validate-target preflight
 	  --port="$(XPROF_PORT)" "$(PROFILE_OUTPUT)/xprof"
 
 report:
-	$(UV_RUN) rig report --runs "$(RUNS_PATH)" --output "$(REPORT)"
+	$(UV_RUN) rig report --runs "$(RUNS_PATH)" --output "$(REPORT)" --layer-snapshots $(LAYER_SNAPSHOTS)

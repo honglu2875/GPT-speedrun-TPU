@@ -353,6 +353,10 @@ block, and the final normalization. Because the final parameter point is
 post-update, it exactly describes the saved checkpoint even when qualifying-only
 retention later removes that file.
 
+The page embeds its data as gzip, base64-encoded, and inflates it on load with
+`DecompressionStream`; the payload is about 99% of the file, so this roughly
+halves it. That needs Chrome 80+, Firefox 113+, or Safari 16.4+.
+
 Layer snapshots are scrubbable. A step dragger above them selects which recorded
 step every per-scope chart shows, defaulting to the last, and its position is
 echoed on each timeline as a faint dashed marker so you can see where in
@@ -360,7 +364,10 @@ training you are looking. Hovering any timeline draws a crosshair at the same x
 on all of them; a single click pins a vertical line there and clicking again
 clears it, while double-click still resets the view. Tooltips report both the
 optimizer step and the estimated FLOPs whichever axis is selected, so a point of
-interest can be located on the dragger. Compatible retained checkpoints are used only
+interest can be located on the dragger. By default every recorded diagnostic
+step is kept, so the dragger moves at the granularity the run recorded;
+`make report LAYER_SNAPSHOTS=N` thins the step axis to N if you would rather
+have a smaller file. Compatible retained checkpoints are used only
 as a legacy fallback for runs that predate `diagnostics.csv`.
 
 Charts render into bounded, downsampled canvases only after an input or resize

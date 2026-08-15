@@ -9,9 +9,11 @@ visualization.
 
 from __future__ import annotations
 
+import base64
 import csv
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import gzip
 import hashlib
 import json
 import math
@@ -23,11 +25,10 @@ from typing import Any, Iterable, Mapping, Sequence
 _MAX_JSON_BYTES = 4 * 1024 * 1024
 _MAX_CSV_BYTES = 128 * 1024 * 1024
 _MAX_CHART_POINTS = 1_400
-# Layer snapshots are a step x scope grid per chart per run, so the embedded
-# JSON grows as the product. The full recorded grid is ~4M values across a
-# dozen runs, which no self-contained page should carry; this bounds the step
-# axis the dragger scrubs while keeping first and last exactly.
-_MAX_LAYER_SNAPSHOTS = 80
+# 0 keeps every recorded diagnostic step, so the step dragger moves at the
+# granularity the run actually recorded. A positive value thins the step axis,
+# trading dragger resolution for file size; first and last are always kept.
+_MAX_LAYER_SNAPSHOTS = 0
 _LAYER_KEY = re.compile(r"(?:^|/)(?:blocks?|layers?|h)(?:/|_)(\d+)(?:/|$)")
 _COLORS = (
     "#7dd3fc",
@@ -132,6 +133,7 @@ def build_report(
     output_path: Path,
     *,
     max_chart_points: int = _MAX_CHART_POINTS,
+    layer_snapshots: int = _MAX_LAYER_SNAPSHOTS,
 ) -> ReportSummary:
     """Scan ``runs_dir`` and write one portable report HTML file.
 
@@ -144,6 +146,10 @@ def build_report(
     output_path = Path(output_path).expanduser().resolve()
     if isinstance(max_chart_points, bool) or max_chart_points < 32:
         raise ReportError("max_chart_points must be an integer of at least 32")
+    if isinstance(layer_snapshots, bool) or layer_snapshots < 0:
+        raise ReportError("layer_snapshots must be 0 (every step) or a positive count")
+    if 0 < layer_snapshots < 2:
+        raise ReportError("layer_snapshots must be 0 (every step) or at least 2")
     if not runs_dir.is_dir():
         raise ReportError(f"runs directory does not exist: {runs_dir}")
     if output_path.exists() and (output_path.is_dir() or output_path.is_symlink()):
@@ -192,6 +198,7 @@ def build_report(
         skipped,
         notices,
         max_chart_points=max_chart_points,
+        layer_snapshots=layer_snapshots,
     )
     html = _render_html(payload)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -992,6 +999,7 @@ def _report_payload(
     notices: Sequence[str],
     *,
     max_chart_points: int,
+    layer_snapshots: int = _MAX_LAYER_SNAPSHOTS,
 ) -> dict[str, Any]:
     run_rows: list[dict[str, Any]] = []
     for index, run in enumerate(runs):
@@ -1100,7 +1108,7 @@ def _report_payload(
     ]
 
     diagnostic_charts = _overall_diagnostic_charts(runs)
-    layer_charts = _final_diagnostic_charts(runs)
+    layer_charts = _final_diagnostic_charts(runs, layer_snapshots)
 
     missing_final_families = []
     for family in _DIAGNOSTIC_FAMILIES:
@@ -1220,11 +1228,26 @@ def _overall_diagnostic_charts(runs: Sequence[_Run]) -> list[dict[str, Any]]:
     return charts
 
 
+def _compact(value: Any) -> Any:
+    """Trim a diagnostic value to float32's worth of digits.
+
+    These come off the accelerator as float32, so a full double repr spends
+    roughly seventeen characters to encode about seven meaningful ones. Across a
+    step x scope grid that is most of the embedded payload.
+    """
+
+    if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+        return value
+    if not math.isfinite(value):
+        return None
+    return float(f"{value:.7g}")
+
+
 def _subsample_steps(steps: Sequence[int], limit: int) -> list[int]:
     """Evenly thin a recorded step list, always keeping the first and last."""
 
     total = len(steps)
-    if total <= limit:
+    if limit <= 0 or total <= limit:
         return list(steps)
     picked = {0, total - 1}
     for index in range(limit):
@@ -1232,7 +1255,9 @@ def _subsample_steps(steps: Sequence[int], limit: int) -> list[int]:
     return [steps[index] for index in sorted(picked)]
 
 
-def _final_diagnostic_charts(runs: Sequence[_Run]) -> list[dict[str, Any]]:
+def _final_diagnostic_charts(
+    runs: Sequence[_Run], snapshots: int = _MAX_LAYER_SNAPSHOTS
+) -> list[dict[str, Any]]:
     """Build per-scope diagnostic snapshots the viewer can scrub through by step.
 
     Each series carries a fixed scope layout plus one value row per retained
@@ -1267,14 +1292,14 @@ def _final_diagnostic_charts(runs: Sequence[_Run]) -> list[dict[str, Any]]:
                     if not layout:
                         continue
                     order = [position for position, _ in layout]
-                    steps = _subsample_steps(recorded, _MAX_LAYER_SNAPSHOTS)
+                    steps = _subsample_steps(recorded, snapshots)
                     values = []
                     for step in steps:
                         found = {
                             point[0]: point[1]
                             for point in _diagnostic_scope_points(by_step[step])
                         }
-                        values.append([found.get(position) for position in order])
+                        values.append([_compact(found.get(position)) for position in order])
                     series.append(
                         {
                             "run": run.run_id,
@@ -1298,7 +1323,7 @@ def _final_diagnostic_charts(runs: Sequence[_Run]) -> list[dict[str, Any]]:
                             "run": run.run_id,
                             "scopes": [[point[0], point[2]] for point in legacy],
                             "steps": [int(run.training[-1]["step"])],
-                            "values": [[point[1] for point in legacy]],
+                            "values": [[_compact(point[1]) for point in legacy]],
                         }
                     )
             if series:
@@ -1539,11 +1564,20 @@ def _submission_from_run_id(run_id: str) -> str:
 
 
 def _render_html(payload: Mapping[str, Any]) -> str:
-    encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
-    # Data lives in a script text node; escape HTML-significant characters so even
-    # a deliberately strange submission name cannot terminate it.
-    encoded = encoded.replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e")
-    return _HTML.replace("__REPORT_DATA__", encoded)
+    """Embed the payload as gzip, base64-encoded into a script text node.
+
+    The payload is nearly the whole file -- the CSS/JS shell is under 40 KB --
+    and it is numeric JSON, which gzip halves even after base64's 33% tax. The
+    base64 alphabet also cannot contain the characters that would terminate a
+    script element, so the escaping the plain-JSON path needed is unnecessary.
+    """
+
+    encoded = json.dumps(
+        payload, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+    # mtime=0 keeps an unchanged report byte-identical between builds.
+    compressed = gzip.compress(encoded, compresslevel=9, mtime=0)
+    return _HTML.replace("__REPORT_DATA__", base64.b64encode(compressed).decode("ascii"))
 
 
 def _object(value: Any, name: str) -> dict[str, Any]:
@@ -1673,17 +1707,28 @@ _HTML = r'''<!doctype html>
     <div class="focus-canvas"><canvas id="focus-canvas"></canvas></div>
   </div>
 </dialog>
-<script type="application/json" id="report-data">__REPORT_DATA__</script>
+<script type="application/gzip-base64" id="report-data">__REPORT_DATA__</script>
 <script>
 (()=>{'use strict';
-const D=JSON.parse(document.getElementById('report-data').textContent), runMap=new Map(D.runs.map(r=>[r.id,r]));
-const visible=new Set(D.runs.filter(r=>r.selected).map(r=>r.id)), families=['grad','update','param'];
+let D, runMap, visible;
+const families=['grad','update','param'];
+async function loadPayload(){
+ // The payload is gzip, base64-encoded: it is ~99% of the file and numeric
+ // JSON, which compresses about 2x even after base64's 33% overhead.
+ const node=document.getElementById('report-data'), raw=node.textContent.trim();
+ if(node.type==='application/json')return JSON.parse(raw);
+ const binary=atob(raw), bytes=new Uint8Array(binary.length);
+ for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);
+ if(typeof DecompressionStream!=='function')
+  throw new Error('this browser cannot inflate the report payload (needs DecompressionStream)');
+ const stream=new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+ return JSON.parse(await new Response(stream).text())}
 const smoothCache=new WeakMap();
 let axis='flops', xScale='log', family='grad', smoothing='raw', charts=[], frame=0, focusItem=null;
 // hoverX follows the pointer, pinnedX survives until clicked again, layerStep
 // is the snapshot the layer charts show. All three are in step space, which is
 // axis-independent, so they stay put when the x axis switches to FLOPs.
-let hoverX=null, pinnedX=null, layerStep=null, layerSteps=[];
+let hoverX=null, hoverPx=null, pinnedX=null, layerStep=null, layerSteps=[];
 const $=id=>document.getElementById(id), esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt=(n,d=3)=>{if(n==null||!Number.isFinite(+n))return '—';n=+n;const a=Math.abs(n);if(a>=1e18)return (n/1e18).toFixed(2)+' EF';if(a>=1e15)return (n/1e15).toFixed(2)+' PF';if(a>=1e12)return (n/1e12).toFixed(2)+' T';if(a>=1e9)return (n/1e9).toFixed(2)+' B';if(a>=1e6)return (n/1e6).toFixed(2)+' M';if(a>=1e3)return (n/1e3).toFixed(2)+' k';if(a>0&&a<.001)return n.toExponential(2);const f=n.toFixed(d);return d?f.replace(/(\.\d*?[1-9])0+$|\.0+$/,'$1'):f};
 function effectiveSpan(normalize=false){const input=$('smoothing-level'),maximum=D.meta.maxChartPoints;let span=Math.round(Number(input.value));if(!Number.isFinite(span))span=21;span=Math.max(1,Math.min(maximum,span));if((smoothing==='mean'||smoothing==='median')&&span%2===0)span=span===maximum?Math.max(1,span-1):span+1;if(normalize)input.value=String(span);return span}
@@ -1735,7 +1780,18 @@ function redraw(item){cancelAnimationFrame(item._frame||0);item._frame=requestAn
 function resetViews(){charts.forEach(item=>item.view=null);if(focusItem)focusItem.view=null}
 function xOf(item,p){return item.type==='layer'?p[0]:p[axis==='flops'?1:0]}function yOf(item,p){return item.type==='layer'?p[1]:p[2]}
 function frameIndex(s,step){let best=0,bd=Infinity;for(let i=0;i<s.steps.length;i++){const d=Math.abs(s.steps[i]-step);if(d<bd){bd=d;best=i}}return best}
-function layerFrame(s,step){const i=frameIndex(s,step),row=s.values[i];return s.scopes.map((sc,j)=>[sc[0],row[j],sc[1]])}
+const frameCache=new WeakMap();
+function layerFrame(s,step){
+ // Identity must be stable across redraws: draw() decides whether a series
+ // is smoothed by comparing array identity, and a fresh array every call
+ // made every layer series look smoothed, which then dereferenced the
+ // s.points that layer series do not have. It also avoids rebuilding every
+ // frame on each repaint while the step dragger is being scrubbed.
+ let hit=frameCache.get(s);
+ if(hit&&hit.step===step)return hit.pts;
+ const i=frameIndex(s,step),row=s.values[i];
+ const pts=s.scopes.map((sc,j)=>[sc[0],row[j],sc[1]]);
+ frameCache.set(s,{step,pts});return pts}
 function seriesPoints(item,s){return item.type==='layer'?layerFrame(s,layerStep):s.points}
 function chartXScale(item){return item.type==='layer'?'linear':xScale}
 function validX(item,x){return Number.isFinite(x)&&(chartXScale(item)==='linear'||x>0)}
@@ -1772,12 +1828,12 @@ function axisToStep(value){
   while(lo<hi-1){const mid=(lo+hi)>>1;if(pts[mid][1]<value)lo=mid;else hi=mid}
   const a=pts[lo],b2=pts[hi],t=(value-a[1])/((b2[1]-a[1])||1);return a[0]+t*(b2[0]-a[0])}
  return value}
-function pinTolerance(){let last=0;for(const c of D.timeCharts)for(const s of c.series)if(s.points.length)last=Math.max(last,s.points[s.points.length-1][0]);return Math.max(1,last*0.004)}
-function setHover(item,e){if(item.type==='layer'||!item._plot)return;const rect=item.canvas.getBoundingClientRect();
- // Quantized to roughly one pixel of the widest plot: a crosshair redraws every
- // chart, so an unquantized pointer would force a full re-render per mousemove.
- const raw=axisToStep(item._plot.IX(e.clientX-rect.left)),q=pinTolerance();
- const step=Math.round(raw/q)*q;if(step===hoverX)return;hoverX=step;schedule()}
+function setHover(item,e){if(item.type==='layer'||!item._plot)return;
+ // Track the pointer exactly and throttle on the *pixel* instead of the value.
+ // Quantizing the value left a visible stride that grew worse as you zoomed in,
+ // because a fixed step-space grid does not shrink with the view.
+ const rect=item.canvas.getBoundingClientRect(),px=Math.round(e.clientX-rect.left);
+ if(px===hoverPx)return;hoverPx=px;hoverX=axisToStep(item._plot.IX(px));schedule()}
 function stepToAxis(step){
  // Markers are held in step space; on a FLOPs axis they are mapped through any
  // visible run's own step->FLOPs curve, which is what makes them line up.
@@ -1805,7 +1861,12 @@ function attachCanvas(item){const c=item.canvas;c.ondblclick=()=>{item.view=null
 function finishBox(e,item){const c=item.canvas,d=item.drag;if(!d)return;const q=eventPoint(e,item,true);d.x1=q.x;d.y1=q.y;item.drag=null;c.classList.remove('dragging');if(c.hasPointerCapture(e.pointerId))c.releasePointerCapture(e.pointerId);if(Math.abs(d.x1-d.x0)<4&&Math.abs(d.y1-d.y0)<4&&item._plot&&item.type!=='layer'){
   // A click, not a zoom box: toggle the pinned vertical line.
   const step=axisToStep(item._plot.IX(d.x1));
-  pinnedX=(pinnedX!==null&&Math.abs(pinnedX-step)<=pinTolerance())?null:step;
+  // Clicking the pinned line again clears it; judged in pixels so the target
+  // stays the same size at every zoom level.
+  let onPinned=false;
+  if(pinnedX!==null){const at=stepToAxis(pinnedX);
+   if(at!=null&&validX(item,at))onPinned=Math.abs(item._plot.X(at)-d.x1)<=6}
+  pinnedX=onPinned?null:step;
   redraw(item);schedule();return}
  if(Math.abs(d.x1-d.x0)>=8&&Math.abs(d.y1-d.y0)>=8&&item._plot){const p=item._plot,left=Math.min(d.x0,d.x1),right=Math.max(d.x0,d.x1),top=Math.min(d.y0,d.y1),bottom=Math.max(d.y0,d.y1),xa=p.IX(left),xb=p.IX(right),ya=p.IY(top),yb=p.IY(bottom);item.view={x0:Math.min(xa,xb),x1:Math.max(xa,xb),y0:Math.min(ya,yb),y1:Math.max(ya,yb)}}redraw(item)}
 function cancelBox(e,item){const c=item.canvas;item.drag=null;c.classList.remove('dragging');if(c.hasPointerCapture(e.pointerId))c.releasePointerCapture(e.pointerId);redraw(item)}
@@ -1817,7 +1878,15 @@ function hideTip(){$('tooltip').style.display='none'}
 function openFocus(source){const dialog=$('focus-dialog'),title=(source.data.family?source.data.family.toUpperCase()+' · ':'')+source.data.title;$('focus-title').textContent=title;$('focus-canvas').setAttribute('aria-label',title);focusItem={canvas:$('focus-canvas'),data:source.data,type:source.type,view:source.view?{...source.view}:null,drag:null,source};attachCanvas(focusItem);dialog.showModal();requestAnimationFrame(()=>draw(focusItem))}
 function closeFocus(){const dialog=$('focus-dialog');if(dialog.open)dialog.close()}
 function finishFocus(){hideTip();if(focusItem){focusItem.source.view=focusItem.view?{...focusItem.view}:null;redraw(focusItem.source)}focusItem=null}
-init();
+loadPayload().then(payload=>{
+ D=payload;
+ runMap=new Map(D.runs.map(r=>[r.id,r]));
+ visible=new Set(D.runs.filter(r=>r.selected).map(r=>r.id));
+ init();
+}).catch(error=>{
+ document.getElementById('summary').innerHTML=
+  '<div class="empty">Could not load report data: '+esc(String(error&&error.message||error))+'</div>';
+});
 })();
 </script>
 </body>

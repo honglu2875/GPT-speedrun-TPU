@@ -79,6 +79,8 @@ def environment_checks(
     profile: str | None = None,
     require_tpu: bool = False,
     expected_process_count: int = 1,
+    accelerator: str = "TPU v4",
+    chips_per_host: int = 4,
     training_tokens: int | None = None,
     check_data: bool = True,
     compile_probe: bool = True,
@@ -90,6 +92,8 @@ def environment_checks(
         lambda: check_devices(
             require_tpu=require_tpu,
             expected_process_count=expected_process_count,
+            accelerator=accelerator,
+            chips_per_host=chips_per_host,
         ),
     ]
     if compile_probe:
@@ -162,7 +166,20 @@ def check_jax_install() -> CheckResult:
     )
 
 
-def check_devices(*, require_tpu: bool, expected_process_count: int = 1) -> CheckResult:
+def check_devices(
+    *,
+    require_tpu: bool,
+    expected_process_count: int = 1,
+    accelerator: str = "TPU v4",
+    chips_per_host: int = 4,
+) -> CheckResult:
+    """Assert the cluster is the accelerator its profile says it is.
+
+    The contract is per cluster rather than a single hard-coded generation, so
+    a v4 slice and a v5e slice are both checked strictly instead of one of them
+    being waved through or rejected outright.
+    """
+
     try:
         import jax
 
@@ -175,34 +192,36 @@ def check_devices(*, require_tpu: bool, expected_process_count: int = 1) -> Chec
     kinds = sorted({str(device.device_kind) for device in devices})
     message = f"{len(devices)} device(s), {', '.join(platforms)}; {', '.join(kinds)}"
     tpu_devices = [device for device in devices if device.platform == "tpu"]
-    exact_v4 = len(tpu_devices) == 4 * expected_process_count and all(
-        str(device.device_kind).strip().lower() == "tpu v4" for device in tpu_devices
+    wanted = accelerator.strip().lower()
+    exact = len(tpu_devices) == chips_per_host * expected_process_count and all(
+        str(device.device_kind).strip().lower() == wanted for device in tpu_devices
     )
     expected_topology = True
     try:
         expected_topology = (
             jax.process_count() == expected_process_count
-            and jax.local_device_count() == 4
+            and jax.local_device_count() == chips_per_host
         )
     except Exception:
         pass
-    if require_tpu and (not exact_v4 or not expected_topology):
+    if require_tpu and (not exact or not expected_topology):
         return CheckResult(
             "accelerator",
             "error",
             message,
-            "official runs require four local TPU v4 chips on every configured process",
+            f"this cluster expects {chips_per_host} local {accelerator} chip(s) on "
+            f"each of {expected_process_count} process(es)",
         )
     if not tpu_devices:
         status = "error" if require_tpu else "warning"
         return CheckResult("accelerator", status, message, "CPU is valid only for smoke runs")
-    if exact_v4 and expected_topology:
+    if exact and expected_topology:
         return CheckResult("accelerator", "ok", message)
     return CheckResult(
         "accelerator",
         "warning",
         message,
-        "this does not match the configured TPU v4 topology",
+        f"this does not match the configured {accelerator} topology",
     )
 
 

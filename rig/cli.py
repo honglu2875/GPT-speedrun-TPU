@@ -155,6 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--track", choices=_TRACKS, help="default competition track")
     prepare.add_argument("--run-profile", choices=_PROFILES, help="default run profile")
     prepare.add_argument("--checkpoints", choices=_RETENTION, help="checkpoint retention policy")
+    prepare.add_argument("--cluster", help="named cluster profile from .rig.toml")
     prepare.add_argument("--color", choices=_COLORS, help="terminal color preference")
     prepare.add_argument(
         "--target-loss",
@@ -202,6 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         help=argparse.SUPPRESS,
     )
+    doctor.add_argument("--cluster", help="named cluster profile from .rig.toml")
     doctor.add_argument("--color", choices=_COLORS)
 
     run = commands.add_parser(
@@ -240,6 +242,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--target-loss", type=_nonnegative_float)
     run.add_argument("--timeout", type=_positive_float, help="whole-process timeout in seconds")
     run.add_argument("--checkpoints", choices=_RETENTION)
+    run.add_argument("--cluster", help="named cluster profile from .rig.toml")
     run.add_argument("--color", choices=_COLORS)
     run.add_argument("--skip-data-check", action="store_true")
     run.add_argument(
@@ -268,6 +271,7 @@ def build_parser() -> argparse.ArgumentParser:
     profile.add_argument("--xprof-steps", type=_positive_int, default=10)
     profile.add_argument("--seed", type=_nonnegative_int, default=1337)
     profile.add_argument("--timeout", type=_positive_float, default=7200.0)
+    profile.add_argument("--cluster", help="named cluster profile from .rig.toml")
     profile.add_argument("--color", choices=_COLORS)
 
     verify = commands.add_parser("verify", help="re-validate a captured run and checkpoint")
@@ -290,6 +294,15 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--runs", type=Path, default=Path("runs"), help="run log directory")
     report.add_argument(
         "--output", type=Path, default=Path("report.html"), help="standalone HTML destination"
+    )
+    report.add_argument(
+        "--layer-snapshots",
+        type=_nonnegative_int,
+        default=0,
+        help=(
+            "recorded steps kept per layer-snapshot chart; 0 (the default) keeps "
+            "every recorded step, a positive value thins them to shrink the file"
+        ),
     )
     report.add_argument(
         "--max-points",
@@ -345,12 +358,13 @@ def main(argv: Iterable[str] | None = None) -> int:
 
 def command_prepare(args: argparse.Namespace) -> int:
     root = repo_root()
-    current = load_config(root)
+    current = load_config(root, cluster=getattr(args, "cluster", None))
     proposed = with_overrides(
         current,
         {
             "data_path": str(args.path) if args.path is not None else None,
             "artifacts_path": str(args.artifacts) if args.artifacts is not None else None,
+            "active_cluster": getattr(args, "cluster", None),
             "tpu_vm_count": args.tpu_vm_count,
             "tpu_vm_hosts": args.tpu_vm_hosts,
             "data_profile": args.profile,
@@ -426,6 +440,8 @@ def command_prepare(args: argparse.Namespace) -> int:
                 profile=proposed.data_profile,
                 require_tpu=require_tpu,
                 expected_process_count=_expected_process_count(proposed),
+                accelerator=proposed.accelerator,
+                chips_per_host=proposed.chips_per_host,
                 training_tokens=proposed.training_tokens,
                 check_data=args.check_only and not route.is_scaled,
                 compile_probe=True,
@@ -496,7 +512,7 @@ def command_prepare(args: argparse.Namespace) -> int:
 
 
 def command_doctor(args: argparse.Namespace) -> int:
-    config = load_config()
+    config = load_config(cluster=getattr(args, 'cluster', None))
     profile = args.profile or config.default_profile
     training_tokens = args.training_tokens or config.training_tokens
     path = resolve_path(args.path or config.data_path)
@@ -513,6 +529,7 @@ def command_doctor(args: argparse.Namespace) -> int:
             quick=args.quick,
             color=color,
             root=repo_root(),
+            cluster=getattr(args, "cluster", None),
         )
 
     process_index = _initialize_distributed_worker(config)
@@ -526,6 +543,8 @@ def command_doctor(args: argparse.Namespace) -> int:
             profile=profile,
             require_tpu=args.require_tpu or profile == "official",
             expected_process_count=_expected_process_count(config),
+            accelerator=config.accelerator,
+            chips_per_host=config.chips_per_host,
             training_tokens=training_tokens,
             check_data=not args.skip_data,
             compile_probe=not args.quick,
@@ -540,7 +559,7 @@ def command_doctor(args: argparse.Namespace) -> int:
 
 
 def command_run(args: argparse.Namespace) -> int:
-    config = load_config()
+    config = load_config(cluster=getattr(args, 'cluster', None))
     root = repo_root()
     track = args.track or config.default_track
     profile = args.profile or config.default_profile
@@ -751,7 +770,7 @@ def command_profile(args: argparse.Namespace) -> int:
     root = repo_root()
     if not config_path(root).is_file():
         raise ConfigError("no saved default profile found; run `make prepare` first")
-    config = load_config(root)
+    config = load_config(root, cluster=getattr(args, "cluster", None))
     profile = args.profile or config.default_profile
     color = args.color or config.color
     style = Style(color)
@@ -903,7 +922,7 @@ def command_profile(args: argparse.Namespace) -> int:
 
 
 def command_verify(args: argparse.Namespace) -> int:
-    config = load_config()
+    config = load_config(cluster=getattr(args, 'cluster', None))
     root = repo_root()
     artifacts = resolve_path(config.artifacts_path, root)
     candidate = Path(args.run).expanduser()
@@ -1006,7 +1025,7 @@ def command_verify(args: argparse.Namespace) -> int:
 
 
 def command_leaderboard(args: argparse.Namespace) -> int:
-    config = load_config()
+    config = load_config(cluster=getattr(args, 'cluster', None))
     track = args.track or config.default_track
     artifacts = resolve_path(config.artifacts_path)
     records = load_records(artifacts / "records.jsonl")
@@ -1034,6 +1053,7 @@ def command_report(args: argparse.Namespace) -> int:
         runs,
         output,
         max_chart_points=args.max_points,
+        layer_snapshots=args.layer_snapshots,
     )
     relative = (
         summary.output_path.relative_to(root)
@@ -1072,7 +1092,7 @@ def command_clone(args: argparse.Namespace) -> int:
 
 
 def command_settings(args: argparse.Namespace) -> int:
-    config = load_config()
+    config = load_config(cluster=getattr(args, 'cluster', None))
     payload = asdict(config)
     root = repo_root()
     payload["data_path_resolved"] = str(resolve_path(config.data_path, root))
@@ -1163,6 +1183,11 @@ def _run_cluster_prepare(
         "--timeout",
         str(args.timeout),
     ]
+    # Peers inherit the mirrored .rig.toml, but an explicit selection on the
+    # controller must reach them or they resolve a different cluster -- or, if
+    # the file has no active cluster, refuse to resolve one at all.
+    if getattr(args, "cluster", None):
+        command.extend(("--cluster", args.cluster))
     if args.train_shards is not None:
         command.extend(("--train-shards", str(args.train_shards)))
     if args.offline:
@@ -1239,6 +1264,7 @@ def _run_cluster_doctor(
     quick: bool,
     color: str,
     root: Path,
+    cluster: str | None = None,
 ) -> int:
     data_path = _cluster_data_argument(data_path, root)
     command = [
@@ -1255,6 +1281,11 @@ def _run_cluster_doctor(
         "--color",
         color,
     ]
+    # Peers must evaluate the same cluster contract; otherwise a controller
+    # invoked with --cluster would check itself against one profile and its
+    # peers against whatever their file happens to make active.
+    if cluster:
+        command.extend(("--cluster", cluster))
     if require_tpu:
         command.append("--require-tpu")
     if not check_data:

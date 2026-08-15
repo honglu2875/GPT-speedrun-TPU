@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import gzip
 import hashlib
 import json
 from pathlib import Path
@@ -15,6 +17,7 @@ from rig.report import (
     _diagnostic_metric,
     _lttb,
     _overall_metric_identity,
+    _compact,
     _subsample_steps,
     build_report,
 )
@@ -211,9 +214,14 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(payload["runs"][0]["flopSource"], "derived: result metrics.flops_per_token × tokens_processed")
         train = next(chart for chart in payload["timeCharts"] if chart["key"] == "train_loss")
         self.assertEqual(train["series"][0]["points"][-1], [2.0, 2000.0, 4.0])
+        # Shell strings stay in the markup; chart titles now live in the
+        # compressed payload, so they are asserted through the decoder.
         self.assertIn("equi-FLOP", html)
         self.assertIn("equi-step", html)
-        self.assertIn("Learning rate", html)
+        self.assertIn(
+            "Learning rate",
+            [chart["title"] for chart in payload["timeCharts"]],
+        )
         coverage = next(
             notice
             for notice in payload["notices"]
@@ -601,13 +609,18 @@ def _record_for_run(run: Path, *, validation: bool) -> dict[str, object]:
 
 
 def _payload(html: str) -> dict[str, object]:
+    """Decode the embedded payload exactly as the page does."""
+
     match = re.search(
-        r'<script type="application/json" id="report-data">(.*?)</script>',
+        r'<script type="application/gzip-base64" id="report-data">(.*?)</script>',
         html,
         flags=re.DOTALL,
     )
     assert match is not None
-    return json.loads(match.group(1))
+    raw = match.group(1).strip()
+    # base64 cannot contain the characters that would terminate a script element.
+    assert not any(character in raw for character in "<>&")
+    return json.loads(gzip.decompress(base64.b64decode(raw)).decode("utf-8"))
 
 
 def _sha(path: Path) -> str:
@@ -657,3 +670,54 @@ class LayerSnapshotTests(unittest.TestCase):
         self.assertEqual(len(series["values"]), len(series["steps"]))
         for row in series["values"]:
             self.assertEqual(len(row), len(series["scopes"]))
+
+
+class PayloadPackingTests(unittest.TestCase):
+    def test_payload_is_compressed_and_smaller_than_plain_json(self) -> None:
+        # The payload is ~99% of the file, so packing it is what bounds size.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "runs"
+            run = runs / "packed"
+            run.mkdir(parents=True)
+            (run / "training.csv").write_text(
+                "step,tokens_processed,cumulative_estimated_flops,train_loss\n"
+                + "".join(f"{i},{i*10},{i*100},{4.5 - i/1000}\n" for i in range(1, 400)),
+                encoding="utf-8",
+            )
+            _write_result(run, validation_artifact=False, tokens=3990, validation_loss=3.0)
+            build_report(runs, root / "report.html")
+            html = (root / "report.html").read_text(encoding="utf-8")
+
+        payload = _payload(html)
+        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        match = re.search(
+            r'<script type="application/gzip-base64" id="report-data">(.*?)</script>',
+            html,
+            flags=re.DOTALL,
+        )
+        assert match is not None
+        # base64-of-gzip must still beat the plain JSON it replaced.
+        self.assertLess(len(match.group(1)), len(raw))
+        self.assertIn("meta", payload)
+        self.assertIn("runs", payload)
+
+    def test_layer_snapshots_zero_keeps_every_recorded_step(self) -> None:
+        self.assertEqual(_subsample_steps([1, 2, 3, 4, 5], 0), [1, 2, 3, 4, 5])
+        self.assertEqual(len(_subsample_steps(list(range(500)), 0)), 500)
+
+    def test_layer_snapshots_must_be_zero_or_at_least_two(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "runs"
+            runs.mkdir()
+            with self.assertRaises(ReportError):
+                build_report(runs, root / "r.html", layer_snapshots=1)
+            with self.assertRaises(ReportError):
+                build_report(runs, root / "r.html", layer_snapshots=-1)
+
+    def test_values_are_trimmed_to_float32_precision(self) -> None:
+        # Full double repr spends ~17 chars to encode ~7 meaningful ones.
+        self.assertEqual(_compact(169.65899658203125), 169.659)
+        self.assertIsNone(_compact(float("nan")))
+        self.assertIsNone(_compact(None))

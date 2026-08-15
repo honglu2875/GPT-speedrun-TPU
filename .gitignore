@@ -15,3 +15,6 @@ __pycache__/
 # JAX compilation/profile artifacts.
 /.jax_cache/
 /profiles/
+
+# Local config backups.
+/.rig.toml.*
