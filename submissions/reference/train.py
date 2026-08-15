@@ -359,7 +359,7 @@ class Console:
         if not self.active:
             return
         mark = self.paint("◆", "magenta", "bold")
-        title = self.paint(" GPT TPU SPEEDRUN ", "white", "bold")
+        title = self.paint(" GPT TPU RIG ", "white", "bold")
         print(
             f"\n  {mark}{title}{self.paint('reference / jax', 'cyan')}\n",
             file=sys.stderr,

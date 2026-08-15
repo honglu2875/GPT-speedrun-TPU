@@ -1,4 +1,4 @@
-# GPT Speedrun TPU rules
+# GPT TPU rig rules
 
 This benchmark asks a deliberately simple question: how quickly, or with how
 few training tokens, can a single-entry JAX trainer reach the target loss on a

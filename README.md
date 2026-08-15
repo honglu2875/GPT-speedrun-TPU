@@ -1,7 +1,7 @@
-# GPT Speedrun TPU
+# GPT TPU Rig
 
-A collaborative GPT training speedrun for Cloud TPU v4 slices, from a v4-8 to
-larger multi-host slices. Every algorithm is a polished JAX entry program named
+A collaborative GPT pretraining rig for Cloud TPU slices, from a single host to
+larger multi-host v4 and v5e slices. Every algorithm is a polished JAX entry program named
 `train.py`, with a sibling `config.yaml`; shared code handles
 reproducible data, machine checks, run capture, protocol validation, and
 leaderboards.

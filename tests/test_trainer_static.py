@@ -1163,7 +1163,7 @@ class TrainerStaticTests(unittest.TestCase):
             console.step(1, 1, 1.25, 1.0e-3, 0.5, 1024.0)
             console.success(1.0, 12.5, 0.25)
         self.assertEqual(stdout.getvalue(), "")
-        self.assertIn("GPT TPU SPEEDRUN", stderr.getvalue())
+        self.assertIn("GPT TPU RIG", stderr.getvalue())
         self.assertIn("synchronized training 12.500s", stderr.getvalue())
         self.assertIn("compilation excluded", stderr.getvalue())
         self.assertIn("validation loss", stderr.getvalue())

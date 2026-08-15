@@ -755,6 +755,38 @@ class ClientSourceGuardTests(unittest.TestCase):
         self.assertIn("frameCache.get(s)", script[start:end])
         self.assertIn("frameCache.set(s,", script[start:end])
 
+    def _body(self) -> str:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "runs"
+            runs.mkdir()
+            build_report(runs, root / "report.html")
+            html = (root / "report.html").read_text(encoding="utf-8")
+        return html[: html.index('<script type="application/gzip-base64"')]
+
+    def test_notices_sit_below_the_charts_and_the_summary_above(self) -> None:
+        # Results lead; diagnostics get pushed out of the primary reading path.
+        body = self._body()
+        self.assertLess(body.index('id="summary-fold"'), body.index('id="time-charts"'))
+        self.assertGreater(
+            body.index('id="notices-fold"'), body.index('id="layer-charts"')
+        )
+
+    def test_summary_fold_is_open_so_a_load_failure_is_visible(self) -> None:
+        # The payload error handler writes into #summary; a collapsed fold
+        # would hide the only report of why the page is empty.
+        body = self._body()
+        self.assertIn('id="summary-fold" open', body)
+        script = self._script()
+        start = script.index("}).catch(error=>{")
+        self.assertIn("fold.open=true", script[start:])
+
+    def test_notice_fold_stays_hidden_when_there_is_nothing_to_say(self) -> None:
+        body = self._body()
+        self.assertIn('<details class="fold" id="notices-fold" hidden>', body)
+        script = self._script()
+        self.assertIn("$('notices-fold').hidden=!D.notices.length", script)
+
     def test_export_slot_cannot_collide_with_the_build_time_placeholder(self) -> None:
         # _render_html does a global replace of the build placeholder. If the
         # client's export slot used that same literal, the whole base64 payload

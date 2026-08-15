@@ -112,7 +112,7 @@ class Style:
     def banner(self, subtitle: str) -> None:
         print(
             f"\n  {self.text('◆', 'magenta', 'bold')}"
-            f"{self.text(' GPT TPU SPEEDRUN ', 'bold')}"
+            f"{self.text(' GPT TPU RIG ', 'bold')}"
             f"{self.text(subtitle, 'cyan')}\n",
             flush=True,
         )

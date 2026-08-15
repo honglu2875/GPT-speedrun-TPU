@@ -15,7 +15,7 @@ tags:
 
 This repository contains nested 2B, 4B, 8B, and hero-scale token prefixes for
 controlled language-model scaling experiments. The binary shards use the
-llm.c GPT-2 v1 format and are directly consumable by the GPT TPU Speedrun
+llm.c GPT-2 v1 format and are directly consumable by the GPT TPU Rig
 trainer.
 
 ## Dataset structure
@@ -104,7 +104,7 @@ content controls, legal review, and downstream safety evaluation.
 FineWeb is distributed under
 [ODC-By 1.0](https://opendatacommons.org/licenses/by/1-0/) and remains subject
 to the [Common Crawl Terms of Use](https://commoncrawl.org/terms-of-use) and
-underlying source terms. The GPT TPU Speedrun preparation code is
+underlying source terms. The GPT TPU Rig preparation code is
 Apache-2.0; that code license does not replace the corpus license. Please cite
 and attribute the upstream
 [FineWeb dataset and paper](https://huggingface.co/datasets/HuggingFaceFW/fineweb)
