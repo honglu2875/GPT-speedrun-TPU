@@ -721,3 +721,36 @@ class PayloadPackingTests(unittest.TestCase):
         self.assertEqual(_compact(169.65899658203125), 169.659)
         self.assertIsNone(_compact(float("nan")))
         self.assertIsNone(_compact(None))
+
+
+class ClientSourceGuardTests(unittest.TestCase):
+    """Source-level guards for client code no test here can execute."""
+
+    def _script(self) -> str:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "runs"
+            runs.mkdir()
+            build_report(runs, root / "report.html")
+            html = (root / "report.html").read_text(encoding="utf-8")
+        scripts = re.findall(r"<script(?![^>]*id=)[^>]*>(.*?)</script>", html, re.DOTALL)
+        return max(scripts, key=len)
+
+    def test_draw_never_reaches_for_series_points(self) -> None:
+        # Layer series carry scopes/steps/values and have no `points`. draw()
+        # reading s.points made every layer series look "smoothed" and then
+        # threw on undefined, so the charts rendered blank.
+        script = self._script()
+        start = script.index("function draw(item){")
+        end = script.index("function axisToStep(", start)
+        self.assertNotIn("s.points", script[start:end])
+        self.assertIn("base=seriesPoints(item,s)", script[start:end])
+
+    def test_layer_frames_are_cached_for_stable_identity(self) -> None:
+        # draw() decides "smoothed" by array identity, so layerFrame must not
+        # return a fresh array per call.
+        script = self._script()
+        start = script.index("function layerFrame(")
+        end = script.index("function seriesPoints(", start)
+        self.assertIn("frameCache.get(s)", script[start:end])
+        self.assertIn("frameCache.set(s,", script[start:end])
