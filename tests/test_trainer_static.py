@@ -26,6 +26,17 @@ sys.modules[SPEC.name] = trainer
 SPEC.loader.exec_module(trainer)
 
 
+# Tracing needs real parameters, so shrink the model to keep these tests
+# cheap. Head dim stays 64 so the flash tile plan resolves as it does in
+# training; only depth and width move.
+_SMALL = {"layers": 2, "d_model": 128, "heads": 2}
+
+
+def _traced_per_token(config) -> int:
+    params = trainer.init_params(config, 1337)
+    return trainer.traced_flops(config, params).per_token(config.seq_len)
+
+
 @dataclass(frozen=True)
 class FakeDevice:
     platform: str
@@ -521,10 +532,11 @@ class TrainerStaticTests(unittest.TestCase):
         # objective. Masking storage-only rows is an explicit algorithm choice.
         self.assertEqual(tiled.semantic_vocab_size, 50_304)
         self.assertEqual(tiled.vocab_tile_size, 2_048)
-        params_total = 123_670_272
+        # The tiled head's extra work is now traced, not asserted by formula:
+        # its custom VJP recomputes logits and its table pads to a whole tile.
         self.assertGreater(
-            trainer.estimated_flops_per_token(tiled, params_total),
-            trainer.estimated_flops_per_token(dense, params_total),
+            _traced_per_token(replace(tiled, **_SMALL)),
+            _traced_per_token(replace(dense, **_SMALL)),
         )
 
         with self.assertRaisesRegex(ValueError, "defined by sibling config.yaml"):
@@ -549,9 +561,12 @@ class TrainerStaticTests(unittest.TestCase):
             50_304,
             replace(base, seq_len=129, attention_backend="tpu_flash"),
         )
+        # Flash right-pads q/k/v to 128-wide tiles, so an unaligned sequence
+        # genuinely costs more there than in the dense path. The traced count
+        # picks this up from the padded shapes with no formula to maintain.
         self.assertGreater(
-            trainer.estimated_flops_per_token(flash, 1_000_000),
-            trainer.estimated_flops_per_token(dense, 1_000_000),
+            _traced_per_token(replace(flash, **_SMALL)),
+            _traced_per_token(replace(dense, **_SMALL)),
         )
 
     def test_batches_reject_tokens_outside_semantic_vocabulary(self) -> None:

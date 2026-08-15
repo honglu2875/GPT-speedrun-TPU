@@ -31,3 +31,12 @@ import os
 
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
+# Several CPU devices so sharding paths are exercised rather than skipped:
+# rig.flops scales a shard_map body by the mesh size, which a single-device
+# mesh cannot distinguish from no scaling at all.
+_XLA_FLAGS = os.environ.get("XLA_FLAGS", "")
+if "xla_force_host_platform_device_count" not in _XLA_FLAGS:
+    os.environ["XLA_FLAGS"] = (
+        f"{_XLA_FLAGS} --xla_force_host_platform_device_count=8".strip()
+    )

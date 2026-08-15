@@ -40,6 +40,12 @@ from jax.experimental import multihost_utils
 import yaml
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from rig.flops import (
+    FlopBreakdown,
+    count_training_flops,
+    default_rules,
+    describe,
+)
 from rig.kernels import (
     AttentionConfig,
     AttentionTiles,
@@ -50,7 +56,6 @@ from rig.kernels import (
 )
 from rig.kernels.autotune import (
     make_runtime_key,
-    padded_sequence_length,
     resolve_attention_tile_plan,
 )
 
@@ -440,6 +445,16 @@ class Console:
             f"{bar}  loss {self.paint(f'{loss:.4f}', 'yellow', 'bold')}  "
             f"lr {lr:.2e}  |g| {grad_norm:.3f}  "
             f"{format_rate(tokens_per_second)} tok/s",
+            file=sys.stderr,
+        )
+
+    def warn(self, message: str) -> None:
+        """Surface something that did not fail but must not pass unnoticed."""
+
+        if not self.active:
+            return
+        print(
+            f"  {self.paint('!', 'yellow', 'bold')} {self.paint(message, 'yellow')}",
             file=sys.stderr,
         )
 
@@ -3247,38 +3262,48 @@ def parameter_count(params: Any) -> int:
     return sum(int(value.size) for value in jax.tree_util.tree_leaves(params))
 
 
-def estimated_flops_per_token(config: Config, params_total: int) -> int:
-    """Return the analytic training FLOP estimate used by logs and reports.
+def traced_flops(config: Config, params: Mapping[str, Any]) -> FlopBreakdown:
+    """Count one training step's algorithmic FLOPs by tracing the model.
 
-    The familiar ``6P`` approximation covers the dense forward and two
-    backward matrix products. The tiled output head recomputes vocabulary
-    logits in its custom VJP and pads the storage table to a whole tile, so its
-    additional work must be recorded for honest equi-FLOP comparisons.
+    Nothing executes and nothing is allocated: ``jax.make_jaxpr`` builds the
+    graph from shapes alone. The count therefore follows the architecture
+    automatically -- change the depth, width, head count, or the shape of a
+    block and this number moves with it, with no formula to maintain.
+
+    A single sequence is traced and the result divided by ``seq_len``. Every
+    term is linear in the batch dimension (attention included, which is
+    quadratic in sequence but linear in batch), so one sequence determines
+    the per-token cost; ``test_flops_are_linear_in_batch`` pins that down.
+
+    ADDING A COMPONENT
+    ------------------
+    Ordinary blocks built from matmuls need nothing: they are counted from
+    their traced shapes. Two cases do need attention, and both announce
+    themselves in ``breakdown.warnings`` rather than failing quietly:
+
+    * A new opaque kernel (anything built with ``pallas_call``) is invisible
+      to the tracer. Register its cost with
+      ``rules.with_kernel("<kernel name>", rule)`` in ``rig.flops``.
+    * A component whose real cost differs from its traced cost -- sparsity
+      being the usual reason -- must say so. A mixture-of-experts written as
+      "compute every expert, then mask to top-k" contains the full dense work
+      in its graph and will be billed for all of it, because the tracer sees
+      real multiplications and cannot know a mask discards them. Wrap the
+      component in a named ``jax.jit`` and register
+      ``rules.with_scope("<name>", rule)``; the walker then bills the rule
+      and does not descend. This is the one case no warning can catch, since
+      nothing about the graph looks unusual.
+
+    See ``docs/FLOPS.md`` for the full checklist.
     """
 
-    attention_extent = config.seq_len
-    if config.attention_backend != "dense":
-        # Both TPU Flash paths right-pad q/k/v to native 128-wide tiles.  The
-        # surrounding projections still process only logical tokens, while the
-        # quadratic attention products execute across the padded square.
-        attention_extent = padded_sequence_length(config.seq_len)
-    attention_total_per_sequence = (
-        12 * config.layers * config.d_model * attention_extent * attention_extent
-    )
-    attention_per_logical_token = (
-        attention_total_per_sequence + config.seq_len - 1
-    ) // config.seq_len
-    estimate = 6 * params_total + attention_per_logical_token
-    if config.loss_backend == "tiled":
-        padded_vocab = (
-            (config.vocab_size + config.vocab_tile_size - 1)
-            // config.vocab_tile_size
-            * config.vocab_tile_size
-        )
-        dense_head = 6 * config.vocab_size * config.d_model
-        tiled_head = 8 * padded_vocab * config.d_model
-        estimate += tiled_head - dense_head
-    return int(estimate)
+    tokens = jnp.zeros((1, config.seq_len), jnp.int32)
+    targets = jnp.zeros((1, config.seq_len), jnp.int32)
+
+    def loss(trainable: Mapping[str, Any]) -> jax.Array:
+        return cross_entropy(trainable, tokens, targets, config)
+
+    return count_training_flops(loss, params, rules=default_rules())
 
 
 def flatten_arrays(tree: Any, prefix: str = "params") -> dict[str, np.ndarray]:
@@ -3804,7 +3829,10 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             f"tier {config.tier} declares {config.declared_parameters:,} parameters, "
             f"but initialized {params_total:,}"
         )
-    flops_per_token = estimated_flops_per_token(config, params_total)
+    flop_breakdown = traced_flops(config, host_params)
+    flops_per_token = flop_breakdown.per_token(config.seq_len)
+    for warning in flop_breakdown.warnings:
+        console.warn(f"FLOP accounting: {warning}")
     tokens_processed = config.steps * config.batch_size * config.seq_len
 
     console.table(
@@ -3871,7 +3899,15 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                 ),
             ),
             ("train tokens", format_count(tokens_processed)),
-            ("estimated FLOPs", format_count(flops_per_token * tokens_processed)),
+            ("traced FLOPs", format_count(flops_per_token * tokens_processed)),
+            (
+                "FLOP breakdown",
+                " · ".join(
+                    f"{label} {share}"
+                    for label, share in describe(flop_breakdown)
+                )
+                or "none",
+            ),
             (
                 "XProf",
                 (
@@ -4447,6 +4483,20 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             "parameters": int(params_total),
             "flops_per_token": int(flops_per_token),
             "estimated_total_flops": total_flops,
+            # Traced from the jaxpr, not a maintained formula. The breakdown
+            # attributes the count to its sources so a change in architecture
+            # is auditable after the fact; warnings record any work the walker
+            # could not account for.
+            "flop_accounting": {
+                "method": "traced-jaxpr",
+                "matmul_per_sequence": int(flop_breakdown.matmul),
+                "elementwise_per_sequence": int(flop_breakdown.elementwise),
+                "by_site": {
+                    label: int(value)
+                    for label, value in sorted(flop_breakdown.by_site.items())
+                },
+                "warnings": list(flop_breakdown.warnings),
+            },
             "tokens_per_second": tokens_per_second,
             "achieved_tflops": achieved_tflops,
             "mfu_estimate": finite_metric("mfu_estimate", mfu),
