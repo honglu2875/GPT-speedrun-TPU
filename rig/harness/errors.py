@@ -11,12 +11,12 @@ class ConfigurationError(HarnessError):
     """The requested run configuration is invalid."""
 
 
-class SubmissionError(HarnessError):
-    """The submission could not be launched or did not finish correctly."""
+class RecipeError(HarnessError):
+    """The recipe could not be launched or did not finish correctly."""
 
 
 class ResultValidationError(HarnessError):
-    """The submission result or artifact did not satisfy the protocol."""
+    """The recipe result or artifact did not satisfy the protocol."""
 
 
 class RecordError(HarnessError):

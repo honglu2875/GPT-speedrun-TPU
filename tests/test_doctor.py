@@ -14,9 +14,9 @@ def _tree(root: Path) -> None:
     (root / "rig" / "kernels").mkdir(parents=True)
     (root / "rig" / "__init__.py").write_text("x = 1\n", encoding="utf-8")
     (root / "rig" / "kernels" / "a.py").write_text("y = 2\n", encoding="utf-8")
-    (root / "submissions" / "reference").mkdir(parents=True)
-    (root / "submissions" / "reference" / "train.py").write_text("z = 3\n", encoding="utf-8")
-    (root / "submissions" / "reference" / "config.yaml").write_text("k: v\n", encoding="utf-8")
+    (root / "recipes" / "reference").mkdir(parents=True)
+    (root / "recipes" / "reference" / "train.py").write_text("z = 3\n", encoding="utf-8")
+    (root / "recipes" / "reference" / "config.yaml").write_text("k: v\n", encoding="utf-8")
 
 
 class SourceDigestTests(unittest.TestCase):
@@ -46,7 +46,7 @@ class SourceDigestTests(unittest.TestCase):
                     root = Path(directory)
                     _tree(root)
                     before, _ = source_digest(root)
-                    path = root / "submissions" / "reference" / name
+                    path = root / "recipes" / "reference" / name
                     path.write_text(path.read_text(encoding="utf-8") + "# edit\n", encoding="utf-8")
                     self.assertNotEqual(before, source_digest(root)[0])
 

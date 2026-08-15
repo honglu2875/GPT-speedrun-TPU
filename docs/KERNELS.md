@@ -3,7 +3,7 @@
 The shared kernel package contains two trainable building blocks: causal TPU
 FlashAttention and a memory-bounded tied output projection with cross entropy.
 They are common infrastructure; model and optimization choices remain in each
-submission's `train.py`.
+recipe's `train.py`.
 
 Both kernels have dense correctness oracles and explicit static tile sizes.
 Treat the defaults as good seeds for the repository's GPT-2-small shape, not as

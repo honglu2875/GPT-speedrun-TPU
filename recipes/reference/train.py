@@ -1272,7 +1272,7 @@ def reject_static_cli_overrides(args: argparse.Namespace) -> None:
         if getattr(args, destination) is not None:
             raise ValueError(
                 f"{option} is defined by sibling config.yaml; edit the selected "
-                "profile or clone a new submission variant"
+                "profile or clone a new recipe variant"
             )
 
 

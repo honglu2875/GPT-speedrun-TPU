@@ -60,10 +60,10 @@ class CliTests(unittest.TestCase):
 
         cli._reject_reserved_trainer_args(["--steps", "20", "--batch-size=32"])
 
-    def test_clone_copies_submission_config_byte_exactly(self) -> None:
+    def test_clone_copies_recipe_config_byte_exactly(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source = root / "submissions" / "source"
+            source = root / "recipes" / "source"
             source.mkdir(parents=True)
             (source / "train.py").write_text("print('train')\n", encoding="utf-8")
             config_bytes = b"steps: 20\r\nlearning_rate: 3.0e-4\r\n"
@@ -74,7 +74,7 @@ class CliTests(unittest.TestCase):
             with patch("rig.cli.repo_root", return_value=root):
                 self.assertEqual(cli.command_clone(args), 0)
 
-            destination = root / "submissions" / "variant"
+            destination = root / "recipes" / "variant"
             self.assertEqual((destination / "config.yaml").read_bytes(), config_bytes)
             self.assertEqual(
                 (destination / "train.py").read_text(encoding="utf-8"),
@@ -85,7 +85,7 @@ class CliTests(unittest.TestCase):
     def test_clone_requires_config_before_creating_destination(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source = root / "submissions" / "source"
+            source = root / "recipes" / "source"
             source.mkdir(parents=True)
             (source / "train.py").write_text("print('train')\n", encoding="utf-8")
             args = cli.build_parser().parse_args(["clone", "source", "variant"])
@@ -94,7 +94,7 @@ class CliTests(unittest.TestCase):
                 with self.assertRaisesRegex(ConfigError, "configuration does not exist"):
                     cli.command_clone(args)
 
-            self.assertFalse((root / "submissions" / "variant").exists())
+            self.assertFalse((root / "recipes" / "variant").exists())
 
     def test_non_run_unknown_arguments_are_rejected(self) -> None:
         with self.assertRaises(SystemExit):
@@ -354,10 +354,10 @@ class CliTests(unittest.TestCase):
     def test_profile_launches_every_configured_host_with_controller_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            submission = root / "submissions" / "variant"
-            submission.mkdir(parents=True)
-            (submission / "train.py").write_text("pass\n", encoding="utf-8")
-            (submission / "config.yaml").write_text("schema_version: 1\n", encoding="utf-8")
+            recipe = root / "recipes" / "variant"
+            recipe.mkdir(parents=True)
+            (recipe / "train.py").write_text("pass\n", encoding="utf-8")
+            (recipe / "config.yaml").write_text("schema_version: 1\n", encoding="utf-8")
             (root / ".rig.toml").write_text("[rig]\n", encoding="utf-8")
             config = LocalConfig(
                 data_path="shm",

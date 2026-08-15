@@ -328,7 +328,7 @@ class ReportTests(unittest.TestCase):
             record = {
                 "run_id": run.name,
                 "status": "ok",
-                "submission": "reference",
+                "recipe": "reference",
                 "track": "sample_efficiency",
                 "profile": "official",
                 "seed": 1,
@@ -481,7 +481,7 @@ class ReportTests(unittest.TestCase):
             record = {
                 "run_id": run.name,
                 "status": "ok",
-                "submission": "</script><script>alert(1)</script>",
+                "recipe": "</script><script>alert(1)</script>",
                 "track": "sample_efficiency",
                 "profile": "official",
                 "seed": 1,
@@ -503,9 +503,9 @@ class ReportTests(unittest.TestCase):
             html = (root / "report.html").read_text(encoding="utf-8")
             payload = _payload(html)
 
-        self.assertEqual(payload["runs"][0]["submission"], record["submission"])
+        self.assertEqual(payload["runs"][0]["recipe"], record["recipe"])
         self.assertEqual(html.count("<script>"), 1)
-        self.assertNotIn(record["submission"], html)
+        self.assertNotIn(record["recipe"], html)
 
 
 def _write_result(
@@ -579,7 +579,7 @@ def _record_for_run(run: Path, *, validation: bool) -> dict[str, object]:
     record: dict[str, object] = {
         "run_id": run.name,
         "status": "ok",
-        "submission": "reference",
+        "recipe": "reference",
         "track": "sample_efficiency",
         "profile": "official",
         "seed": 1,

@@ -275,7 +275,7 @@ def check_compilation() -> CheckResult:
 def source_digest(repo: Path) -> tuple[str, int]:
     """Digest the source every process must agree on.
 
-    Covers the shared package and every submission's entry program and config
+    Covers the shared package and every recipe's entry program and config
     -- exactly the bytes the workspace synchronization mirrors onto the peers.
     Paths are relative and sorted so the digest depends only on content and
     layout, never on where the checkout lives.
@@ -285,10 +285,10 @@ def source_digest(repo: Path) -> tuple[str, int]:
     package = repo / "rig"
     if package.is_dir():
         paths.extend(p for p in package.rglob("*.py") if p.is_file())
-    submissions = repo / "submissions"
-    if submissions.is_dir():
+    recipes = repo / "recipes"
+    if recipes.is_dir():
         for name in ("train.py", "config.yaml"):
-            paths.extend(p for p in submissions.glob(f"*/{name}") if p.is_file())
+            paths.extend(p for p in recipes.glob(f"*/{name}") if p.is_file())
     paths.sort(key=lambda item: item.relative_to(repo).as_posix())
     digest = hashlib.sha256()
     for path in paths:

@@ -1,4 +1,4 @@
-# Versioned model-family definition for submissions/reference/train.py.
+# Versioned model-family definition for recipes/reference/train.py.
 #
 # A tier selects a complete architecture. Profiles select execution budgets and
 # kernels; smoke deliberately remains a tiny inline wiring test. The family uses

@@ -21,7 +21,7 @@ PROFILE_ID ?= $(shell date -u +%Y%m%dT%H%M%SZ)
 PROFILE_ID := $(PROFILE_ID)
 PROFILE_OUTPUT ?= $(CURDIR)/profiles/$(PROFILE_ID)-$(TARGET)
 PROFILE_OUTPUT := $(PROFILE_OUTPUT)
-TARGET_DIR := $(CURDIR)/submissions/$(TARGET)
+TARGET_DIR := $(CURDIR)/recipes/$(TARGET)
 TARGET_ENTRY := $(TARGET_DIR)/train.py
 
 UV_BASE = $(UV) --cache-dir "$(UV_CACHE_DIR)"
@@ -53,11 +53,11 @@ check:
 	@printf '\n== the CLI is importable and its surface is intact ==\n'
 	$(UV_RUN) rig --help >/dev/null && printf 'rig --help ok\n'
 	$(UV_RUN) rig settings >/dev/null && printf 'rig settings ok\n'
-	@printf '\n== every submission still parses and resolves its profiles ==\n'
-	@for entry in $(CURDIR)/submissions/*/train.py; do \
+	@printf '\n== every recipe still parses and resolves its profiles ==\n'
+	@for entry in $(CURDIR)/recipes/*/train.py; do \
 	  name=$$(basename $$(dirname $$entry)); \
 	  JAX_PLATFORMS=cpu $(UV_RUN) python $$entry --help >/dev/null \
-	    && printf 'submissions/%s ok\n' "$$name" || exit 1; \
+	    && printf 'recipes/%s ok\n' "$$name" || exit 1; \
 	done
 	@printf '\n== the report builds from the recorded runs ==\n'
 	$(UV_RUN) rig report --runs "$(RUNS_PATH)" --output "$(CURDIR)/.check-report.html" | tail -1
@@ -82,15 +82,15 @@ validate-target:
 	  exit 2; \
 	fi
 	@if [[ ! -f "$(TARGET_ENTRY)" || -L "$(TARGET_ENTRY)" ]]; then \
-	  printf '%s\n' 'Missing regular target entry: submissions/$(TARGET)/train.py' >&2; \
+	  printf '%s\n' 'Missing regular target entry: recipes/$(TARGET)/train.py' >&2; \
 	  exit 2; \
 	fi
 	@if [[ ! -f "$(TARGET_DIR)/config.yaml" || -L "$(TARGET_DIR)/config.yaml" ]]; then \
-	  printf '%s\n' 'Missing regular target config: submissions/$(TARGET)/config.yaml' >&2; \
+	  printf '%s\n' 'Missing regular target config: recipes/$(TARGET)/config.yaml' >&2; \
 	  exit 2; \
 	fi
 	@if ! grep -Eq '^schema_version:[[:space:]]*2[[:space:]]*$$' "$(TARGET_DIR)/config.yaml"; then \
-	  printf '%s\n' 'TARGET is a legacy fixed-model submission. Clone the current reference to create a tiered family.' >&2; \
+	  printf '%s\n' 'TARGET is a legacy fixed-model recipe. Clone the current reference to create a tiered family.' >&2; \
 	  exit 2; \
 	fi
 

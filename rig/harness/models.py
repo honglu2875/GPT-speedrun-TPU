@@ -44,10 +44,10 @@ class ReferenceContract:
 
 @dataclass(frozen=True)
 class RunConfig:
-    """Everything needed to execute one submission reproducibly."""
+    """Everything needed to execute one recipe reproducibly."""
 
     repo_root: Path
-    submission: str
+    recipe: str
     runs_dir: Path
     records_path: Path
     track: Track = "open"

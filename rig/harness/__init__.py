@@ -9,9 +9,9 @@ concrete checks that use it.
 from .errors import (
     ConfigurationError,
     HarnessError,
+    RecipeError,
     RecordError,
     ResultValidationError,
-    SubmissionError,
 )
 from .models import (
     ReferenceContract,
@@ -21,7 +21,7 @@ from .models import (
     normalize_run_name,
 )
 from .records import append_record, load_records
-from .runner import run_submission
+from .runner import run_recipe
 from .scoring import rank_records, render_leaderboard
 from .validation import RESULT_PREFIX, SCHEMA_VERSION, parse_result_line, validate_result, verify_run
 
@@ -29,13 +29,13 @@ __all__ = [
     "ConfigurationError",
     "HarnessError",
     "RESULT_PREFIX",
+    "RecipeError",
     "RecordError",
     "ReferenceContract",
     "ResultValidationError",
     "RunConfig",
     "RunOutcome",
     "SCHEMA_VERSION",
-    "SubmissionError",
     "ValidationResult",
     "append_record",
     "load_records",
@@ -43,7 +43,7 @@ __all__ = [
     "parse_result_line",
     "rank_records",
     "render_leaderboard",
-    "run_submission",
+    "run_recipe",
     "validate_result",
     "verify_run",
 ]
