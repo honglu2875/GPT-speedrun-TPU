@@ -1798,9 +1798,10 @@ function validX(item,x){return Number.isFinite(x)&&(chartXScale(item)==='linear'
 function transformX(item,x){return chartXScale(item)==='log'?Math.log10(x):x}
 function untransformX(item,x){return chartXScale(item)==='log'?10**x:x}
 function dataBounds(item){let x0=Infinity,x1=-Infinity,y0=Infinity,y1=-Infinity,count=0;for(const s of item.data.series){if(!visible.has(s.run))continue;
-  // Layer y-bounds span every retained frame so scrubbing the step dragger
-  // never rescales the axis underneath you.
-  const pts=item.type==='layer'?s.scopes.flatMap((sc,j)=>s.values.map(row=>[sc[0],row[j]])):s.points;
+  // Bounds must match what draw() actually plots. Layer charts show one
+  // step's frame at a time; sizing the axis to every retained step instead
+  // let a single early spike (grad_clip is off) set the ceiling forever.
+  const pts=seriesPoints(item,s);
   for(const p of pts){const x=xOf(item,p),y=yOf(item,p);if(validX(item,x)&&Number.isFinite(y)){x0=Math.min(x0,x);x1=Math.max(x1,x);y0=Math.min(y0,y);y1=Math.max(y1,y);count++}}}if(!count)return null;if(x0===x1){if(chartXScale(item)==='log'){const q=Math.sqrt(10);x0/=q;x1*=q}else{x0-=.5;x1+=.5}}if(y0===y1){const q=Math.abs(y0)*.05||.5;y0-=q;y1+=q}else{const q=(y1-y0)*.08;y0-=q;y1+=q}return{x0,x1,y0,y1}}
 function bounds(item){const base=dataBounds(item);return base?(item.view||base):null}
 function smoothingApplies(item){return smoothing!=='raw'&&effectiveSpan()>1&&item.type==='time'&&item.data.key!=='learning_rate'}

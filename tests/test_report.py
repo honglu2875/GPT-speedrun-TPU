@@ -754,3 +754,15 @@ class ClientSourceGuardTests(unittest.TestCase):
         end = script.index("function seriesPoints(", start)
         self.assertIn("frameCache.get(s)", script[start:end])
         self.assertIn("frameCache.set(s,", script[start:end])
+
+    def test_layer_axis_bounds_track_the_selected_frame_not_the_full_history(
+        self,
+    ) -> None:
+        # dataBounds used to flatten every retained step to find y-bounds, so
+        # one early spike (grad_clip is off) set the axis ceiling for every
+        # frame forever. Bounds must come from the same frame draw() plots.
+        script = self._script()
+        start = script.index("function dataBounds(item){")
+        end = script.index("function bounds(item){", start)
+        self.assertNotIn("s.values.map(row=>", script[start:end])
+        self.assertIn("const pts=seriesPoints(item,s);", script[start:end])
