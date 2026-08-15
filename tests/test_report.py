@@ -755,6 +755,51 @@ class ClientSourceGuardTests(unittest.TestCase):
         self.assertIn("frameCache.get(s)", script[start:end])
         self.assertIn("frameCache.set(s,", script[start:end])
 
+    def test_export_slot_cannot_collide_with_the_build_time_placeholder(self) -> None:
+        # _render_html does a global replace of the build placeholder. If the
+        # client's export slot used that same literal, the whole base64 payload
+        # would be inlined into the script at build time.
+        script = self._script()
+        self.assertIn("PAYLOAD_SLOT='@@RIG_PAYLOAD@@'", script)
+        self.assertNotIn("__REPORT_DATA__", script)
+
+    def test_export_controls_are_wired(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "runs"
+            runs.mkdir()
+            build_report(runs, root / "report.html")
+            html = (root / "report.html").read_text(encoding="utf-8")
+        self.assertIn('id="export-runs"', html)
+        self.assertIn('id="export-status"', html)
+        # Exactly one live slot: the constant. The payload itself is base64,
+        # whose alphabet cannot produce it.
+        self.assertEqual(html.count("@@RIG_PAYLOAD@@"), 1)
+
+    def test_export_refuses_an_empty_selection(self) -> None:
+        script = self._script()
+        start = script.index("async function exportSelection(){")
+        end = script.index("loadPayload().then(", start)
+        self.assertIn("if(!visible.size)", script[start:end])
+
+    def test_export_filters_every_chart_family_to_the_selection(self) -> None:
+        # A subset export must not smuggle unselected runs' series along.
+        script = self._script()
+        start = script.index("function selectedPayload(){")
+        end = script.index("async function packPayload(", start)
+        body = script[start:end]
+        self.assertIn("c.series.filter(s=>keep.has(s.run))", body)
+        for field in ("timeCharts", "diagnosticCharts", "layerCharts"):
+            self.assertIn(f"{field}:pick(D.{field})", body)
+
+    def test_shell_is_captured_before_init_mutates_the_dom(self) -> None:
+        # init() rewrites the run list and chart containers, so a shell taken
+        # afterwards would bake rendered state into every export.
+        script = self._script()
+        start = script.index("loadPayload().then(")
+        tail = script[start:]
+        self.assertLess(tail.index("captureShell()"), tail.index("init()"))
+
     def test_layer_axis_bounds_track_the_selected_frame_not_the_full_history(
         self,
     ) -> None:
