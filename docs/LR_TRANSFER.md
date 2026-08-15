@@ -3,7 +3,11 @@
 Whether one normalized learning rate, tuned once at a small size, stays optimal
 as the model grows. Measured on the reference family at 5 TPP. **Every
 configuration measured, including 250M re-run at three seeds, puts the optimum
-at `2^-8`. No transfer break was found.**
+at `2^-8`. Complete(d)P's learning-rate transfer reproduces at 5 TPP, and the
+one apparent break was a seed artifact with an identified mechanism: an
+outsized gradient spike in an unclipped run.** See
+[The 250M reseed](#the-250m-reseed) and [Why the v3 250M point
+moved](#why-the-v3-250m-point-moved).
 
 ## Terms
 
@@ -71,11 +75,16 @@ the same stream.
    changes width *and* depth together, and the only one that shifted — to
    `2^-7`. Because 1 and 2 exonerate each axis alone, this is not attributable
    to the depth rule.
-4. **That shift did not survive reseeding.** Its single-seed margin was 0.021
-   nats. Re-measured at three seeds it reversed: see below.
-5. **The shipped default is far below the optimum.** `config.yaml` ships
-   `learning_rate: 0.001` (≈ `2^-9.97`), the leftmost edge of the grid. Against
-   `2^-8` that cost 0.225 / 0.183 / 0.184 nats at 60m / 125m / 250m.
+4. **That shift did not survive reseeding, and its cause is identified.** Its
+   single-seed margin was 0.021 nats. Re-measured at three seeds it reversed,
+   and the reversal traces to a gradient spike in one unclipped run: see
+   [Why the v3 250M point moved](#why-the-v3-250m-point-moved).
+5. **The default was far below the optimum, and has been corrected.**
+   `config.yaml` shipped `learning_rate: 0.001` (≈ `2^-9.97`), the leftmost
+   edge of the grid; against `2^-8` that cost 0.225 / 0.183 / 0.184 nats at
+   60m / 125m / 250m. The `dev` and `official` profiles now ship `2^-8`
+   (`0.00390625`). The `smoke` profile keeps its own value: it is a
+   correctness fixture, not a rung of the ladder.
 
 ## The 250M reseed
 
@@ -115,6 +124,53 @@ sample near the optimum carries far less information than one sample on the
 shoulder. Treat any single-seed comparison within about 0.05 nats of the best
 point as unresolved.
 
+## Why the v3 250M point moved
+
+The reseed says *that* v3's ranking was wrong. The per-step gradient norms say
+*why*, and the explanation is specific rather than "noise".
+
+`grad_clip: 0.0` — clipping is disabled in every profile — so a large gradient
+lands in the weights at full size. Taking each run's peak gradient norm over
+its own median as a spike ratio:
+
+| base LR | seed 1337 | seed 1338 | seed 1339 | loss spread |
+|---|--:|--:|--:|--:|
+| 2^-9 | 12x | 13x | 13x | 0.005 |
+| **2^-8** | **90x** | 18x | 18x | 0.016 |
+| **2^-7** | **25x** | 125x | 1633x | 0.063 |
+| 2^-6 | 748x | 2294x | 114x | 0.021 |
+
+Seed 1337 is the outlier at both learning rates that matter, in opposite
+directions. At `2^-8` it spikes 90x where its siblings spike 18x, and it is
+the worst of the three (+0.011 nats against a mean the other two sit 0.005
+below). At `2^-7` it is the *mildest* of the three at 25x, and the best. The
+v3 study ran seed 1337 alone, so it compared a depressed `2^-8` against a
+flattered `2^-7`.
+
+That reproduces quantitatively. Restricted to seed 1337, the reseed puts
+`2^-7` ahead of `2^-8` by **+0.023 nats**; v3 reported **+0.021**. On three-seed
+means the sign flips and `2^-8` leads by 0.014.
+
+Within a learning rate, spike ordering matches loss ordering exactly at `2^-7`
+(25x < 125x < 1633x, best < middle < worst) and at `2^-6`. At `2^-8` the
+largest spike belongs to the worst run, while the other two are tied in both
+spike and loss to within 0.0001 nats. At `2^-9` nothing spikes and nothing
+separates.
+
+**How far to trust this.** Three seeds per point, so the ordering is
+suggestive, not established; pooled across all learning rates the rank
+correlation is only +0.17, because spike magnitude grows with LR while loss
+excess is centred within each LR — the signal is a within-LR effect and
+disappears if the groups are mixed. What the data does support is the narrow
+claim the transfer result needs: **the single v3 seed was unrepresentative at
+`2^-8` for an identifiable reason, and correcting for it removes the apparent
+transfer break.**
+
+The practical reading is that unclipped training at or above the optimal LR
+has a heavy-tailed seed distribution, and single-seed LR comparisons near the
+optimum inherit it. Enabling gradient clipping would likely shrink this, but
+that changes the optimizer being studied and was not done here.
+
 **Corpus sensitivity, incidentally measured.** Seed 1337 was run on both
 corpora. At `2^-9`, `2^-8`, and `2^-7` the 4B-to-8B difference was -0.0005,
 +0.0022, and +0.0001 -- an order of magnitude below seed noise. At `2^-6` it
@@ -133,6 +189,12 @@ are not cleanly separable at high learning rates.
   everything since used the 8B one, so absolute losses do not cross that line.
 - **One horizon.** 5 TPP only. Complete(d)P's `sqrt(m_D)` correction is meant to
   carry the base LR to other horizons, but that was not measured here.
+- **One batch size.** Global batch 128 throughout. The optimal LR and the
+  optimal batch size interact, so `2^-8` is the optimum *at this batch size*;
+  a batch-size sweep at fixed 5 TPP is the natural next study.
+- **The spike mechanism rests on three seeds.** It explains the v3 result and
+  reproduces its margin, but three samples per point cannot establish the
+  distribution being claimed.
 - **500m and 1b are unbracketed.** Only the `2^-8` center completed; both
   neighbours are still pending. Those two rows are single points, not optima.
 - **Edge points are not results.** At 60m the grid's own edge (`2^-4`) diverged
