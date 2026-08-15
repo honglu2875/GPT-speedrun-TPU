@@ -15,6 +15,7 @@ from rig.report import (
     _diagnostic_metric,
     _lttb,
     _overall_metric_identity,
+    _subsample_steps,
     build_report,
 )
 
@@ -122,9 +123,16 @@ class ReportTests(unittest.TestCase):
             for chart in payload["layerCharts"]
             if chart["family"] == "param" and chart["stat"] == "mean"
         )
+        # Layer series now carry a fixed scope layout plus one value row per
+        # retained step, so the dragger can render any recorded step.
+        series = parameter_mean["series"][0]
         self.assertEqual(
-            [point[2] for point in parameter_mean["series"][0]["points"]],
+            [scope[1] for scope in series["scopes"]],
             ["embeddings", "block 0", "final norm", "unembedding"],
+        )
+        self.assertEqual(len(series["values"]), len(series["steps"]))
+        self.assertTrue(
+            all(len(row) == len(series["scopes"]) for row in series["values"])
         )
         self.assertIn('id="family-control"', html)
         self.assertIn('id="focus-dialog"', html)
@@ -608,3 +616,44 @@ def _sha(path: Path) -> str:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LayerSnapshotTests(unittest.TestCase):
+    def test_subsample_keeps_the_ends_and_bounds_the_count(self) -> None:
+        steps = list(range(1, 1000))
+        picked = _subsample_steps(steps, 80)
+        self.assertLessEqual(len(picked), 81)
+        self.assertEqual(picked[0], 1)
+        self.assertEqual(picked[-1], 999)
+        self.assertEqual(picked, sorted(set(picked)))
+
+    def test_short_lists_are_returned_whole(self) -> None:
+        steps = [1, 5, 9]
+        self.assertEqual(_subsample_steps(steps, 80), steps)
+
+    def test_layer_series_expose_aligned_step_frames(self) -> None:
+        # The dragger needs one value row per retained step, aligned to a fixed
+        # scope layout, and the final step must always be present.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "runs"
+            run = runs / "layered"
+            run.mkdir(parents=True)
+            (run / "training.csv").write_text(
+                "step,tokens_processed,cumulative_estimated_flops,train_loss\n"
+                "1,10,1000,4.5\n2,20,2000,4.0\n",
+                encoding="utf-8",
+            )
+            _write_diagnostics(run / "diagnostics.csv")
+            _write_result(run, validation_artifact=False, tokens=20, validation_loss=3.0)
+            build_report(runs, root / "report.html")
+            payload = _payload((root / "report.html").read_text(encoding="utf-8"))
+
+        charts = [c for c in payload["layerCharts"] if c["key"] == "layer_grad_l2_norm"]
+        self.assertTrue(charts)
+        series = charts[0]["series"][0]
+        self.assertEqual(sorted(series), ["run", "scopes", "steps", "values"])
+        self.assertEqual(series["steps"][-1], 2, "final step must be retained")
+        self.assertEqual(len(series["values"]), len(series["steps"]))
+        for row in series["values"]:
+            self.assertEqual(len(row), len(series["scopes"]))

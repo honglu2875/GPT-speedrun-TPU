@@ -23,6 +23,11 @@ from typing import Any, Iterable, Mapping, Sequence
 _MAX_JSON_BYTES = 4 * 1024 * 1024
 _MAX_CSV_BYTES = 128 * 1024 * 1024
 _MAX_CHART_POINTS = 1_400
+# Layer snapshots are a step x scope grid per chart per run, so the embedded
+# JSON grows as the product. The full recorded grid is ~4M values across a
+# dozen runs, which no self-contained page should carry; this bounds the step
+# axis the dragger scrubs while keeping first and last exactly.
+_MAX_LAYER_SNAPSHOTS = 80
 _LAYER_KEY = re.compile(r"(?:^|/)(?:blocks?|layers?|h)(?:/|_)(\d+)(?:/|$)")
 _COLORS = (
     "#7dd3fc",
@@ -1215,34 +1220,87 @@ def _overall_diagnostic_charts(runs: Sequence[_Run]) -> list[dict[str, Any]]:
     return charts
 
 
+def _subsample_steps(steps: Sequence[int], limit: int) -> list[int]:
+    """Evenly thin a recorded step list, always keeping the first and last."""
+
+    total = len(steps)
+    if total <= limit:
+        return list(steps)
+    picked = {0, total - 1}
+    for index in range(limit):
+        picked.add(round(index * (total - 1) / (limit - 1)))
+    return [steps[index] for index in sorted(picked)]
+
+
 def _final_diagnostic_charts(runs: Sequence[_Run]) -> list[dict[str, Any]]:
-    """Build final-step embeddings/block/final-norm/unembedding plots."""
+    """Build per-scope diagnostic snapshots the viewer can scrub through by step.
+
+    Each series carries a fixed scope layout plus one value row per retained
+    step, so the client can render any recorded step without re-deriving the
+    layout. The final step is always present, which keeps the historical
+    final-snapshot behaviour available as the default.
+    """
 
     charts: list[dict[str, Any]] = []
     for family in _DIAGNOSTIC_FAMILIES:
         for statistic in _DIAGNOSTIC_STATS:
             series: list[dict[str, Any]] = []
             for run in runs:
-                final_step = int(run.training[-1]["step"])
                 rows = [
                     row
                     for row in run.diagnostics
-                    if row["step"] == final_step
-                    and row["scope"] != "overall"
+                    if row["scope"] != "overall"
                     and row["family"] == family
                     and row["stat"] == statistic
                 ]
-                points = _diagnostic_scope_points(rows)
-                if not points:
-                    # Checkpoint-derived arrays are a useful fallback for legacy
-                    # runs, but diagnostics.csv wins whenever both exist.
-                    points = [
-                        [int(row["layer"]), row[statistic], f"block {int(row['layer'])}"]
-                        for row in run.layer_stats.get(family, [])
-                        if statistic in row
+                by_step: dict[int, list[Mapping[str, Any]]] = {}
+                for row in rows:
+                    by_step.setdefault(int(row["step"]), []).append(row)
+                recorded = sorted(by_step)
+                if recorded:
+                    # The last frame is the most complete, so it defines the
+                    # scope layout every other frame is aligned to.
+                    layout = [
+                        [point[0], point[2]]
+                        for point in _diagnostic_scope_points(by_step[recorded[-1]])
                     ]
-                if points:
-                    series.append({"run": run.run_id, "points": points})
+                    if not layout:
+                        continue
+                    order = [position for position, _ in layout]
+                    steps = _subsample_steps(recorded, _MAX_LAYER_SNAPSHOTS)
+                    values = []
+                    for step in steps:
+                        found = {
+                            point[0]: point[1]
+                            for point in _diagnostic_scope_points(by_step[step])
+                        }
+                        values.append([found.get(position) for position in order])
+                    series.append(
+                        {
+                            "run": run.run_id,
+                            "scopes": layout,
+                            "steps": steps,
+                            "values": values,
+                        }
+                    )
+                    continue
+                # Checkpoint-derived arrays are a useful fallback for legacy
+                # runs, but diagnostics.csv wins whenever both exist.
+                legacy = [
+                    [int(row["layer"]), row[statistic], f"block {int(row['layer'])}"]
+                    for row in run.layer_stats.get(family, [])
+                    if statistic in row
+                ]
+                if legacy:
+                    legacy.sort(key=lambda point: point[0])
+                    series.append(
+                        {
+                            "run": run.run_id,
+                            "scopes": [[point[0], point[2]] for point in legacy],
+                            "steps": [int(run.training[-1]["step"])],
+                            "values": [[point[1] for point in legacy]],
+                        }
+                    )
             if series:
                 charts.append(
                     {
@@ -1556,7 +1614,7 @@ _HTML = r'''<!doctype html>
 <style>
 :root{--bg:#080b12;--panel:#101521;--panel2:#151b29;--line:#273247;--text:#edf4ff;--muted:#91a0b8;--accent:#7dd3fc;--good:#86efac;--warn:#fde047;--bad:#fca5a5;--radius:14px;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--text);background:var(--bg);font-synthesis:none}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 75% -10%,#17233a 0,transparent 35rem),var(--bg);min-height:100vh}button,input{font:inherit}.shell{display:grid;grid-template-columns:280px minmax(0,1fr);min-height:100vh}.sidebar{position:sticky;top:0;height:100vh;overflow:auto;border-right:1px solid var(--line);background:rgba(10,14,23,.94);backdrop-filter:blur(16px);padding:20px}.brand{font-weight:800;letter-spacing:.02em;font-size:17px}.brand b{color:var(--accent)}.subtle{color:var(--muted);font-size:12px;line-height:1.5}.side-actions{display:flex;gap:7px;margin:18px 0 10px}.ghost{border:1px solid var(--line);color:var(--muted);background:var(--panel);border-radius:8px;padding:6px 9px;cursor:pointer}.ghost:hover{color:var(--text);border-color:#41516d}.search{width:100%;border:1px solid var(--line);background:#090d16;color:var(--text);padding:9px 10px;border-radius:9px;outline:none}.search:focus{border-color:var(--accent)}.run-list{display:grid;gap:7px;margin-top:12px}.run-toggle{display:grid;grid-template-columns:auto 10px 1fr;gap:9px;align-items:start;padding:9px;border:1px solid transparent;border-radius:10px;cursor:pointer}.run-toggle:hover{background:var(--panel);border-color:var(--line)}.run-toggle input{margin-top:3px;accent-color:var(--accent)}.dot{width:9px;height:9px;border-radius:50%;margin-top:4px;box-shadow:0 0 14px currentColor}.run-name{font-size:12px;font-weight:650;overflow-wrap:anywhere}.run-meta{display:block;color:var(--muted);font-size:10px;margin-top:3px}.main{min-width:0;padding:26px 28px 60px}.top{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:20px}.eyebrow{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent);font-weight:750}.top h1{font-size:clamp(25px,3vw,42px);letter-spacing:-.04em;margin:5px 0 7px}.stats{display:flex;gap:8px;flex-wrap:wrap}.pill{border:1px solid var(--line);background:rgba(16,21,33,.8);border-radius:999px;padding:7px 10px;color:var(--muted);font-size:12px}.pill strong{color:var(--text)}.axis-control{flex:none;border:1px solid var(--line);border-radius:11px;padding:4px;background:#090d16;display:flex}.axis-control label{cursor:pointer}.axis-control input{position:absolute;opacity:0;pointer-events:none}.axis-control span{display:block;padding:8px 11px;border-radius:7px;color:var(--muted);font-size:12px;font-weight:700}.axis-control input:checked+span{background:var(--panel2);color:var(--text);box-shadow:0 1px 5px #0008}.axis-hint{text-align:right;color:var(--muted);font-size:10px;margin-top:6px}.notice-wrap{display:grid;gap:7px;margin:16px 0}.notice{padding:10px 12px;border:1px solid #3d3940;background:#18161c;color:#c6b9c6;border-radius:10px;font-size:12px}.section-title{margin:30px 0 12px;font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,410px),1fr));gap:12px}.chart{background:linear-gradient(145deg,rgba(20,27,42,.92),rgba(12,17,27,.92));border:1px solid var(--line);border-radius:var(--radius);padding:15px;min-width:0}.chart-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:7px}.chart h2{font-size:14px;margin:0;letter-spacing:-.01em}.chart-unit{color:var(--muted);font-size:10px}.canvas-wrap{height:270px;position:relative}.chart canvas{display:block;width:100%;height:100%;touch-action:none}.tooltip{position:fixed;z-index:20;pointer-events:none;background:#070a11ec;border:1px solid #36435b;border-radius:8px;padding:7px 9px;box-shadow:0 12px 30px #000a;font-size:11px;line-height:1.45;display:none;max-width:270px}.empty{border:1px dashed var(--line);border-radius:var(--radius);padding:30px;color:var(--muted);text-align:center}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:var(--radius);background:var(--panel)}table{border-collapse:collapse;width:100%;font-size:12px;white-space:nowrap}th,td{text-align:right;padding:10px 12px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em}th:first-child,td:first-child{text-align:left}tbody tr:last-child td{border-bottom:0}.status{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:7px}.footer{color:var(--muted);font-size:11px;margin-top:26px}.mobile-runs{display:none}.skip details{color:var(--muted);font-size:12px}.skip summary{cursor:pointer}.skip code{color:var(--bad);white-space:normal;overflow-wrap:anywhere}@media(max-width:850px){.shell{grid-template-columns:1fr}.sidebar{display:none;position:fixed;z-index:30;width:min(88vw,320px);box-shadow:20px 0 70px #000;height:100vh}.sidebar.open{display:block}.main{padding:20px 14px 50px}.mobile-runs{display:inline-flex}.top{align-items:stretch;flex-direction:column}.axis-control{align-self:flex-start}.axis-hint{text-align:left}.canvas-wrap{height:240px}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
-.analysis-controls{display:flex;align-items:center;gap:10px 14px;flex-wrap:wrap;border:1px solid var(--line);background:rgba(9,13,22,.82);border-radius:12px;padding:10px 12px;margin:0 0 18px}.control-title{font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}.smoothing-control{border:1px solid var(--line);border-radius:9px;padding:3px;background:#070b13;display:flex;flex-wrap:wrap}.smoothing-control label{cursor:pointer}.smoothing-control input{position:absolute;opacity:0;pointer-events:none}.smoothing-control span{display:block;padding:6px 9px;border-radius:6px;color:var(--muted);font-size:11px;font-weight:700}.smoothing-control input:checked+span{background:var(--panel2);color:var(--text);box-shadow:0 1px 4px #0008}.smooth-level{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:11px;font-weight:700}.smooth-level input{width:76px;border:1px solid var(--line);border-radius:7px;background:#070b13;color:var(--text);padding:6px 7px;outline:none}.smooth-level input:focus{border-color:var(--accent)}.smooth-level input:disabled{opacity:.45}.smoothing-hint{flex:1 1 100%;color:var(--muted);font-size:10px;line-height:1.45}.chart-head{align-items:center}.chart-tools{display:flex;align-items:center;gap:5px}.icon-button{border:1px solid transparent;background:transparent;color:var(--muted);border-radius:7px;padding:4px 7px;cursor:pointer;line-height:1}.icon-button:hover,.icon-button:focus-visible{border-color:var(--line);color:var(--text);outline:none}.chart canvas{cursor:crosshair}.chart canvas.dragging{cursor:crosshair}.chart.family-hidden{display:none}.family-control{display:flex;gap:5px;margin:12px 0;flex-wrap:wrap}.family-control button{border:1px solid var(--line);background:#090d16;color:var(--muted);border-radius:8px;padding:7px 11px;cursor:pointer;font-weight:700;font-size:12px}.family-control button.active{background:var(--panel2);color:var(--text);border-color:#49617f}.tooltip{z-index:60}.focus-dialog{width:min(96vw,1500px);height:min(94vh,980px);padding:0;border:1px solid #43516a;border-radius:16px;background:var(--panel);color:var(--text);box-shadow:0 30px 100px #000d}.focus-dialog::backdrop{background:#03050ae8;backdrop-filter:blur(4px)}.focus-shell{height:100%;display:flex;flex-direction:column;padding:16px}.focus-head{display:flex;justify-content:space-between;align-items:center;gap:12px}.focus-head h2{font-size:17px;margin:0}.focus-canvas{flex:1;min-height:0;margin-top:8px}.focus-canvas canvas{display:block;width:100%;height:100%;touch-action:none;cursor:crosshair}.interaction-hint{color:var(--muted);font-size:10px;margin-top:7px}@media(max-width:850px){.focus-dialog{width:100vw;height:100vh;max-width:none;max-height:none;border-radius:0}.analysis-controls{align-items:flex-start}.smoothing-control{width:100%}.smoothing-control label{flex:1;text-align:center}}
+.analysis-controls{display:flex;align-items:center;gap:10px 14px;flex-wrap:wrap;border:1px solid var(--line);background:rgba(9,13,22,.82);border-radius:12px;padding:10px 12px;margin:0 0 18px}.control-title{font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}.smoothing-control{border:1px solid var(--line);border-radius:9px;padding:3px;background:#070b13;display:flex;flex-wrap:wrap}.smoothing-control label{cursor:pointer}.smoothing-control input{position:absolute;opacity:0;pointer-events:none}.smoothing-control span{display:block;padding:6px 9px;border-radius:6px;color:var(--muted);font-size:11px;font-weight:700}.smoothing-control input:checked+span{background:var(--panel2);color:var(--text);box-shadow:0 1px 4px #0008}.smooth-level{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:11px;font-weight:700}.smooth-level input{width:76px;border:1px solid var(--line);border-radius:7px;background:#070b13;color:var(--text);padding:6px 7px;outline:none}.smooth-level input:focus{border-color:var(--accent)}.smooth-level input:disabled{opacity:.45}.smoothing-hint{flex:1 1 100%;color:var(--muted);font-size:10px;line-height:1.45}.chart-head{align-items:center}.chart-tools{display:flex;align-items:center;gap:5px}.icon-button{border:1px solid transparent;background:transparent;color:var(--muted);border-radius:7px;padding:4px 7px;cursor:pointer;line-height:1}.icon-button:hover,.icon-button:focus-visible{border-color:var(--line);color:var(--text);outline:none}.chart canvas{cursor:crosshair}.chart canvas.dragging{cursor:crosshair}.chart.family-hidden{display:none}.family-control{display:flex;gap:5px;margin:12px 0;flex-wrap:wrap}.family-control button{border:1px solid var(--line);background:#090d16;color:var(--muted);border-radius:8px;padding:7px 11px;cursor:pointer;font-weight:700;font-size:12px}.family-control button.active{background:var(--panel2);color:var(--text);border-color:#49617f}.tooltip{z-index:60}.focus-dialog{width:min(96vw,1500px);height:min(94vh,980px);padding:0;border:1px solid #43516a;border-radius:16px;background:var(--panel);color:var(--text);box-shadow:0 30px 100px #000d}.focus-dialog::backdrop{background:#03050ae8;backdrop-filter:blur(4px)}.focus-shell{height:100%;display:flex;flex-direction:column;padding:16px}.focus-head{display:flex;justify-content:space-between;align-items:center;gap:12px}.focus-head h2{font-size:17px;margin:0}.focus-canvas{flex:1;min-height:0;margin-top:8px}.focus-canvas canvas{display:block;width:100%;height:100%;touch-action:none;cursor:crosshair}.interaction-hint{color:var(--muted);font-size:10px;margin-top:7px}.layer-step{display:flex;align-items:center;gap:11px;border:1px solid var(--line);background:rgba(9,13,22,.82);border-radius:11px;padding:9px 12px;margin:0 0 12px}.layer-step label{font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}.layer-step input[type=range]{flex:1;min-width:140px;accent-color:var(--accent)}.layer-step output{font:11px ui-monospace,monospace;color:var(--text);min-width:9ch;text-align:right}@media(max-width:850px){.focus-dialog{width:100vw;height:100vh;max-width:none;max-height:none;border-radius:0}.analysis-controls{align-items:flex-start}.smoothing-control{width:100%}.smoothing-control label{flex:1;text-align:center}}
 </style>
 </head>
 <body>
@@ -1595,7 +1653,14 @@ _HTML = r'''<!doctype html>
   <div class="section-title">Overall diagnostics timeline</div>
   <div class="family-control" id="family-control" role="group" aria-label="Diagnostic family"></div>
   <div class="charts" id="diagnostic-charts"></div>
-  <div class="section-title">Final diagnostic snapshot · categorical model scope / logical layer remains linear</div><div class="charts" id="layer-charts"></div>
+  <div class="section-title">Per-scope diagnostic snapshot · categorical model scope / logical layer remains linear</div>
+  <div class="layer-step" id="layer-step-control" hidden>
+    <label for="layer-step">Step</label>
+    <input type="range" id="layer-step" min="0" max="0" step="1" value="0" aria-label="Layer snapshot step">
+    <output id="layer-step-value">—</output>
+    <button class="ghost" id="layer-step-last" type="button">Last</button>
+  </div>
+  <div class="charts" id="layer-charts"></div>
   <div class="skip" id="skipped"></div>
   <div class="footer" id="footer"></div>
 </main>
@@ -1604,7 +1669,7 @@ _HTML = r'''<!doctype html>
 <dialog class="focus-dialog" id="focus-dialog" aria-labelledby="focus-title">
   <div class="focus-shell">
     <div class="focus-head"><h2 id="focus-title"></h2><div><button class="ghost" id="focus-reset">Reset view</button> <button class="ghost" id="focus-close">Close</button></div></div>
-    <div class="interaction-hint">Drag a rectangle to zoom both axes · double-click to reset · wheel does not zoom · Esc to close</div>
+    <div class="interaction-hint">Drag a rectangle to zoom both axes · click to pin a vertical line, click again to clear · double-click to reset · wheel does not zoom · Esc to close</div>
     <div class="focus-canvas"><canvas id="focus-canvas"></canvas></div>
   </div>
 </dialog>
@@ -1615,11 +1680,15 @@ const D=JSON.parse(document.getElementById('report-data').textContent), runMap=n
 const visible=new Set(D.runs.filter(r=>r.selected).map(r=>r.id)), families=['grad','update','param'];
 const smoothCache=new WeakMap();
 let axis='flops', xScale='log', family='grad', smoothing='raw', charts=[], frame=0, focusItem=null;
+// hoverX follows the pointer, pinnedX survives until clicked again, layerStep
+// is the snapshot the layer charts show. All three are in step space, which is
+// axis-independent, so they stay put when the x axis switches to FLOPs.
+let hoverX=null, pinnedX=null, layerStep=null, layerSteps=[];
 const $=id=>document.getElementById(id), esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt=(n,d=3)=>{if(n==null||!Number.isFinite(+n))return '—';n=+n;const a=Math.abs(n);if(a>=1e18)return (n/1e18).toFixed(2)+' EF';if(a>=1e15)return (n/1e15).toFixed(2)+' PF';if(a>=1e12)return (n/1e12).toFixed(2)+' T';if(a>=1e9)return (n/1e9).toFixed(2)+' B';if(a>=1e6)return (n/1e6).toFixed(2)+' M';if(a>=1e3)return (n/1e3).toFixed(2)+' k';if(a>0&&a<.001)return n.toExponential(2);const f=n.toFixed(d);return d?f.replace(/(\.\d*?[1-9])0+$|\.0+$/,'$1'):f};
 function effectiveSpan(normalize=false){const input=$('smoothing-level'),maximum=D.meta.maxChartPoints;let span=Math.round(Number(input.value));if(!Number.isFinite(span))span=21;span=Math.max(1,Math.min(maximum,span));if((smoothing==='mean'||smoothing==='median')&&span%2===0)span=span===maximum?Math.max(1,span-1):span+1;if(normalize)input.value=String(span);return span}
 function smoothingName(){const span=effectiveSpan();return smoothing==='ema'?`EMA (span ${span})`:smoothing==='mean'?`centered mean (${span})`:smoothing==='median'?`centered median (${span})`:'raw'}
-function updateSmoothingControls(normalize=false){const input=$('smoothing-level'),span=effectiveSpan(normalize);input.disabled=smoothing==='raw';$('smoothing-level-label').textContent=smoothing==='ema'?'Span':smoothing==='raw'?'Span':'Window';let detail;if(smoothing==='raw')detail='Exact recorded samples; no display smoothing.';else if(smoothing==='ema'){const alpha=2/(span+1);detail=`Causal EMA initialized at the first point; span ${span} gives α = 2/(span + 1) = ${alpha.toPrecision(4)}.`}else if(smoothing==='mean')detail=`Centered ${span}-sample arithmetic mean, with truncated endpoint windows; this avoids EMA phase lag but blurs peaks and is sensitive to outliers.`;else detail=`Centered ${span}-sample median, with truncated endpoint windows; this rejects isolated spikes and preserves step edges, but is not an amplitude average.`;$('smoothing-hint').textContent=detail+' Smoothing is display-only: a faint raw trace remains underneath and tooltips retain the raw sample. The learning-rate schedule and layer snapshots stay raw. Timeline x axes default to logarithmic; non-positive samples are hidden until Linear is selected. Categorical layer-snapshot axes remain linear. Span/window counts embedded plot samples. Drag a rectangle to zoom both axes; double-click or ↺ resets; the wheel never changes chart axes.'}
+function updateSmoothingControls(normalize=false){const input=$('smoothing-level'),span=effectiveSpan(normalize);input.disabled=smoothing==='raw';$('smoothing-level-label').textContent=smoothing==='ema'?'Span':smoothing==='raw'?'Span':'Window';let detail;if(smoothing==='raw')detail='Exact recorded samples; no display smoothing.';else if(smoothing==='ema'){const alpha=2/(span+1);detail=`Causal EMA initialized at the first point; span ${span} gives α = 2/(span + 1) = ${alpha.toPrecision(4)}.`}else if(smoothing==='mean')detail=`Centered ${span}-sample arithmetic mean, with truncated endpoint windows; this avoids EMA phase lag but blurs peaks and is sensitive to outliers.`;else detail=`Centered ${span}-sample median, with truncated endpoint windows; this rejects isolated spikes and preserves step edges, but is not an amplitude average.`;$('smoothing-hint').textContent=detail+' Smoothing is display-only: a faint raw trace remains underneath and tooltips retain the raw sample. The learning-rate schedule and layer snapshots stay raw. Timeline x axes default to logarithmic; non-positive samples are hidden until Linear is selected. Categorical layer-snapshot axes remain linear. Span/window counts embedded plot samples. Drag a rectangle to zoom both axes; double-click or ↺ resets; the wheel never changes chart axes. Hovering any timeline draws a synchronized crosshair on all of them; a single click pins a vertical line there and clicking again clears it. The layer-snapshot step dragger marks its position on every timeline with a fainter dashed line.'}
 function updateAxisHint(){$('axis-hint').textContent=(axis==='flops'?'Estimated cumulative FLOPs':'Optimizer step')+(xScale==='log'?' · logarithmic':' · linear')}
 function init(){
  $('smoothing-level').max=String(D.meta.maxChartPoints);
@@ -1635,15 +1704,28 @@ function init(){
  $('run-search').oninput=e=>{const q=e.target.value.toLowerCase();document.querySelectorAll('.run-toggle').forEach(x=>x.hidden=!x.dataset.search.includes(q))};
  $('open-runs').onclick=()=>{$('sidebar').classList.add('open')}; $('close-runs').onclick=()=>{$('sidebar').classList.remove('open')};
  $('focus-close').onclick=()=>closeFocus(); $('focus-reset').onclick=()=>{if(focusItem){focusItem.view=null;redraw(focusItem)}};
+ $('layer-step').addEventListener('input',e=>{const i=Number(e.target.value);if(layerSteps[i]!==undefined)setLayerStep(layerSteps[i])});
+ $('layer-step-last').addEventListener('click',()=>{if(!layerSteps.length)return;$('layer-step').value=String(layerSteps.length-1);setLayerStep(layerSteps[layerSteps.length-1])});
  $('focus-dialog').addEventListener('close',finishFocus);
  new ResizeObserver(()=>{if(focusItem&&$('focus-dialog').open)redraw(focusItem)}).observe($('focus-dialog'));
  new ResizeObserver(schedule).observe(document.querySelector('.main')); schedule();
 }
-function buildRuns(){$('run-list').innerHTML=D.runs.map(r=>`<label class="run-toggle" data-search="${esc((r.label+' '+r.id+' '+r.classification).toLowerCase())}"><input type="checkbox" data-run="${esc(r.id)}" ${r.selected?'checked':''}><span class="dot" style="color:${r.color};background:${r.color}"></span><span class="run-name">${esc(r.label)}<small class="run-meta">${esc(r.classification)} · step ${fmt(r.finalStep,0)} · val ${fmt(r.validationLoss,4)}${r.ledger?' · ledger ✓':' · unledgered'}</small></span></label>`).join('')||'<p class="subtle">No plot-able runs found.</p>';document.querySelectorAll('[data-run]').forEach(x=>x.onchange=()=>{x.checked?visible.add(x.dataset.run):visible.delete(x.dataset.run);resetViews();schedule()})}
+function buildRuns(){$('run-list').innerHTML=D.runs.map(r=>`<label class="run-toggle" data-search="${esc((r.label+' '+r.id+' '+r.classification).toLowerCase())}"><input type="checkbox" data-run="${esc(r.id)}" ${r.selected?'checked':''}><span class="dot" style="color:${r.color};background:${r.color}"></span><span class="run-name">${esc(r.label)}<small class="run-meta">${esc(r.classification)} · step ${fmt(r.finalStep,0)} · val ${fmt(r.validationLoss,4)}${r.ledger?' · ledger ✓':' · unledgered'}</small></span></label>`).join('')||'<p class="subtle">No plot-able runs found.</p>';document.querySelectorAll('[data-run]').forEach(x=>x.onchange=()=>{x.checked?visible.add(x.dataset.run):visible.delete(x.dataset.run);resetViews();buildLayerSteps();schedule()})}
 function syncChecks(){document.querySelectorAll('[data-run]').forEach(x=>x.checked=visible.has(x.dataset.run))}
 function buildSummary(){if(!D.runs.length){$('summary').innerHTML='<div class="empty">No eligible run passed the report completeness, profile, and qualification checks.</div>';return}$('summary').innerHTML=`<div class="table-wrap"><table><thead><tr><th>Run</th><th>Class</th><th>Steps</th><th>Tokens</th><th>Train s</th><th>Train loss</th><th>Val loss</th><th>Fresh10</th><th>FLOP x</th><th>Final scopes</th></tr></thead><tbody>${D.runs.map(r=>`<tr><td><span class="status" style="background:${r.color}"></span>${esc(r.label)}</td><td>${esc(r.classification)}</td><td>${fmt(r.finalStep,0)}</td><td>${fmt(r.tokens,0)}</td><td>${fmt(r.trainSeconds,2)}</td><td>${fmt(r.trainLoss,4)}</td><td>${fmt(r.validationLoss,4)}</td><td>${fmt(r.fresh10Loss,4)}</td><td title="${esc(r.flopSource)}">${r.flopSource.startsWith('derived:')?'derived':'logged'}</td><td>${r.hasLayerStats?'yes':'—'}</td></tr>`).join('')}</tbody></table></div>`}
-function buildCharts(){charts=[];makeGroup($('time-charts'),D.timeCharts,'time');makeGroup($('diagnostic-charts'),D.diagnosticCharts,'time');makeGroup($('layer-charts'),D.layerCharts,'layer');buildFamilies();if(!D.diagnosticCharts.length)$('diagnostic-charts').innerHTML='<div class="empty">No included run recorded overall diagnostics.</div>';if(!D.layerCharts.length)$('layer-charts').innerHTML='<div class="empty">No included run recorded final model-scope diagnostics or retained compatible layer arrays.</div>'}
+function buildCharts(){charts=[];makeGroup($('time-charts'),D.timeCharts,'time');makeGroup($('diagnostic-charts'),D.diagnosticCharts,'time');makeGroup($('layer-charts'),D.layerCharts,'layer');buildLayerSteps();buildFamilies();if(!D.diagnosticCharts.length)$('diagnostic-charts').innerHTML='<div class="empty">No included run recorded overall diagnostics.</div>';if(!D.layerCharts.length)$('layer-charts').innerHTML='<div class="empty">No included run recorded final model-scope diagnostics or retained compatible layer arrays.</div>'}
 function makeGroup(root,data,type){root.innerHTML=data.map(c=>`<article class="chart" data-family="${esc(c.family||'')}"><div class="chart-head"><h2>${esc(c.title)}</h2><div class="chart-tools"><span class="chart-unit">${esc(c.yLabel)}</span><button class="icon-button reset-chart" title="Reset view" aria-label="Reset ${esc(c.title)} view">↺</button><button class="icon-button expand-chart" title="Open full panel" aria-label="Enlarge ${esc(c.title)}">⛶</button></div></div><div class="canvas-wrap"><canvas aria-label="${esc(c.title)}"></canvas></div></article>`).join('');[...root.querySelectorAll('.chart')].forEach((article,i)=>{const item={canvas:article.querySelector('canvas'),article,data:data[i],type,view:null,drag:null};article.querySelector('.reset-chart').onclick=()=>{item.view=null;redraw(item)};article.querySelector('.expand-chart').onclick=()=>openFocus(item);attachCanvas(item);charts.push(item)})}
+function buildLayerSteps(){
+ const all=new Set();for(const c of D.layerCharts)for(const s of c.series)if(visible.has(s.run))for(const step of s.steps)all.add(step);
+ layerSteps=[...all].sort((a,b)=>a-b);
+ const wrap=$('layer-step-control'),slider=$('layer-step');
+ wrap.hidden=layerSteps.length<2;
+ if(!layerSteps.length){layerStep=null;$('layer-step-value').textContent='—';return}
+ // Default to the last recorded step, which is the historical behaviour.
+ if(layerStep===null||!layerSteps.includes(layerStep))layerStep=layerSteps[layerSteps.length-1];
+ slider.max=String(layerSteps.length-1);slider.value=String(layerSteps.indexOf(layerStep));
+ $('layer-step-value').textContent='step '+fmt(layerStep,0)}
+function setLayerStep(step){if(step===layerStep)return;layerStep=step;$('layer-step-value').textContent='step '+fmt(layerStep,0);schedule()}
 function buildFamilies(){const available=new Set([...D.diagnosticCharts,...D.layerCharts].map(c=>c.family));family=families.find(x=>available.has(x))||'grad';$('family-control').innerHTML=families.map(x=>`<button data-family-button="${x}" aria-pressed="false" ${available.has(x)?'':'disabled'}>${x==='param'?'Parameter':x[0].toUpperCase()+x.slice(1)}</button>`).join('');document.querySelectorAll('[data-family-button]').forEach(b=>b.onclick=()=>{family=b.dataset.familyButton;applyFamily()});applyFamily()}
 function applyFamily(){document.querySelectorAll('[data-family-button]').forEach(b=>{const active=b.dataset.familyButton===family;b.classList.toggle('active',active);b.setAttribute('aria-pressed',String(active))});charts.forEach(item=>{if(item.data.family)item.article.classList.toggle('family-hidden',item.data.family!==family)});setFamilyEmpty($('diagnostic-charts'),D.diagnosticCharts,'No overall '+family+' diagnostics were recorded.');setFamilyEmpty($('layer-charts'),D.layerCharts,'No final model-scope '+family+' diagnostics were recorded.');schedule()}
 function setFamilyEmpty(root,data,message){let empty=root.querySelector('.family-empty');const missing=!data.some(c=>c.family===family);if(missing&&!empty){empty=document.createElement('div');empty.className='empty family-empty';root.appendChild(empty)}if(empty){empty.textContent=message;empty.hidden=!missing}}
@@ -1652,14 +1734,21 @@ function schedule(){cancelAnimationFrame(frame);frame=requestAnimationFrame(()=>
 function redraw(item){cancelAnimationFrame(item._frame||0);item._frame=requestAnimationFrame(()=>draw(item))}
 function resetViews(){charts.forEach(item=>item.view=null);if(focusItem)focusItem.view=null}
 function xOf(item,p){return item.type==='layer'?p[0]:p[axis==='flops'?1:0]}function yOf(item,p){return item.type==='layer'?p[1]:p[2]}
+function frameIndex(s,step){let best=0,bd=Infinity;for(let i=0;i<s.steps.length;i++){const d=Math.abs(s.steps[i]-step);if(d<bd){bd=d;best=i}}return best}
+function layerFrame(s,step){const i=frameIndex(s,step),row=s.values[i];return s.scopes.map((sc,j)=>[sc[0],row[j],sc[1]])}
+function seriesPoints(item,s){return item.type==='layer'?layerFrame(s,layerStep):s.points}
 function chartXScale(item){return item.type==='layer'?'linear':xScale}
 function validX(item,x){return Number.isFinite(x)&&(chartXScale(item)==='linear'||x>0)}
 function transformX(item,x){return chartXScale(item)==='log'?Math.log10(x):x}
 function untransformX(item,x){return chartXScale(item)==='log'?10**x:x}
-function dataBounds(item){let x0=Infinity,x1=-Infinity,y0=Infinity,y1=-Infinity,count=0;for(const s of item.data.series){if(!visible.has(s.run))continue;for(const p of s.points){const x=xOf(item,p),y=yOf(item,p);if(validX(item,x)&&Number.isFinite(y)){x0=Math.min(x0,x);x1=Math.max(x1,x);y0=Math.min(y0,y);y1=Math.max(y1,y);count++}}}if(!count)return null;if(x0===x1){if(chartXScale(item)==='log'){const q=Math.sqrt(10);x0/=q;x1*=q}else{x0-=.5;x1+=.5}}if(y0===y1){const q=Math.abs(y0)*.05||.5;y0-=q;y1+=q}else{const q=(y1-y0)*.08;y0-=q;y1+=q}return{x0,x1,y0,y1}}
+function dataBounds(item){let x0=Infinity,x1=-Infinity,y0=Infinity,y1=-Infinity,count=0;for(const s of item.data.series){if(!visible.has(s.run))continue;
+  // Layer y-bounds span every retained frame so scrubbing the step dragger
+  // never rescales the axis underneath you.
+  const pts=item.type==='layer'?s.scopes.flatMap((sc,j)=>s.values.map(row=>[sc[0],row[j]])):s.points;
+  for(const p of pts){const x=xOf(item,p),y=yOf(item,p);if(validX(item,x)&&Number.isFinite(y)){x0=Math.min(x0,x);x1=Math.max(x1,x);y0=Math.min(y0,y);y1=Math.max(y1,y);count++}}}if(!count)return null;if(x0===x1){if(chartXScale(item)==='log'){const q=Math.sqrt(10);x0/=q;x1*=q}else{x0-=.5;x1+=.5}}if(y0===y1){const q=Math.abs(y0)*.05||.5;y0-=q;y1+=q}else{const q=(y1-y0)*.08;y0-=q;y1+=q}return{x0,x1,y0,y1}}
 function bounds(item){const base=dataBounds(item);return base?(item.view||base):null}
 function smoothingApplies(item){return smoothing!=='raw'&&effectiveSpan()>1&&item.type==='time'&&item.data.key!=='learning_rate'}
-function displayPoints(item,series){const source=series.points;if(!smoothingApplies(item)||source.length<2)return source;const span=effectiveSpan(),key=smoothing+':'+span;let cache=smoothCache.get(series);if(!cache){cache=new Map();smoothCache.set(series,cache)}if(cache.has(key))return cache.get(key);let result;if(smoothing==='ema'){const alpha=2/(span+1);let value=source[0][2];result=source.map((point,index)=>{if(index)value=alpha*point[2]+(1-alpha)*value;return[point[0],point[1],value]})}else{const half=(span-1)>>1;if(smoothing==='mean'){const prefix=[0];for(const point of source)prefix.push(prefix[prefix.length-1]+point[2]);result=source.map((point,index)=>{const lo=Math.max(0,index-half),hi=Math.min(source.length-1,index+half);return[point[0],point[1],(prefix[hi+1]-prefix[lo])/(hi-lo+1)]})}else result=source.map((point,index)=>{const lo=Math.max(0,index-half),hi=Math.min(source.length-1,index+half),values=[];for(let i=lo;i<=hi;i++)values.push(source[i][2]);values.sort((a,b)=>a-b);const middle=values.length>>1,value=values.length%2?values[middle]:(values[middle-1]+values[middle])/2;return[point[0],point[1],value]})}cache.set(key,result);return result}
+function displayPoints(item,series){const source=seriesPoints(item,series);if(!smoothingApplies(item)||source.length<2)return source;const span=effectiveSpan(),key=smoothing+':'+span;let cache=smoothCache.get(series);if(!cache){cache=new Map();smoothCache.set(series,cache)}if(cache.has(key))return cache.get(key);let result;if(smoothing==='ema'){const alpha=2/(span+1);let value=source[0][2];result=source.map((point,index)=>{if(index)value=alpha*point[2]+(1-alpha)*value;return[point[0],point[1],value]})}else{const half=(span-1)>>1;if(smoothing==='mean'){const prefix=[0];for(const point of source)prefix.push(prefix[prefix.length-1]+point[2]);result=source.map((point,index)=>{const lo=Math.max(0,index-half),hi=Math.min(source.length-1,index+half);return[point[0],point[1],(prefix[hi+1]-prefix[lo])/(hi-lo+1)]})}else result=source.map((point,index)=>{const lo=Math.max(0,index-half),hi=Math.min(source.length-1,index+half),values=[];for(let i=lo;i<=hi;i++)values.push(source[i][2]);values.sort((a,b)=>a-b);const middle=values.length>>1,value=values.length%2?values[middle]:(values[middle-1]+values[middle])/2;return[point[0],point[1],value]})}cache.set(key,result);return result}
 function draw(item){
  const c=item.canvas,rect=c.getBoundingClientRect(),dpr=Math.min(devicePixelRatio||1,2),w=Math.max(1,rect.width),h=Math.max(1,rect.height);
  if(c.width!==Math.round(w*dpr)||c.height!==Math.round(h*dpr)){c.width=Math.round(w*dpr);c.height=Math.round(h*dpr)}
@@ -1672,14 +1761,58 @@ function draw(item){
  g.save();g.beginPath();g.rect(m.l,m.t,w-m.l-m.r,h-m.t-m.b);g.clip();
  for(const s of item.data.series){if(!visible.has(s.run))continue;const r=runMap.get(s.run),shown=displayPoints(item,s),smoothed=shown!==s.points;const stroke=(points,alpha,width)=>{g.strokeStyle=r.color;g.lineWidth=width;g.globalAlpha=alpha;g.beginPath();let count=0;for(const point of points){const x=xOf(item,point),y=yOf(item,point);if(!validX(item,x)||!Number.isFinite(y))continue;count?g.lineTo(X(x),Y(y)):g.moveTo(X(x),Y(y));count++}g.stroke();return count};if(smoothed)stroke(s.points,.22,1);const count=stroke(shown,.92,smoothed?2.2:1.7);if(count<=20){g.fillStyle=r.color;for(const point of shown){const x=xOf(item,point),y=yOf(item,point);if(!validX(item,x)||!Number.isFinite(y))continue;g.beginPath();g.arc(X(x),Y(y),2.3,0,Math.PI*2);g.fill()}}}
  g.restore();g.globalAlpha=1;item._plot={b,m,w,h,X,Y,IX,IY};
+ drawMarkers(item,g);
  if(item.drag){const d=item.drag,left=Math.min(d.x0,d.x1),top=Math.min(d.y0,d.y1),width=Math.abs(d.x1-d.x0),height=Math.abs(d.y1-d.y0);g.save();g.fillStyle='rgba(125,211,252,.13)';g.strokeStyle='#7dd3fc';g.lineWidth=1.25;g.setLineDash([5,3]);g.fillRect(left,top,width,height);g.strokeRect(left+.5,top+.5,Math.max(0,width-1),Math.max(0,height-1));g.restore()}
 }
+function axisToStep(value){
+ if(axis!=='flops')return value;
+ for(const c of D.timeCharts)for(const s of c.series){if(!visible.has(s.run))continue;
+  const pts=s.points;if(!pts.length)continue;
+  let lo=0,hi=pts.length-1;if(value<=pts[0][1])return pts[0][0];if(value>=pts[hi][1])return pts[hi][0];
+  while(lo<hi-1){const mid=(lo+hi)>>1;if(pts[mid][1]<value)lo=mid;else hi=mid}
+  const a=pts[lo],b2=pts[hi],t=(value-a[1])/((b2[1]-a[1])||1);return a[0]+t*(b2[0]-a[0])}
+ return value}
+function pinTolerance(){let last=0;for(const c of D.timeCharts)for(const s of c.series)if(s.points.length)last=Math.max(last,s.points[s.points.length-1][0]);return Math.max(1,last*0.004)}
+function setHover(item,e){if(item.type==='layer'||!item._plot)return;const rect=item.canvas.getBoundingClientRect();
+ // Quantized to roughly one pixel of the widest plot: a crosshair redraws every
+ // chart, so an unquantized pointer would force a full re-render per mousemove.
+ const raw=axisToStep(item._plot.IX(e.clientX-rect.left)),q=pinTolerance();
+ const step=Math.round(raw/q)*q;if(step===hoverX)return;hoverX=step;schedule()}
+function stepToAxis(step){
+ // Markers are held in step space; on a FLOPs axis they are mapped through any
+ // visible run's own step->FLOPs curve, which is what makes them line up.
+ if(axis!=='flops')return step;
+ for(const c of D.timeCharts)for(const s of c.series){if(!visible.has(s.run))continue;
+  const pts=s.points;if(!pts.length)continue;
+  let lo=0,hi=pts.length-1;if(step<=pts[0][0])return pts[0][1];if(step>=pts[hi][0])return pts[hi][1];
+  while(lo<hi-1){const mid=(lo+hi)>>1;if(pts[mid][0]<step)lo=mid;else hi=mid}
+  const a=pts[lo],b2=pts[hi],t=(step-a[0])/((b2[0]-a[0])||1);return a[1]+t*(b2[1]-a[1])}
+ return null}
+function markerLine(item,g,step,color,width,dash,alpha){
+ if(step==null||item.type==='layer')return;const p=item._plot,x=stepToAxis(step);
+ if(x==null||!validX(item,x))return;const px=p.X(x);
+ if(px<p.m.l-.5||px>p.w-p.m.r+.5)return;
+ g.save();g.globalAlpha=alpha;g.strokeStyle=color;g.lineWidth=width;g.setLineDash(dash);
+ g.beginPath();g.moveTo(px,p.m.t);g.lineTo(px,p.h-p.m.b);g.stroke();g.restore()}
+function drawMarkers(item,g){
+ // Fainter dashed = where the layer dragger is; solid = pinned by a click;
+ // thin = the live cursor. Three deliberately distinct weights.
+ markerLine(item,g,layerStep,'#f0abfc',1.5,[3,4],.55);
+ markerLine(item,g,pinnedX,'#7dd3fc',1.5,[],.85);
+ markerLine(item,g,hoverX,'#93a4bf',1,[2,3],.55)}
 function eventPoint(e,item,clampToPlot=false){const p=item._plot,rect=item.canvas.getBoundingClientRect();let x=e.clientX-rect.left,y=e.clientY-rect.top;if(clampToPlot){x=Math.max(p.m.l,Math.min(p.w-p.m.r,x));y=Math.max(p.m.t,Math.min(p.h-p.m.b,y))}return{x,y}}
-function attachCanvas(item){const c=item.canvas;c.ondblclick=()=>{item.view=null;redraw(item)};c.onpointerdown=e=>{if(e.button!==0||!item._plot)return;const q=eventPoint(e,item);if(q.x<item._plot.m.l||q.x>item._plot.w-item._plot.m.r||q.y<item._plot.m.t||q.y>item._plot.h-item._plot.m.b)return;e.preventDefault();item.drag={x0:q.x,y0:q.y,x1:q.x,y1:q.y};c.setPointerCapture(e.pointerId);c.classList.add('dragging');hideTip()};c.onpointermove=e=>{if(item.drag){const q=eventPoint(e,item,true);item.drag.x1=q.x;item.drag.y1=q.y;redraw(item);return}tip(e,item)};c.onpointerup=e=>finishBox(e,item);c.onpointercancel=e=>cancelBox(e,item);c.onpointerleave=()=>{if(!item.drag)hideTip()}}
-function finishBox(e,item){const c=item.canvas,d=item.drag;if(!d)return;const q=eventPoint(e,item,true);d.x1=q.x;d.y1=q.y;item.drag=null;c.classList.remove('dragging');if(c.hasPointerCapture(e.pointerId))c.releasePointerCapture(e.pointerId);if(Math.abs(d.x1-d.x0)>=8&&Math.abs(d.y1-d.y0)>=8&&item._plot){const p=item._plot,left=Math.min(d.x0,d.x1),right=Math.max(d.x0,d.x1),top=Math.min(d.y0,d.y1),bottom=Math.max(d.y0,d.y1),xa=p.IX(left),xb=p.IX(right),ya=p.IY(top),yb=p.IY(bottom);item.view={x0:Math.min(xa,xb),x1:Math.max(xa,xb),y0:Math.min(ya,yb),y1:Math.max(ya,yb)}}redraw(item)}
+function attachCanvas(item){const c=item.canvas;c.ondblclick=()=>{item.view=null;redraw(item)};c.onpointerdown=e=>{if(e.button!==0||!item._plot)return;const q=eventPoint(e,item);if(q.x<item._plot.m.l||q.x>item._plot.w-item._plot.m.r||q.y<item._plot.m.t||q.y>item._plot.h-item._plot.m.b)return;e.preventDefault();item.drag={x0:q.x,y0:q.y,x1:q.x,y1:q.y};c.setPointerCapture(e.pointerId);c.classList.add('dragging');hideTip()};c.onpointermove=e=>{if(item.drag){const q=eventPoint(e,item,true);item.drag.x1=q.x;item.drag.y1=q.y;redraw(item);return}setHover(item,e);tip(e,item)};c.onpointerup=e=>finishBox(e,item);c.onpointercancel=e=>cancelBox(e,item);c.onpointerleave=()=>{if(!item.drag)hideTip()}}
+function finishBox(e,item){const c=item.canvas,d=item.drag;if(!d)return;const q=eventPoint(e,item,true);d.x1=q.x;d.y1=q.y;item.drag=null;c.classList.remove('dragging');if(c.hasPointerCapture(e.pointerId))c.releasePointerCapture(e.pointerId);if(Math.abs(d.x1-d.x0)<4&&Math.abs(d.y1-d.y0)<4&&item._plot&&item.type!=='layer'){
+  // A click, not a zoom box: toggle the pinned vertical line.
+  const step=axisToStep(item._plot.IX(d.x1));
+  pinnedX=(pinnedX!==null&&Math.abs(pinnedX-step)<=pinTolerance())?null:step;
+  redraw(item);schedule();return}
+ if(Math.abs(d.x1-d.x0)>=8&&Math.abs(d.y1-d.y0)>=8&&item._plot){const p=item._plot,left=Math.min(d.x0,d.x1),right=Math.max(d.x0,d.x1),top=Math.min(d.y0,d.y1),bottom=Math.max(d.y0,d.y1),xa=p.IX(left),xb=p.IX(right),ya=p.IY(top),yb=p.IY(bottom);item.view={x0:Math.min(xa,xb),x1:Math.max(xa,xb),y0:Math.min(ya,yb),y1:Math.max(ya,yb)}}redraw(item)}
 function cancelBox(e,item){const c=item.canvas;item.drag=null;c.classList.remove('dragging');if(c.hasPointerCapture(e.pointerId))c.releasePointerCapture(e.pointerId);redraw(item)}
 function nearest(series,item,target){let lo=0,hi=series.length;while(lo<hi){const mid=(lo+hi)>>1;if(xOf(item,series[mid])<target)lo=mid+1;else hi=mid}let best=null;for(const index of [lo-1,lo])if(index>=0&&index<series.length){const point=series[index],x=xOf(item,point);if(!validX(item,x))continue;const dist=Math.abs(transformX(item,x)-transformX(item,target));if(!best||dist<best.dist)best={p:point,dist,index}}return best}
-function tip(e,item){if(!item._plot)return;const rect=item.canvas.getBoundingClientRect(),px=e.clientX-rect.left,py=e.clientY-rect.top,target=item._plot.IX(px);let best=null;for(const s of item.data.series){if(!visible.has(s.run))continue;const shown=displayPoints(item,s),found=nearest(shown,item,target);if(!found)continue;const x=xOf(item,found.p),y=yOf(item,found.p),dx=item._plot.X(x)-px,dy=item._plot.Y(y)-py,dist=Math.hypot(dx,dy),raw=s.points[found.index];if(!best||dist<best.dist)best={dist,p:found.p,x,y,rawY:raw?yOf(item,raw):null,smoothed:shown!==s.points,run:runMap.get(s.run)}}if(!best||best.dist>42){hideTip();return}const xname=item.type==='layer'?(best.p[2]||'model scope'):axis==='flops'?'estimated FLOPs':'step',xline=item.type==='layer'?esc(xname):esc(xname)+': '+fmt(best.x,axis==='step'?0:2),valueLine=best.smoothed?`${esc(item.data.title)} · ${esc(smoothingName())}: ${fmt(best.y,5)}<br>Raw sample: ${fmt(best.rawY,5)}`:`${esc(item.data.title)}: ${fmt(best.y,5)}`,t=$('tooltip');t.innerHTML=`<b style="color:${best.run.color}">${esc(best.run.label)}</b><br>${xline}<br>${valueLine}`;t.style.display='block';t.style.left=Math.max(4,Math.min(innerWidth-285,e.clientX+13))+'px';t.style.top=Math.max(4,Math.min(innerHeight-105,e.clientY+13))+'px'}
+function tip(e,item){if(!item._plot)return;const rect=item.canvas.getBoundingClientRect(),px=e.clientX-rect.left,py=e.clientY-rect.top,target=item._plot.IX(px);let best=null;for(const s of item.data.series){if(!visible.has(s.run))continue;const shown=displayPoints(item,s),found=nearest(shown,item,target);if(!found)continue;const x=xOf(item,found.p),y=yOf(item,found.p),dx=item._plot.X(x)-px,dy=item._plot.Y(y)-py,dist=Math.hypot(dx,dy),raw=seriesPoints(item,s)[found.index];if(!best||dist<best.dist)best={dist,p:found.p,x,y,rawY:raw?yOf(item,raw):null,smoothed:shown!==seriesPoints(item,s),run:runMap.get(s.run)}}if(!best||best.dist>42){hideTip();return}const xline=item.type==='layer'
+  ? esc(best.p[2]||'model scope')+(layerStep!=null?' · step '+fmt(layerStep,0):'')
+  : 'step '+fmt(best.p[0],0)+' · FLOPs '+fmt(best.p[1],2),valueLine=best.smoothed?`${esc(item.data.title)} · ${esc(smoothingName())}: ${fmt(best.y,5)}<br>Raw sample: ${fmt(best.rawY,5)}`:`${esc(item.data.title)}: ${fmt(best.y,5)}`,t=$('tooltip');t.innerHTML=`<b style="color:${best.run.color}">${esc(best.run.label)}</b><br>${xline}<br>${valueLine}`;t.style.display='block';t.style.left=Math.max(4,Math.min(innerWidth-285,e.clientX+13))+'px';t.style.top=Math.max(4,Math.min(innerHeight-105,e.clientY+13))+'px'}
 function hideTip(){$('tooltip').style.display='none'}
 function openFocus(source){const dialog=$('focus-dialog'),title=(source.data.family?source.data.family.toUpperCase()+' · ':'')+source.data.title;$('focus-title').textContent=title;$('focus-canvas').setAttribute('aria-label',title);focusItem={canvas:$('focus-canvas'),data:source.data,type:source.type,view:source.view?{...source.view}:null,drag:null,source};attachCanvas(focusItem);dialog.showModal();requestAnimationFrame(()=>draw(focusItem))}
 function closeFocus(){const dialog=$('focus-dialog');if(dialog.open)dialog.close()}

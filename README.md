@@ -75,7 +75,9 @@ with 60M, 125M, 250M, 500M, and 1B tiers; `TIER` defaults to `125m`.
 
 For a multi-host run using the conventional `shm` cache, preparation requires
 `/dev/shm` to be a writable `tmpfs` or `ramfs` on every VM and creates
-`shm -> /dev/shm/.rig-cache` in each checkout. It uses `sudo -n` to make
+`shm -> /dev/shm/.speedrun-cache` in each checkout. That directory keeps its
+pre-rename name deliberately: renaming it would orphan the prepared corpus
+already installed on every TPU VM. It uses `sudo -n` to make
 that dedicated directory and completed entries root-owned but writable by the
 caller's primary group. This is necessary because systemd-logind defaults to
 `RemoveIPC=yes` and recursively removes user-owned `/dev/shm` entries after the
@@ -349,7 +351,16 @@ mean, standard deviation, and centered third/fourth moment. Timeline charts use
 the whole-model values; final-snapshot charts show embeddings, every transformer
 block, and the final normalization. Because the final parameter point is
 post-update, it exactly describes the saved checkpoint even when qualifying-only
-retention later removes that file. Compatible retained checkpoints are used only
+retention later removes that file.
+
+Layer snapshots are scrubbable. A step dragger above them selects which recorded
+step every per-scope chart shows, defaulting to the last, and its position is
+echoed on each timeline as a faint dashed marker so you can see where in
+training you are looking. Hovering any timeline draws a crosshair at the same x
+on all of them; a single click pins a vertical line there and clicking again
+clears it, while double-click still resets the view. Tooltips report both the
+optimizer step and the estimated FLOPs whichever axis is selected, so a point of
+interest can be located on the dragger. Compatible retained checkpoints are used only
 as a legacy fallback for runs that predate `diagnostics.csv`.
 
 Charts render into bounded, downsampled canvases only after an input or resize
