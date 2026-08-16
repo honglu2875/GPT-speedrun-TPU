@@ -557,8 +557,8 @@ def main() -> None:
     body = []
     body.append("<h2>The result</h2>")
     body.append(card(
-        "Batch 128 is optimal at all three tiers. The basin flattens sharply "
-        "with scale: exceeding it costs 0.45 nats at 60M and 0.016 at 250M.",
+        "Batch 128 is optimal at all three tiers. The penalty for exceeding "
+        "it falls steeply with scale: 0.45 nats at 60M, 0.016 at 250M.",
         fig_batch_normalized(c)))
     body.append("<h2>Full grids</h2>")
     body.append('<div class="row">'

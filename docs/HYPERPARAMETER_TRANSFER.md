@@ -12,9 +12,9 @@ cause. Note that a fixed *base* LR is a `sqrt(batch)` schedule on the
 batch-invariant base LR confirms that correction rather than showing LR is
 independent of batch.
 
-The sharpness does *not* transfer: exceeding the optimal batch costs 0.45 nats
-at 60M and 0.016 nats at 250M, a ~28x reduction. The location is stable; the
-penalty for being wrong shrinks fast with scale.
+The penalty for missing it does *not* transfer: exceeding the optimal batch
+costs 0.45 nats at 60M and 0.016 nats at 250M, a ~28x reduction. Where the
+optimum sits is stable across scale; what it costs to be wrong is not.
 
 Supersedes the former `LR_TRANSFER.md`.
 
@@ -176,7 +176,7 @@ bs64 vs bs128 t=+9.41 separated · bs128 vs bs256 t=−2.89 separated · bs256 v
 bs512 t=−34.62 separated. `2^-7` vs `2^-8` at bs128: t=+0.71, **not
 separated** — independently reproducing Study 1's finding.
 
-### The optimum transfers; its sharpness does not
+### The optimum transfers; the penalty for missing it does not
 
 At `2^-8`:
 
@@ -199,7 +199,7 @@ If steps were binding, 250M would peak at batch 512 (2,331 steps, matching
 
 ### Wall clock
 
-Larger batches are faster, so the flattening basin has a practical consequence.
+Larger batches are faster, so a shrinking penalty has a practical consequence.
 
 | tier | batch | loss | train s | speedup |
 |---|--:|--:|--:|--:|
