@@ -19,7 +19,7 @@ import time
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, BinaryIO, TextIO
+from typing import Any, BinaryIO, Callable, TextIO
 
 from .cluster import (
     build_distributed_launch_command,
@@ -169,6 +169,8 @@ def run_recipe(config: RunConfig, *, evaluator: Evaluator | None = None) -> RunO
                 stdout_handle=stdout_handle,
                 stderr_handle=stderr_handle,
                 timeout_seconds=float(config.timeout_seconds),
+                tick=_artifact_puller(config, run_dir, environment),
+                tick_seconds=_PULL_INTERVAL_SECONDS,
             )
     except BaseException:
         clean_distributed_workers()
@@ -361,6 +363,33 @@ class _LiveStderr:
             self._enabled = False
 
 
+# Opportunistic salvage cadence. On preemptible hardware the job can vanish at
+# any step, so partial artifacts are pulled while it runs rather than only on
+# success. Bounded loss, negligible cost: these are small text files.
+_PULL_INTERVAL_SECONDS = 60.0
+
+
+def _artifact_puller(
+    config: RunConfig, run_dir: Path, environment: Mapping[str, str]
+) -> Callable[[], None] | None:
+    """Return a best-effort puller, or None when artifacts are already local."""
+
+    if not (config.remote_controller and config.artifact_host):
+        return None
+
+    def pull() -> None:
+        try:
+            fetch_run_artifacts(
+                config.artifact_host, run_dir, run_dir, environment=environment
+            )
+        except Exception:
+            # A failed opportunistic pull is not a failed run. The next tick
+            # retries, and the authoritative pull still runs on completion.
+            return
+
+    return pull
+
+
 def _run_process(
     command: list[str],
     *,
@@ -369,8 +398,15 @@ def _run_process(
     stdout_handle: BinaryIO,
     stderr_handle: BinaryIO,
     timeout_seconds: float,
+    tick: Callable[[], None] | None = None,
+    tick_seconds: float = 60.0,
 ) -> tuple[int | None, bool]:
-    """Capture stdout and tee stderr without allowing either pipe to block the child."""
+    """Capture stdout and tee stderr without allowing either pipe to block the child.
+
+    ``tick`` runs at most every ``tick_seconds`` from the same loop that drains
+    the pipes, which is where opportunistic artifact pulls happen. It must not
+    raise and must not block for long: this loop also enforces the timeout.
+    """
 
     process = subprocess.Popen(
         command,
@@ -390,6 +426,7 @@ def _run_process(
     live_stderr = _LiveStderr(sys.stderr)
     deadline = time.perf_counter() + timeout_seconds
     timed_out = False
+    next_tick = time.perf_counter() + tick_seconds
 
     try:
         while True:
@@ -403,6 +440,10 @@ def _run_process(
             wait_seconds = 0.0 if return_code is not None else min(0.1, max(0.0, remaining))
             for _key, _events in selector.select(wait_seconds):
                 _drain_stderr(descriptor, stderr_handle, live_stderr)
+
+            if tick is not None and time.perf_counter() >= next_tick:
+                next_tick = time.perf_counter() + tick_seconds
+                tick()
 
             return_code = process.poll()
             if return_code is not None:

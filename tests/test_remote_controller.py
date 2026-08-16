@@ -186,5 +186,83 @@ class ControllerIdentityTests(unittest.TestCase):
         self.assertIn("config.remote_controller and config.artifact_host", guard)
 
 
+class OpportunisticSalvageTests(unittest.TestCase):
+    """Partial artifacts must survive a job that never finishes."""
+
+    def _run(self, script: str, **kwargs):
+        # _run_process needs real descriptors: it calls fileno() on the pipes.
+        from rig.harness import runner
+
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "out"
+            err = Path(directory) / "err"
+            with out.open("wb") as stdout, err.open("wb") as stderr:
+                return runner._run_process(
+                    ["python3", "-c", script],
+                    cwd=Path("."),
+                    environment={},
+                    stdout_handle=stdout,
+                    stderr_handle=stderr,
+                    timeout_seconds=30.0,
+                    **kwargs,
+                )
+
+    def test_the_stream_loop_ticks_while_the_child_runs(self) -> None:
+        calls: list[int] = []
+        code, timed_out = self._run(
+            "import time; time.sleep(0.5)",
+            tick=lambda: calls.append(1),
+            tick_seconds=0.1,
+        )
+        self.assertEqual(code, 0)
+        self.assertFalse(timed_out)
+        self.assertGreaterEqual(len(calls), 2)
+
+    def test_a_raising_tick_propagates_so_the_puller_must_swallow(self) -> None:
+        # The loop deliberately does not catch tick errors -- that would hide
+        # real bugs. Safety therefore lives in the puller, which is why the
+        # next test pins that it swallows transfer failures itself.
+        def boom() -> None:
+            raise RuntimeError("host unreachable")
+
+        with self.assertRaises(RuntimeError):
+            self._run("import time; time.sleep(0.3)", tick=boom, tick_seconds=0.05)
+
+    def test_no_puller_when_artifacts_are_already_local(self) -> None:
+        from rig.harness import runner
+        from rig.harness.models import RunConfig
+
+        local = RunConfig(
+            repo_root=Path("/repo"),
+            recipe="reference",
+            runs_dir=Path("/repo/runs"),
+            records_path=Path("/repo/runs/records.jsonl"),
+            tpu_vm_count=4,
+        )
+        self.assertIsNone(runner._artifact_puller(local, Path("/repo/runs/x"), {}))
+
+    def test_puller_swallows_transfer_failures(self) -> None:
+        from rig.harness import runner
+        from rig.harness.models import RunConfig
+
+        remote = RunConfig(
+            repo_root=Path("/repo"),
+            recipe="reference",
+            runs_dir=Path("/repo/runs"),
+            records_path=Path("/repo/runs/records.jsonl"),
+            tpu_vm_count=4,
+            remote_controller=True,
+            artifact_host="pod-w-0",
+            artifact_hostname="pod-w-0",
+        )
+        pull = runner._artifact_puller(remote, Path("/repo/runs/x"), {})
+        self.assertIsNotNone(pull)
+        with patch(
+            "rig.harness.runner.fetch_run_artifacts",
+            side_effect=OSError("network down"),
+        ):
+            pull()  # a lost pull is not a lost run
+
+
 if __name__ == "__main__":
     unittest.main()

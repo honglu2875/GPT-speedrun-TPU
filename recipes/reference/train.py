@@ -3432,6 +3432,66 @@ def write_training_csv(
     os.replace(temporary, destination)
 
 
+def append_progress_row(
+    output_dir: Path,
+    step: int,
+    *,
+    loss: float,
+    learning_rate_value: float,
+    grad_norm: float,
+    config: Config,
+    flops_per_token: int | None,
+) -> None:
+    """Append one already-materialized step to training.csv, best effort.
+
+    Salvage for runs that never reach their final write: on preemptible
+    hardware the job can vanish at any step, and everything else is written
+    only after the loop exits. The rows land at ``log_every`` cadence rather
+    than every step, because this reuses the host metrics the progress line
+    already pulled -- so it costs no extra device synchronization. A run that
+    finishes is rewritten at full per-step resolution by ``write_training_csv``
+    and this file is superseded.
+
+    Never raises. A partial artifact is a convenience; failing the run because
+    a convenience could not be written would be worse than losing it.
+    """
+
+    tokens_processed = step * config.batch_size * config.seq_len
+    destination = output_dir / TRAINING_CSV_NAME
+    try:
+        new = not destination.exists()
+        with destination.open("a", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle, lineterminator="\n")
+            if new:
+                writer.writerow(
+                    (
+                        "step",
+                        "tokens_processed",
+                        "cumulative_estimated_flops",
+                        "train_loss",
+                        "learning_rate",
+                        "grad_norm",
+                    )
+                )
+            writer.writerow(
+                (
+                    step,
+                    tokens_processed,
+                    (
+                        tokens_processed * flops_per_token
+                        if flops_per_token is not None
+                        else ""
+                    ),
+                    float(loss),
+                    float(learning_rate_value),
+                    float(grad_norm),
+                )
+            )
+            handle.flush()
+    except OSError:
+        return
+
+
 def write_diagnostics_csv(
     output_dir: Path,
     points: Sequence[DiagnosticPoint],
@@ -4031,6 +4091,13 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         args.xprof_dir.expanduser().resolve() if capture_window is not None else None
     )
     trace_active = False
+    # Needed inside the loop for best-effort partial artifacts, not just
+    # by the writers that run after it.
+    output_dir = args.output_dir.expanduser().resolve()
+    if is_controller:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        # A stale file from a reused directory would be appended to.
+        (output_dir / TRAINING_CSV_NAME).unlink(missing_ok=True)
     try:
         for step_index in range(1, config.steps + 1):
             if capture_window is not None and step_index == capture_window[0]:
@@ -4146,6 +4213,18 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                     host_metrics = local_device_get(last_metrics)
                     elapsed_so_far = max(time.perf_counter() - train_started, 1.0e-12)
                     seen_tokens = step_index * config.batch_size * config.seq_len
+                    if is_controller:
+                        # host_metrics is already on the host for the progress
+                        # line, so this adds no synchronization.
+                        append_progress_row(
+                            output_dir,
+                            step_index,
+                            loss=float(host_metrics["loss"]),
+                            learning_rate_value=float(host_metrics["learning_rate"]),
+                            grad_norm=float(host_metrics["grad_norm"]),
+                            config=config,
+                            flops_per_token=flops_per_token,
+                        )
                     console.step(
                         step_index,
                         config.steps,
