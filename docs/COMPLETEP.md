@@ -111,22 +111,28 @@ stops there; 500M and 1B are reserved for later reproduction or hero runs.
 | 500M | 19 | 1,280 | 20 | 502,602,240 | 19,173 | 2,513,043,456 |
 | 1B | 21 | 1,792 | 28 | 989,943,808 | 37,763 | 4,949,671,936 |
 
-The learning-rate sweep is intentionally one-dimensional: the seven normalized
-base LRs `2^-10`, `2^-9`, `2^-8`, `2^-7`, `2^-6`, `2^-5`, and `2^-4`, one
-seed, batch 128, and 5 TPP (0.25× the 20-TPP ladder). This matches the
-powers-of-two LR grid visible in the paper's Figures 2 and 3 while retaining our
-compute-limited horizon. The same grid runs independently and in sequence at
-60M, 125M, and 250M.
+The first two tiers share the 12-layer base depth, so `mL = 1` and CompleteP
+reduces to ordinary muP there. Only 250M, at 16 layers, exercises the
+depth-specific rules. This is therefore primarily a width-transfer test with one
+modest depth point, not a reproduction of the paper's 2-to-128-layer experiment.
 
-The first two tiers both have the 12-layer base depth, so `mL = 1` and
-CompleteP is identical to ordinary muP there. Only 250M, at 16 layers, exercises
-the depth-specific rules: both residual branches and residual-block AdamW
-epsilon receive `mL^-1 = 3/4`. Consequently this is primarily a width-transfer
-test with one modest depth-transfer point, not a reproduction of the paper's
-2-to-128-layer experiment.
+### Sweep protocol
 
-Collect every point before any chart is designed. An optimum on a grid edge is
-an unbracketed result, not a winner. Once a common interior neighborhood
-appears, it should be rerun with at least three seeds. Only then should batch
-size vary, using the SDE rules above and keeping the selected normalized base
-LR fixed.
+**Sweep the base LR, never the effective one.** The runtime applies
+`sqrt(mB / mD)`, so a fixed base LR is already a `sqrt(batch)` schedule on the
+effective LR. Grids are powers of two, wide enough that the winner has measured
+neighbours; an edge optimum is unbracketed, not a winner.
+
+**Ranking requires seeds.** One seed locates a region; ranking needs three and
+Welch's `t >= 2.5`. Never rank points within ~0.05 nats from single seeds — seed
+noise peaks at the optimum, and one such comparison produced a spurious
+transfer break.
+
+**Batch and LR are swept jointly**, because the `sqrt(mB)` rule is the
+hypothesis under test. Over batch 32-512 at 5 TPP the base-LR optimum proved
+batch-invariant, confirming the rule and justifying a one-dimensional LR sweep
+at batch 128 — empirically, and only at this horizon.
+
+Measurements are in
+[HYPERPARAMETER_TRANSFER.md](HYPERPARAMETER_TRANSFER.md); this page is the
+contract and method.

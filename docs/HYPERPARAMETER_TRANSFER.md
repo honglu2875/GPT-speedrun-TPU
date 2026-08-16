@@ -7,7 +7,10 @@ and global batch size.
 **Both transfer.** Every configuration measured puts the optimum at base LR
 `2^-8` and global batch `128`, across a 4x parameter range (60M → 250M) and a
 16x batch range. The one apparent break was a seed artifact with an identified
-cause.
+cause. Note that a fixed *base* LR is a `sqrt(batch)` schedule on the
+*effective* LR, since the runtime applies `sqrt(m_B / m_D)` — so the
+batch-invariant base LR confirms that correction rather than showing LR is
+independent of batch.
 
 The sharpness does *not* transfer: exceeding the optimal batch costs 0.45 nats
 at 60M and 0.016 nats at 250M, a ~28x reduction. The location is stable; the
@@ -21,7 +24,8 @@ Supersedes the former `LR_TRANSFER.md`.
 |---|---|
 | **LR** | learning rate |
 | **base LR** | the normalized, scale-free LR knob that is swept. `config.yaml`'s `learning_rate` and the trainer's `--base-learning-rate` are the same field |
-| **effective peak LR** | what the optimizer actually applies at the top of the schedule. For a token-budgeted run it is `base LR / sqrt(m_D)`; for a step-bounded run `m_D = 1`, so it equals the base LR |
+| **effective peak LR** | what the optimizer actually applies at the top of the schedule: `base LR * sqrt(m_B / m_D)`. Both factors matter here — sweeping batch moves the effective LR even at a fixed base LR |
+| **m_B** | batch multiplier — global batch over the 128 baseline |
 | **TPP** | tokens per parameter — training tokens divided by parameter count. Sets the token horizon |
 | **µP** | Maximal Update Parameterization. Rescales initialization, LR, and multipliers so activation and update magnitudes stay width-invariant |
 | **CompleteP** | µP extended so the rules also hold as *depth* grows |
@@ -115,6 +119,22 @@ single v3 seed was unrepresentative for an identifiable reason.
 ## Study 2 — batch size x learning rate
 
 Full grid, three seeds per cell, 123 runs.
+
+**What "the LR optimum does not move" means here.** The runtime already applies
+`sqrt(m_B / m_D)`, so holding the base LR fixed *is* a `sqrt(batch)` schedule on
+the effective LR. At 60M:
+
+| batch | base LR | effective peak LR |
+|---|--:|--:|
+| 32 | 0.00390625 | 0.00195312 |
+| 128 | 0.00390625 | 0.00390625 |
+| 512 | 0.00390625 | 0.00781250 |
+
+A 4x effective swing across the 16x batch range. So the finding below —
+`2^-8` optimal at every batch — is not evidence that LR is independent of
+batch. It is evidence that **Complete(d)P's `sqrt(m_B)` rule is the right
+correction**, because applying it makes the remaining knob batch-invariant.
+Sweeping base LR at each batch is what tests the rule rather than assuming it.
 
 ### 60M — 5 batches x 5 LRs
 
