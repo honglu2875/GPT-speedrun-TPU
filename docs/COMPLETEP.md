@@ -1,17 +1,21 @@
-# Complete(d)P model-family contract
+# Complete(d)P
 
-This repository uses a conservative **Complete(d)P, α = 1** contract for the
-reference family. It is a post-µP engineering baseline, not a claim that every
-result in the original µP work is false.
+(note originally drafted by GPT 5.6 but revised by myself)
 
-The distinction matters. Tensor Programs V established a useful width-scaling
-framework and a practical proxy-to-target workflow. Later work found that
-transfer is approximate at finite width, that multiple parameterizations can
+This repository currently uses **Complete(d)P, α = 1** for the
+baseline family.
+
+muP established a useful width-scaling framework and a practical
+proxy-to-target workflow. Later work found that transfer is approximate at
+finite width, that multiple parameterizations can
 transfer with the right layerwise rules, and that the original transformer
-recipe did not cover depth, Adam epsilon, weight decay, batch size, or training
-duration completely. CompleteP adds depth scaling; the August 11, 2026 revision
+recipe did not cover depth, Adam epsilon, weight decay, batch size, or
+training duration completely. CompleteP adds depth scaling; the August 11, 2026 revision
 of Complete(d)P corrects implementation details and unifies width/depth rules
 with approximate SDE rules for batch and token horizon.
+
+Here we do observe the learning-rate and batch size transfer after implemented
+CompleteP.
 
 Primary sources:
 
@@ -25,7 +29,9 @@ Primary sources:
 - [Completed Hyperparameter Transfer across Modules, Width, Depth, Batch & Duration](https://arxiv.org/abs/2512.22382)
 - [Weight Decay may matter more than µP for Learning Rate Transfer in Practice](https://arxiv.org/abs/2510.19093)
 
-## Implemented rule
+## Implementation details
+
+(authored by GPT 5.6)
 
 The 60M tier is the base discretization. Let `mN = width / 384`,
 `mL = layers / 12`, `mD = training tokens / base-tier training tokens`, and
@@ -124,10 +130,3 @@ an unbracketed result, not a winner. Once a common interior neighborhood
 appears, it should be rerun with at least three seeds. Only then should batch
 size vary, using the SDE rules above and keeping the selected normalized base
 LR fixed.
-
-The one-off suites that produced the results above have been removed along with
-the study runner; the rules on this page are the durable part. To repeat this
-kind of measurement, loop `rig run` over the tiers and learning rates you want
-and read the recorded runs back out of `runs/records.jsonl` — every run already
-carries the resolved parameterization, so a study is a query over run records
-rather than a separate execution framework.
