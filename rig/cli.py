@@ -63,7 +63,13 @@ from .data import (
     verify_dataset,
     verify_fresh10,
 )
-from .data_routing import preparation_route, resolve_preparation_manifest
+from .data_routing import (
+    SCALED_CACHE_SUBDIRECTORY,
+    dataset_names,
+    named_preparation_route,
+    preparation_route,
+    resolve_preparation_manifest,
+)
 from .doctor import (
     data_selection,
     doctor_ok,
@@ -290,6 +296,40 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--track", choices=_TRACKS)
     verify.add_argument("--profile", choices=_PROFILES)
 
+    dataset = commands.add_parser(
+        "dataset",
+        help="prepare and distribute named corpora, independently of settings",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    dataset_actions = dataset.add_subparsers(dest="dataset_command", required=True)
+    dataset_actions.add_parser("list", help="show every corpus and whether it is here")
+    dataset_prepare = dataset_actions.add_parser(
+        "prepare", help="download and verify one corpus by name"
+    )
+    dataset_prepare.add_argument("name", help="corpus name, for example hero")
+    dataset_prepare.add_argument(
+        "--shards",
+        type=_positive_int,
+        help="train shards to fetch; omit for the whole corpus",
+    )
+    dataset_prepare.add_argument("--path", type=Path, help="cache root override")
+    dataset_prepare.add_argument("--offline", action="store_true")
+    dataset_prepare.add_argument("--force", action="store_true")
+    dataset_prepare.add_argument("--check-only", action="store_true")
+    dataset_prepare.add_argument("--timeout", type=_positive_float, default=60.0)
+    dataset_prepare.add_argument("--color", choices=_COLORS)
+    dataset_ship = dataset_actions.add_parser(
+        "ship", help="copy a prepared corpus to a cluster that cannot download it"
+    )
+    dataset_ship.add_argument("name", help="corpus name, for example hero")
+    dataset_ship.add_argument("--cluster", help="target cluster profile")
+    dataset_ship.add_argument("--color", choices=_COLORS)
+    dataset_status = dataset_actions.add_parser(
+        "status", help="report which corpora are present here and on a cluster"
+    )
+    dataset_status.add_argument("--cluster", help="also check this cluster's hosts")
+    dataset_status.add_argument("--color", choices=_COLORS)
+
     leaderboard = commands.add_parser("leaderboard", help="render recorded qualifying scores")
     leaderboard.add_argument("--track", choices=_TRACKS)
     leaderboard.add_argument("--profile", choices=_PROFILES, default="official")
@@ -351,6 +391,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             return command_profile(args)
         if args.command == "verify":
             return command_verify(args)
+        if args.command == "dataset":
+            return command_dataset(args)
         if args.command == "leaderboard":
             return command_leaderboard(args)
         if args.command == "report":
@@ -609,7 +651,10 @@ def command_run(args: argparse.Namespace) -> int:
     # Keeping those axes separate lets a short dev study consume the same
     # rank-disjoint corpus as the eventual official family run.
     run_data_profile = "smoke" if profile == "smoke" else config.data_profile
-    route = preparation_route(run_data_profile, config.training_tokens)
+    route = _route_for_config(config, run_data_profile)
+    _require_prepared_dataset(
+        config, route, data_path, cluster=getattr(args, "cluster", None)
+    )
     manifest = resolve_preparation_manifest(route)
     route_root = route.data_root(data_path)
     shards = route.train_shards
@@ -835,7 +880,7 @@ def command_profile(args: argparse.Namespace) -> int:
         configured_data_path = _cluster_data_argument(configured_data_path, root)
     data_path = resolve_path(configured_data_path, root)
     run_data_profile = "smoke" if profile == "smoke" else config.data_profile
-    route = preparation_route(run_data_profile, config.training_tokens)
+    route = _route_for_config(config, run_data_profile)
     manifest = resolve_preparation_manifest(route)
     route_root = route.data_root(data_path)
     shards = route.train_shards
@@ -1058,6 +1103,153 @@ def command_verify(args: argparse.Namespace) -> int:
         f"tokens={result.tokens_processed:,}, checkpoint={checkpoint_label}"
     )
     return 0
+
+
+def _dataset_cache_root(config: LocalConfig, override: Path | None = None) -> Path:
+    return resolve_path(str(override) if override else config.data_path)
+
+
+def _dataset_presence(root: Path) -> dict[str, tuple[int, int]]:
+    """Map corpus name -> (shard files present, bytes) in a local cache root."""
+
+    found: dict[str, tuple[int, int]] = {}
+    for name in dataset_names():
+        directory = root / SCALED_CACHE_SUBDIRECTORY / name
+        if not directory.is_dir():
+            continue
+        files = [entry for entry in directory.iterdir() if entry.suffix == ".bin"]
+        found[name] = (len(files), sum(entry.stat().st_size for entry in files))
+    return found
+
+
+def _route_for_config(config: LocalConfig, data_profile: str):
+    """Resolve the corpus a run should use, by name when one is configured.
+
+    A named dataset is authoritative: if it is absent, the run stops with the
+    command that prepares it rather than silently falling back to whichever
+    corpus the training_tokens capacity happens to select. That fallback is the
+    dangerous case -- it trains successfully on the wrong data.
+    """
+
+    if config.dataset and data_profile == "official":
+        return named_preparation_route(config.dataset)
+    return preparation_route(data_profile, config.training_tokens)
+
+
+def _require_prepared_dataset(
+    config: LocalConfig, route, root: Path, *, cluster: str | None
+) -> None:
+    """Fail with the fixing command when a named corpus is not present."""
+
+    if not config.dataset or not route.is_scaled:
+        return
+    directory = root / route.cache_subdirectory
+    if directory.is_dir() and any(directory.glob("*.bin")):
+        return
+    ship = (
+        f"\n  then ship it:     rig dataset ship {config.dataset} --cluster {cluster}"
+        if cluster
+        else ""
+    )
+    raise ConfigError(
+        f"dataset {config.dataset!r} is not prepared at {directory}"
+        f"\n  prepare it here:  rig dataset prepare {config.dataset}{ship}"
+    )
+
+
+def command_dataset(args: argparse.Namespace) -> int:
+    """Prepare and distribute corpora by name, decoupled from saved settings.
+
+    Selecting a corpus through the ``training_tokens`` capacity request meant a
+    caller who wanted "hero" had to know which budget happened to select it,
+    and could not prepare data without also touching profile settings. Naming
+    the corpus removes both, and lets `rig run` report a missing dataset with
+    the command that fixes it instead of silently choosing another one.
+    """
+
+    config = load_config(cluster=getattr(args, "cluster", None))
+    style = Style(getattr(args, "color", None) or config.color)
+    action = args.dataset_command
+
+    if action == "list":
+        root = _dataset_cache_root(config)
+        present = _dataset_presence(root)
+        style.heading("corpora")
+        for name in dataset_names():
+            route = named_preparation_route(name)
+            here = present.get(name)
+            state = (
+                f"{here[0]} shard files, {here[1] / 2**30:.1f} GiB here"
+                if here
+                else "not prepared here"
+            )
+            style.note(
+                f"{name:<5} up to {route.train_capacity:>15,} train tokens  ·  {state}"
+            )
+        return 0
+
+    if action == "status":
+        root = _dataset_cache_root(config)
+        present = _dataset_presence(root)
+        style.heading("dataset status")
+        for name in dataset_names():
+            here = present.get(name)
+            style.note(
+                f"{name:<5} local: "
+                + (f"{here[0]} shards" if here else "absent")
+            )
+        if getattr(args, "cluster", None):
+            inventory = _probe_configured_cluster(config)
+            listing = (
+                f"for d in {shlex.quote(str(RAM_CACHE_ROOT / SCALED_CACHE_SUBDIRECTORY))}/*; "
+                'do [ -d "$d" ] && echo "$(basename $d) $(ls "$d" | wc -l)"; done'
+            )
+            style.heading(f"on {args.cluster}")
+            run_pdsh(inventory.hosts, listing, labels=True)
+        return 0
+
+    if action == "prepare":
+        route = named_preparation_route(args.name, train_shards=args.shards)
+        root = _dataset_cache_root(config, args.path)
+        style.heading(f"preparing {args.name}")
+        style.note(
+            f"{route.train_shards} train shards "
+            f"({route.train_capacity:,} tokens) into {root}"
+        )
+        prepared = prepare_data(
+            root / route.cache_subdirectory,
+            resolve_preparation_manifest(route),
+            train_shards=route.train_shards,
+            offline=args.offline,
+            check_only=args.check_only,
+            force=args.force,
+            progress=_progress_reporter(style),
+            timeout=args.timeout,
+        )
+        _print_prepared(prepared, style)
+        return 0
+
+    if action == "ship":
+        route = named_preparation_route(args.name)
+        root = _dataset_cache_root(config)
+        source = root / route.cache_subdirectory
+        if not source.is_dir():
+            raise ConfigError(
+                f"{args.name} is not prepared here ({source} is missing); run "
+                f"`rig dataset prepare {args.name}` first"
+            )
+        if not _work_runs_elsewhere(config):
+            raise ConfigError(
+                "shipping needs a cluster whose accelerators are elsewhere; "
+                "pass --cluster"
+            )
+        inventory = _probe_configured_cluster(config)
+        style.heading(f"shipping {args.name}")
+        count = ship_dataset(inventory.remote_hosts, source)
+        style.ok(f"{args.name} present and sealed on {count} host(s)")
+        return 0
+
+    raise ConfigError(f"unknown dataset action: {action}")
 
 
 def command_leaderboard(args: argparse.Namespace) -> int:

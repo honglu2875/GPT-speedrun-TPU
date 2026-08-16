@@ -23,6 +23,7 @@ _CLUSTER_FIELDS = (
     "chips_per_host",
     "remote_controller",
     "artifact_host",
+    "dataset",
 )
 
 
@@ -43,6 +44,9 @@ class ClusterProfile:
     # the expression. Naming one explicitly matters on preemptible pods,
     # where you may want artifacts off a host you expect to lose.
     artifact_host: str = ""
+    # Corpus name, e.g. "hero". Empty keeps the legacy behaviour of selecting a
+    # corpus by training_tokens capacity, so existing clusters are unaffected.
+    dataset: str = ""
 
     def overlay(self) -> dict[str, Any]:
         return {
@@ -52,6 +56,7 @@ class ClusterProfile:
             "chips_per_host": self.chips_per_host,
             "remote_controller": self.remote_controller,
             "artifact_host": self.artifact_host,
+            "dataset": self.dataset,
         }
 
 
@@ -70,6 +75,8 @@ class LocalConfig:
     # keeps the artifacts.
     remote_controller: bool = False
     artifact_host: str = ""
+    # Named corpus; empty falls back to training_tokens capacity routing.
+    dataset: str = ""
     active_cluster: str = ""
     data_profile: str = "official"
     default_profile: str = "official"
@@ -107,6 +114,10 @@ class LocalConfig:
             raise ConfigError("remote_controller requires tpu_vm_hosts")
         if self.artifact_host and not self.tpu_vm_hosts.strip():
             raise ConfigError("artifact_host requires tpu_vm_hosts")
+        if not isinstance(self.dataset, str):
+            raise ConfigError("dataset must be a string")
+        if self.dataset and any(character.isspace() for character in self.dataset):
+            raise ConfigError("dataset must be a bare corpus name")
         if not isinstance(self.accelerator, str) or not self.accelerator.strip():
             raise ConfigError("accelerator must be a non-empty string")
         if isinstance(self.chips_per_host, bool) or not isinstance(

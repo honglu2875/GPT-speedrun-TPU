@@ -206,6 +206,51 @@ def preparation_route(
     )
 
 
+def named_preparation_route(
+    name: str,
+    *,
+    train_shards: int | None = None,
+    manifest_root: Path | None = None,
+) -> PreparationRoute:
+    """Resolve a corpus by name rather than by capacity.
+
+    ``preparation_route`` picks the smallest corpus that covers a token budget,
+    which is indirect: a caller who wants "hero" has to know that some number
+    above the 8B capacity selects it, and a budget that overshoots the largest
+    corpus fails with an arithmetic complaint rather than a name. Naming the
+    dataset says what is meant, and lets a partial download be requested
+    honestly through ``train_shards``.
+    """
+
+    variant = scaled_variant_named(name)
+    root = (
+        manifest_root or Path(__file__).resolve().parent.parent / "data" / "manifests"
+    )
+    shards = variant.train_shards if train_shards is None else int(train_shards)
+    if shards < 1:
+        raise DataError("train_shards must be at least 1")
+    if shards > variant.train_shards:
+        raise DataError(
+            f"{name} publishes {variant.train_shards} train shards; "
+            f"cannot prepare {shards}"
+        )
+    return PreparationRoute(
+        "official",
+        f"scaled FineWeb {variant.name}",
+        root / SCALED_MANIFEST_SUBDIRECTORY / f"{variant.name}.json",
+        shards,
+        shards * SCALED_VALIDATION_TOKENS,
+        SCALED_CACHE_SUBDIRECTORY / variant.name,
+        variant,
+    )
+
+
+def dataset_names() -> tuple[str, ...]:
+    """Every corpus that can be requested by name."""
+
+    return tuple(variant.name for variant in SCALED_VARIANTS)
+
+
 def resolve_preparation_manifest(route: PreparationRoute) -> str | Path:
     """Resolve and validate a real manifest for ``route``.
 
@@ -447,6 +492,8 @@ __all__ = [
     "SCALED_SOURCE_REVISION",
     "SCALED_VARIANTS",
     "ScaledVariant",
+    "dataset_names",
+    "named_preparation_route",
     "preparation_route",
     "resolve_preparation_manifest",
     "scaled_variant_named",
