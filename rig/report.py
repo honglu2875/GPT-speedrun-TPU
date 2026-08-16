@@ -1013,6 +1013,13 @@ def _report_payload(
             if isinstance(run.record, dict) and isinstance(run.record.get("recipe"), str)
             else _recipe_from_run_id(run.run_id)
         )
+        # Records began carrying a bare "recipe" field, which then won over the
+        # run-id fallback that had been supplying the folded-in run name. The
+        # name is the whole point of naming a run, so take it from the record
+        # where it actually lives rather than re-parsing the directory.
+        run_name = run.record.get("name") if isinstance(run.record, dict) else None
+        if isinstance(run_name, str) and run_name and run_name not in recipe:
+            recipe = f"{recipe}-{run_name}"
         _, classification = _default_run_selection(str(result["profile"]))
         qualified = run.record.get("qualified") if run.record else None
         if not isinstance(qualified, bool):
