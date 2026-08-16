@@ -336,3 +336,33 @@ class SingleRemoteHostTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CacheOwnershipTests(unittest.TestCase):
+    """The RAM cache must stay writable by the user who prepared it."""
+
+    def test_group_survives_running_as_root(self) -> None:
+        # The seal makes the cache root-owned so logout cleanup cannot delete
+        # it, and group-writable so the owner keeps access. Resolving the group
+        # with a bare `id -g` yields 0 when the fragment itself runs as root,
+        # producing root:root and locking the user out of their own cache --
+        # observed as "Permission denied" creating a new corpus directory.
+        from rig.harness.cluster import (
+            prepare_ram_cache,
+            seal_ram_cache_command,
+            unseal_ram_cache_command,
+        )
+        import inspect
+
+        for fragment in (seal_ram_cache_command(), unseal_ram_cache_command()):
+            self.assertIn("SUDO_GID", fragment)
+            self.assertNotIn('group="$(id -g)"', fragment)
+        setup = inspect.getsource(prepare_ram_cache)
+        self.assertIn("SUDO_GID", setup)
+        self.assertNotIn('group="$(id -g)"', setup)
+
+    def test_the_fragments_still_grant_root_ownership(self) -> None:
+        # Group is the part that changed; root ownership is the whole point.
+        from rig.harness.cluster import seal_ram_cache_command
+
+        self.assertIn("chown -R root:", seal_ram_cache_command())

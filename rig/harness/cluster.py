@@ -396,7 +396,10 @@ def prepare_ram_cache(
     )
     if create_link:
         cache_setup = (
-            'group="$(id -g)"; '
+            # id -g is 0 when this fragment runs as root, which would make the
+        # cache root:root and lock out the user it exists to serve.
+        # SUDO_GID carries the invoking user's group through sudo.
+        'group="${SUDO_GID:-$(id -g)}"; '
             'if [ "$(id -u)" -eq 0 ]; then '
             f"install -d -o root -g \"$group\" -m 0775 {quoted_cache} || exit 5; "
             "elif command -v sudo >/dev/null 2>&1 && "
@@ -452,7 +455,10 @@ def seal_ram_cache_command() -> str:
         f"sudo -n find {cache} -type d -exec chmod 0775 {{}} +"
     )
     return (
-        'group="$(id -g)"; '
+        # id -g is 0 when this fragment runs as root, which would make the
+        # cache root:root and lock out the user it exists to serve.
+        # SUDO_GID carries the invoking user's group through sudo.
+        'group="${SUDO_GID:-$(id -g)}"; '
         'if [ "$(id -u)" -eq 0 ]; then '
         f"{protect_direct}; "
         "elif command -v sudo >/dev/null 2>&1 && "
@@ -478,7 +484,7 @@ def unseal_ram_cache_command() -> str:
     restore_direct = f'chown -R "$owner":"$group" -- {cache}'
     restore_sudo = f'sudo -n chown -R "$owner":"$group" -- {cache}'
     return (
-        'owner="$(id -u)"; group="$(id -g)"; '
+        'owner="${SUDO_UID:-$(id -u)}"; group="${SUDO_GID:-$(id -g)}"; '
         f"if [ ! -d {cache} ]; then exit 0; fi; "
         'if [ "$(id -u)" -eq 0 ]; then '
         f"{restore_direct}; "
