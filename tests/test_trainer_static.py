@@ -17,7 +17,7 @@ from unittest.mock import patch
 import numpy as np
 
 
-TRAINER_PATH = Path(__file__).parents[1] / "submissions" / "reference" / "train.py"
+TRAINER_PATH = Path(__file__).parents[1] / "recipes" / "reference" / "train.py"
 SPEC = importlib.util.spec_from_file_location("reference_train", TRAINER_PATH)
 if SPEC is None or SPEC.loader is None:  # pragma: no cover - importlib invariant
     raise RuntimeError(f"could not import {TRAINER_PATH}")

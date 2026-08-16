@@ -22,7 +22,7 @@ from .harness import (
     load_records,
     rank_records,
     render_leaderboard,
-    run_submission,
+    run_recipe,
     verify_run,
 )
 from .harness.cluster import (
@@ -208,10 +208,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = commands.add_parser(
         "run",
-        help="execute, validate, and record one submission",
+        help="execute, validate, and record one recipe",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    run.add_argument("submission", help="folder name beneath submissions/")
+    run.add_argument("recipe", help="folder name beneath recipes/")
     run.add_argument("--track", choices=_TRACKS)
     run.add_argument("--profile", choices=_PROFILES)
     run.add_argument("--tier", choices=_TIERS, default="125m")
@@ -256,11 +256,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     profile = commands.add_parser(
         "profile",
-        help="capture a bounded XProf trace from a distributed submission",
+        help="capture a bounded XProf trace from a distributed recipe",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     profile.add_argument(
-        "submission", nargs="?", default="reference", help="folder name beneath submissions/"
+        "recipe", nargs="?", default="reference", help="folder name beneath recipes/"
     )
     profile.add_argument("--profile", choices=_PROFILES, help="saved profile override")
     profile.add_argument("--tier", choices=_TIERS, default="125m")
@@ -283,7 +283,7 @@ def build_parser() -> argparse.ArgumentParser:
     leaderboard.add_argument("--track", choices=_TRACKS)
     leaderboard.add_argument("--profile", choices=_PROFILES, default="official")
     leaderboard.add_argument("--target-loss", type=_nonnegative_float)
-    leaderboard.add_argument("--all-submissions", action="store_true")
+    leaderboard.add_argument("--all-recipes", action="store_true")
     leaderboard.add_argument("--color", choices=_COLORS)
 
     report = commands.add_parser(
@@ -311,7 +311,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum embedded points per run and scalar series",
     )
 
-    clone = commands.add_parser("clone", help="clone one submission into a new algorithm folder")
+    clone = commands.add_parser("clone", help="clone one recipe into a new algorithm folder")
     clone.add_argument("source", nargs="?", default="reference")
     clone.add_argument("name")
 
@@ -692,10 +692,10 @@ def command_run(args: argparse.Namespace) -> int:
         else None
     )
     style.banner(f"run / {track} / {profile}")
-    outcome = run_submission(
+    outcome = run_recipe(
         RunConfig(
             repo_root=root,
-            submission=args.submission,
+            recipe=args.recipe,
             name=run_name,
             runs_dir=artifacts,
             records_path=artifacts / "records.jsonl",
@@ -777,22 +777,22 @@ def command_profile(args: argparse.Namespace) -> int:
     if args.xprof_start_step + args.xprof_steps - 1 > args.steps:
         raise ConfigError("the XProf capture window must fit inside --steps")
 
-    if not _NAME.fullmatch(args.submission):
+    if not _NAME.fullmatch(args.recipe):
         raise ConfigError(
-            "submission names may contain only letters, digits, '.', '_' and '-'"
+            "recipe names may contain only letters, digits, '.', '_' and '-'"
         )
-    submissions_root = (root / "submissions").resolve()
-    submission_dir = (submissions_root / args.submission).resolve()
+    recipes_root = (root / "recipes").resolve()
+    recipe_dir = (recipes_root / args.recipe).resolve()
     try:
-        submission_dir.relative_to(submissions_root)
+        recipe_dir.relative_to(recipes_root)
     except ValueError as exc:
-        raise ConfigError("submission path escapes submissions directory") from exc
-    trainer = submission_dir / "train.py"
-    experiment_config = submission_dir / "config.yaml"
+        raise ConfigError("recipe path escapes recipes directory") from exc
+    trainer = recipe_dir / "train.py"
+    experiment_config = recipe_dir / "config.yaml"
     if not trainer.is_file() or trainer.is_symlink():
-        raise ConfigError(f"submission entry script not found: {trainer}")
+        raise ConfigError(f"recipe entry script not found: {trainer}")
     if not experiment_config.is_file() or experiment_config.is_symlink():
-        raise ConfigError(f"submission configuration file not found: {experiment_config}")
+        raise ConfigError(f"recipe configuration file not found: {experiment_config}")
 
     configured_data_path = str(args.data_path or config.data_path)
     if config.tpu_vm_count > 1:
@@ -865,7 +865,7 @@ def command_profile(args: argparse.Namespace) -> int:
         )
     )
 
-    style.banner(f"profile / {args.submission} / {profile}")
+    style.banner(f"profile / {args.recipe} / {profile}")
     if config.tpu_vm_count > 1:
         inventory = _probe_configured_cluster(config)
         style.note(
@@ -889,7 +889,7 @@ def command_profile(args: argparse.Namespace) -> int:
             f"{key}={shlex.quote(value)}" for key, value in remote_environment.items()
         )
         remote = (
-            f"cd {shlex.quote(str(submission_dir))} && "
+            f"cd {shlex.quote(str(recipe_dir))} && "
             f"env {assignments} {shlex.join(trainer_command)}"
         )
         run_pdsh(
@@ -905,7 +905,7 @@ def command_profile(args: argparse.Namespace) -> int:
         try:
             completed = subprocess.run(
                 trainer_command,
-                cwd=submission_dir,
+                cwd=recipe_dir,
                 check=False,
                 timeout=float(args.timeout),
             )
@@ -1037,7 +1037,7 @@ def command_leaderboard(args: argparse.Namespace) -> int:
         track=track,
         profile=args.profile,
         target_loss=target_loss,
-        best_per_submission=not args.all_submissions,
+        best_per_recipe=not args.all_recipes,
     )
     style = Style(args.color or config.color)
     print(f"target validation loss ≤ {target_loss:.4f}\n")
@@ -1071,15 +1071,15 @@ def command_report(args: argparse.Namespace) -> int:
 
 def command_clone(args: argparse.Namespace) -> int:
     if not _NAME.fullmatch(args.source) or not _NAME.fullmatch(args.name):
-        raise ConfigError("submission names may contain only letters, digits, '.', '_' and '-'")
+        raise ConfigError("recipe names may contain only letters, digits, '.', '_' and '-'")
     root = repo_root()
-    source = root / "submissions" / args.source
-    destination = root / "submissions" / args.name
+    source = root / "recipes" / args.source
+    destination = root / "recipes" / args.name
     if not (source / "train.py").is_file():
-        raise ConfigError(f"source submission does not exist: {source}")
+        raise ConfigError(f"source recipe does not exist: {source}")
     source_config = source / "config.yaml"
     if not source_config.is_file() or source_config.is_symlink():
-        raise ConfigError(f"source submission configuration does not exist: {source_config}")
+        raise ConfigError(f"source recipe configuration does not exist: {source_config}")
     if destination.exists():
         raise ConfigError(f"destination already exists: {destination}")
     destination.mkdir(parents=True)

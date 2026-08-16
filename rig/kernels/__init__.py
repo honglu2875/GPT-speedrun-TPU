@@ -1,4 +1,4 @@
-"""Reusable JAX kernels shared by rig submissions.
+"""Reusable JAX kernels shared by rig recipes.
 
 The competition still keeps the model/training algorithm in one entry script;
 these kernels are deliberately limited to fundamental, shape-generic building

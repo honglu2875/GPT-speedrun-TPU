@@ -1,4 +1,4 @@
-"""Submission process lifecycle and immutable record construction."""
+"""Recipe process lifecycle and immutable record construction."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from .cluster import (
     pdsh_environment,
     terminate_distributed_workers,
 )
-from .errors import ConfigurationError, ResultValidationError, SubmissionError
+from .errors import ConfigurationError, RecipeError, ResultValidationError
 from .models import Evaluator, RunConfig, RunOutcome
 from .records import append_record
 from .validation import (
@@ -37,7 +37,7 @@ from .validation import (
 )
 
 
-_SUBMISSION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_RECIPE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _RESERVED_PASSTHROUGH_FLAGS = (
     "--config",
@@ -48,29 +48,29 @@ _RESERVED_PASSTHROUGH_FLAGS = (
 )
 
 
-def run_submission(config: RunConfig, *, evaluator: Evaluator | None = None) -> RunOutcome:
-    """Run, validate, record, and apply checkpoint retention for one submission.
+def run_recipe(config: RunConfig, *, evaluator: Evaluator | None = None) -> RunOutcome:
+    """Run, validate, record, and apply checkpoint retention for one recipe.
 
     This is process isolation for accidental mistakes, not a security sandbox. A
-    submission is trusted local Python code and can access the invoking user's data.
+    recipe is trusted local Python code and can access the invoking user's data.
     """
 
     checked = _validate_config(config)
     (
         repo_root,
-        submission_dir,
-        submission_config,
+        recipe_dir,
+        recipe_config,
         runs_dir,
         records_path,
         configured_provenance,
     ) = checked
     provenance = _collect_provenance(
         repo_root,
-        submission_dir / "train.py",
-        submission_config,
+        recipe_dir / "train.py",
+        recipe_config,
         configured_provenance,
     )
-    run_id = _new_run_id(config.submission, config.name)
+    run_id = _new_run_id(config.recipe, config.name)
     run_dir = runs_dir / run_id
     run_dir.mkdir(parents=False, exist_ok=False)
     stdout_path = run_dir / "stdout.log"
@@ -79,9 +79,9 @@ def run_submission(config: RunConfig, *, evaluator: Evaluator | None = None) -> 
 
     trainer_command = [
         config.python_executable or sys.executable,
-        str(submission_dir / "train.py"),
+        str(recipe_dir / "train.py"),
         "--config",
-        str(submission_config),
+        str(recipe_config),
         "--output-dir",
         str(run_dir),
         "--seed",
@@ -102,7 +102,7 @@ def run_submission(config: RunConfig, *, evaluator: Evaluator | None = None) -> 
         "RIG_PROFILE": config.profile,
         # Every attempt receives a fresh persistent cache. This keeps cold
         # compilation reproducible and prevents run order from advantaging
-        # later submissions.
+        # later recipes.
         "JAX_COMPILATION_CACHE_DIR": str(run_dir / ".jax_cache"),
         "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",
         "PYTHONUNBUFFERED": "1",
@@ -125,7 +125,7 @@ def run_submission(config: RunConfig, *, evaluator: Evaluator | None = None) -> 
         command = build_distributed_launch_command(
             host_expression=config.tpu_vm_hosts,
             host_count=config.tpu_vm_count,
-            cwd=submission_dir,
+            cwd=recipe_dir,
             command=trainer_command,
             environment=remote_environment,
         )
@@ -156,7 +156,7 @@ def run_submission(config: RunConfig, *, evaluator: Evaluator | None = None) -> 
         with stdout_path.open("wb") as stdout_handle, stderr_path.open("wb") as stderr_handle:
             return_code, timed_out = _run_process(
                 command,
-                cwd=submission_dir,
+                cwd=recipe_dir,
                 environment=environment,
                 stdout_handle=stdout_handle,
                 stderr_handle=stderr_handle,
@@ -174,14 +174,14 @@ def run_submission(config: RunConfig, *, evaluator: Evaluator | None = None) -> 
     stdout_text = stdout_path.read_text(encoding="utf-8", errors="replace")
     stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
     if timed_out:
-        raise SubmissionError(
-            f"submission timed out after {config.timeout_seconds:g}s; logs: {run_dir}"
+        raise RecipeError(
+            f"recipe timed out after {config.timeout_seconds:g}s; logs: {run_dir}"
         )
     if return_code != 0:
         tail = _tail(stderr_text)
         detail = f" ({tail})" if tail else ""
-        raise SubmissionError(
-            f"submission exited with status {return_code}{detail}; logs: {run_dir}"
+        raise RecipeError(
+            f"recipe exited with status {return_code}{detail}; logs: {run_dir}"
         )
 
     payload = parse_result_line(stdout_text)
@@ -225,7 +225,7 @@ def run_submission(config: RunConfig, *, evaluator: Evaluator | None = None) -> 
         "run_id": run_id,
         "status": "ok",
         "qualified": qualified,
-        "submission": config.submission,
+        "recipe": config.recipe,
         "name": config.name,
         "track": config.track,
         "profile": config.profile,
@@ -476,9 +476,9 @@ def _validate_official_system(value: Any, *, expected_process_count: int = 1) ->
 def _validate_config(
     config: RunConfig,
 ) -> tuple[Path, Path, Path, Path, Path, dict[str, Any]]:
-    if not _SUBMISSION_NAME.fullmatch(config.submission):
+    if not _RECIPE_NAME.fullmatch(config.recipe):
         raise ConfigurationError(
-            "submission must be a simple name containing only letters, digits, '.', '_' or '-'"
+            "recipe must be a simple name containing only letters, digits, '.', '_' or '-'"
         )
     if not _PROFILE_NAME.fullmatch(config.profile):
         raise ConfigurationError("profile must be a non-empty simple name")
@@ -534,19 +534,19 @@ def _validate_config(
     repo_root = config.repo_root.resolve()
     if not repo_root.is_dir():
         raise ConfigurationError(f"repository root does not exist: {repo_root}")
-    submissions_root = (repo_root / "submissions").resolve()
-    submission_dir = (submissions_root / config.submission).resolve()
+    recipes_root = (repo_root / "recipes").resolve()
+    recipe_dir = (recipes_root / config.recipe).resolve()
     try:
-        submission_dir.relative_to(submissions_root)
+        recipe_dir.relative_to(recipes_root)
     except ValueError as exc:  # defensive in addition to name regex
-        raise ConfigurationError("submission path escapes submissions directory") from exc
-    trainer = submission_dir / "train.py"
+        raise ConfigurationError("recipe path escapes recipes directory") from exc
+    trainer = recipe_dir / "train.py"
     if not trainer.is_file() or trainer.is_symlink():
-        raise ConfigurationError(f"submission entry script not found: {trainer}")
-    submission_config = submission_dir / "config.yaml"
-    if not submission_config.is_file() or submission_config.is_symlink():
+        raise ConfigurationError(f"recipe entry script not found: {trainer}")
+    recipe_config = recipe_dir / "config.yaml"
+    if not recipe_config.is_file() or recipe_config.is_symlink():
         raise ConfigurationError(
-            f"submission configuration file not found: {submission_config}"
+            f"recipe configuration file not found: {recipe_config}"
         )
 
     runs_dir = _resolve_managed_path(repo_root, config.runs_dir, "runs_dir", directory=True)
@@ -590,8 +590,8 @@ def _validate_config(
         raise ConfigurationError(str(exc)) from exc
     return (
         repo_root,
-        submission_dir,
-        submission_config,
+        recipe_dir,
+        recipe_config,
         runs_dir,
         records_path,
         configured_provenance,
@@ -616,7 +616,7 @@ def _copy_finite_mapping(value: Any, label: str) -> dict[str, Any]:
 def _collect_provenance(
     repo_root: Path,
     trainer: Path,
-    submission_config: Path,
+    recipe_config: Path,
     configured: Mapping[str, Any],
 ) -> dict[str, Any]:
     owned_keys = {"train_py", "config_yaml", "shared_python", "uv_lock", "git"}
@@ -629,7 +629,7 @@ def _collect_provenance(
     provenance: dict[str, Any] = {
         **dict(configured),
         "train_py": _file_provenance(repo_root, trainer),
-        "config_yaml": _file_provenance(repo_root, submission_config),
+        "config_yaml": _file_provenance(repo_root, recipe_config),
         "shared_python": _python_tree_provenance(repo_root),
         "uv_lock": None,
         "git": _git_provenance(repo_root),
@@ -740,7 +740,7 @@ def _discard_compilation_cache(cache_path: Path) -> None:
         elif cache_path.is_dir():
             shutil.rmtree(cache_path)
     except OSError:
-        # Cache cleanup must not replace the real submission outcome. The run
+        # Cache cleanup must not replace the real recipe outcome. The run
         # directory remains available for manual cleanup if the filesystem refuses.
         pass
 
@@ -759,11 +759,11 @@ def _resolve_managed_path(
     return resolved
 
 
-def _new_run_id(submission: str, name: str = "") -> str:
+def _new_run_id(recipe: str, name: str = "") -> str:
     """Compose a sortable, unique, and -- when named -- readable run directory."""
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-    parts = [timestamp, submission]
+    parts = [timestamp, recipe]
     if name:
         parts.append(name)
     parts.append(secrets.token_hex(4))

@@ -4,7 +4,7 @@ This benchmark asks a deliberately simple question: how quickly, or with how
 few training tokens, can a single-entry JAX trainer reach the target loss on a
 declared Cloud TPU v4 slice?
 
-The project is collaborative. Submissions are short enough to review by hand;
+The project is collaborative. Recipes are short enough to review by hand;
 the harness is intended to make honest experiments reproducible, not to be a
 security boundary.
 
@@ -50,7 +50,7 @@ official runs use approximately **20 tokens per parameter**, rounded to a
 complete global step. Architecture, optimizer, schedule, precision, batch size,
 sequence length, sharding, kernels, data order, and other systems choices may
 change, but comparisons and candidate-admission trends must use matching tier,
-token horizon, and dataset identity. A submission must train from its declared
+token horizon, and dataset identity. A recipe must train from its declared
 initialization during the run and may use only the selected immutable training
 split.
 
@@ -80,16 +80,16 @@ untimed synthetic compilation warm-up do not count.
 
 ## Timing
 
-Submissions may compile every static training shape on synthetic data before
+Recipes may compile every static training shape on synthetic data before
 the timed region. Warm-up must use disposable model and optimizer state and may
 not inspect real training or validation tokens.
 
-Immediately before timing, the submission restores its declared initial state
+Immediately before timing, the recipe restores its declared initial state
 and random generator. The timed region covers every real training step and its
 input transfer. It ends only after the final device result has been synchronized
 with the host (for example, using `jax.block_until_ready`). Any periodic
 validation performed between optimizer steps is part of the timed region;
-submissions must synchronize the preceding training work before timing such a
+recipes must synchronize the preceding training work before timing such a
 probe. The canonical final evaluation and checkpoint serialization follow
 outside the timed region.
 
@@ -106,14 +106,14 @@ Reports include both synchronized training time and cold process wall time.
 XProf captures are separate diagnostic runs: profiling starts only after
 compilation and synchronization, and no profiled timing enters the leaderboard.
 
-## Submission shape
+## Recipe shape
 
 Each algorithm is a directory containing the same entry and configuration
 filenames:
 
 ```text
-submissions/<algorithm>/train.py
-submissions/<algorithm>/config.yaml
+recipes/<algorithm>/train.py
+recipes/<algorithm>/config.yaml
 ```
 
 A schema-2 candidate directory defines a family, not one isolated shape. Its
@@ -164,9 +164,9 @@ manifest hashes, selected shard names, seed, device/runtime information,
 captured output, checkpoint hash, and declared metrics.
 
 The version-one harness validates result structure, identities, finite metrics,
-artifact containment, and hashes. It does not yet reload arbitrary submission
+artifact containment, and hashes. It does not yet reload arbitrary recipe
 checkpoints or independently recompute loss; qualification is therefore
-provisional and based on the submission's deterministic evaluation. Human
+provisional and based on the recipe's deterministic evaluation. Human
 review checks the entry-file evaluator and can rerun the captured command before
 accepting a record. A future checkpoint-evaluator protocol can promote this to
 automatic independent validation without changing the two scores.

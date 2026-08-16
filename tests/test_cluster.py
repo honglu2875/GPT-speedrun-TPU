@@ -143,14 +143,14 @@ class ClusterTests(unittest.TestCase):
             command = build_distributed_launch_command(
                 host_expression="slice-w-[0-3]",
                 host_count=4,
-                cwd=Path("/repo with space/submissions/reference"),
+                cwd=Path("/repo with space/recipes/reference"),
                 command=("/repo with space/.venv/bin/python", "train.py", "--seed", "7"),
                 environment={"SAFE_VALUE": "value with space", "RANK_COUNT": "4"},
             )
 
         self.assertEqual(command[:8], ["pdsh", "-S", "-R", "ssh", "-f", "4", "-w", "slice-w-[0-3]"])
         self.assertEqual(command[8], "-N")
-        self.assertIn("cd '/repo with space/submissions/reference'", command[-1])
+        self.assertIn("cd '/repo with space/recipes/reference'", command[-1])
         self.assertIn("SAFE_VALUE='value with space'", command[-1])
         self.assertIn("'/repo with space/.venv/bin/python'", command[-1])
 
@@ -164,7 +164,7 @@ class ClusterTests(unittest.TestCase):
                 host_expression="slice-w-[0-3]",
                 host_count=4,
                 executable=Path("/repo/.venv/bin/python3"),
-                script=Path("/repo/submissions/candidate/train.py"),
+                script=Path("/repo/recipes/candidate/train.py"),
                 output_dir=Path("/repo/runs/run-123"),
             )
 

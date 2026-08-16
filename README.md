@@ -1,19 +1,19 @@
 # GPT TPU Rig
 
-A collaborative GPT pretraining rig for Cloud TPU slices, from a single host to
+A simple GPT pretraining rig for Cloud TPU slices, from a single host to
 larger multi-host v4 and v5e slices. Every algorithm is a polished JAX entry program named
 `train.py`, with a sibling `config.yaml`; shared code handles
 reproducible data, machine checks, run capture, protocol validation, and
 leaderboards.
 
-This is intentionally a checkout-based benchmark, not a relocatable Python
-library: manifests, submissions, Git state, and persistent run records are all
-repository resources. Run the commands from a cloned checkout (they remain
-independent of the caller's current directory after installation by `uv sync`).
+Just copy the `recipes/reference` and start hacking.
 
-The initial goal is a mean next-token validation loss at or below **3.28** on
-the fixed GPT-2-tokenized FineWeb validation prefix. We retain the complete
-metrics needed to push the target lower after calibrating this hardware.
+This is largely inspired by nano-GPT speedrun. The baseline is a GPT-2 with slightly modernized architecture choices (RoPE, GELU, etc).
+To ensure hyperparameter transfer, I also let Codex implemented [CompleteP](https://arxiv.org/html/2505.01618) which is an extension of muP by two additional aspects that completes the training recipe:
+1. Depth scaling for pre-LN transformer (using α=1 for L^{-α}). c.f. [1]
+2. AdamW ϵ, weight decay, residual block, embeddings.
+
+I did successfully observe the optimal learning-rate on the 60M, 125M, 250M ladder with 5 token-per-parameter (TPP). I cannot try 20 TPP or higher ladders because of compute. The compute I used is a v4-32 multi-slice VM from Google TPU Research Cloud (TRC) program.
 
 ## Start here
 
@@ -31,11 +31,11 @@ make report
 
 | Target | Purpose |
 |---|---|
-| `make check` | run every CPU-only check: tests, CLI surface, submission parsing, report build |
+| `make check` | run every CPU-only check: tests, CLI surface, recipe parsing, report build |
 | `make prepare` | synchronize the frozen uv environment, then open the interactive setup wizard |
 | `make run` | verify every configured TPU VM and its data, then run the 125M reference tier using the saved profile |
 | `make baseline` | compatibility alias for `make run` |
-| `make run TARGET=name TIER=250m` | run one tier from the model family in `submissions/name/` |
+| `make run TARGET=name TIER=250m` | run one tier from the model family in `recipes/name/` |
 | `make profile` | run a distributed, validation-free 100-step diagnostic, capture worker 0 steps 11–20, then serve XProf on port 8791 |
 | `make report` | integrity-check completed runs and rebuild the standalone `report.html` dashboard |
 
@@ -69,7 +69,7 @@ tightened explicitly.
 
 `make run` requires that saved file to contain a default profile; otherwise it
 stops and asks for `make prepare`. `TARGET` defaults to `reference`. A custom
-target must be a folder beneath `submissions/` containing regular, non-symlink
+target must be a folder beneath `recipes/` containing regular, non-symlink
 `train.py` and `config.yaml` files. New candidates use schema 2 family configs
 with 60M, 125M, 250M, 500M, and 1B tiers; `TIER` defaults to `125m`.
 
@@ -198,7 +198,7 @@ make run
 # Select another size tier
 make run TIER=250m
 
-# Run a variant from submissions/dense_control/train.py
+# Run a variant from recipes/dense_control/train.py
 make run TARGET=dense_control TIER=125m
 
 # Fast end-to-end check
@@ -278,7 +278,7 @@ like-for-like hardware comparison with the original v4-8 number.
 
 ### TPU kernel baseline
 
-The reference [`config.yaml`](submissions/reference/config.yaml) pins the custom
+The reference [`config.yaml`](recipes/reference/config.yaml) pins the custom
 trainable Pallas attention with the memory-bounded tiled output loss. It also
 preserves the family shapes, Complete(d)P contract, objective, schedule,
 validation cadence, and TPP rule beside
@@ -289,7 +289,7 @@ change in a long launch command:
 
 ```bash
 uv run --frozen --no-sync rig clone reference dense_control
-# edit submissions/dense_control/config.yaml
+# edit recipes/dense_control/config.yaml
 uv run --frozen --no-sync rig run dense_control --profile official
 ```
 
@@ -416,8 +416,8 @@ uv run --frozen --no-sync rig leaderboard --track sample_efficiency
 Every entry has the same two-file path contract:
 
 ```text
-submissions/<algorithm>/train.py
-submissions/<algorithm>/config.yaml
+recipes/<algorithm>/train.py
+recipes/<algorithm>/config.yaml
 ```
 
 Clone the current reference without overwriting anything:
@@ -464,9 +464,12 @@ data/manifests/          pinned datasets and hashes
 rig/                     CLI, wizard, doctor, data preparation, report
 rig/harness/             execution, result protocol, records, scoring
 rig/kernels/             shared TPU attention, loss, and autotuning primitives
-submissions/reference/   JAX entry trainer + versioned experiment config
+recipes/reference/       JAX entry trainer + versioned experiment config
 tests/                   CPU-only infrastructure tests
 runs/                    gitignored persistent run artifacts
 ```
 
 The project is licensed under Apache-2.0.
+
+[1] Bordelon, B., Chaudhry, H., & Pehlevan, C. (2024). Infinite Limits of Multi-head Transformer Dynamics. In *Advances in Neural Information Processing Systems 37 (NeurIPS 2024)*. arXiv:2405.15712.
+

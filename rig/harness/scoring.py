@@ -16,7 +16,7 @@ def rank_records(
     track: str,
     profile: str | None = None,
     target_loss: float | None = None,
-    best_per_submission: bool = True,
+    best_per_recipe: bool = True,
 ) -> list[dict[str, Any]]:
     """Rank qualifying, comparable records using the track's canonical score."""
 
@@ -53,14 +53,14 @@ def rank_records(
         return (seconds, record["run_id"])
 
     candidates.sort(key=key)
-    if best_per_submission:
+    if best_per_recipe:
         seen: set[str] = set()
         unique: list[dict[str, Any]] = []
         for record in candidates:
-            submission = str(record.get("submission", ""))
-            if submission in seen:
+            recipe = str(record.get("recipe", ""))
+            if recipe in seen:
                 continue
-            seen.add(submission)
+            seen.add(recipe)
             unique.append(record)
         candidates = unique
     for rank, record in enumerate(candidates, 1):
@@ -73,14 +73,14 @@ def render_leaderboard(
 ) -> str:
     """Return a compact terminal table; callers decide whether ANSI is suitable."""
 
-    headers = ["#", "submission", "time", "tokens", "val loss", "run"]
+    headers = ["#", "recipe", "time", "tokens", "val loss", "run"]
     rows: list[list[str]] = []
     for position, record in enumerate(records, 1):
         metrics = record.get("metrics", {})
         rows.append(
             [
                 str(record.get("rank", position)),
-                str(record.get("submission", "?")),
+                str(record.get("recipe", "?")),
                 _seconds(metrics.get("train_seconds")),
                 _integer(metrics.get("tokens_processed")),
                 _loss(metrics.get("validation_loss")),

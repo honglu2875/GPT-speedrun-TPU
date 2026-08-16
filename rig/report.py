@@ -1008,10 +1008,10 @@ def _report_payload(
         evaluation = result.get("evaluations", {})
         fresh = evaluation.get("fresh10") if isinstance(evaluation, dict) else None
         fresh_loss = fresh.get("macro_loss") if isinstance(fresh, dict) else None
-        submission = (
-            run.record.get("submission")
-            if isinstance(run.record, dict) and isinstance(run.record.get("submission"), str)
-            else _submission_from_run_id(run.run_id)
+        recipe = (
+            run.record.get("recipe")
+            if isinstance(run.record, dict) and isinstance(run.record.get("recipe"), str)
+            else _recipe_from_run_id(run.run_id)
         )
         _, classification = _default_run_selection(str(result["profile"]))
         qualified = run.record.get("qualified") if run.record else None
@@ -1020,8 +1020,8 @@ def _report_payload(
         run_rows.append(
             {
                 "id": run.run_id,
-                "submission": submission,
-                "label": f"{submission} · {result['profile']} · {run.run_id[:15]}",
+                "recipe": recipe,
+                "label": f"{recipe} · {result['profile']} · {run.run_id[:15]}",
                 "track": result["track"],
                 "profile": result["profile"],
                 "classification": classification,
@@ -1556,8 +1556,8 @@ def _humanize(value: str) -> str:
     return value.replace("_", " ").replace("-", " ").strip().title()
 
 
-def _submission_from_run_id(run_id: str) -> str:
-    # Run IDs are timestamp-submission-random.  This is display-only; the ledger is
+def _recipe_from_run_id(run_id: str) -> str:
+    # Run IDs are timestamp-recipe-random.  This is display-only; the ledger is
     # authoritative whenever it exists.
     match = re.match(r"^\d{8}T\d{6}\.\d+Z-(.+)-[0-9a-f]{8}$", run_id)
     return match.group(1) if match else run_id

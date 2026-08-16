@@ -564,7 +564,7 @@ def terminate_distributed_workers(
     Killing the local ``pdsh`` process group is insufficient when an SSH channel
     disappears while TPU execution is inside XLA: the remote Python processes
     can survive as orphans. Match the immutable executable, trainer path, and
-    run directory so cleanup cannot affect another submission or run.
+    run directory so cleanup cannot affect another recipe or run.
     """
 
     if host_count <= 1:
