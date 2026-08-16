@@ -52,18 +52,29 @@ class Run:
 
 def load_runs(roots: list[Path]) -> list[Run]:
     found: list[Run] = []
-    seen: set[str] = set()
+    # Keyed by configuration, not directory: a re-run of the same cell (a
+    # validation probe, say) is the same measurement and must not be averaged
+    # in twice.
+    seen: set[tuple[str, int, int, int]] = set()
     for root in roots:
         if not root.exists():
             continue
         for directory in sorted(root.glob("2026*")):
             metrics = directory / "metrics.json"
-            if not metrics.exists() or directory.name in seen:
+            if not metrics.exists():
                 continue
             match = re.search(r"(\d+m)-bs(\d+)-lr2e-(\d+)-s(\d+)", directory.name)
             if not match:
                 continue
-            seen.add(directory.name)
+            key = (
+                match.group(1),
+                int(match.group(2)),
+                -int(match.group(3)),
+                int(match.group(4)),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
             m = json.loads(metrics.read_text())["metrics"]
             found.append(
                 Run(

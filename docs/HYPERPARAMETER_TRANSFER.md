@@ -118,7 +118,7 @@ single v3 seed was unrepresentative for an identifiable reason.
 
 ## Study 2 — batch size x learning rate
 
-Full grid, three seeds per cell, 123 runs.
+Full grid, three seeds per cell, 135 runs.
 
 **What "the LR optimum does not move" means here.** The runtime already applies
 `sqrt(m_B / m_D)`, so holding the base LR fixed *is* a `sqrt(batch)` schedule on
@@ -163,18 +163,41 @@ collapse above 128 is significant.
 
 bs64 vs bs128 t=+9.22 separated · bs128 vs bs256 t=−7.06 separated.
 
-### 250M — 4 batches x 2 LRs
+### 250M — 4 batches × 3 LRs
 
-| batch | steps | 2^-7 | 2^-8 |
-|---|--:|--:|--:|
-| 64 | 18,650 | 3.4872 | **3.4831** |
-| 128 | 9,325 | 3.4437 | **3.4299** |
-| 256 | 4,662 | 3.4897 | **3.4457** |
-| 512 | 2,331 | — | **3.4895** |
+| batch | steps | 2^-7 | 2^-8 | 2^-9 |
+|---|--:|--:|--:|--:|
+| 64 | 18,650 | 3.4872 | **3.4831** | 3.5113 |
+| 128 | 9,325 | 3.4437 | **3.4299** | *3.4740* |
+| 256 | 4,662 | 3.4897 | **3.4457** | 3.5099 |
+| 512 | 2,331 | 3.6029 | **3.4895** | 3.5631 |
 
-bs64 vs bs128 t=+9.41 separated · bs128 vs bs256 t=−2.89 separated · bs256 vs
-bs512 t=−34.62 separated. `2^-7` vs `2^-8` at bs128: t=+0.71, **not
+*Italic* is Study 1's measurement, included because those runs reproduce
+bit-identically (see [Reproducibility](#reproducibility)) and are therefore the
+same experiment, not a comparable one.
+
+`2^-8` wins at every batch and every optimum is now bracketed on both sides:
+`2^-9` is worse by t=+12.3 / +56.0 / +60.8 at bs64 / bs256 / bs512. Across
+batches, bs64 vs bs128 t=+9.41 · bs128 vs bs256 t=−2.89 · bs256 vs bs512
+t=−34.62, all separated. `2^-7` vs `2^-8` at bs128 remains t=+0.71, **not
 separated** — independently reproducing Study 1's finding.
+
+### Learning rate gets less forgiving as batch grows
+
+The cost of being one octave off the optimum, at 250M:
+
+| batch | 2^-8 | +1 octave | −1 octave | worst |
+|---|--:|--:|--:|--:|
+| 64 | 3.4831 | +0.0041 | +0.0282 | **+0.028** |
+| 128 | 3.4299 | +0.0139 | +0.0441 | **+0.044** |
+| 256 | 3.4457 | +0.0440 | +0.0642 | **+0.064** |
+| 512 | 3.4895 | +0.1134 | +0.0735 | **+0.113** |
+
+A 4× increase from batch 64 to 512, monotonic. This runs *opposite* to the
+batch-size penalty, which shrinks with model scale. Both optima transfer, but
+tuning the learning rate matters more at large batch while tuning the batch
+matters less at large model. The practical consequence: adopting a larger batch
+to buy wall clock also narrows the LR window it has to be paired with.
 
 ### The optimum transfers; the penalty for missing it does not
 
@@ -230,8 +253,9 @@ initialization and data order, not run-to-run nondeterminism.
   to carry the base LR to other horizons; that was not measured. The batch
   result is especially horizon-bound — at 20 TPP every batch gets 4x the steps,
   and the large-batch collapse should move.
-- **250M's LR is a two-point row.** Study 2 measured only `2^-7` and `2^-8` at
-  250M, so its LR optimum is bracketed only by Study 1.
+- **250M's `2^-6` shoulder is untested in Study 2.** The optimum is bracketed
+  by `2^-7` and `2^-9` at every batch, but the far upper shoulder rests on
+  Study 1's batch-128 measurement alone.
 - **60M's lower edge is unresolved.** {32, 64, 128} are not separated there, so
   "batch 128 at 60M" is a plateau statement.
 - **Batch below 32 and above 512 untested**, as is batch 512 at 125M.
