@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, replace
+import csv
 import hashlib
 import importlib.util
+import inspect
 from io import StringIO
 import json
 import math
@@ -1320,3 +1322,108 @@ class TrainerStaticTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SalvageTests(unittest.TestCase):
+    """Partial artifacts for jobs that never reach their final write."""
+
+    def _config(self, steps: int = 200):
+        parser = trainer.build_parser()
+        return trainer.resolve_config(
+            parser.parse_args(["--profile", "dev", "--steps", str(steps)]),
+            "tpu",
+            50_304,
+        )
+
+    def _meta(self):
+        return [("embeddings", None, 100), ("block", 0, 200), ("final norm", None, 50)]
+
+    def _point(self, step: int):
+        shape = (
+            len(self._meta()),
+            len(trainer._DIAGNOSTIC_FAMILIES),
+            len(trainer._DIAGNOSTIC_STATS),
+        )
+        return trainer.DiagnosticPoint(
+            step, np.full(shape, step / 1000.0, dtype=np.float32)
+        )
+
+    def test_device_residency_is_bounded_by_a_constant(self) -> None:
+        # Without a cap the capture list grows with the run: one small device
+        # allocation per capture, all live until the loop ends.
+        self.assertIsInstance(trainer.DIAGNOSTIC_FLUSH_POINTS, int)
+        self.assertGreater(trainer.DIAGNOSTIC_FLUSH_POINTS, 0)
+        source = inspect.getsource(trainer.run)
+        self.assertIn(
+            "len(diagnostic_device_points) >= DIAGNOSTIC_FLUSH_POINTS", source
+        )
+        self.assertIn("diagnostic_device_points.clear()", source)
+
+    def test_flushed_points_still_reach_the_authoritative_file(self) -> None:
+        # Assembling the final tuple from the device list alone would truncate
+        # the file to whatever had not yet been flushed.
+        source = inspect.getsource(trainer.run)
+        assembly = source[source.index("diagnostic_points = tuple(") :]
+        self.assertIn("diagnostic_points_host", assembly[:400])
+
+    def test_partial_rows_match_the_authoritative_layout(self) -> None:
+        config, meta = self._config(), self._meta()
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            trainer.append_diagnostic_rows(
+                out, [self._point(s) for s in (10, 20)], meta, config, 341_312_256
+            )
+            partial = list(csv.DictReader((out / "diagnostics.csv").open()))
+            trainer.write_diagnostics_csv(
+                out,
+                [self._point(s) for s in range(10, 201, 10)],
+                meta,
+                config,
+                341_312_256,
+            )
+            complete = list(csv.DictReader((out / "diagnostics.csv").open()))
+        self.assertEqual(list(partial[0]), list(complete[0]))
+        cells = len(meta) * len(trainer._DIAGNOSTIC_FAMILIES) * len(
+            trainer._DIAGNOSTIC_STATS
+        )
+        self.assertEqual(len(partial), 2 * cells)
+        # Superseded, not appended to.
+        self.assertEqual(len(complete), 20 * cells)
+
+    def test_training_rows_match_the_authoritative_layout(self) -> None:
+        config = self._config(25)
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            for step in (1, 10, 20):
+                trainer.append_progress_row(
+                    out,
+                    step,
+                    loss=1.0,
+                    learning_rate_value=1e-4,
+                    grad_norm=0.5,
+                    config=config,
+                    flops_per_token=341_312_256,
+                )
+            partial = list(csv.reader((out / "training.csv").open()))
+            history = np.zeros((config.steps, 3), dtype=np.float32)
+            trainer.write_training_csv(out, history, config, flops_per_token=341_312_256)
+            complete = list(csv.reader((out / "training.csv").open()))
+        self.assertEqual(partial[0], complete[0])
+        self.assertEqual(len(partial) - 1, 3)
+        self.assertEqual(len(complete) - 1, config.steps)
+
+    def test_salvage_writers_never_fail_a_run(self) -> None:
+        config, meta = self._config(), self._meta()
+        missing = Path("/nonexistent/rig-salvage")
+        trainer.append_progress_row(
+            missing,
+            1,
+            loss=1.0,
+            learning_rate_value=1e-4,
+            grad_norm=0.1,
+            config=config,
+            flops_per_token=None,
+        )
+        trainer.append_diagnostic_rows(
+            missing, [self._point(10)], meta, config, 341_312_256
+        )

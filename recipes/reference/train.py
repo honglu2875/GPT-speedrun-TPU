@@ -3492,6 +3492,79 @@ def append_progress_row(
         return
 
 
+# How many diagnostic captures may sit on the accelerator before being pulled
+# to the host. Bounded on purpose: without a cap this list grows with the run,
+# holding one small device allocation per capture until the very end, and a
+# preempted job loses every one of them.
+DIAGNOSTIC_FLUSH_POINTS = 64
+
+
+def append_diagnostic_rows(
+    output_dir: Path,
+    points: Sequence[DiagnosticPoint],
+    scope_metadata: Sequence[tuple[str, int | None, int]],
+    config: Config,
+    flops_per_token: int | None,
+) -> None:
+    """Append already-materialized diagnostic captures, best effort.
+
+    Salvage counterpart to :func:`write_diagnostics_csv`, which runs only after
+    the training loop and so yields nothing on a preempted job. Row layout is
+    identical, so a partial file parses exactly like a complete one. A run that
+    finishes rewrites the file atomically and supersedes this.
+
+    Never raises: losing a convenience artifact must not fail a run.
+    """
+
+    if not points or flops_per_token is None or flops_per_token <= 0:
+        return
+    tokens_per_step = config.batch_size * config.seq_len
+    destination = output_dir / DIAGNOSTICS_CSV_NAME
+    try:
+        new = not destination.exists()
+        with destination.open("a", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle, lineterminator="\n")
+            if new:
+                writer.writerow(
+                    (
+                        "step",
+                        "tokens_processed",
+                        "cumulative_estimated_flops",
+                        "scope",
+                        "layer",
+                        "family",
+                        "stat",
+                        "value",
+                        "element_count",
+                    )
+                )
+            for point in points:
+                values = np.asarray(point.values, dtype=np.float32)
+                tokens_processed = point.step * tokens_per_step
+                cumulative_flops = tokens_processed * flops_per_token
+                for scope_index, (scope, layer, element_count) in enumerate(
+                    scope_metadata
+                ):
+                    for family_index, family in enumerate(_DIAGNOSTIC_FAMILIES):
+                        for stat_index, stat in enumerate(_DIAGNOSTIC_STATS):
+                            writer.writerow(
+                                (
+                                    point.step,
+                                    tokens_processed,
+                                    cumulative_flops,
+                                    scope,
+                                    "" if layer is None else layer,
+                                    family,
+                                    stat,
+                                    float(values[scope_index, family_index, stat_index]),
+                                    element_count,
+                                )
+                            )
+            handle.flush()
+    except (OSError, IndexError, ValueError):
+        return
+
+
 def write_diagnostics_csv(
     output_dir: Path,
     points: Sequence[DiagnosticPoint],
@@ -4093,11 +4166,16 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     trace_active = False
     # Needed inside the loop for best-effort partial artifacts, not just
     # by the writers that run after it.
+    # Captures already pulled off the accelerator. The device list stays
+    # bounded by DIAGNOSTIC_FLUSH_POINTS; this keeps the full history so
+    # the authoritative writer still sees every point.
+    diagnostic_points_host: list[DiagnosticPoint] = []
     output_dir = args.output_dir.expanduser().resolve()
     if is_controller:
         output_dir.mkdir(parents=True, exist_ok=True)
         # A stale file from a reused directory would be appended to.
         (output_dir / TRAINING_CSV_NAME).unlink(missing_ok=True)
+        (output_dir / DIAGNOSTICS_CSV_NAME).unlink(missing_ok=True)
     try:
         for step_index in range(1, config.steps + 1):
             if capture_window is not None and step_index == capture_window[0]:
@@ -4161,6 +4239,26 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                     diagnostic_device_points.append(
                         (step_index, diagnostic_values_at_step)
                     )
+                    if len(diagnostic_device_points) >= DIAGNOSTIC_FLUSH_POINTS:
+                        # Pull to the host and drop the device references. This
+                        # is what bounds accelerator residency: without it one
+                        # small allocation per capture lives until the run ends.
+                        flushed = [
+                            DiagnosticPoint(
+                                step, np.asarray(local_device_get(v), dtype=np.float32)
+                            )
+                            for step, v in diagnostic_device_points
+                        ]
+                        diagnostic_device_points.clear()
+                        diagnostic_points_host.extend(flushed)
+                        if is_controller:
+                            append_diagnostic_rows(
+                                output_dir,
+                                flushed,
+                                diagnostic_metadata,
+                                config,
+                                flops_per_token,
+                            )
                 else:
                     params, optimizer, last_metrics = executable(
                         params, optimizer, batch_x, batch_y
@@ -4270,9 +4368,19 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     training_history = np.asarray(
         local_device_get(optimizer["history"]), dtype=np.float32
     )
+    # Points already pulled by an intermediate flush, then whatever is still
+    # resident. Dropping the first group here would silently truncate the
+    # authoritative file to the last partial buffer.
     diagnostic_points = tuple(
-        DiagnosticPoint(step, np.asarray(local_device_get(values), dtype=np.float32))
-        for step, values in diagnostic_device_points
+        [
+            *diagnostic_points_host,
+            *(
+                DiagnosticPoint(
+                    step, np.asarray(local_device_get(values), dtype=np.float32)
+                )
+                for step, values in diagnostic_device_points
+            ),
+        ]
     )
     train_loss = finite_metric("train_loss", float(final_train["loss"]))
 
