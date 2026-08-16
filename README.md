@@ -220,8 +220,8 @@ run is one command, so a study is an ordinary shell loop over `rig run` with
 the tiers and overrides you care about, and each point lands in `runs/` as a
 normal recorded run. The parameterization rules that make a tier's learning
 rate comparable across sizes are in
-[the Complete(d)P contract](docs/COMPLETEP.md), and what one such sweep
-measured is in [the learning-rate transfer note](docs/LR_TRANSFER.md).
+[the Complete(d)P contract](docs/COMPLETEP.md), and what those sweeps
+measured is in [the hyperparameter transfer note](docs/HYPERPARAMETER_TRANSFER.md).
 
 Name your runs. `make run NAME=cosine-floor` folds a label into the run
 directory, turning `20260814T212706.356271Z-reference-9ff5c908` into
