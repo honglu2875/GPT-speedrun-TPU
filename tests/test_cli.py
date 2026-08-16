@@ -225,6 +225,7 @@ class CliTests(unittest.TestCase):
             hosts=("slice-w-0", "slice-w-1"),
             remote_hosts=("slice-w-1",),
             local_host="slice-w-0",
+            artifact_host="slice-w-0",
             reported_hostnames={
                 "slice-w-0": "slice-w-0",
                 "slice-w-1": "slice-w-1",
@@ -328,6 +329,7 @@ class CliTests(unittest.TestCase):
             hosts=tuple(f"slice-w-{index}" for index in range(4)),
             remote_hosts=tuple(f"slice-w-{index}" for index in range(1, 4)),
             local_host="slice-w-0",
+            artifact_host="slice-w-0",
             reported_hostnames={
                 f"slice-w-{index}": f"slice-w-{index}" for index in range(4)
             },
@@ -370,6 +372,7 @@ class CliTests(unittest.TestCase):
                 hosts=tuple(f"slice-w-{index}" for index in range(4)),
                 remote_hosts=tuple(f"slice-w-{index}" for index in range(1, 4)),
                 local_host="slice-w-0",
+                artifact_host="slice-w-0",
                 reported_hostnames={
                     f"slice-w-{index}": f"slice-w-{index}" for index in range(4)
                 },

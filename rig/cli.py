@@ -612,6 +612,8 @@ def command_run(args: argparse.Namespace) -> int:
             f"{fresh10.scored_tokens:,} scored tokens"
         )
 
+    artifact_target = ""
+    artifact_hostname = ""
     if config.tpu_vm_count > 1:
         style.heading("Synchronizing TPU VM cluster")
         inventory = _probe_configured_cluster(config)
@@ -622,6 +624,13 @@ def command_run(args: argparse.Namespace) -> int:
             data_path=data_path,
         )
         style.ok(f"current source synchronized to {len(inventory.remote_hosts)} peer VMs")
+        artifact_target = inventory.artifact_host
+        artifact_hostname = inventory.reported_hostnames[artifact_target]
+        if config.remote_controller:
+            style.ok(
+                f"remote controller: artifacts land on {artifact_hostname} "
+                "and are pulled back after the run"
+            )
 
     dataset_id, tokenizer_id = _data_identity(
         run_data_profile, prepared_name=prepared.name
@@ -716,6 +725,9 @@ def command_run(args: argparse.Namespace) -> int:
             passthrough_args=tuple(passthrough),
             reference_contract=reference,
             checkpoint_retention=retention,
+            remote_controller=config.remote_controller,
+            artifact_host=artifact_target,
+            artifact_hostname=artifact_hostname,
             environment={},
             provenance={
                 **_data_provenance(
@@ -879,7 +891,7 @@ def command_profile(args: argparse.Namespace) -> int:
         )
         remote_environment = {
             _CLUSTER_WORKER_ENV: "1",
-            _CONTROLLER_HOST_ENV: inventory.reported_hostnames[inventory.local_host],
+            _CONTROLLER_HOST_ENV: inventory.reported_hostnames[inventory.artifact_host],
             _DISTRIBUTED_ENV: "1",
             _PROCESS_COUNT_ENV: str(config.tpu_vm_count),
             "JAX_COMPILATION_CACHE_DIR": f"/tmp/rig-profile-cache-{os.getpid()}",
@@ -1116,7 +1128,12 @@ def _prepare_cluster(
     style: Style,
 ) -> ClusterInventory:
     style.heading("TPU VM cluster")
-    inventory = probe_cluster(config.tpu_vm_hosts, config.tpu_vm_count)
+    inventory = probe_cluster(
+        config.tpu_vm_hosts,
+        config.tpu_vm_count,
+        remote_controller=config.remote_controller,
+        artifact_host=config.artifact_host,
+    )
     style.ok(
         f"passwordless SSH ready on {len(inventory.hosts)} hosts "
         f"({len(inventory.remote_hosts)} peer VMs)"
@@ -1250,7 +1267,12 @@ def _cluster_data_argument(value: str, root: Path) -> str:
 def _probe_configured_cluster(config: LocalConfig) -> ClusterInventory:
     if config.tpu_vm_count <= 1:
         raise ConfigError("multi-host operation requires tpu_vm_count greater than 1")
-    return probe_cluster(config.tpu_vm_hosts, config.tpu_vm_count)
+    return probe_cluster(
+        config.tpu_vm_hosts,
+        config.tpu_vm_count,
+        remote_controller=config.remote_controller,
+        artifact_host=config.artifact_host,
+    )
 
 
 def _run_cluster_doctor(
@@ -1295,7 +1317,7 @@ def _run_cluster_doctor(
     remote = (
         f"cd {shlex.quote(str(root.resolve()))} && env "
         f"{_CLUSTER_WORKER_ENV}=1 "
-        f"{_CONTROLLER_HOST_ENV}={shlex.quote(inventory.reported_hostnames[inventory.local_host])} "
+        f"{_CONTROLLER_HOST_ENV}={shlex.quote(inventory.reported_hostnames[inventory.artifact_host])} "
         f"{_DISTRIBUTED_ENV}=1 "
         f"{_PROCESS_COUNT_ENV}={config.tpu_vm_count} {shlex.join(command)}"
     )

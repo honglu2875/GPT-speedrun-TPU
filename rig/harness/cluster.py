@@ -109,8 +109,13 @@ class ClusterInventory:
     host_expression: str
     hosts: tuple[str, ...]
     remote_hosts: tuple[str, ...]
-    local_host: str
+    # None when this machine orchestrates from outside the slice.
+    local_host: str | None
     reported_hostnames: Mapping[str, str]
+    # The TPU VM that writes run artifacts. Equals local_host in the ordinary
+    # setup; in remote mode it is a peer, and its runs/ is pulled back after.
+    # No default: an inventory that has not decided this is not usable.
+    artifact_host: str
 
 
 def infer_host_expression(host_count: int, hostname: str | None = None) -> str:
@@ -179,8 +184,16 @@ def probe_cluster(
     host_count: int,
     *,
     environment: Mapping[str, str] | None = None,
+    remote_controller: bool = False,
+    artifact_host: str = "",
 ) -> ClusterInventory:
-    """Verify passwordless SSH and identify the controller in the target set."""
+    """Verify passwordless SSH and decide which host owns the artifacts.
+
+    Ordinarily this machine is one of the TPU VMs and keeps the artifacts
+    itself. Under ``remote_controller`` it is outside the slice entirely, so
+    a peer is designated instead -- ``artifact_host`` when given, otherwise
+    the first host in the expression.
+    """
 
     if host_count <= 1:
         raise ClusterError("cluster probing requires at least two TPU VM hosts")
@@ -224,17 +237,59 @@ def probe_cluster(
         for target, remote_name in reported.items()
         if _short_hostname(remote_name) == local_name
     ]
+    if remote_controller:
+        if matches:
+            raise ClusterError(
+                "remote_controller is set, but this machine is one of the "
+                f"configured TPU VM hosts ({matches[0]}). Either clear "
+                "remote_controller or remove this host from tpu_vm_hosts."
+            )
+        chosen = _resolve_artifact_host(artifact_host, hosts, reported)
+        return ClusterInventory(
+            host_expression=host_expression,
+            hosts=hosts,
+            remote_hosts=hosts,
+            local_host=None,
+            reported_hostnames=reported,
+            artifact_host=chosen,
+        )
     if len(matches) != 1:
         raise ClusterError(
-            "the configured TPU VM hosts must include this controller exactly once"
+            "the configured TPU VM hosts must include this controller exactly "
+            "once. Set remote_controller = true on this cluster to orchestrate "
+            "from outside the slice."
         )
     local_target = matches[0]
+    if artifact_host:
+        chosen = _resolve_artifact_host(artifact_host, hosts, reported)
+    else:
+        chosen = local_target
     return ClusterInventory(
         host_expression=host_expression,
         hosts=hosts,
         remote_hosts=tuple(host for host in hosts if host != local_target),
         local_host=local_target,
         reported_hostnames=reported,
+        artifact_host=chosen,
+    )
+
+
+def _resolve_artifact_host(
+    requested: str, hosts: tuple[str, ...], reported: Mapping[str, str]
+) -> str:
+    """Pick the artifact-owning target, matching on target or reported name."""
+
+    if not requested:
+        return hosts[0]
+    wanted = _short_hostname(requested)
+    for target in hosts:
+        if _short_hostname(target) == wanted:
+            return target
+        if _short_hostname(reported.get(target, "")) == wanted:
+            return target
+    raise ClusterError(
+        f"artifact_host {requested!r} is not one of the configured TPU VM "
+        f"hosts: {', '.join(hosts)}"
     )
 
 
@@ -601,6 +656,57 @@ def terminate_distributed_workers(
     return completed.returncode == 0
 
 
+def fetch_run_artifacts(
+    host: str,
+    remote_dir: Path,
+    local_dir: Path,
+    *,
+    environment: Mapping[str, str] | None = None,
+    timeout: float = 900.0,
+) -> None:
+    """Pull one run directory back from the artifact-owning TPU VM.
+
+    Only used under a remote controller, where the run's outputs were written
+    on a peer's disk. The transfer is additive: it never deletes locally, so a
+    partial pull leaves whatever already arrived rather than truncating the
+    run. The trailing slash copies the directory's contents, not the
+    directory itself, so the local run id is preserved.
+    """
+
+    _require_program("rsync")
+    local_dir.mkdir(parents=True, exist_ok=True)
+    ssh_arguments = ["ssh"]
+    for option in _SSH_OPTIONS:
+        ssh_arguments.extend(("-o", option))
+    command = [
+        "rsync",
+        "-a",
+        "--partial",
+        "-e",
+        shlex.join(ssh_arguments),
+        f"{host}:{remote_dir.as_posix()}/",
+        f"{local_dir.as_posix()}/",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            env=pdsh_environment(environment),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ClusterError(
+            f"timed out pulling run artifacts from {host}"
+        ) from exc
+    if completed.returncode != 0:
+        raise ClusterError(
+            _command_failure(f"could not pull run artifacts from {host}", completed)
+        )
+
+
 def _pdsh_command(
     host_expression: str,
     host_count: int,
@@ -758,6 +864,7 @@ __all__ = [
     "bootstrap_uv",
     "build_distributed_launch_command",
     "expand_host_expression",
+    "fetch_run_artifacts",
     "infer_host_expression",
     "pdsh_environment",
     "prepare_ram_cache",

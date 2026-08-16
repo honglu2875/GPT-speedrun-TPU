@@ -16,7 +16,14 @@ class ConfigError(ValueError):
     """A local configuration file or requested setting is invalid."""
 
 
-_CLUSTER_FIELDS = ("tpu_vm_count", "tpu_vm_hosts", "accelerator", "chips_per_host")
+_CLUSTER_FIELDS = (
+    "tpu_vm_count",
+    "tpu_vm_hosts",
+    "accelerator",
+    "chips_per_host",
+    "remote_controller",
+    "artifact_host",
+)
 
 
 @dataclass(frozen=True)
@@ -28,6 +35,14 @@ class ClusterProfile:
     tpu_vm_hosts: str
     accelerator: str
     chips_per_host: int
+    # True when this machine orchestrates the slice without being part of it:
+    # it holds no accelerator, takes no JAX rank, and pulls artifacts back
+    # from the designated host afterwards.
+    remote_controller: bool = False
+    # Which TPU VM writes the run artifacts. Empty means the first host in
+    # the expression. Naming one explicitly matters on preemptible pods,
+    # where you may want artifacts off a host you expect to lose.
+    artifact_host: str = ""
 
     def overlay(self) -> dict[str, Any]:
         return {
@@ -35,6 +50,8 @@ class ClusterProfile:
             "tpu_vm_hosts": self.tpu_vm_hosts,
             "accelerator": self.accelerator,
             "chips_per_host": self.chips_per_host,
+            "remote_controller": self.remote_controller,
+            "artifact_host": self.artifact_host,
         }
 
 
@@ -49,6 +66,10 @@ class LocalConfig:
     # each checked against their own contract instead of a hard-coded default.
     accelerator: str = "TPU v4"
     chips_per_host: int = 4
+    # See ClusterProfile: orchestrate-without-participating, and which host
+    # keeps the artifacts.
+    remote_controller: bool = False
+    artifact_host: str = ""
     active_cluster: str = ""
     data_profile: str = "official"
     default_profile: str = "official"
@@ -72,6 +93,20 @@ class LocalConfig:
             raise ConfigError("tpu_vm_hosts is required when tpu_vm_count is greater than 1")
         if any(character.isspace() for character in self.tpu_vm_hosts):
             raise ConfigError("tpu_vm_hosts may not contain whitespace")
+        if not isinstance(self.remote_controller, bool):
+            raise ConfigError("remote_controller must be true or false")
+        if not isinstance(self.artifact_host, str):
+            raise ConfigError("artifact_host must be a string")
+        if any(character.isspace() for character in self.artifact_host):
+            raise ConfigError("artifact_host may not contain whitespace")
+        if self.remote_controller and self.tpu_vm_count <= 1:
+            # With one host there is no slice to orchestrate from outside, and
+            # the run would have no accelerator to land on.
+            raise ConfigError(
+                "remote_controller requires tpu_vm_count greater than 1"
+            )
+        if self.artifact_host and not self.tpu_vm_hosts.strip():
+            raise ConfigError("artifact_host requires tpu_vm_hosts")
         if not isinstance(self.accelerator, str) or not self.accelerator.strip():
             raise ConfigError("accelerator must be a non-empty string")
         if isinstance(self.chips_per_host, bool) or not isinstance(
@@ -230,27 +265,33 @@ def save_config(
         "[rig]",
     ]
     for key, value in values.items():
-        if isinstance(value, str):
-            encoded = _toml_string(value)
-        elif isinstance(value, float):
-            encoded = repr(value)
-        elif isinstance(value, int) and not isinstance(value, bool):
-            encoded = str(value)
-        else:  # defensive for future scalar settings
-            raise ConfigError(f"cannot encode setting {key}")
-        lines.append(f"{key} = {encoded}")
+        lines.append(f"{key} = {_toml_scalar(key, value)}")
     for name in sorted(clusters):
         profile = clusters[name]
         lines.append("")
         lines.append(f"[cluster.{name}]")
         for key, value in profile.overlay().items():
-            encoded = _toml_string(value) if isinstance(value, str) else str(value)
-            lines.append(f"{key} = {encoded}")
+            lines.append(f"{key} = {_toml_scalar(key, value)}")
     lines.append("")
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text("\n".join(lines), encoding="utf-8")
     temporary.replace(path)
     return path
+
+
+def _toml_scalar(key: str, value: Any) -> str:
+    """Encode one setting. bool is checked first: it subclasses int, and TOML
+    spells it lowercase, so falling through would emit Python's ``True``."""
+
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return _toml_string(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, int):
+        return str(value)
+    raise ConfigError(f"cannot encode setting {key}")
 
 
 def resolve_path(value: str | Path, root: Path | None = None) -> Path:

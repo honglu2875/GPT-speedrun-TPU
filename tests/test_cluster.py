@@ -242,6 +242,7 @@ class ClusterTests(unittest.TestCase):
             hosts=("slice-w-0", "slice-w-1"),
             remote_hosts=("slice-w-1",),
             local_host="slice-w-0",
+            artifact_host="slice-w-0",
             reported_hostnames={"slice-w-0": "slice-w-0", "slice-w-1": "slice-w-1"},
         )
         with patch("rig.harness.cluster.run_pdsh") as run:
@@ -270,6 +271,7 @@ class ClusterTests(unittest.TestCase):
             hosts=("slice-w-0", "slice-w-1"),
             remote_hosts=("slice-w-1",),
             local_host="slice-w-0",
+            artifact_host="slice-w-0",
             reported_hostnames={"slice-w-0": "slice-w-0", "slice-w-1": "slice-w-1"},
         )
         with (
@@ -285,6 +287,7 @@ class ClusterTests(unittest.TestCase):
             hosts=("slice-w-0", "slice-w-1"),
             remote_hosts=("slice-w-1",),
             local_host="slice-w-0",
+            artifact_host="slice-w-0",
             reported_hostnames={"slice-w-0": "slice-w-0", "slice-w-1": "slice-w-1"},
         )
         with (

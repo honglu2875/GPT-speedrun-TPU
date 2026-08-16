@@ -23,6 +23,7 @@ from typing import Any, BinaryIO, TextIO
 
 from .cluster import (
     build_distributed_launch_command,
+    fetch_run_artifacts,
     pdsh_environment,
     terminate_distributed_workers,
 )
@@ -118,7 +119,14 @@ def run_recipe(config: RunConfig, *, evaluator: Evaluator | None = None) -> RunO
             # caches ephemeral instead of leaving shadow run directories.
             "JAX_COMPILATION_CACHE_DIR": f"/tmp/rig-jax-cache-{run_id}",
             "RIG_CLUSTER_WORKER": "1",
-            "RIG_CONTROLLER_HOSTNAME": socket.gethostname(),
+            # Whoever owns the artifacts announces itself here. In the
+            # ordinary setup that is this machine; under a remote
+            # controller it is a peer, and this machine is not in the
+            # slice at all -- announcing gethostname() there would match
+            # no worker and every process would decline to write results.
+            "RIG_CONTROLLER_HOSTNAME": (
+                config.artifact_hostname or socket.gethostname()
+            ),
             "RIG_DISTRIBUTED": "1",
             "RIG_PROCESS_COUNT": str(config.tpu_vm_count),
         }
@@ -182,6 +190,16 @@ def run_recipe(config: RunConfig, *, evaluator: Evaluator | None = None) -> RunO
         detail = f" ({tail})" if tail else ""
         raise RecipeError(
             f"recipe exited with status {return_code}{detail}; logs: {run_dir}"
+        )
+
+    if config.remote_controller and config.artifact_host:
+        # The artifact host wrote everything to its own disk. Nothing below
+        # can read the run until it is here, so pull before validating.
+        fetch_run_artifacts(
+            config.artifact_host,
+            run_dir,
+            run_dir,
+            environment=environment,
         )
 
     payload = parse_result_line(stdout_text)

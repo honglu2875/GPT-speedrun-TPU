@@ -67,6 +67,15 @@ class RunConfig:
     name: str = ""
     tpu_vm_count: int = 1
     tpu_vm_hosts: str = ""
+    # Orchestrate the slice without being in it. The artifact host then
+    # writes runs/ on its own disk and it is pulled back afterwards.
+    remote_controller: bool = False
+    # ssh target of the artifact-owning VM, used to pull runs/ back.
+    artifact_host: str = ""
+    # What that VM reports as its own hostname. The trainer compares this
+    # against socket.gethostname() to decide who writes artifacts, so it
+    # must be the reported name, not the ssh target.
+    artifact_hostname: str = ""
     require_checkpoint: bool = True
 
 
