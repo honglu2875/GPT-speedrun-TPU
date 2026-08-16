@@ -111,7 +111,14 @@ def run_recipe(config: RunConfig, *, evaluator: Evaluator | None = None) -> RunO
     environment = os.environ.copy()
     environment.update(configured_environment)
     environment.update(managed_environment)
-    if config.tpu_vm_count > 1:
+    # Where the work runs and whether it is a multi-process job are separate
+    # questions. A remote single host (v6e-8, say) launches over pdsh but takes
+    # no distributed init; an in-slice v4-32 does both. Keying everything on
+    # tpu_vm_count would run a remote single-host job on this machine, which
+    # has no accelerator.
+    launch_remotely = config.tpu_vm_count > 1 or config.remote_controller
+    distributed = config.tpu_vm_count > 1
+    if launch_remotely:
         remote_environment = {
             **configured_environment,
             **managed_environment,
@@ -127,9 +134,10 @@ def run_recipe(config: RunConfig, *, evaluator: Evaluator | None = None) -> RunO
             "RIG_CONTROLLER_HOSTNAME": (
                 config.artifact_hostname or socket.gethostname()
             ),
-            "RIG_DISTRIBUTED": "1",
-            "RIG_PROCESS_COUNT": str(config.tpu_vm_count),
         }
+        if distributed:
+            remote_environment["RIG_DISTRIBUTED"] = "1"
+            remote_environment["RIG_PROCESS_COUNT"] = str(config.tpu_vm_count)
         command = build_distributed_launch_command(
             host_expression=config.tpu_vm_hosts,
             host_count=config.tpu_vm_count,
@@ -143,7 +151,7 @@ def run_recipe(config: RunConfig, *, evaluator: Evaluator | None = None) -> RunO
     started_at = datetime.now(timezone.utc)
     monotonic_start = time.perf_counter()
     def clean_distributed_workers() -> None:
-        if config.tpu_vm_count <= 1:
+        if not launch_remotely:
             return
         cleaned = terminate_distributed_workers(
             host_expression=config.tpu_vm_hosts,

@@ -34,6 +34,9 @@ from .harness.cluster import (
     probe_cluster,
     run_pdsh,
     seal_ram_cache_command,
+    ship_uv_binary,
+    ship_uv_cache,
+    ship_uv_python,
     sync_workspace,
 )
 
@@ -356,6 +359,19 @@ def main(argv: Iterable[str] | None = None) -> int:
     return 0
 
 
+def _work_runs_elsewhere(config: LocalConfig) -> bool:
+    """Whether the accelerators are on other machines rather than this one.
+
+    Distinct from "is this a multi-process job". A remote single host (a v6e-8,
+    say) needs the full fan-out -- source sync, uv, data, remote launch -- but
+    takes no distributed initialization. Gating that work on tpu_vm_count alone
+    silently skipped every step for such a host and then ran the trainer here,
+    where there is no accelerator.
+    """
+
+    return config.tpu_vm_count > 1 or config.remote_controller
+
+
 def command_prepare(args: argparse.Namespace) -> int:
     root = repo_root()
     current = load_config(root, cluster=getattr(args, "cluster", None))
@@ -421,7 +437,7 @@ def command_prepare(args: argparse.Namespace) -> int:
     else:
         style.note("settings are temporary (--no-save)")
 
-    cluster_controller = proposed.tpu_vm_count > 1 and not _is_cluster_worker()
+    cluster_controller = _work_runs_elsewhere(proposed) and not _is_cluster_worker()
     inventory: ClusterInventory | None = None
     if cluster_controller:
         inventory = _prepare_cluster(
@@ -517,7 +533,7 @@ def command_doctor(args: argparse.Namespace) -> int:
     training_tokens = args.training_tokens or config.training_tokens
     path = resolve_path(args.path or config.data_path)
     color = args.color or config.color
-    if config.tpu_vm_count > 1 and not _is_cluster_worker():
+    if _work_runs_elsewhere(config) and not _is_cluster_worker():
         inventory = _probe_configured_cluster(config)
         return _run_cluster_doctor(
             config,
@@ -573,7 +589,7 @@ def command_run(args: argparse.Namespace) -> int:
         profile, requested=args.target_loss, development_default=config.target_loss
     )
     configured_data_path = str(args.data_path or config.data_path)
-    if config.tpu_vm_count > 1:
+    if _work_runs_elsewhere(config):
         configured_data_path = _cluster_data_argument(configured_data_path, root)
     data_path = resolve_path(configured_data_path, root)
     artifacts = resolve_path(config.artifacts_path, root)
@@ -614,7 +630,7 @@ def command_run(args: argparse.Namespace) -> int:
 
     artifact_target = ""
     artifact_hostname = ""
-    if config.tpu_vm_count > 1:
+    if _work_runs_elsewhere(config):
         style.heading("Synchronizing TPU VM cluster")
         inventory = _probe_configured_cluster(config)
         sync_workspace(
@@ -807,7 +823,7 @@ def command_profile(args: argparse.Namespace) -> int:
         raise ConfigError(f"recipe configuration file not found: {experiment_config}")
 
     configured_data_path = str(args.data_path or config.data_path)
-    if config.tpu_vm_count > 1:
+    if _work_runs_elsewhere(config):
         configured_data_path = _cluster_data_argument(configured_data_path, root)
     data_path = resolve_path(configured_data_path, root)
     run_data_profile = "smoke" if profile == "smoke" else config.data_profile
@@ -878,7 +894,7 @@ def command_profile(args: argparse.Namespace) -> int:
     )
 
     style.banner(f"profile / {args.recipe} / {profile}")
-    if config.tpu_vm_count > 1:
+    if _work_runs_elsewhere(config):
         inventory = _probe_configured_cluster(config)
         style.note(
             f"synchronizing source and launching all {len(inventory.hosts)} TPU VMs"
@@ -1153,6 +1169,15 @@ def _prepare_cluster(
             data_path=resolve_path(config.data_path, root),
         )
         style.note("synchronizing the frozen uv environment on peer VMs")
+        shipped = ship_uv_binary(inventory.remote_hosts)
+        if shipped:
+            style.ok(f"shipped {shipped} to peers that lacked it")
+        interpreters = ship_uv_python(inventory.remote_hosts)
+        if interpreters:
+            style.ok(f"shipped interpreters: {', '.join(interpreters)}")
+        cached = ship_uv_cache(inventory.remote_hosts, Path("/tmp/uv-cache"))
+        if cached:
+            style.ok(f"shipped the uv package cache to {cached} peer VMs")
         bootstrap_uv(root, inventory.remote_hosts, offline=args.offline)
     return inventory
 
@@ -1265,8 +1290,11 @@ def _cluster_data_argument(value: str, root: Path) -> str:
 
 
 def _probe_configured_cluster(config: LocalConfig) -> ClusterInventory:
-    if config.tpu_vm_count <= 1:
-        raise ConfigError("multi-host operation requires tpu_vm_count greater than 1")
+    if not _work_runs_elsewhere(config):
+        raise ConfigError(
+            "this operation needs accelerators on other machines: set "
+            "tpu_vm_count above 1, or remote_controller for a single remote host"
+        )
     return probe_cluster(
         config.tpu_vm_hosts,
         config.tpu_vm_count,

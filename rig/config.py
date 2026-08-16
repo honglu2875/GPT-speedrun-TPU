@@ -99,12 +99,12 @@ class LocalConfig:
             raise ConfigError("artifact_host must be a string")
         if any(character.isspace() for character in self.artifact_host):
             raise ConfigError("artifact_host may not contain whitespace")
-        if self.remote_controller and self.tpu_vm_count <= 1:
-            # With one host there is no slice to orchestrate from outside, and
-            # the run would have no accelerator to land on.
-            raise ConfigError(
-                "remote_controller requires tpu_vm_count greater than 1"
-            )
+        if self.remote_controller and not self.tpu_vm_hosts.strip():
+            # A single remote host is legitimate and is the simplest remote
+            # case: this machine holds no accelerator and the work runs on the
+            # one host named here. What remote mode actually requires is a
+            # host to reach, not a multi-host slice.
+            raise ConfigError("remote_controller requires tpu_vm_hosts")
         if self.artifact_host and not self.tpu_vm_hosts.strip():
             raise ConfigError("artifact_host requires tpu_vm_hosts")
         if not isinstance(self.accelerator, str) or not self.accelerator.strip():

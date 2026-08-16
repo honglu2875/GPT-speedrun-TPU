@@ -195,7 +195,8 @@ def probe_cluster(
     the first host in the expression.
     """
 
-    if host_count <= 1:
+    if host_count <= 1 and not remote_controller:
+        # In-slice mode needs peers; remote mode may legitimately drive one host.
         raise ClusterError("cluster probing requires at least two TPU VM hosts")
     hosts = expand_host_expression(host_expression, environment=environment)
     if len(hosts) != host_count:
@@ -495,6 +496,251 @@ def bootstrap_rsync(
     except ClusterError as exc:
         raise ClusterError(RSYNC_SETUP_GUIDANCE) from exc
     _require_program("rsync")
+
+
+def ship_uv_binary(
+    hosts: Sequence[str],
+    *,
+    environment: Mapping[str, str] | None = None,
+    timeout: float = 300.0,
+) -> str | None:
+    """Copy this machine's uv to every peer that lacks it.
+
+    Peers without internet cannot fetch the installer, and the curl attempt
+    fails slowly -- a four-minute connect timeout per host before anything says
+    so. Shipping the binary we already run is faster, offline-safe, and pins
+    peers to the controller's exact uv version instead of whatever the
+    installer serves today.
+
+    Returns the shipped version, or None when there was nothing to ship.
+    """
+
+    if not hosts:
+        return None
+    local = shutil.which("uv") or str(Path.home() / ".local/bin/uv")
+    source = Path(local)
+    if not source.is_file():
+        return None
+    try:
+        version = subprocess.run(
+            [str(source), "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=30.0,
+        ).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        version = ""
+
+    ssh_arguments = ["ssh"]
+    for option in _SSH_OPTIONS:
+        ssh_arguments.extend(("-o", option))
+    failures: list[str] = []
+    for host in hosts:
+        try:
+            prepare = subprocess.run(
+                _ssh_command(host, "mkdir -p ~/.local/bin"),
+                env=pdsh_environment(environment),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=60.0,
+            )
+            if prepare.returncode != 0:
+                failures.append(host)
+                continue
+            copied = subprocess.run(
+                [
+                    "rsync",
+                    "-a",
+                    "--times",
+                    "-e",
+                    shlex.join(ssh_arguments),
+                    str(source),
+                    f"{host}:.local/bin/uv",
+                ],
+                env=pdsh_environment(environment),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+            if copied.returncode != 0:
+                failures.append(host)
+        except (OSError, subprocess.TimeoutExpired):
+            failures.append(host)
+    if failures:
+        raise ClusterError(
+            "could not copy uv to: " + ", ".join(failures)
+        )
+    return version or None
+
+
+# uv keeps managed interpreters here, as a real versioned directory plus a
+# "latest minor" symlink beside it.
+_UV_PYTHON_ROOT = Path.home() / ".local/share/uv/python"
+
+
+def ship_uv_python(
+    hosts: Sequence[str],
+    *,
+    environment: Mapping[str, str] | None = None,
+    timeout: float = 900.0,
+) -> tuple[str, ...]:
+    """Copy this machine's uv-managed interpreters to peers.
+
+    An offline peer cannot fetch python-build-standalone, so ``uv sync`` fails
+    on a host that has no matching interpreter. Shipping ours also guarantees
+    peers run the same patch release the controller resolved its lockfile
+    against.
+
+    The real directory is transferred with its internal symlinks intact
+    (``bin/python`` points at ``python3.12`` and must stay a link), and the
+    sibling "latest minor" symlink is recreated remotely afterwards. Following
+    symlinks wholesale instead would both triple the payload and break the
+    install.
+    """
+
+    if not hosts or not _UV_PYTHON_ROOT.is_dir():
+        return ()
+    real = sorted(
+        entry
+        for entry in _UV_PYTHON_ROOT.iterdir()
+        if entry.is_dir() and not entry.is_symlink()
+    )
+    if not real:
+        return ()
+    links = [
+        entry
+        for entry in _UV_PYTHON_ROOT.iterdir()
+        if entry.is_symlink() and entry.resolve().parent == _UV_PYTHON_ROOT
+    ]
+    remote_root = ".local/share/uv/python"
+    ssh_arguments = ["ssh"]
+    for option in _SSH_OPTIONS:
+        ssh_arguments.extend(("-o", option))
+
+    failures: list[str] = []
+    for host in hosts:
+        try:
+            if subprocess.run(
+                _ssh_command(host, f"mkdir -p {shlex.quote(remote_root)}"),
+                env=pdsh_environment(environment),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=60.0,
+            ).returncode != 0:
+                failures.append(host)
+                continue
+            copied = subprocess.run(
+                [
+                    "rsync",
+                    "-a",
+                    "--partial",
+                    "-e",
+                    shlex.join(ssh_arguments),
+                    *[str(entry) for entry in real],
+                    f"{host}:{remote_root}/",
+                ],
+                env=pdsh_environment(environment),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+            if copied.returncode != 0:
+                failures.append(host)
+                continue
+            for link in links:
+                target = link.resolve().name
+                command = (
+                    f"cd {shlex.quote(remote_root)} && "
+                    f"ln -sfn {shlex.quote(target)} {shlex.quote(link.name)}"
+                )
+                subprocess.run(
+                    _ssh_command(host, command),
+                    env=pdsh_environment(environment),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                    timeout=60.0,
+                )
+        except (OSError, subprocess.TimeoutExpired):
+            failures.append(host)
+    if failures:
+        raise ClusterError(
+            "could not copy the uv-managed Python to: " + ", ".join(failures)
+        )
+    return tuple(entry.name for entry in real)
+
+
+def ship_uv_cache(
+    hosts: Sequence[str],
+    cache_dir: Path,
+    *,
+    environment: Mapping[str, str] | None = None,
+    timeout: float = 1800.0,
+) -> int:
+    """Copy the controller's uv cache to peers so a frozen sync needs no network.
+
+    ``uv sync --frozen`` still downloads wheels; only a populated cache makes it
+    offline. Transferring the controller's cache is what lets a peer with no
+    route to PyPI resolve the same lockfile.
+
+    Environment and interpreter directories are excluded: those are built
+    against local absolute paths and are rebuilt cheaply on the peer, whereas
+    copying them invites stale interpreter records pointing at paths that
+    exist here and not there.
+
+    Returns the number of hosts updated.
+    """
+
+    if not hosts or not cache_dir.is_dir():
+        return 0
+    ssh_arguments = ["ssh"]
+    for option in _SSH_OPTIONS:
+        ssh_arguments.extend(("-o", option))
+    failures: list[str] = []
+    updated = 0
+    for host in hosts:
+        try:
+            copied = subprocess.run(
+                [
+                    "rsync",
+                    "-a",
+                    "--partial",
+                    "--exclude",
+                    "environments-v2/",
+                    "--exclude",
+                    "interpreter-v4/",
+                    "-e",
+                    shlex.join(ssh_arguments),
+                    f"{cache_dir.resolve().as_posix()}/",
+                    f"{host}:{cache_dir.resolve().as_posix()}/",
+                ],
+                env=pdsh_environment(environment),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+            if copied.returncode != 0:
+                failures.append(host)
+            else:
+                updated += 1
+        except (OSError, subprocess.TimeoutExpired):
+            failures.append(host)
+    if failures:
+        raise ClusterError("could not copy the uv cache to: " + ", ".join(failures))
+    return updated
 
 
 def bootstrap_uv(
@@ -864,6 +1110,9 @@ __all__ = [
     "bootstrap_uv",
     "build_distributed_launch_command",
     "expand_host_expression",
+    "ship_uv_binary",
+    "ship_uv_cache",
+    "ship_uv_python",
     "fetch_run_artifacts",
     "infer_host_expression",
     "pdsh_environment",

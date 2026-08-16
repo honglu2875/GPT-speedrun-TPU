@@ -86,9 +86,20 @@ class ConfigTests(unittest.TestCase):
             self.assertNotIn("True", text)
             self.assertTrue(load_clusters(root)["v6e-64"].remote_controller)
 
-    def test_remote_controller_needs_a_real_slice(self) -> None:
-        with self.assertRaisesRegex(ConfigError, "tpu_vm_count"):
+    def test_remote_controller_needs_a_host_not_a_multi_host_slice(self) -> None:
+        # A single remote host is the simplest valid remote setup: this machine
+        # holds no accelerator and the work runs on the one host named. What
+        # remote mode requires is somewhere to reach, not peers.
+        with self.assertRaisesRegex(ConfigError, "tpu_vm_hosts"):
             LocalConfig(remote_controller=True, tpu_vm_count=1).validate()
+        single = LocalConfig(
+            remote_controller=True,
+            tpu_vm_count=1,
+            tpu_vm_hosts="10.0.0.1",
+            accelerator="TPU v6 lite",
+            chips_per_host=8,
+        ).validate()
+        self.assertEqual(single.tpu_vm_count, 1)
 
     def test_artifact_host_must_be_a_bare_name(self) -> None:
         with self.assertRaisesRegex(ConfigError, "artifact_host"):
