@@ -743,6 +743,94 @@ def ship_uv_cache(
     return updated
 
 
+def ship_dataset(
+    hosts: Sequence[str],
+    source: Path,
+    *,
+    environment: Mapping[str, str] | None = None,
+    timeout: float = 7200.0,
+) -> int:
+    """Copy a prepared corpus from this machine's RAM cache to peers.
+
+    An offline peer cannot download shards, so the controller's already
+    verified copy is the source. The transfer and the seal happen inside one
+    SSH session on purpose: systemd-logind defaults to RemoveIPC=yes and
+    deletes user-owned /dev/shm entries once that user's last session on the
+    host ends, so a copy that finishes and then loses its session evaporates.
+    That failure is silent -- rsync reports success and the files are gone --
+    and it is exactly what happened during the v5e-64 bring-up.
+
+    Returns the number of hosts updated.
+    """
+
+    if not hosts or not source.is_dir():
+        return 0
+    relative = source.resolve().relative_to(RAM_CACHE_ROOT.resolve())
+    remote_parent = (RAM_CACHE_ROOT / relative).parent
+    ssh_arguments = ["ssh"]
+    for option in _SSH_OPTIONS:
+        ssh_arguments.extend(("-o", option))
+    failures: list[str] = []
+    updated = 0
+    for host in hosts:
+        try:
+            made = subprocess.run(
+                _ssh_command(
+                    host,
+                    'install -d -o "$(id -u)" -g "$(id -gn)" -m 0775 '
+                    f"{shlex.quote(str(remote_parent))} 2>/dev/null || "
+                    f"mkdir -p {shlex.quote(str(remote_parent))}",
+                ),
+                env=pdsh_environment(environment),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=120.0,
+            )
+            if made.returncode != 0:
+                failures.append(host)
+                continue
+            copied = subprocess.run(
+                [
+                    "rsync",
+                    "-a",
+                    "--partial",
+                    "-e",
+                    shlex.join(ssh_arguments),
+                    f"{source.resolve().as_posix()}",
+                    f"{host}:{remote_parent.as_posix()}/",
+                ],
+                env=pdsh_environment(environment),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+            if copied.returncode != 0:
+                failures.append(host)
+                continue
+            sealed = subprocess.run(
+                _ssh_command(host, seal_ram_cache_command()),
+                env=pdsh_environment(environment),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=600.0,
+            )
+            if sealed.returncode != 0:
+                failures.append(host)
+                continue
+            updated += 1
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            failures.append(host)
+    if failures:
+        raise ClusterError("could not copy the dataset to: " + ", ".join(failures))
+    return updated
+
+
 def bootstrap_uv(
     root: Path,
     hosts: Sequence[str],
@@ -1110,6 +1198,7 @@ __all__ = [
     "bootstrap_uv",
     "build_distributed_launch_command",
     "expand_host_expression",
+    "ship_dataset",
     "ship_uv_binary",
     "ship_uv_cache",
     "ship_uv_python",

@@ -34,6 +34,8 @@ from .harness.cluster import (
     probe_cluster,
     run_pdsh,
     seal_ram_cache_command,
+    RAM_CACHE_ROOT,
+    ship_dataset,
     ship_uv_binary,
     ship_uv_cache,
     ship_uv_python,
@@ -185,6 +187,12 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--yes", action="store_true", help="accept defaults and run non-interactively")
     prepare.add_argument("--no-doctor", action="store_true", help="skip environment diagnostics")
     prepare.add_argument("--no-download", action="store_true", help="save settings without data work")
+    prepare.add_argument(
+        "--ship-data",
+        action="store_true",
+        help="copy this host's prepared corpus to the peers instead of "
+        "having each download it (required when peers have no internet)",
+    )
     prepare.add_argument("--no-save", action="store_true", help="do not write .rig.toml")
 
     doctor = commands.add_parser(
@@ -1135,6 +1143,34 @@ def command_settings(args: argparse.Namespace) -> int:
     return 0
 
 
+def _ship_prepared_data(
+    config: LocalConfig, inventory: ClusterInventory, *, style: Style
+) -> None:
+    """Send this host's prepared corpus to peers that cannot download it.
+
+    Every directory already present in the local RAM cache is mirrored, so the
+    same call serves whichever corpus is installed here. Sealing happens inside
+    ship_dataset, in the same session as the copy.
+    """
+
+    if not RAM_CACHE_ROOT.is_dir():
+        raise ConfigError(
+            f"{RAM_CACHE_ROOT} holds no prepared data to ship; run `rig prepare` "
+            "here first"
+        )
+    sources = sorted(
+        entry
+        for entry in RAM_CACHE_ROOT.iterdir()
+        if entry.is_dir() and not entry.name.startswith(".")
+    )
+    if not sources:
+        raise ConfigError(f"{RAM_CACHE_ROOT} contains no dataset directories")
+    for source in sources:
+        style.note(f"copying {source.name} to peer VMs")
+        count = ship_dataset(inventory.remote_hosts, source)
+        style.ok(f"{source.name} present and sealed on {count} peer VMs")
+
+
 def _prepare_cluster(
     config: LocalConfig,
     args: argparse.Namespace,
@@ -1178,6 +1214,8 @@ def _prepare_cluster(
         cached = ship_uv_cache(inventory.remote_hosts, Path("/tmp/uv-cache"))
         if cached:
             style.ok(f"shipped the uv package cache to {cached} peer VMs")
+        if getattr(args, "ship_data", False):
+            _ship_prepared_data(config, inventory, style=style)
         bootstrap_uv(root, inventory.remote_hosts, offline=args.offline)
     return inventory
 
