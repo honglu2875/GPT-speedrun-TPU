@@ -463,6 +463,33 @@ def seal_ram_cache_command() -> str:
     )
 
 
+def unseal_ram_cache_command() -> str:
+    """Return a fragment that hands the cache back to the invoking user.
+
+    The seal chowns completed entries to root so logout cleanup cannot remove
+    them, which also means a later rsync cannot rewrite them: setting owner or
+    mtime on a root-owned file needs privileges the caller does not have, and
+    the transfer fails with rsync code 23. Shipping therefore unseals first and
+    reseals afterwards, so the operation is repeatable and a partial transfer
+    can be resumed -- which matters when the corpus is hundreds of gigabytes.
+    """
+
+    cache = shlex.quote(str(RAM_CACHE_ROOT))
+    restore_direct = f'chown -R "$owner":"$group" -- {cache}'
+    restore_sudo = f'sudo -n chown -R "$owner":"$group" -- {cache}'
+    return (
+        'owner="$(id -u)"; group="$(id -g)"; '
+        f"if [ ! -d {cache} ]; then exit 0; fi; "
+        'if [ "$(id -u)" -eq 0 ]; then '
+        f"{restore_direct}; "
+        "elif command -v sudo >/dev/null 2>&1 && "
+        "sudo -n true >/dev/null 2>&1; then "
+        f"{restore_sudo}; "
+        "else echo 'ERROR: passwordless sudo is required to update the RAM cache' "
+        ">&2; exit 5; fi"
+    )
+
+
 def bootstrap_rsync(
     inventory: ClusterInventory,
     *,
@@ -743,6 +770,16 @@ def ship_uv_cache(
     return updated
 
 
+def _transfer_failure(
+    host: str, action: str, completed: subprocess.CompletedProcess[str]
+) -> str:
+    """Summarize a failed remote step, keeping the reason the tool was told."""
+
+    detail = (completed.stderr or completed.stdout or "").strip().splitlines()
+    tail = detail[-1] if detail else f"exit status {completed.returncode}"
+    return f"{host}: could not {action}: {tail}"
+
+
 def ship_dataset(
     hosts: Sequence[str],
     source: Path,
@@ -789,7 +826,21 @@ def ship_dataset(
                 timeout=120.0,
             )
             if made.returncode != 0:
-                failures.append(host)
+                failures.append(_transfer_failure(host, "create the cache directory", made))
+                continue
+            unsealed = subprocess.run(
+                _ssh_command(host, unseal_ram_cache_command()),
+                env=pdsh_environment(environment),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=600.0,
+            )
+            if unsealed.returncode != 0:
+                failures.append(
+                    _transfer_failure(host, "unseal the cache for writing", unsealed)
+                )
                 continue
             copied = subprocess.run(
                 [
@@ -809,7 +860,7 @@ def ship_dataset(
                 timeout=timeout,
             )
             if copied.returncode != 0:
-                failures.append(host)
+                failures.append(_transfer_failure(host, "copy the dataset", copied))
                 continue
             sealed = subprocess.run(
                 _ssh_command(host, seal_ram_cache_command()),
@@ -821,13 +872,13 @@ def ship_dataset(
                 timeout=600.0,
             )
             if sealed.returncode != 0:
-                failures.append(host)
+                failures.append(_transfer_failure(host, "seal the cache", sealed))
                 continue
             updated += 1
-        except (OSError, subprocess.TimeoutExpired, ValueError):
-            failures.append(host)
+        except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+            failures.append(f"{host}: {type(exc).__name__}: {exc}")
     if failures:
-        raise ClusterError("could not copy the dataset to: " + ", ".join(failures))
+        raise ClusterError("could not copy the dataset:\n  " + "\n  ".join(failures))
     return updated
 
 
@@ -917,10 +968,15 @@ def build_distributed_launch_command(
     command: Sequence[str],
     environment: Mapping[str, str],
 ) -> list[str]:
-    """Build a label-free pdsh command suitable for harness stdout capture."""
+    """Build a label-free pdsh command suitable for harness stdout capture.
 
-    if host_count <= 1:
-        raise ClusterError("distributed launch requires at least two TPU VM hosts")
+    Used for any launch that happens on other machines, whether or not the job
+    is distributed. A single remote host is legitimate: it takes no distributed
+    initialization, but the work still has to run over there.
+    """
+
+    if host_count < 1:
+        raise ClusterError("a remote launch needs at least one TPU VM host")
     _require_program("pdsh")
     assignments: list[str] = []
     for key, value in sorted(environment.items()):
@@ -956,7 +1012,7 @@ def terminate_distributed_workers(
     run directory so cleanup cannot affect another recipe or run.
     """
 
-    if host_count <= 1:
+    if host_count < 1:
         return True
     try:
         _require_program("pdsh")
@@ -1209,6 +1265,7 @@ __all__ = [
     "probe_cluster",
     "run_pdsh",
     "seal_ram_cache_command",
+    "unseal_ram_cache_command",
     "sync_workspace",
     "terminate_distributed_workers",
 ]

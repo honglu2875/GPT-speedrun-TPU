@@ -275,5 +275,64 @@ class OpportunisticSalvageTests(unittest.TestCase):
             pull()  # a lost pull is not a lost run
 
 
+class SingleRemoteHostTests(unittest.TestCase):
+    """One remote host is a valid target, not a degenerate cluster.
+
+    This was rejected in four separate places -- config validation, the CLI
+    gates, the launch builder, and orphan cleanup -- each keyed on
+    "tpu_vm_count > 1" as a stand-in for "work runs elsewhere". Every one of
+    them either refused outright or silently ran the trainer on a machine with
+    no accelerator.
+    """
+
+    def test_a_remote_launch_may_target_exactly_one_host(self) -> None:
+        from rig.harness.cluster import build_distributed_launch_command
+
+        command = build_distributed_launch_command(
+            host_expression="10.0.0.1",
+            host_count=1,
+            cwd=Path("/repo/recipes/reference"),
+            command=["python", "train.py"],
+            environment={"RIG_OUTPUT_DIR": "/repo/runs/x"},
+        )
+        self.assertEqual(command[0], "pdsh")
+        self.assertIn("10.0.0.1", command)
+
+    def test_a_launch_still_needs_somewhere_to_run(self) -> None:
+        from rig.harness.cluster import build_distributed_launch_command
+
+        with self.assertRaisesRegex(ClusterError, "at least one"):
+            build_distributed_launch_command(
+                host_expression="",
+                host_count=0,
+                cwd=Path("/repo"),
+                command=["python"],
+                environment={},
+            )
+
+    def test_orphan_cleanup_is_not_skipped_for_one_host(self) -> None:
+        # A single remote host can strand processes holding the TPU just as a
+        # slice can; skipping cleanup there leaves the chip unusable.
+        import inspect
+        from rig.harness import cluster
+
+        source = inspect.getsource(cluster.terminate_distributed_workers)
+        self.assertIn("if host_count < 1:", source)
+        self.assertNotIn("if host_count <= 1:", source)
+
+    def test_single_remote_host_is_launched_remotely(self) -> None:
+        import inspect
+        from rig.harness import runner
+
+        source = inspect.getsource(runner.run_recipe)
+        self.assertIn(
+            "launch_remotely = config.tpu_vm_count > 1 or config.remote_controller",
+            source,
+        )
+        # ...but takes no distributed initialization.
+        self.assertIn("distributed = config.tpu_vm_count > 1", source)
+        self.assertIn('if distributed:', source)
+
+
 if __name__ == "__main__":
     unittest.main()
