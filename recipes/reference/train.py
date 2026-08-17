@@ -41,6 +41,30 @@ import yaml
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from rig import logpack
+from rig.configfile import (
+    config_choice,
+    config_float,
+    config_int,
+    config_keys,
+    config_mapping,
+    read_config_document,
+    resolve_sibling_config_path,
+)
+from rig.console import Console, device_label, format_count, format_rate
+from rig.mesh import (
+    finite_metric,
+    initialize_distributed_runtime,
+    inferred_peak_tflops,
+    is_controller_process,
+    local_batch_size,
+    local_device_get,
+    put_host_local_array,
+    put_replicated_tree,
+    rank_local_slice,
+    sync_tree,
+    system_metadata,
+    validate_official_topology,
+)
 from rig.flops import (
     FlopBreakdown,
     count_training_flops,
@@ -70,7 +94,6 @@ SCHEMA_VERSION = 1
 CONFIG_SCHEMA_VERSION = 2
 CONFIG_FILENAME = "config.yaml"
 CONFIG_PATH = Path(__file__).resolve().with_name(CONFIG_FILENAME)
-_MAX_CONFIG_BYTES = 256 * 1024
 _VALID_TRACKS = ("open", "sample_efficiency")
 _VALID_PROFILES = ("smoke", "dev", "official")
 _VALID_TIERS = ("60m", "125m", "250m", "500m", "1b")
@@ -84,9 +107,6 @@ _DIAGNOSTIC_STATS = (
     "third_moment",
     "fourth_moment",
 )
-_DISTRIBUTED_ENV = "RIG_DISTRIBUTED"
-_PROCESS_COUNT_ENV = "RIG_PROCESS_COUNT"
-_CONTROLLER_HOST_ENV = "RIG_CONTROLLER_HOSTNAME"
 
 
 # A deliberately small, original corpus for offline and smoke-test use.  The
@@ -221,30 +241,10 @@ class ExperimentProfile:
     log_every: int
 
 
-class _StrictSafeLoader(yaml.SafeLoader):
-    """Safe YAML loader which rejects duplicate mapping keys."""
 
 
-def _construct_unique_mapping(
-    loader: _StrictSafeLoader, node: yaml.nodes.MappingNode, deep: bool = False
-) -> dict[Any, Any]:
-    loader.flatten_mapping(node)
-    result: dict[Any, Any] = {}
-    for key_node, value_node in node.value:
-        key = loader.construct_object(key_node, deep=deep)
-        try:
-            duplicate = key in result
-        except TypeError as exc:
-            raise ValueError("config.yaml mapping keys must be scalar values") from exc
-        if duplicate:
-            raise ValueError(f"config.yaml contains duplicate key {key!r}")
-        result[key] = loader.construct_object(value_node, deep=deep)
-    return result
 
 
-_StrictSafeLoader.add_constructor(
-    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping
-)
 
 
 _STATIC_CLI_FIELDS = {
@@ -343,173 +343,6 @@ class DiagnosticPoint:
     values: np.ndarray
 
 
-class Console:
-    """Tiny ANSI renderer; avoids adding a UI dependency to the reference."""
-
-    COLORS = {
-        "reset": "\033[0m",
-        "bold": "\033[1m",
-        "dim": "\033[2m",
-        "cyan": "\033[38;5;81m",
-        "blue": "\033[38;5;75m",
-        "green": "\033[38;5;114m",
-        "yellow": "\033[38;5;221m",
-        "magenta": "\033[38;5;176m",
-        "red": "\033[38;5;203m",
-        "white": "\033[38;5;255m",
-    }
-
-    def __init__(self, mode: str, *, active: bool = True) -> None:
-        auto = sys.stderr.isatty() and "NO_COLOR" not in os.environ
-        self.enabled = mode == "always" or (mode == "auto" and auto)
-        self.active = active
-
-    def paint(self, text: object, *styles: str) -> str:
-        raw = str(text)
-        if not self.enabled or not styles:
-            return raw
-        prefix = "".join(self.COLORS[s] for s in styles)
-        return f"{prefix}{raw}{self.COLORS['reset']}"
-
-    def banner(self) -> None:
-        if not self.active:
-            return
-        mark = self.paint("◆", "magenta", "bold")
-        title = self.paint(" GPT TPU RIG ", "white", "bold")
-        print(
-            f"\n  {mark}{title}{self.paint('reference / jax', 'cyan')}\n",
-            file=sys.stderr,
-        )
-
-    def table(self, title: str, rows: Sequence[tuple[str, object]]) -> None:
-        if not self.active:
-            return
-        # Keep configuration cards readable in ordinary terminals. Provenance
-        # remains complete in result.json/checkpoints; the live card is a
-        # compact summary and must never grow to a digest- or JSON-sized width.
-        width = min(
-            78,
-            max(52, *(max(20, len(str(k))) + len(str(v)) + 7 for k, v in rows)),
-        )
-        inner = width - 2
-        heading = f" {title} "
-        top_fill = max(0, inner - len(heading) - 1)
-        print(
-            "  "
-            + self.paint("╭─", "blue")
-            + self.paint(heading, "white", "bold")
-            + self.paint("─" * top_fill + "╮", "blue"),
-            file=sys.stderr,
-        )
-        for key, value in rows:
-            raw_key = str(key)
-            if len(raw_key) > 20:
-                raw_key = raw_key[:19] + "…"
-            key_text = f"{raw_key:<20}"
-            value_text = str(value)
-            value_limit = max(8, inner - 23)
-            if len(value_text) > value_limit:
-                value_text = value_text[: value_limit - 1] + "…"
-            padding = max(1, inner - 2 - len(key_text) - len(value_text))
-            print(
-                "  "
-                + self.paint("│", "blue")
-                + " "
-                + self.paint(key_text, "dim")
-                + " " * padding
-                + self.paint(value_text, "cyan", "bold")
-                + " "
-                + self.paint("│", "blue"),
-                file=sys.stderr,
-            )
-        print(
-            "  " + self.paint("╰" + "─" * inner + "╯", "blue"),
-            file=sys.stderr,
-        )
-
-    def phase(self, label: str, detail: str = "") -> None:
-        if not self.active:
-            return
-        suffix = f" {self.paint(detail, 'dim')}" if detail else ""
-        print(
-            f"\n  {self.paint('●', 'magenta')} {self.paint(label, 'white', 'bold')}{suffix}",
-            file=sys.stderr,
-        )
-
-    def step(
-        self,
-        step: int,
-        total: int,
-        loss: float,
-        lr: float,
-        grad_norm: float,
-        tokens_per_second: float,
-    ) -> None:
-        if not self.active:
-            return
-        fraction = step / total
-        slots = 18
-        filled = min(slots, int(round(fraction * slots)))
-        bar = self.paint("━" * filled, "green") + self.paint("─" * (slots - filled), "dim")
-        print(
-            f"  {self.paint(f'{step:>4}/{total:<4}', 'white', 'bold')} "
-            f"{bar}  loss {self.paint(f'{loss:.4f}', 'yellow', 'bold')}  "
-            f"lr {lr:.2e}  |g| {grad_norm:.3f}  "
-            f"{format_rate(tokens_per_second)} tok/s",
-            file=sys.stderr,
-        )
-
-    def warn(self, message: str) -> None:
-        """Surface something that did not fail but must not pass unnoticed."""
-
-        if not self.active:
-            return
-        print(
-            f"  {self.paint('!', 'yellow', 'bold')} {self.paint(message, 'yellow')}",
-            file=sys.stderr,
-        )
-
-    def success(
-        self,
-        validation_loss: float,
-        train_seconds: float,
-        validation_seconds: float,
-    ) -> None:
-        if not self.active:
-            return
-        print(
-            f"\n  {self.paint('✓', 'green', 'bold')} "
-            f"synchronized training "
-            f"{self.paint(f'{train_seconds:.3f}s', 'white', 'bold')} "
-            f"{self.paint('(compilation excluded)', 'dim')}\n"
-            f"    validation loss {self.paint(f'{validation_loss:.4f}', 'green', 'bold')} "
-            f"in {self.paint(f'{validation_seconds:.3f}s', 'white', 'bold')}\n",
-            file=sys.stderr,
-        )
-
-    def validation_probe(
-        self, step: int, loss: float, batches: int, elapsed: float
-    ) -> None:
-        if not self.active:
-            return
-        print(
-            f"  {self.paint('◇', 'cyan')} validation @ {step:,}  "
-            f"loss {self.paint(f'{loss:.4f}', 'yellow', 'bold')}  "
-            f"{batches} batches in {elapsed:.3f}s",
-            file=sys.stderr,
-        )
-
-    def downstream(
-        self, domain: str, loss: float, perplexity: float, tokens: int, elapsed: float
-    ) -> None:
-        if not self.active:
-            return
-        print(
-            f"  {self.paint('◇', 'cyan')} {domain:<14} "
-            f"loss {self.paint(f'{loss:.4f}', 'yellow', 'bold')}  "
-            f"ppl {perplexity:.2f}  {tokens:,} tokens in {elapsed:.3f}s",
-            file=sys.stderr,
-        )
 
 
 class ShardedTokens:
@@ -775,91 +608,20 @@ def nonnegative_int(text: str) -> int:
     return value
 
 
-def _config_mapping(value: Any, label: str) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping):
-        raise ValueError(f"config.yaml {label} must be a mapping")
-    if any(not isinstance(key, str) for key in value):
-        raise ValueError(f"config.yaml {label} keys must be strings")
-    return value
 
 
-def _config_keys(
-    value: Any,
-    label: str,
-    required: set[str],
-    *,
-    optional: set[str] = frozenset(),
-) -> Mapping[str, Any]:
-    mapping = _config_mapping(value, label)
-    keys = set(mapping)
-    missing = sorted(required - keys)
-    unknown = sorted(keys - required - optional)
-    if missing:
-        raise ValueError(
-            f"config.yaml {label} is missing required key(s): {', '.join(missing)}"
-        )
-    if unknown:
-        raise ValueError(
-            f"config.yaml {label} contains unknown key(s): {', '.join(unknown)}"
-        )
-    return mapping
 
 
-def _config_int(value: Any, label: str, *, minimum: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-        raise ValueError(
-            f"config.yaml {label} must be an integer >= {minimum}; got {value!r}"
-        )
-    return value
 
 
-def _config_float(value: Any, label: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"config.yaml {label} must be a finite number")
-    try:
-        result = float(value)
-    except OverflowError as exc:
-        raise ValueError(f"config.yaml {label} must be a finite number") from exc
-    if not math.isfinite(result):
-        raise ValueError(f"config.yaml {label} must be a finite number")
-    return result
 
 
-def _config_choice(value: Any, label: str, choices: Sequence[str]) -> str:
-    if not isinstance(value, str) or value not in choices:
-        raise ValueError(
-            f"config.yaml {label} must be one of {', '.join(choices)}; got {value!r}"
-        )
-    return value
 
 
-def resolve_experiment_config_path(requested: Path | None) -> Path:
-    """Resolve the one accepted config path: config.yaml beside this trainer."""
-
-    if CONFIG_PATH.is_symlink() or not CONFIG_PATH.is_file():
-        raise ValueError(
-            f"required sibling experiment config must be a regular, non-symlink file: {CONFIG_PATH}"
-        )
-    try:
-        expected = CONFIG_PATH.expanduser().resolve(strict=True)
-    except OSError as exc:
-        raise ValueError(f"required sibling experiment config is unavailable: {CONFIG_PATH}") from exc
-    candidate = CONFIG_PATH if requested is None else requested
-    if candidate.is_symlink():
-        raise ValueError("--config may not be a symlink")
-    try:
-        resolved = candidate.expanduser().resolve(strict=True)
-    except OSError as exc:
-        raise ValueError(f"experiment config is unavailable: {candidate}") from exc
-    if resolved != expected:
-        raise ValueError(
-            f"--config must name the config.yaml beside train.py: {CONFIG_PATH}"
-        )
-    return expected
 
 
 def _parse_model(value: Any, label: str) -> dict[str, Any]:
-    model = _config_keys(
+    model = config_keys(
         value,
         label,
         {
@@ -869,25 +631,25 @@ def _parse_model(value: Any, label: str) -> dict[str, Any]:
         },
     )
     parsed = {
-        "layers": _config_int(model["layers"], f"{label}.layers", minimum=1),
-        "heads": _config_int(model["heads"], f"{label}.heads", minimum=1),
-        "d_model": _config_int(model["d_model"], f"{label}.d_model", minimum=1),
-        "mlp_mult": _config_int(model["mlp_mult"], f"{label}.mlp_mult", minimum=1),
-        "normalization": _config_choice(
+        "layers": config_int(model["layers"], f"{label}.layers", minimum=1),
+        "heads": config_int(model["heads"], f"{label}.heads", minimum=1),
+        "d_model": config_int(model["d_model"], f"{label}.d_model", minimum=1),
+        "mlp_mult": config_int(model["mlp_mult"], f"{label}.mlp_mult", minimum=1),
+        "normalization": config_choice(
             model["normalization"], f"{label}.normalization", ("rms_norm",)
         ),
-        "position_encoding": _config_choice(
+        "position_encoding": config_choice(
             model["position_encoding"],
             f"{label}.position_encoding",
             ("rope_base_10000",),
         ),
-        "mlp_activation": _config_choice(
+        "mlp_activation": config_choice(
             model["mlp_activation"], f"{label}.mlp_activation", ("gelu",)
         ),
-        "vocab_size": _config_int(
+        "vocab_size": config_int(
             model["vocab_size"], f"{label}.vocab_size", minimum=1
         ),
-        "semantic_vocab_size": _config_int(
+        "semantic_vocab_size": config_int(
             model["semantic_vocab_size"],
             f"{label}.semantic_vocab_size",
             minimum=1,
@@ -920,10 +682,10 @@ def _declared_family_parameter_count(model: Mapping[str, Any]) -> int:
 def _parse_experiment_profile(
     payload: Mapping[str, Any], profile: str, source_sha256: str, tier: str
 ) -> ExperimentProfile:
-    top = _config_keys(
+    top = config_keys(
         payload, "document", {"schema_version", "family", "profiles"}
     )
-    schema_version = _config_int(
+    schema_version = config_int(
         top["schema_version"], "schema_version", minimum=1
     )
     if schema_version != CONFIG_SCHEMA_VERSION:
@@ -931,19 +693,19 @@ def _parse_experiment_profile(
             "unsupported config.yaml schema_version "
             f"{schema_version}; expected {CONFIG_SCHEMA_VERSION}"
         )
-    family = _config_keys(
+    family = config_keys(
         top["family"],
         "family",
         {"default_tier", "parameterization", "tiers"},
     )
-    default_tier = _config_choice(
+    default_tier = config_choice(
         family["default_tier"], "family.default_tier", _VALID_TIERS
     )
     if tier not in _VALID_TIERS:
         raise ValueError(
             f"unknown model tier {tier!r}; expected {', '.join(_VALID_TIERS)}"
         )
-    parameterization = _config_keys(
+    parameterization = config_keys(
         family["parameterization"],
         "family.parameterization",
         {
@@ -951,25 +713,25 @@ def _parse_experiment_profile(
             "attention_scale", "embeddings",
         },
     )
-    parameterization_name = _config_choice(
+    parameterization_name = config_choice(
         parameterization["name"],
         "family.parameterization.name",
         ("complete_d_p",),
     )
-    base_width = _config_int(
+    base_width = config_int(
         parameterization["base_width"],
         "family.parameterization.base_width",
         minimum=1,
     )
-    base_depth = _config_int(
+    base_depth = config_int(
         parameterization["base_depth"],
         "family.parameterization.base_depth",
         minimum=1,
     )
-    depth_alpha = _config_float(
+    depth_alpha = config_float(
         parameterization["depth_alpha"], "family.parameterization.depth_alpha"
     )
-    init_std = _config_float(
+    init_std = config_float(
         parameterization["init_std"], "family.parameterization.init_std"
     )
     if not 0.5 <= depth_alpha <= 1.0:
@@ -980,25 +742,25 @@ def _parse_experiment_profile(
         raise ValueError(
             "config.yaml family.parameterization.init_std must be positive"
         )
-    attention_scale = _config_choice(
+    attention_scale = config_choice(
         parameterization["attention_scale"],
         "family.parameterization.attention_scale",
         ("inverse_head_dim",),
     )
-    embeddings = _config_choice(
+    embeddings = config_choice(
         parameterization["embeddings"],
         "family.parameterization.embeddings",
         ("untied",),
     )
-    raw_tiers = _config_keys(family["tiers"], "family.tiers", set(_VALID_TIERS))
+    raw_tiers = config_keys(family["tiers"], "family.tiers", set(_VALID_TIERS))
     parsed_tiers: dict[str, tuple[int, dict[str, Any]]] = {}
     for tier_name in _VALID_TIERS:
-        tier_value = _config_keys(
+        tier_value = config_keys(
             raw_tiers[tier_name],
             f"family.tiers.{tier_name}",
             {"parameters", "model"},
         )
-        declared = _config_int(
+        declared = config_int(
             tier_value["parameters"],
             f"family.tiers.{tier_name}.parameters",
             minimum=1,
@@ -1022,13 +784,13 @@ def _parse_experiment_profile(
     # changing that tier. The data-horizon anchor remains the candidate's own
     # 60m parameter count below, keeping fixed-TPP comparisons well defined.
 
-    profiles = _config_keys(top["profiles"], "profiles", set(_VALID_PROFILES))
-    selected = _config_keys(
+    profiles = config_keys(top["profiles"], "profiles", set(_VALID_PROFILES))
+    selected = config_keys(
         profiles[profile],
         f"profiles.{profile}",
         {"training", "model", "kernels", "optimizer", "evaluation", "logging"},
     )
-    training = _config_keys(
+    training = config_keys(
         selected["training"],
         f"profiles.{profile}.training",
         {"batch_size", "seq_len", "sampling", "dtype"},
@@ -1069,12 +831,12 @@ def _parse_experiment_profile(
         selected_init_std = init_std
         selected_attention_scale = attention_scale
         selected_embeddings = embeddings
-    kernels = _config_keys(
+    kernels = config_keys(
         selected["kernels"],
         f"profiles.{profile}.kernels",
         {"attention_backend", "loss_backend", "vocab_tile_size"},
     )
-    optimizer = _config_keys(
+    optimizer = config_keys(
         selected["optimizer"],
         f"profiles.{profile}.optimizer",
         {
@@ -1082,35 +844,35 @@ def _parse_experiment_profile(
             "adam_epsilon", "beta1", "beta2", "grad_clip",
         },
     )
-    evaluation = _config_keys(
+    evaluation = config_keys(
         selected["evaluation"],
         f"profiles.{profile}.evaluation",
         {"eval_batches", "val_every", "val_probe_batches"},
     )
-    logging = _config_keys(
+    logging = config_keys(
         selected["logging"],
         f"profiles.{profile}.logging",
         {"diagnostics_every", "log_every"},
     )
     prefix = f"profiles.{profile}"
-    learning_rate = _config_float(
+    learning_rate = config_float(
         optimizer["learning_rate"], f"{prefix}.optimizer.learning_rate"
     )
-    min_lr_ratio = _config_float(
+    min_lr_ratio = config_float(
         optimizer["min_lr_ratio"], f"{prefix}.optimizer.min_lr_ratio"
     )
-    weight_decay = _config_float(
+    weight_decay = config_float(
         optimizer["weight_decay"], f"{prefix}.optimizer.weight_decay"
     )
-    adam_epsilon = _config_float(
+    adam_epsilon = config_float(
         optimizer["adam_epsilon"], f"{prefix}.optimizer.adam_epsilon"
     )
-    warmup_ratio = _config_float(
+    warmup_ratio = config_float(
         optimizer["warmup_ratio"], f"{prefix}.optimizer.warmup_ratio"
     )
-    beta1 = _config_float(optimizer["beta1"], f"{prefix}.optimizer.beta1")
-    beta2 = _config_float(optimizer["beta2"], f"{prefix}.optimizer.beta2")
-    grad_clip = _config_float(
+    beta1 = config_float(optimizer["beta1"], f"{prefix}.optimizer.beta1")
+    beta2 = config_float(optimizer["beta2"], f"{prefix}.optimizer.beta2")
+    grad_clip = config_float(
         optimizer["grad_clip"], f"{prefix}.optimizer.grad_clip"
     )
     if learning_rate <= 0.0:
@@ -1132,34 +894,34 @@ def _parse_experiment_profile(
         source_sha256=source_sha256,
         name=profile,
         steps=(
-            _config_int(training["steps"], f"{prefix}.training.steps", minimum=1)
+            config_int(training["steps"], f"{prefix}.training.steps", minimum=1)
             if "steps" in training else None
         ),
         train_tokens=(
-            _config_int(
+            config_int(
                 training["train_tokens"], f"{prefix}.training.train_tokens", minimum=1
             ) if "train_tokens" in training else None
         ),
         tokens_per_parameter=(
-            _config_float(
+            config_float(
                 training["tokens_per_parameter"],
                 f"{prefix}.training.tokens_per_parameter",
             )
             if "tokens_per_parameter" in training
             else None
         ),
-        batch_size=_config_int(
+        batch_size=config_int(
             training["batch_size"], f"{prefix}.training.batch_size", minimum=1
         ),
-        seq_len=_config_int(
+        seq_len=config_int(
             training["seq_len"], f"{prefix}.training.seq_len", minimum=1
         ),
-        sampling=_config_choice(
+        sampling=config_choice(
             training["sampling"],
             f"{prefix}.training.sampling",
             ("random_windows", "shuffled_epochs"),
         ),
-        dtype_name=_config_choice(
+        dtype_name=config_choice(
             training["dtype"], f"{prefix}.training.dtype", ("bfloat16", "float32")
         ),
         layers=int(model["layers"]),
@@ -1181,15 +943,15 @@ def _parse_experiment_profile(
         embeddings=selected_embeddings,
         vocab_size=int(model["vocab_size"]),
         semantic_vocab_size=int(model["semantic_vocab_size"]),
-        attention_backend=_config_choice(
+        attention_backend=config_choice(
             kernels["attention_backend"],
             f"{prefix}.kernels.attention_backend",
             ("dense", "jax_flash", "tpu_flash"),
         ),
-        loss_backend=_config_choice(
+        loss_backend=config_choice(
             kernels["loss_backend"], f"{prefix}.kernels.loss_backend", ("dense", "tiled")
         ),
-        vocab_tile_size=_config_int(
+        vocab_tile_size=config_int(
             kernels["vocab_tile_size"], f"{prefix}.kernels.vocab_tile_size", minimum=1
         ),
         learning_rate=learning_rate,
@@ -1200,21 +962,21 @@ def _parse_experiment_profile(
         beta1=beta1,
         beta2=beta2,
         grad_clip=grad_clip,
-        eval_batches=_config_int(
+        eval_batches=config_int(
             evaluation["eval_batches"], f"{prefix}.evaluation.eval_batches", minimum=1
         ),
-        val_every=_config_int(
+        val_every=config_int(
             evaluation["val_every"], f"{prefix}.evaluation.val_every", minimum=0
         ),
-        val_probe_batches=_config_int(
+        val_probe_batches=config_int(
             evaluation["val_probe_batches"],
             f"{prefix}.evaluation.val_probe_batches",
             minimum=1,
         ),
-        diagnostics_every=_config_int(
+        diagnostics_every=config_int(
             logging["diagnostics_every"], f"{prefix}.logging.diagnostics_every", minimum=0
         ),
-        log_every=_config_int(
+        log_every=config_int(
             logging["log_every"], f"{prefix}.logging.log_every", minimum=1
         ),
     )
@@ -1258,34 +1020,8 @@ def load_experiment_profile(
 ) -> ExperimentProfile:
     if profile not in _VALID_PROFILES:
         raise ValueError(f"unknown experiment profile: {profile!r}")
-    path = resolve_experiment_config_path(requested_path)
-    raw = path.read_bytes()
-    if len(raw) > _MAX_CONFIG_BYTES:
-        raise ValueError(
-            f"config.yaml exceeds the {_MAX_CONFIG_BYTES:,}-byte safety limit"
-        )
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ValueError("config.yaml must be UTF-8") from exc
-    try:
-        forbidden_tokens = (
-            yaml.tokens.AliasToken,
-            yaml.tokens.AnchorToken,
-            yaml.tokens.DirectiveToken,
-            yaml.tokens.TagToken,
-        )
-        for token in yaml.scan(text, Loader=_StrictSafeLoader):
-            if isinstance(token, forbidden_tokens):
-                kind = type(token).__name__.removesuffix("Token").lower()
-                raise ValueError(f"config.yaml may not contain YAML {kind}s")
-        documents = list(yaml.load_all(text, Loader=_StrictSafeLoader))
-    except yaml.YAMLError as exc:
-        raise ValueError(f"invalid config.yaml YAML: {exc}") from exc
-    if len(documents) != 1:
-        raise ValueError("config.yaml must contain exactly one YAML document")
-    mapping = _config_mapping(documents[0], "document")
-    source_sha256 = hashlib.sha256(raw).hexdigest()
+    path = resolve_sibling_config_path(requested_path, CONFIG_PATH)
+    mapping, source_sha256 = read_config_document(path)
     parsed = {
         name: _parse_experiment_profile(mapping, name, source_sha256, tier)
         for name in _VALID_PROFILES
@@ -3641,199 +3377,34 @@ def write_validation_csv(output_dir: Path, rows: Sequence[ValidationRow]) -> Non
     os.replace(temporary, destination)
 
 
-def format_count(value: float) -> str:
-    for suffix, scale in (("T", 1e12), ("B", 1e9), ("M", 1e6), ("K", 1e3)):
-        if abs(value) >= scale:
-            return f"{value / scale:.2f}{suffix}"
-    return f"{value:.0f}"
 
 
-def format_rate(value: float) -> str:
-    return format_count(value)
 
 
-def device_label(devices: Sequence[jax.Device]) -> str:
-    kinds = sorted({str(device.device_kind) for device in devices})
-    return ", ".join(kinds)
 
 
-def validate_official_topology(profile: str, devices: Sequence[jax.Device]) -> None:
-    """Require four TPU v4 chips per process on a coherent global mesh."""
-
-    if profile != "official":
-        return
-    local_devices = tuple(jax.local_devices())
-    process_count = int(jax.process_count())
-    device_count = int(jax.device_count())
-    platforms = sorted({str(device.platform) for device in local_devices})
-    kinds = sorted({str(device.device_kind) for device in local_devices})
-    is_tpu_v4 = all(
-        str(device.platform).lower() == "tpu"
-        and str(device.device_kind).strip().lower() == "tpu v4"
-        for device in local_devices
-    )
-    if (
-        process_count < 1
-        or len(local_devices) != 4
-        or device_count != 4 * process_count
-        or len(devices) != device_count
-        or not is_tpu_v4
-    ):
-        raise RuntimeError(
-            "official profile requires exactly 4 local TPU v4 devices per JAX "
-            "process and one coherent global device mesh; detected "
-            f"process_count={process_count}, device_count={device_count}, "
-            f"local_device_count={len(local_devices)}, platforms={platforms}, "
-            f"device_kinds={kinds}"
-        )
 
 
-def system_metadata(devices: Sequence[jax.Device]) -> dict[str, Any]:
-    platforms = sorted({str(device.platform) for device in devices})
-
-    def optional_int(device: jax.Device, name: str) -> int | None:
-        value = getattr(device, name, None)
-        return int(value) if value is not None else None
-
-    try:
-        libtpu_version = importlib_metadata.version("libtpu")
-    except importlib_metadata.PackageNotFoundError:
-        libtpu_version = None
-    return {
-        "python_version": host_platform.python_version(),
-        "jax_version": str(jax.__version__),
-        "jaxlib_version": str(jaxlib.__version__),
-        "libtpu_version": libtpu_version,
-        "platform": platforms[0] if len(platforms) == 1 else ",".join(platforms),
-        "device_count": int(jax.device_count()),
-        "local_device_count": int(jax.local_device_count()),
-        "process_count": int(jax.process_count()),
-        "device_kinds": sorted({str(device.device_kind) for device in devices}),
-        "device_ids": [optional_int(device, "id") for device in devices],
-        "process_indices": [optional_int(device, "process_index") for device in devices],
-    }
 
 
-def inferred_peak_tflops(args: argparse.Namespace, devices: Sequence[jax.Device]) -> float | None:
-    if args.peak_tflops is not None:
-        return args.peak_tflops
-    labels = " ".join(str(device.device_kind).lower() for device in devices)
-    # A JAX-visible device on a v4-8 is one full 275-TFLOP/s TPU v4 chip. This
-    # only feeds an explicitly labeled theoretical-utilization estimate.
-    if "tpu" in labels and "v4" in labels:
-        return 275.0 * len(devices)
-    return None
 
 
-def sync_tree(tree: Any) -> None:
-    for value in jax.tree_util.tree_leaves(tree):
-        if hasattr(value, "block_until_ready"):
-            value.block_until_ready()
 
 
-def initialize_distributed_runtime() -> tuple[int, int]:
-    """Initialize JAX's Cloud TPU coordinator before the first device query."""
-
-    distributed = os.environ.get(_DISTRIBUTED_ENV) == "1"
-    if distributed:
-        # On Cloud TPU VMs JAX discovers the coordinator, process count, and
-        # process id from TPU metadata. Every host must enter this call.
-        jax.distributed.initialize()
-    process_count = int(jax.process_count())
-    process_index = int(jax.process_index())
-    expected_raw = os.environ.get(_PROCESS_COUNT_ENV)
-    if expected_raw is not None:
-        try:
-            expected = int(expected_raw)
-        except ValueError as exc:
-            raise ValueError(f"{_PROCESS_COUNT_ENV} must be a positive integer") from exc
-        if expected <= 0:
-            raise ValueError(f"{_PROCESS_COUNT_ENV} must be a positive integer")
-        if process_count != expected:
-            raise RuntimeError(
-                f"JAX discovered {process_count} processes, but the launcher expected "
-                f"{expected}"
-            )
-    if not 0 <= process_index < process_count:
-        raise RuntimeError(
-            f"invalid JAX process index {process_index} for {process_count} processes"
-        )
-    return process_index, process_count
 
 
-def is_controller_process(process_index: int) -> bool:
-    """Keep artifacts on the host that owns the harness, regardless of JAX rank."""
-
-    configured = os.environ.get(_CONTROLLER_HOST_ENV)
-    if configured is None:
-        return process_index == 0
-    local = socket.gethostname().strip().split(".", 1)[0]
-    expected = configured.strip().split(".", 1)[0]
-    if not expected:
-        raise ValueError(f"{_CONTROLLER_HOST_ENV} may not be empty")
-    return local == expected
 
 
-def local_batch_size(global_batch_size: int, process_count: int) -> int:
-    if global_batch_size % process_count:
-        raise ValueError(
-            f"global batch size {global_batch_size} must be divisible by JAX "
-            f"process count {process_count}"
-        )
-    return global_batch_size // process_count
 
 
-def rank_local_slice(
-    value: np.ndarray, process_index: int, process_count: int
-) -> np.ndarray:
-    """Return this process's contiguous part of a global leading batch axis."""
-
-    size = local_batch_size(int(value.shape[0]), process_count)
-    start = process_index * size
-    return np.ascontiguousarray(value[start : start + size])
 
 
-def put_host_local_array(
-    value: np.ndarray,
-    mesh: Mesh,
-    partition_spec: P,
-    sharding: NamedSharding,
-    process_count: int,
-) -> jax.Array:
-    """Convert rank-local NumPy data into one globally sharded JAX array."""
-
-    if process_count == 1:
-        return jax.device_put(value, sharding)
-    return multihost_utils.host_local_array_to_global_array(
-        value, mesh, partition_spec
-    )
 
 
-def put_replicated_tree(tree: Any, mesh: Mesh, sharding: NamedSharding, process_count: int) -> Any:
-    """Create identical global replicas from the same host value on every rank."""
-
-    if process_count == 1:
-        return jax.device_put(tree, sharding)
-    return multihost_utils.host_local_array_to_global_array(tree, mesh, P())
 
 
-def local_device_get(tree: Any) -> Any:
-    """Copy replicated values through one addressable shard on multi-host JAX."""
-
-    def fetch(value: Any) -> Any:
-        if isinstance(value, jax.Array) and not value.is_fully_addressable:
-            return jax.device_get(value.addressable_data(0))
-        return jax.device_get(value)
-
-    return jax.tree_util.tree_map(fetch, tree)
 
 
-def finite_metric(name: str, value: float, *, positive: bool = False) -> float:
-    value = float(value)
-    if not math.isfinite(value) or (positive and value <= 0.0) or (not positive and value < 0.0):
-        qualifier = "finite and positive" if positive else "finite and nonnegative"
-        raise FloatingPointError(f"{name} must be {qualifier}, got {value!r}")
-    return value
 
 
 def perplexity_from_loss(loss: float) -> float:

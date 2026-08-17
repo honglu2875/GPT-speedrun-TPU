@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from rig import logpack
+from rig import configfile, logpack
 
 
 TRAINER_PATH = Path(__file__).parents[1] / "recipes" / "reference" / "train.py"
@@ -213,7 +213,7 @@ class TrainerStaticTests(unittest.TestCase):
                     ):
                         trainer.load_experiment_profile("smoke")
             path = root / "config.yaml"
-            path.write_bytes(b"#" * (trainer._MAX_CONFIG_BYTES + 1))
+            path.write_bytes(b"#" * (configfile.MAX_CONFIG_BYTES + 1))
             with patch.object(trainer, "CONFIG_PATH", path), self.assertRaisesRegex(
                 ValueError, "safety limit"
             ):
