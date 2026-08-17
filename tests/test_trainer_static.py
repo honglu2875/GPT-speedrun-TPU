@@ -18,6 +18,8 @@ from unittest.mock import patch
 
 import numpy as np
 
+from rig import logpack
+
 
 TRAINER_PATH = Path(__file__).parents[1] / "recipes" / "reference" / "train.py"
 SPEC = importlib.util.spec_from_file_location("reference_train", TRAINER_PATH)
@@ -32,6 +34,19 @@ SPEC.loader.exec_module(trainer)
 # cheap. Head dim stays 64 so the flash tile plan resolves as it does in
 # training; only depth and width move.
 _SMALL = {"layers": 2, "d_model": 128, "heads": 2}
+
+
+def _fake_config(**fields) -> SimpleNamespace:
+    """Stand in for Config where a schedule helper only reads a few fields.
+
+    ``final_step`` is derived exactly as the real property derives it, so these
+    fixtures cannot drift into declaring a stopping step the horizon contradicts.
+    """
+
+    fields.setdefault("early_stopping_step", None)
+    return SimpleNamespace(
+        final_step=fields["early_stopping_step"] or fields.get("steps"), **fields
+    )
 
 
 def _traced_per_token(config) -> int:
@@ -853,7 +868,7 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertNotIn("attention_backend", trainer.contract_model_metadata(config))
 
     def test_probe_schedule_excludes_final_step(self) -> None:
-        config = SimpleNamespace(val_every=3, steps=9)
+        config = _fake_config(val_every=3, steps=9)
         selected = [
             step
             for step in range(1, config.steps + 1)
@@ -862,12 +877,12 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertEqual(selected, [3, 6])
         self.assertFalse(
             trainer.should_run_validation_probe(
-                1, SimpleNamespace(val_every=0, steps=10)
+                1, _fake_config(val_every=0, steps=10)
             )
         )
 
     def test_diagnostic_schedule_includes_first_cadence_and_final(self) -> None:
-        config = SimpleNamespace(diagnostics_every=3, steps=8)
+        config = _fake_config(diagnostics_every=3, steps=8)
         selected = [
             step
             for step in range(1, config.steps + 1)
@@ -876,7 +891,7 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertEqual(selected, [1, 3, 6, 8])
         self.assertFalse(
             trainer.should_run_diagnostics(
-                1, SimpleNamespace(diagnostics_every=0, steps=1)
+                1, _fake_config(diagnostics_every=0, steps=1)
             )
         )
 
@@ -915,48 +930,138 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertAlmostEqual(loss, 2.0)
         self.assertGreater(elapsed, 0.0)
 
-    def test_training_csv_contains_every_step(self) -> None:
+    def test_training_log_contains_every_step(self) -> None:
         history = np.asarray(
             [[2.0, 1.0e-3, 0.5], [1.5, 5.0e-4, 0.25]], dtype=np.float32
         )
-        config = SimpleNamespace(steps=2, batch_size=4, seq_len=8)
+        config = _fake_config(steps=2, batch_size=4, seq_len=8)
         with tempfile.TemporaryDirectory() as directory:
-            trainer.write_training_csv(
+            trainer.write_training_log(
                 Path(directory), history, config, flops_per_token=10
             )
-            rows = (Path(directory) / trainer.TRAINING_CSV_NAME).read_text().splitlines()
+            log = logpack.read_log(Path(directory) / trainer.TRAINING_LOG_NAME)
         self.assertEqual(
-            rows[0],
-            "step,tokens_processed,cumulative_estimated_flops,train_loss,"
-            "learning_rate,grad_norm",
+            [entry.describe() for entry in log.columns],
+            ["overall/train_loss", "overall/learning_rate", "overall/grad_norm"],
         )
-        self.assertEqual(len(rows), 3)
-        self.assertTrue(rows[1].startswith("1,32,320,2.0,"))
-        self.assertTrue(rows[2].startswith("2,64,640,1.5,"))
+        np.testing.assert_array_equal(log.steps, [1, 2])
+        np.testing.assert_array_equal(log.values, history)
+        # The axes are derived from the header, not stored per row.
+        np.testing.assert_array_equal(log.axis("tokens_processed"), [32, 64])
+        np.testing.assert_array_equal(log.axis("cumulative_flops"), [320.0, 640.0])
 
-    def test_diagnostics_csv_is_long_form_and_atomic(self) -> None:
+    def test_early_stopping_step_truncates_without_moving_the_schedule(self) -> None:
+        parser = trainer.build_parser()
+        horizon = ["--profile", "dev", "--tier", "250m", "--tokens-per-parameter", "5"]
+        full = trainer.resolve_config(parser.parse_args(horizon), "tpu", 50_304)
+        stopped = trainer.resolve_config(
+            parser.parse_args([*horizon, "--early-stopping-step", "60"]),
+            "tpu",
+            50_304,
+        )
+        # Everything the trajectory depends on has to be bit-identical, or the
+        # truncated run samples a different curve than the one it stands in for.
+        self.assertEqual(
+            (stopped.steps, stopped.warmup_steps, stopped.data_multiplier),
+            (full.steps, full.warmup_steps, full.data_multiplier),
+        )
+        self.assertEqual(
+            trainer.effective_optimizer_metadata(stopped),
+            trainer.effective_optimizer_metadata(full),
+        )
+        self.assertEqual(stopped.final_step, 60)
+        self.assertEqual(full.final_step, full.steps)
+        self.assertLess(60, full.steps)
+
+        # The step-driven forms rebuild the schedule around the length asked
+        # for, so truncation there would not reproduce anything.
+        for duration in (["--steps", "9325"], ["--train-tokens", "5242880"]):
+            with self.subTest(duration=duration[0]):
+                with self.assertRaisesRegex(
+                    ValueError, "requires a tokens-per-parameter horizon"
+                ):
+                    trainer.resolve_config(
+                        parser.parse_args(
+                            ["--profile", "dev", "--tier", "250m", *duration,
+                             "--early-stopping-step", "60"]
+                        ),
+                        "tpu",
+                        50_304,
+                    )
+        with self.assertRaisesRegex(ValueError, "past the"):
+            trainer.resolve_config(
+                parser.parse_args(
+                    [*horizon, "--early-stopping-step", str(full.steps + 1)]
+                ),
+                "tpu",
+                50_304,
+            )
+
+    def test_early_stopped_artifacts_cover_only_the_steps_taken(self) -> None:
+        config = _fake_config(
+            steps=5, early_stopping_step=2, batch_size=4, seq_len=8
+        )
+        # The device history buffer is sized for the full horizon and only its
+        # prefix is written, so the writer must drop the trailing zeros.
+        history = np.zeros((5, 3), dtype=np.float32)
+        history[:2] = [[2.0, 1.0e-3, 0.5], [1.5, 5.0e-4, 0.25]]
+        values = np.arange(2 * 3 * 6, dtype=np.float32).reshape((2, 3, 6))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trainer.write_training_log(root, history, config, flops_per_token=10)
+            training = logpack.read_log(root / trainer.TRAINING_LOG_NAME)
+            trainer.write_diagnostics_log(
+                root,
+                (
+                    trainer.DiagnosticPoint(1, values),
+                    trainer.DiagnosticPoint(2, values + 1.0),
+                ),
+                (("overall", None, 7), ("block", 0, 4)),
+                config,
+                10,
+            )
+            diagnostics = logpack.read_log(root / trainer.DIAGNOSTICS_LOG_NAME)
+        self.assertEqual(len(training), 2)
+        np.testing.assert_array_equal(training.steps, [1, 2])
+        np.testing.assert_array_equal(training.values, history[:2])
+        np.testing.assert_array_equal(diagnostics.steps, [1, 2])
+        self.assertTrue(
+            trainer.should_run_diagnostics(
+                2, _fake_config(diagnostics_every=100, steps=5, early_stopping_step=2)
+            )
+        )
+
+    def test_diagnostics_log_flattens_the_grid_and_lands_atomically(self) -> None:
         metadata = (("overall", None, 7), ("block", 0, 4))
         shape = (len(metadata), 3, 6)
         values = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
-        config = SimpleNamespace(steps=2, batch_size=4, seq_len=8)
+        config = _fake_config(steps=2, batch_size=4, seq_len=8)
         points = (
             trainer.DiagnosticPoint(1, values),
             trainer.DiagnosticPoint(2, values + 1.0),
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            trainer.write_diagnostics_csv(root, points, metadata, config, 10)
-            destination = root / trainer.DIAGNOSTICS_CSV_NAME
-            rows = destination.read_text(encoding="utf-8").splitlines()
-            self.assertFalse((root / ".diagnostics.csv.tmp").exists())
-        self.assertEqual(
-            rows[0],
-            "step,tokens_processed,cumulative_estimated_flops,scope,layer,"
-            "family,stat,value,element_count",
+            trainer.write_diagnostics_log(root, points, metadata, config, 10)
+            destination = root / trainer.DIAGNOSTICS_LOG_NAME
+            self.assertFalse((root / f".{trainer.DIAGNOSTICS_LOG_NAME}.tmp").exists())
+            log = logpack.read_log(destination)
+
+        # Column order is the [scope, family, stat] grid flattened in place, so
+        # a captured point becomes a record with no per-value bookkeeping.
+        self.assertEqual(len(log.columns), 2 * 3 * 6)
+        self.assertEqual(log.columns[0].describe(), "overall/param.l1_norm")
+        self.assertEqual(log.columns[-1].describe(), "block[0]/update.fourth_moment")
+        np.testing.assert_array_equal(log.values[0], values.reshape(-1))
+        np.testing.assert_array_equal(log.values[1], (values + 1.0).reshape(-1))
+        np.testing.assert_array_equal(log.steps, [1, 2])
+
+        # element_count rides in the column table once, not on every row.
+        self.assertEqual(log.columns[0].element_count, 7)
+        self.assertEqual(log.columns[-1].element_count, 4)
+        self.assertAlmostEqual(
+            float(log.series("update.fourth_moment", "block", 0)[0]), 35.0
         )
-        self.assertEqual(len(rows), 1 + 2 * 2 * 3 * 6)
-        self.assertEqual(rows[1], "1,32,320,overall,,param,l1_norm,0.0,7")
-        self.assertIn("2,64,640,block,0,update,fourth_moment,", rows[-1])
 
     def test_diagnostic_statistics_use_postupdate_param_raw_gradient_and_signed_delta(self) -> None:
         params = {
@@ -1336,7 +1441,7 @@ class SalvageTests(unittest.TestCase):
         )
 
     def _meta(self):
-        return [("embeddings", None, 100), ("block", 0, 200), ("final norm", None, 50)]
+        return [("embeddings", None, 100), ("block", 0, 200), ("final_norm", None, 50)]
 
     def _point(self, step: int):
         shape = (
@@ -1366,64 +1471,81 @@ class SalvageTests(unittest.TestCase):
         assembly = source[source.index("diagnostic_points = tuple(") :]
         self.assertIn("diagnostic_points_host", assembly[:400])
 
-    def test_partial_rows_match_the_authoritative_layout(self) -> None:
+    def test_partial_points_match_the_authoritative_layout(self) -> None:
         config, meta = self._config(), self._meta()
         with tempfile.TemporaryDirectory() as directory:
             out = Path(directory)
-            trainer.append_diagnostic_rows(
-                out, [self._point(s) for s in (10, 20)], meta, config, 341_312_256
+            destination = out / trainer.DIAGNOSTICS_LOG_NAME
+            writer = trainer.open_log(
+                destination,
+                trainer.diagnostic_log_columns(meta),
+                config,
+                341_312_256,
             )
-            partial = list(csv.DictReader((out / "diagnostics.csv").open()))
-            trainer.write_diagnostics_csv(
+            for step in (10, 20):
+                trainer.append_log_row(
+                    writer, step, self._point(step).values.reshape(-1)
+                )
+            trainer.close_log(writer)
+            partial = logpack.read_log(destination)
+
+            trainer.write_diagnostics_log(
                 out,
                 [self._point(s) for s in range(10, 201, 10)],
                 meta,
                 config,
                 341_312_256,
             )
-            complete = list(csv.DictReader((out / "diagnostics.csv").open()))
-        self.assertEqual(list(partial[0]), list(complete[0]))
-        cells = len(meta) * len(trainer._DIAGNOSTIC_FAMILIES) * len(
-            trainer._DIAGNOSTIC_STATS
-        )
-        self.assertEqual(len(partial), 2 * cells)
-        # Superseded, not appended to.
-        self.assertEqual(len(complete), 20 * cells)
+            complete = logpack.read_log(destination)
 
-    def test_training_rows_match_the_authoritative_layout(self) -> None:
+        # Both writers build their columns from the same helper, so a partial
+        # file is a prefix of the complete one rather than a different shape.
+        self.assertEqual(partial.columns, complete.columns)
+        self.assertEqual(len(partial), 2)
+        # Superseded, not appended to.
+        self.assertEqual(len(complete), 20)
+        np.testing.assert_array_equal(partial.values, complete.values[:2])
+
+    def test_partial_training_points_match_the_authoritative_layout(self) -> None:
         config = self._config(25)
         with tempfile.TemporaryDirectory() as directory:
             out = Path(directory)
+            destination = out / trainer.TRAINING_LOG_NAME
+            writer = trainer.open_log(
+                destination, trainer.training_log_columns(), config, 341_312_256
+            )
             for step in (1, 10, 20):
-                trainer.append_progress_row(
-                    out,
-                    step,
-                    loss=1.0,
-                    learning_rate_value=1e-4,
-                    grad_norm=0.5,
-                    config=config,
-                    flops_per_token=341_312_256,
-                )
-            partial = list(csv.reader((out / "training.csv").open()))
+                trainer.append_log_row(writer, step, (1.0, 1e-4, 0.5))
+            trainer.close_log(writer)
+            partial = logpack.read_log(destination)
+
             history = np.zeros((config.steps, 3), dtype=np.float32)
-            trainer.write_training_csv(out, history, config, flops_per_token=341_312_256)
-            complete = list(csv.reader((out / "training.csv").open()))
-        self.assertEqual(partial[0], complete[0])
-        self.assertEqual(len(partial) - 1, 3)
-        self.assertEqual(len(complete) - 1, config.steps)
+            trainer.write_training_log(
+                out, history, config, flops_per_token=341_312_256
+            )
+            complete = logpack.read_log(destination)
+
+        self.assertEqual(partial.columns, complete.columns)
+        self.assertEqual(partial.tokens_per_step, complete.tokens_per_step)
+        np.testing.assert_array_equal(partial.steps, [1, 10, 20])
+        self.assertEqual(len(complete), config.steps)
 
     def test_salvage_writers_never_fail_a_run(self) -> None:
         config, meta = self._config(), self._meta()
         missing = Path("/nonexistent/rig-salvage")
-        trainer.append_progress_row(
-            missing,
-            1,
-            loss=1.0,
-            learning_rate_value=1e-4,
-            grad_norm=0.1,
-            config=config,
-            flops_per_token=None,
-        )
-        trainer.append_diagnostic_rows(
-            missing, [self._point(10)], meta, config, 341_312_256
+        for columns in (
+            trainer.training_log_columns(),
+            trainer.diagnostic_log_columns(meta),
+        ):
+            with self.subTest(columns=len(columns)):
+                writer = trainer.open_log(
+                    missing / "x.riglog", columns, config, 341_312_256
+                )
+                trainer.append_log_row(writer, 1, np.zeros(len(columns)))
+                trainer.close_log(writer)
+        # A run with no traced FLOP count still trains; it just has no log.
+        self.assertIsNone(
+            trainer.open_log(
+                missing / "x.riglog", trainer.training_log_columns(), config, None
+            )
         )

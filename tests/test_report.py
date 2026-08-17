@@ -5,20 +5,22 @@ import gzip
 import hashlib
 import json
 from pathlib import Path
+from typing import Sequence
 import re
 import tempfile
 import unittest
 
+from rig import logpack
 from rig.report import (
+    DIAGNOSTICS_LOG_NAME,
+    TRAINING_LOG_NAME,
     ReportError,
-    _attach_flops,
     _checkpoint_layer_stats,
     _default_run_selection,
     _diagnostic_metric,
     _lttb,
-    _overall_metric_identity,
     _compact,
-    _subsample_steps,
+    _subsample_indices,
     build_report,
 )
 
@@ -41,10 +43,7 @@ class ReportTests(unittest.TestCase):
             for name, (track, profile, tokens, validation_loss) in cases.items():
                 run = runs / name
                 run.mkdir(parents=True)
-                (run / "training.csv").write_text(
-                    "step,tokens_processed,train_loss\n1,10,4.5\n2,20,4.0\n",
-                    encoding="utf-8",
-                )
+                _write_training(run, [(4.5, 1e-4, 0.5), (4.0, 9e-5, 0.4)])
                 _write_result(
                     run,
                     validation_artifact=False,
@@ -74,10 +73,7 @@ class ReportTests(unittest.TestCase):
             runs = root / "runs"
             run = runs / "bad-track"
             run.mkdir(parents=True)
-            (run / "training.csv").write_text(
-                "step,tokens_processed,train_loss\n1,10,4.5\n2,20,4.0\n",
-                encoding="utf-8",
-            )
+            _write_training(run, [(4.5, 1e-4, 0.5), (4.0, 9e-5, 0.4)])
             _write_result(
                 run,
                 validation_artifact=False,
@@ -97,13 +93,8 @@ class ReportTests(unittest.TestCase):
             runs = root / "runs"
             run = runs / "diagnostic-run"
             run.mkdir(parents=True)
-            (run / "training.csv").write_text(
-                "step,tokens_processed,cumulative_estimated_flops,train_loss\n"
-                "1,10,1000,4.5\n"
-                "2,20,2000,4.0\n",
-                encoding="utf-8",
-            )
-            _write_diagnostics(run / "diagnostics.csv")
+            _write_training(run, [(4.5, 1e-4, 0.5), (4.0, 9e-5, 0.4)])
+            _write_diagnostics(run / DIAGNOSTICS_LOG_NAME)
             _write_result(
                 run,
                 validation_artifact=False,
@@ -153,22 +144,16 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("function zoom(", html)
         self.assertNotIn("setInterval", html)
 
-    def test_incomplete_diagnostics_grid_excludes_run(self) -> None:
+    def test_diagnostics_recorded_on_a_different_axis_exclude_the_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runs = root / "runs"
             run = runs / "truncated-diagnostics"
             run.mkdir(parents=True)
-            (run / "training.csv").write_text(
-                "step,tokens_processed,cumulative_estimated_flops,train_loss\n"
-                "1,10,1000,4.5\n"
-                "2,20,2000,4.0\n",
-                encoding="utf-8",
-            )
-            diagnostics = run / "diagnostics.csv"
-            _write_diagnostics(diagnostics)
-            lines = diagnostics.read_text(encoding="utf-8").splitlines()
-            diagnostics.write_text("\n".join(lines[:-1]) + "\n", encoding="utf-8")
+            _write_training(run, [(4.5, 1e-4, 0.5), (4.0, 9e-5, 0.4)])
+            # Diagnostics recorded against a different token accounting than the
+            # training curve cannot be plotted on the same axis.
+            _write_diagnostics(run / DIAGNOSTICS_LOG_NAME, tokens_per_step=77)
             _write_result(
                 run,
                 validation_artifact=False,
@@ -178,7 +163,7 @@ class ReportTests(unittest.TestCase):
             summary = build_report(runs, root / "report.html")
 
         self.assertFalse(summary.included)
-        self.assertIn("incomplete diagnostic grid", summary.skipped[run.name])
+        self.assertIn("token accounting disagrees", summary.skipped[run.name])
 
     def test_standalone_report_includes_sound_run_and_both_axis_modes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -186,12 +171,7 @@ class ReportTests(unittest.TestCase):
             runs = root / "runs"
             run = runs / "complete-run"
             run.mkdir(parents=True)
-            (run / "training.csv").write_text(
-                "step,tokens_processed,train_loss,learning_rate,grad_norm\n"
-                "1,10,4.5,0.001,2.0\n"
-                "2,20,4.0,0.0001,1.5\n",
-                encoding="utf-8",
-            )
+            _write_training(run, [(4.5, 0.001, 2.0), (4.0, 0.0001, 1.5)])
             (run / "validation.csv").write_text(
                 "step,tokens_processed,kind,domain,validation_loss\n"
                 "1,10,fineweb_probe,fineweb,4.4\n"
@@ -211,7 +191,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(payload["meta"]["maxChartPoints"], 64)
         self.assertTrue(payload["runs"][0]["selected"])
         self.assertEqual(payload["runs"][0]["classification"], "official")
-        self.assertEqual(payload["runs"][0]["flopSource"], "derived: result metrics.flops_per_token × tokens_processed")
+        self.assertEqual(payload["runs"][0]["flopSource"], "traced")
         train = next(chart for chart in payload["timeCharts"] if chart["key"] == "train_loss")
         self.assertEqual(train["series"][0]["points"][-1], [2.0, 2000.0, 4.0])
         # Shell strings stay in the markup; chart titles now live in the
@@ -227,10 +207,12 @@ class ReportTests(unittest.TestCase):
             for notice in payload["notices"]
             if notice.startswith("Overall training diagnostic coverage:")
         )
-        self.assertIn("recorded gradient L2 norm", coverage)
+        # This run recorded no diagnostics log, so the grid is entirely
+        # unrecorded. Coverage now reflects the log's declared columns rather
+        # than being inferred from training-column names.
         self.assertIn("not recorded: gradient L1 norm", coverage)
+        self.assertIn("gradient L2 norm", coverage)
         self.assertIn("update fourth moment", coverage)
-        self.assertIn("parameter fourth moment", coverage)
         self.assertIn("parameter fourth moment", coverage)
         self.assertNotRegex(html, r'<script[^>]+src=|<link[^>]+href=')
         self.assertNotIn(".slice(0,10)", html)
@@ -244,54 +226,31 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(_default_run_selection("dev"), (True, "diagnostic"))
         self.assertEqual(_default_run_selection("smoke"), (True, "smoke"))
 
-    def test_explicit_cumulative_flops_take_precedence(self) -> None:
+    def test_the_flop_axis_comes_from_the_header_and_is_exactly_linear(self) -> None:
+        # There is no per-sample FLOP column to disagree with itself any more:
+        # the axis is step x tokens_per_step x flops_per_token, and the writer
+        # refuses a non-positive value for either constant.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runs = root / "runs"
-            run = runs / "explicit-flops"
+            run = runs / "flop-axis"
             run.mkdir(parents=True)
-            (run / "training.csv").write_text(
-                "step,tokens_processed,train_loss,cumulative_estimated_flops\n"
-                "1,10,4.5,1234\n"
-                "2,20,4.0,3456\n",
-                encoding="utf-8",
+            _write_training(
+                run,
+                [(4.5, 1e-4, 0.5), (4.0, 9e-5, 0.4)],
+                tokens_per_step=10,
+                flops_per_token=100.0,
             )
             _write_result(run, validation_artifact=False)
             build_report(runs, root / "report.html", max_chart_points=64)
             payload = _payload((root / "report.html").read_text(encoding="utf-8"))
 
-        self.assertEqual(
-            payload["runs"][0]["flopSource"],
-            "training.csv cumulative_estimated_flops",
+        self.assertEqual(payload["runs"][0]["flopSource"], "traced")
+        train = next(
+            chart for chart in payload["timeCharts"] if chart["key"] == "train_loss"
         )
-        train = next(chart for chart in payload["timeCharts"] if chart["key"] == "train_loss")
-        self.assertEqual(train["series"][0]["points"][-1][1], 3456.0)
-
-    def test_explicit_cumulative_flops_are_strict_and_match_declared_total(self) -> None:
-        with self.assertRaisesRegex(ReportError, "positive and increase strictly"):
-            _attach_flops(
-                [
-                    {"cumulative_estimated_flops": 10.0},
-                    {"cumulative_estimated_flops": 10.0},
-                ],
-                {},
-            )
-        with self.assertRaisesRegex(ReportError, "estimated_total_flops"):
-            _attach_flops(
-                [
-                    {"cumulative_estimated_flops": 10.0},
-                    {"cumulative_estimated_flops": 20.0},
-                ],
-                {"estimated_total_flops": 21.0},
-            )
-        rows = [
-            {"cumulative_estimated_flops": 10.0},
-            {"cumulative_estimated_flops": 20.0},
-        ]
-        self.assertEqual(
-            _attach_flops(rows, {"estimated_total_flops": 20.0}),
-            "training.csv cumulative_estimated_flops",
-        )
+        points = train["series"][0]["points"]
+        self.assertEqual([point[1] for point in points], [1000.0, 2000.0])
 
     def test_lttb_defaults_to_the_flop_coordinate(self) -> None:
         points = [
@@ -313,12 +272,8 @@ class ReportTests(unittest.TestCase):
             runs = root / "runs"
             run = runs / "tampered-run"
             run.mkdir(parents=True)
-            training = run / "training.csv"
+            training = _write_training(run, [(4.5, 1e-4, 0.5), (4.0, 9e-5, 0.4)])
             validation = run / "validation.csv"
-            training.write_text(
-                "step,tokens_processed,train_loss\n1,10,4.5\n2,20,4.0\n",
-                encoding="utf-8",
-            )
             validation.write_text(
                 "step,tokens_processed,kind,domain,validation_loss\n"
                 "2,20,fineweb,fineweb,3.7\n",
@@ -339,7 +294,7 @@ class ReportTests(unittest.TestCase):
                 },
                 "artifacts": {
                     "training_curve": {
-                        "path": "training.csv",
+                        "path": TRAINING_LOG_NAME,
                         "bytes": training.stat().st_size,
                         "sha256": "0" * 64,
                     },
@@ -367,10 +322,7 @@ class ReportTests(unittest.TestCase):
             bad = runs / "bad-run"
             for run in (good, bad):
                 run.mkdir(parents=True)
-                (run / "training.csv").write_text(
-                    "step,tokens_processed,train_loss\n1,10,4.5\n2,20,4.0\n",
-                    encoding="utf-8",
-                )
+                _write_training(run, [(4.5, 1e-4, 0.5), (4.0, 9e-5, 0.4)])
                 _write_result(run, validation_artifact=False)
             bad_result = json.loads((bad / "result.json").read_text(encoding="utf-8"))
             bad_result["metrics"]["train_seconds"] = float("nan")
@@ -387,11 +339,7 @@ class ReportTests(unittest.TestCase):
             runs = root / "runs"
             run = runs / "odd-qualified"
             run.mkdir(parents=True)
-            training = run / "training.csv"
-            training.write_text(
-                "step,tokens_processed,train_loss\n1,10,4.5\n2,20,4.0\n",
-                encoding="utf-8",
-            )
+            _write_training(run, [(4.5, 1e-4, 0.5), (4.0, 9e-5, 0.4)])
             _write_result(run, validation_artifact=False)
             record = _record_for_run(run, validation=False)
             record["qualified"] = float("nan")
@@ -412,10 +360,7 @@ class ReportTests(unittest.TestCase):
             runs = root / "runs"
             run = runs / "duplicate-run"
             run.mkdir(parents=True)
-            (run / "training.csv").write_text(
-                "step,tokens_processed,train_loss\n1,10,4.5\n2,20,4.0\n",
-                encoding="utf-8",
-            )
+            _write_training(run, [(4.5, 1e-4, 0.5), (4.0, 9e-5, 0.4)])
             _write_result(run, validation_artifact=False)
             record = _record_for_run(run, validation=False)
             (runs / "records.jsonl").write_text(
@@ -454,18 +399,16 @@ class ReportTests(unittest.TestCase):
         self.assertAlmostEqual(stats["grad"][0]["l1_norm"], 1.0)
         self.assertAlmostEqual(stats["update"][0]["l2_norm"], 2**-2 * 2**0.5)
 
-    def test_future_overall_grad_update_and_param_columns_are_recognized(self) -> None:
-        expected = {
-            "overall_grad_l1_norm": ("grad", "l1_norm"),
-            "gradient_norm": ("grad", "l2_norm"),
-            "update_std": ("update", "std"),
-            "params_third_moment": ("param", "third_moment"),
-            "parameter_fourth_moment": ("param", "fourth_moment"),
-        }
-        for name, identity in expected.items():
-            with self.subTest(name=name):
-                self.assertTrue(_diagnostic_metric(name))
-                self.assertEqual(_overall_metric_identity(name), identity)
+    def test_diagnostic_columns_are_named_by_the_registry(self) -> None:
+        # Column identity used to be guessed from ad-hoc CSV header text. It is
+        # an explicit registry id now, so the guessing has no inputs left.
+        for family in ("param", "grad", "update"):
+            for statistic in ("l1_norm", "l2_norm", "std", "third_moment"):
+                with self.subTest(metric=f"{family}.{statistic}"):
+                    entry = logpack.column(f"{family}.{statistic}", "block", 0)
+                    self.assertEqual(entry.metric.family, family)
+                    self.assertEqual(entry.metric.stat, statistic)
+                    self.assertTrue(_diagnostic_metric(f"{family}_{statistic}"))
 
     def test_embedded_data_escapes_html_and_cannot_close_script(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -473,10 +416,7 @@ class ReportTests(unittest.TestCase):
             runs = root / "runs"
             run = runs / "script-safe"
             run.mkdir(parents=True)
-            (run / "training.csv").write_text(
-                "step,tokens_processed,train_loss\n1,10,4.5\n2,20,4.0\n",
-                encoding="utf-8",
-            )
+            _write_training(run, [(4.5, 1e-4, 0.5), (4.0, 9e-5, 0.4)])
             _write_result(run, validation_artifact=False)
             record = {
                 "run_id": run.name,
@@ -492,9 +432,9 @@ class ReportTests(unittest.TestCase):
                 },
                 "artifacts": {
                     "training_curve": {
-                        "path": "training.csv",
-                        "bytes": (run / "training.csv").stat().st_size,
-                        "sha256": _sha(run / "training.csv"),
+                        "path": TRAINING_LOG_NAME,
+                        "bytes": (run / TRAINING_LOG_NAME).stat().st_size,
+                        "sha256": _sha(run / TRAINING_LOG_NAME),
                     }
                 },
             }
@@ -518,11 +458,11 @@ def _write_result(
     tokens: int = 20,
     validation_loss: float = 3.7,
 ) -> None:
-    artifacts = {"training_curve": "training.csv"}
+    artifacts = {"training_curve": TRAINING_LOG_NAME}
     if validation_artifact:
         artifacts["validation_curve"] = "validation.csv"
     if diagnostics_artifact:
-        artifacts["diagnostics"] = "diagnostics.csv"
+        artifacts["diagnostics"] = DIAGNOSTICS_LOG_NAME
     result = {
         "schema_version": 1,
         "status": "ok",
@@ -542,7 +482,30 @@ def _write_result(
     (run / "result.json").write_text(json.dumps(result), encoding="utf-8")
 
 
-def _write_diagnostics(path: Path) -> None:
+def _write_training(
+    run: Path, rows: Sequence[Sequence[float]], *, tokens_per_step: int = 10,
+    flops_per_token: float = 100.0
+) -> Path:
+    """Write a packed training log; rows are ``(loss, learning_rate, grad_norm)``."""
+
+    path = run / TRAINING_LOG_NAME
+    with logpack.LogWriter(
+        path,
+        (
+            logpack.column("train_loss"),
+            logpack.column("learning_rate"),
+            logpack.column("grad_norm"),
+        ),
+        tokens_per_step=tokens_per_step,
+        flops_per_token=flops_per_token,
+    ) as writer:
+        for step, row in enumerate(rows, 1):
+            writer.append(step, row)
+    return path
+
+
+def _write_diagnostics(path: Path, *, tokens_per_step: int = 10,
+                       flops_per_token: float = 100.0) -> None:
     families = ("param", "grad", "update")
     statistics = (
         "l1_norm",
@@ -553,26 +516,29 @@ def _write_diagnostics(path: Path) -> None:
         "fourth_moment",
     )
     scopes = (
-        ("overall", "", 8),
-        ("embeddings", "", 2),
-        ("unembedding", "", 2),
-        ("block", "0", 3),
-        ("final_norm", "", 1),
+        ("overall", None, 8),
+        ("embeddings", None, 2),
+        ("unembedding", None, 2),
+        ("block", 0, 3),
+        ("final_norm", None, 1),
     )
-    rows = [
-        "step,tokens_processed,cumulative_estimated_flops,scope,layer,"
-        "family,stat,value,element_count"
+    columns = [
+        logpack.column(f"{family}.{statistic}", scope, layer, element_count=count)
+        for scope, layer, count in scopes
+        for family in families
+        for statistic in statistics
     ]
-    for step in (1, 2):
-        for scope_index, (scope, layer, element_count) in enumerate(scopes):
-            for family_index, family in enumerate(families):
-                for stat_index, statistic in enumerate(statistics):
-                    value = step + scope_index / 10 + family_index / 100 + stat_index / 1000
-                    rows.append(
-                        f"{step},{step * 10},{step * 1000},{scope},{layer},"
-                        f"{family},{statistic},{value},{element_count}"
-                    )
-    path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    with logpack.LogWriter(
+        path, columns, tokens_per_step=tokens_per_step, flops_per_token=flops_per_token
+    ) as writer:
+        for step in (1, 2):
+            values = [
+                step + scope_index / 10 + family_index / 100 + stat_index / 1000
+                for scope_index, _ in enumerate(scopes)
+                for family_index, _ in enumerate(families)
+                for stat_index, _ in enumerate(statistics)
+            ]
+            writer.append(step, values)
 
 
 def _record_for_run(run: Path, *, validation: bool) -> dict[str, object]:
@@ -591,9 +557,9 @@ def _record_for_run(run: Path, *, validation: bool) -> dict[str, object]:
         },
         "artifacts": {
             "training_curve": {
-                "path": "training.csv",
-                "bytes": (run / "training.csv").stat().st_size,
-                "sha256": _sha(run / "training.csv"),
+                "path": TRAINING_LOG_NAME,
+                "bytes": (run / TRAINING_LOG_NAME).stat().st_size,
+                "sha256": _sha(run / TRAINING_LOG_NAME),
             }
         },
     }
@@ -634,7 +600,7 @@ if __name__ == "__main__":
 class LayerSnapshotTests(unittest.TestCase):
     def test_subsample_keeps_the_ends_and_bounds_the_count(self) -> None:
         steps = list(range(1, 1000))
-        picked = _subsample_steps(steps, 80)
+        picked = [steps[index] for index in _subsample_indices(len(steps), 80)]
         self.assertLessEqual(len(picked), 81)
         self.assertEqual(picked[0], 1)
         self.assertEqual(picked[-1], 999)
@@ -642,7 +608,9 @@ class LayerSnapshotTests(unittest.TestCase):
 
     def test_short_lists_are_returned_whole(self) -> None:
         steps = [1, 5, 9]
-        self.assertEqual(_subsample_steps(steps, 80), steps)
+        self.assertEqual(
+            [steps[index] for index in _subsample_indices(len(steps), 80)], steps
+        )
 
     def test_layer_series_expose_aligned_step_frames(self) -> None:
         # The dragger needs one value row per retained step, aligned to a fixed
@@ -652,12 +620,8 @@ class LayerSnapshotTests(unittest.TestCase):
             runs = root / "runs"
             run = runs / "layered"
             run.mkdir(parents=True)
-            (run / "training.csv").write_text(
-                "step,tokens_processed,cumulative_estimated_flops,train_loss\n"
-                "1,10,1000,4.5\n2,20,2000,4.0\n",
-                encoding="utf-8",
-            )
-            _write_diagnostics(run / "diagnostics.csv")
+            _write_training(run, [(4.5, 1e-4, 0.5), (4.0, 9e-5, 0.4)])
+            _write_diagnostics(run / DIAGNOSTICS_LOG_NAME)
             _write_result(run, validation_artifact=False, tokens=20, validation_loss=3.0)
             build_report(runs, root / "report.html")
             payload = _payload((root / "report.html").read_text(encoding="utf-8"))
@@ -680,10 +644,8 @@ class PayloadPackingTests(unittest.TestCase):
             runs = root / "runs"
             run = runs / "packed"
             run.mkdir(parents=True)
-            (run / "training.csv").write_text(
-                "step,tokens_processed,cumulative_estimated_flops,train_loss\n"
-                + "".join(f"{i},{i*10},{i*100},{4.5 - i/1000}\n" for i in range(1, 400)),
-                encoding="utf-8",
+            _write_training(
+                run, [(4.5 - i / 1000, 1e-4, 0.5) for i in range(1, 400)]
             )
             _write_result(run, validation_artifact=False, tokens=3990, validation_loss=3.0)
             build_report(runs, root / "report.html")
@@ -703,8 +665,8 @@ class PayloadPackingTests(unittest.TestCase):
         self.assertIn("runs", payload)
 
     def test_layer_snapshots_zero_keeps_every_recorded_step(self) -> None:
-        self.assertEqual(_subsample_steps([1, 2, 3, 4, 5], 0), [1, 2, 3, 4, 5])
-        self.assertEqual(len(_subsample_steps(list(range(500)), 0)), 500)
+        self.assertEqual(_subsample_indices(5, 0), [0, 1, 2, 3, 4])
+        self.assertEqual(len(_subsample_indices(500, 0)), 500)
 
     def test_layer_snapshots_must_be_zero_or_at_least_two(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

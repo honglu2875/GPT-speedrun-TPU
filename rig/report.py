@@ -19,11 +19,20 @@ import json
 import math
 from pathlib import Path
 import re
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
+
+import numpy as np
+
+from rig import logpack
+# ``metrics`` is a local name in several readers, so the registry is
+# imported under a distinct one rather than being shadowed.
+from rig import metrics as metrics_registry
 
 
 _MAX_JSON_BYTES = 4 * 1024 * 1024
-_MAX_CSV_BYTES = 128 * 1024 * 1024
+_MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
+TRAINING_LOG_NAME = f"training{logpack.SUFFIX}"
+DIAGNOSTICS_LOG_NAME = f"diagnostics{logpack.SUFFIX}"
 _MAX_CHART_POINTS = 1_400
 # 0 keeps every recorded diagnostic step, so the step dragger moves at the
 # granularity the run actually recorded. A positive value thins the step axis,
@@ -116,16 +125,62 @@ class ReportSummary:
 
 @dataclass
 class _Run:
+    """One recorded run, holding its logs as packed arrays rather than rows.
+
+    ``training`` and ``diagnostics`` are read with one memcpy each and sliced by
+    column, so a 76k-step run costs a few milliseconds and a few megabytes
+    instead of the million-plus row dictionaries the long-form CSV required.
+    """
+
     run_id: str
     result: dict[str, Any]
     record: dict[str, Any] | None
-    training: list[dict[str, float]]
+    training: logpack.Log
     validation: list[dict[str, Any]]
-    train_metrics: tuple[str, ...]
     flop_source: str
-    diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    diagnostics: logpack.Log | None = None
     layer_stats: dict[str, list[dict[str, float]]] = field(default_factory=dict)
     notices: list[str] = field(default_factory=list)
+
+    @property
+    def final_step(self) -> int:
+        return int(self.training.steps[-1])
+
+    def training_points(self, metric: str) -> list[list[float]]:
+        """Return ``[step, cumulative_flops, value]`` triples for one scalar."""
+
+        values = self.training.series(metric)
+        if values is None:
+            return []
+        return _points(self.training, values)
+
+    def diagnostic_points(
+        self, family: str, statistic: str, scope: str = "overall", layer: int | None = None
+    ) -> list[list[float]]:
+        if self.diagnostics is None:
+            return []
+        values = self.diagnostics.series(f"{family}.{statistic}", scope, layer)
+        if values is None:
+            return []
+        return _points(self.diagnostics, values)
+
+    def has_layer_diagnostics(self) -> bool:
+        if self.diagnostics is None:
+            return False
+        overall = metrics_registry.scope("overall").id
+        return any(entry.scope_id != overall for entry in self.diagnostics.columns)
+
+
+def _points(log: logpack.Log, values: "np.ndarray") -> list[list[float]]:
+    """Zip a column against the step and FLOP axes, dropping non-finite samples."""
+
+    finite = np.isfinite(values)
+    steps = log.steps[finite]
+    flops = log.axis("cumulative_flops")[finite]
+    return [
+        [float(step), float(flop), float(value)]
+        for step, flop, value in zip(steps, flops, values[finite])
+    ]
 
 
 def build_report(
@@ -299,15 +354,22 @@ def _read_run(path: Path, record: dict[str, Any] | None, limit: int) -> _Run:
     final_train_loss = _finite(metrics.get("train_loss"), "train_loss")
     _finite(metrics.get("validation_loss"), "validation_loss")
 
-    training_path = _artifact_path(path, result, "training_curve", "training.csv", required=True)
+    training_path = _artifact_path(
+        path, result, "training_curve", TRAINING_LOG_NAME, required=True
+    )
     _check_record_artifact(training_path, path, record, "training_curve")
-    training, metric_names = _read_training(training_path)
-    if int(training[-1]["tokens_processed"]) != final_tokens:
-        raise ReportError("training.csv final token count disagrees with result.json")
-    if not _close(training[-1]["train_loss"], final_train_loss):
-        raise ReportError("training.csv final loss disagrees with result.json")
+    training = _read_training(training_path)
+    if int(training.axis("tokens_processed")[-1]) != final_tokens:
+        raise ReportError(
+            f"{TRAINING_LOG_NAME} final token count disagrees with result.json"
+        )
+    loss = training.series("train_loss")
+    if loss is None:
+        raise ReportError(f"{TRAINING_LOG_NAME} does not record train_loss")
+    if not _close(float(loss[-1]), final_train_loss):
+        raise ReportError(f"{TRAINING_LOG_NAME} final loss disagrees with result.json")
 
-    flop_source = _attach_flops(training, metrics)
+    flop_source = "traced" if training.flops_per_token > 1.0 else "unavailable"
     validation_path = _artifact_path(
         path, result, "validation_curve", "validation.csv", required=False
     )
@@ -316,29 +378,26 @@ def _read_run(path: Path, record: dict[str, Any] | None, limit: int) -> _Run:
         validation = _read_validation(validation_path, training)
     else:
         validation = []
-    _validate_and_fill_evaluations(validation, result, training[-1])
+    _validate_and_fill_evaluations(validation, result, training)
 
-    # Downsample independently per scalar later; keep this shared row table bounded
-    # using evenly spaced indices only after validation points have been derived.
-    # Individual metric LTTB downsampling occurs in _training_series.
     run = _Run(
         run_id=run_id,
         result=result,
         record=record,
         training=training,
         validation=validation,
-        train_metrics=metric_names,
         flop_source=flop_source,
     )
     diagnostics_path = _artifact_path(
-        path, result, "diagnostics", "diagnostics.csv", required=False
+        path, result, "diagnostics", DIAGNOSTICS_LOG_NAME, required=False
     )
     if diagnostics_path is not None:
         _check_record_artifact(diagnostics_path, path, record, "diagnostics")
         run.diagnostics = _read_diagnostics(diagnostics_path, training)
     else:
         run.notices.append(
-            f"{run_id}: diagnostics.csv was not recorded; diagnostic plots are unavailable."
+            f"{run_id}: {DIAGNOSTICS_LOG_NAME} was not recorded; "
+            "diagnostic plots are unavailable."
         )
     if record is None:
         run.notices.append(f"{run_id}: not present in records.jsonl (shown as unledgered).")
@@ -346,156 +405,95 @@ def _read_run(path: Path, record: dict[str, Any] | None, limit: int) -> _Run:
         run.notices.append(f"{run_id}: invalid ledger qualified flag was ignored.")
     # Long-form diagnostics already contain final param/grad/update scope values.
     # Avoid hashing and scanning a large checkpoint when that artifact is present.
-    if not run.diagnostics:
+    if run.diagnostics is None:
         _read_checkpoint_layers(path, run)
     # Store the limit on the transient object without widening the public payload.
     run.result["_report_point_limit"] = limit
     return run
 
 
-def _read_diagnostics(
-    path: Path, training: Sequence[Mapping[str, float]]
-) -> list[dict[str, Any]]:
-    """Read the optional long-form diagnostics artifact without importing JAX."""
+def _read_diagnostics(path: Path, training: logpack.Log) -> logpack.Log:
+    """Read the optional diagnostics log and check its structure, not its rows.
 
-    with path.open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        fields = reader.fieldnames
-        if not fields or len(fields) != len(set(fields)):
-            raise ReportError("diagnostics.csv has a missing or duplicate header")
-        missing = [name for name in _DIAGNOSTIC_REQUIRED if name not in fields]
-        if missing:
-            raise ReportError("diagnostics.csv is missing: " + ", ".join(missing))
-        raw_rows = list(reader)
-    if not raw_rows:
-        raise ReportError("diagnostics.csv has no data rows")
+    Under the long-form CSV every one of a million-plus rows had to be parsed
+    and cross-checked against the training curve. The packed log carries its
+    column identities in a table and its axes in the header, so the same
+    guarantees now cost a handful of comparisons: the grid is complete because
+    the columns are fixed, and the axes agree because both files declare them.
+    """
 
-    by_step = {int(row["step"]): row for row in training}
-    parsed: list[dict[str, Any]] = []
-    identities: set[tuple[int, str, int | None, str, str]] = set()
-    identities_by_step: dict[int, set[tuple[str, int | None, str, str]]] = {}
-    counts_by_scope: dict[tuple[str, int | None], int] = {}
-    previous_step = 0
-    for number, raw in enumerate(raw_rows, 2):
-        prefix = f"diagnostics.csv:{number}"
-        step = _positive_int_text(raw.get("step"), f"{prefix} step")
-        training_row = by_step.get(step)
-        if training_row is None:
-            raise ReportError(f"{prefix} step is outside training.csv")
-        if step < previous_step:
-            raise ReportError("diagnostics.csv steps must be ordered")
-        tokens = _positive_int_text(raw.get("tokens_processed"), f"{prefix} tokens")
-        if tokens != int(training_row["tokens_processed"]):
-            raise ReportError(f"{prefix} token count disagrees with training.csv")
-        estimated_flops = _finite_text(
-            raw.get("cumulative_estimated_flops"), f"{prefix} cumulative FLOPs"
-        )
-        if estimated_flops <= 0 or not _close(
-            estimated_flops, float(training_row["estimated_flops"])
-        ):
-            raise ReportError(f"{prefix} cumulative FLOPs disagree with training.csv")
-        scope = (raw.get("scope") or "").strip()
-        family = (raw.get("family") or "").strip()
-        statistic = (raw.get("stat") or "").strip()
-        if scope not in _DIAGNOSTIC_SCOPES:
-            raise ReportError(f"{prefix} scope is invalid")
-        if family not in _DIAGNOSTIC_FAMILIES:
-            raise ReportError(f"{prefix} family is invalid")
-        if statistic not in _DIAGNOSTIC_STATS:
-            raise ReportError(f"{prefix} stat is invalid")
-        layer_text = (raw.get("layer") or "").strip()
-        if scope == "block":
-            if not re.fullmatch(r"0|[1-9][0-9]*", layer_text):
-                raise ReportError(f"{prefix} block layer is not a non-negative integer")
-            layer: int | None = int(layer_text)
-        else:
-            if layer_text:
-                raise ReportError(f"{prefix} layer must be blank outside block scope")
-            layer = None
-        identity = (step, scope, layer, family, statistic)
-        if identity in identities:
-            raise ReportError(f"{prefix} duplicates an earlier diagnostic identity")
-        identities.add(identity)
-        identities_by_step.setdefault(step, set()).add(
-            (scope, layer, family, statistic)
-        )
-        element_count = _positive_int_text(
-            raw.get("element_count"), f"{prefix} element_count"
-        )
-        scope_identity = (scope, layer)
-        previous_count = counts_by_scope.setdefault(scope_identity, element_count)
-        if previous_count != element_count:
-            raise ReportError(
-                f"{prefix} element_count changes within diagnostic scope"
-            )
-        parsed.append(
-            {
-                "step": step,
-                "tokens_processed": tokens,
-                "estimated_flops": estimated_flops,
-                "scope": scope,
-                "layer": layer,
-                "family": family,
-                "stat": statistic,
-                "value": _finite_text(raw.get("value"), f"{prefix} value"),
-                "element_count": element_count,
-            }
-        )
-        previous_step = step
+    try:
+        log = logpack.read_log(path)
+    except logpack.LogError as error:
+        raise ReportError(str(error)) from error
 
-    _validate_diagnostic_grid(identities_by_step, counts_by_scope)
-    if parsed[0]["step"] != 1:
-        raise ReportError("diagnostics.csv must include optimizer step 1")
-    if parsed[-1]["step"] != int(training[-1]["step"]):
-        raise ReportError("diagnostics.csv does not contain the final training step")
-    return parsed
-
-
-def _validate_diagnostic_grid(
-    identities_by_step: Mapping[
-        int, set[tuple[str, int | None, str, str]]
-    ],
-    counts_by_scope: Mapping[tuple[str, int | None], int],
-) -> None:
-    """Require every sampled point to contain the complete version-one grid."""
-
-    expected_scopes = set(counts_by_scope)
-    mandatory = {("overall", None), ("embeddings", None), ("final_norm", None)}
-    if not mandatory.issubset(expected_scopes):
+    if log.tokens_per_step != training.tokens_per_step:
         raise ReportError(
-            "diagnostics.csv is missing an overall, embeddings, or final_norm scope"
+            f"{DIAGNOSTICS_LOG_NAME} token accounting disagrees with "
+            f"{TRAINING_LOG_NAME}"
         )
-    block_layers = sorted(
-        int(layer)
-        for scope, layer in expected_scopes
-        if scope == "block" and layer is not None
-    )
-    if not block_layers or block_layers != list(range(block_layers[-1] + 1)):
+    if not _close(log.flops_per_token, training.flops_per_token):
         raise ReportError(
-            "diagnostics.csv block scopes must be contiguous and start at layer 0"
+            f"{DIAGNOSTICS_LOG_NAME} FLOP accounting disagrees with "
+            f"{TRAINING_LOG_NAME}"
         )
-    expected_grid = {
-        (scope, layer, family, statistic)
-        for scope, layer in expected_scopes
-        for family in _DIAGNOSTIC_FAMILIES
-        for statistic in _DIAGNOSTIC_STATS
+    if len(log) == 0:
+        raise ReportError(f"{DIAGNOSTICS_LOG_NAME} has no samples")
+    if np.any(np.diff(log.steps) <= 0):
+        raise ReportError(f"{DIAGNOSTICS_LOG_NAME} steps must increase")
+    if int(log.steps[0]) != 1:
+        raise ReportError(f"{DIAGNOSTICS_LOG_NAME} must include optimizer step 1")
+    final_step = int(training.steps[-1])
+    if int(log.steps[-1]) != final_step:
+        raise ReportError(
+            f"{DIAGNOSTICS_LOG_NAME} does not contain the final training step"
+        )
+    if int(log.steps[-1]) > final_step:
+        raise ReportError(f"{DIAGNOSTICS_LOG_NAME} runs past the training curve")
+
+    _check_diagnostic_scopes(log)
+    return log
+
+
+def _check_diagnostic_scopes(log: logpack.Log) -> None:
+    """Require the scope layout the layer charts assume."""
+
+    layers_by_scope: dict[int, set[int]] = {}
+    for entry in log.columns:
+        layers_by_scope.setdefault(entry.scope_id, set()).add(entry.layer)
+    names = {
+        scope.name
+        for scope_id in layers_by_scope
+        if (scope := metrics_registry.scope_by_id(scope_id)) is not None
     }
-    for step, identities in identities_by_step.items():
-        if identities != expected_grid:
-            missing = len(expected_grid - identities)
-            extra = len(identities - expected_grid)
-            raise ReportError(
-                f"diagnostics.csv step {step} has an incomplete diagnostic grid "
-                f"({missing} missing, {extra} unexpected rows)"
-            )
-    component_count = sum(
-        count
-        for scope, count in counts_by_scope.items()
-        if scope != ("overall", None)
-    )
-    if counts_by_scope[("overall", None)] != component_count:
+    if not {"overall", "embeddings", "final_norm"} <= names:
         raise ReportError(
-            "diagnostics.csv overall element_count disagrees with its model scopes"
+            f"{DIAGNOSTICS_LOG_NAME} is missing an overall, embeddings, or "
+            "final_norm scope"
+        )
+    block = metrics_registry.scope("block").id
+    if block in layers_by_scope:
+        layers = sorted(layers_by_scope[block])
+        if layers != list(range(len(layers))):
+            raise ReportError(
+                f"{DIAGNOSTICS_LOG_NAME} block scopes must be contiguous and "
+                "start at layer 0"
+            )
+
+    # The overall scope covers the whole model, so its element count has to be
+    # the sum of the disjoint scopes that partition it.
+    overall = metrics_registry.scope("overall").id
+    counts: dict[tuple[int, int], int] = {}
+    for entry in log.columns:
+        counts.setdefault((entry.scope_id, entry.layer), entry.element_count)
+    total = counts.get((overall, -1))
+    parts = sum(
+        value for (scope_id, _), value in counts.items() if scope_id != overall
+    )
+    if total is not None and parts and total != parts:
+        raise ReportError(
+            f"{DIAGNOSTICS_LOG_NAME} overall element_count disagrees with its "
+            "model scopes"
         )
 
 
@@ -553,7 +551,7 @@ def _artifact_path(
         return None
     if not resolved.is_file() or unresolved.is_symlink():
         raise ReportError(f"artifact {artifact_name} is not a regular file")
-    if resolved.stat().st_size > _MAX_CSV_BYTES:
+    if resolved.stat().st_size > _MAX_ARTIFACT_BYTES:
         raise ReportError(f"artifact {artifact_name} is implausibly large")
     return resolved
 
@@ -587,120 +585,28 @@ def _check_record_artifact(
         raise ReportError(f"ledger SHA-256 for {name} no longer matches")
 
 
-def _read_training(path: Path) -> tuple[list[dict[str, float]], tuple[str, ...]]:
-    with path.open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        fields = reader.fieldnames
-        if not fields or len(fields) != len(set(fields)):
-            raise ReportError("training.csv has a missing or duplicate header")
-        missing = [name for name in _TRAIN_REQUIRED if name not in fields]
-        if missing:
-            raise ReportError("training.csv is missing: " + ", ".join(missing))
-        raw_rows = list(reader)
-    if not raw_rows:
-        raise ReportError("training.csv has no data rows")
+def _read_training(path: Path) -> logpack.Log:
+    """Read the training log and check that it covers every optimizer step."""
 
-    primary = set(_TRAIN_REQUIRED)
-    parsed: list[dict[str, float]] = []
-    numeric_extra = {name for name in fields if name not in primary}
-    strict_extra = {
-        name
-        for name in ("learning_rate", "grad_norm", "cumulative_estimated_flops")
-        if name in numeric_extra
-    }
-    for number, raw in enumerate(raw_rows, 2):
-        row: dict[str, float] = {}
-        row["step"] = float(_positive_int_text(raw.get("step"), f"training.csv:{number} step"))
-        row["tokens_processed"] = float(
-            _positive_int_text(raw.get("tokens_processed"), f"training.csv:{number} tokens")
-        )
-        row["train_loss"] = _finite_text(
-            raw.get("train_loss"), f"training.csv:{number} train_loss"
-        )
-        for name in tuple(numeric_extra):
-            value = raw.get(name)
-            if value is None or not value.strip():
-                if name in strict_extra:
-                    raise ReportError(f"training.csv:{number} {name} is missing")
-                numeric_extra.discard(name)
-                continue
-            try:
-                row[name] = _finite_text(value, f"training.csv:{number} {name}")
-            except ReportError:
-                if name in strict_extra:
-                    raise
-                # A textual or sparse diagnostic column is harmless, but is not a
-                # scalar series.  Primary metric corruption remains fatal above.
-                numeric_extra.discard(name)
-        parsed.append(row)
-
-    previous_tokens = 0
-    for expected_step, row in enumerate(parsed, 1):
-        step, tokens = int(row["step"]), int(row["tokens_processed"])
-        if step != expected_step:
-            raise ReportError(
-                "training.csv must contain exactly one row for every optimizer step "
-                f"starting at 1 (expected {expected_step}, got {step})"
-            )
-        if tokens <= previous_tokens:
-            raise ReportError("training.csv token counts must increase strictly")
-        previous_tokens = tokens
-    # Remove values parsed before a later row proved a column non-scalar.
-    for row in parsed:
-        for name in tuple(row):
-            if name not in primary and name not in numeric_extra:
-                del row[name]
-    metric_names = tuple(
-        name
-        for name in fields
-        if name in numeric_extra and name not in {"cumulative_estimated_flops"}
-    )
-    return parsed, ("train_loss", *metric_names)
-
-
-def _attach_flops(rows: list[dict[str, float]], metrics: Mapping[str, Any]) -> str:
-    explicit = all("cumulative_estimated_flops" in row for row in rows)
-    if explicit:
-        prior = 0.0
-        for row in rows:
-            value = row["cumulative_estimated_flops"]
-            if value <= prior:
-                raise ReportError(
-                    "cumulative_estimated_flops must be positive and increase strictly"
-                )
-            row["estimated_flops"] = value
-            prior = value
-        declared_total = metrics.get("estimated_total_flops")
-        if declared_total is not None:
-            expected = _positive_finite(declared_total, "estimated_total_flops")
-            if not _close(prior, expected):
-                raise ReportError(
-                    "training.csv final cumulative_estimated_flops disagrees with "
-                    "result metrics.estimated_total_flops"
-                )
-        return "training.csv cumulative_estimated_flops"
-
-    ratio_value = metrics.get("flops_per_token")
-    if ratio_value is None:
-        total = metrics.get("estimated_total_flops")
-        tokens = metrics.get("tokens_processed")
-        if total is not None and tokens:
-            ratio_value = _finite(total, "estimated_total_flops") / _positive_int(
-                tokens, "tokens_processed"
-            )
-    if ratio_value is None:
+    try:
+        log = logpack.read_log(path)
+    except logpack.LogError as error:
+        raise ReportError(str(error)) from error
+    if len(log) == 0:
+        raise ReportError(f"{TRAINING_LOG_NAME} has no samples")
+    expected = np.arange(1, len(log) + 1, dtype=log.steps.dtype)
+    if not np.array_equal(log.steps, expected):
         raise ReportError(
-            "no cumulative_estimated_flops or result metrics.flops_per_token for equi-FLOP plots"
+            f"{TRAINING_LOG_NAME} must contain exactly one sample for every "
+            "optimizer step starting at 1"
         )
-    ratio = _finite(ratio_value, "flops_per_token")
-    if ratio <= 0:
-        raise ReportError("flops_per_token must be greater than zero")
-    for row in rows:
-        row["estimated_flops"] = ratio * row["tokens_processed"]
-    return "derived: result metrics.flops_per_token × tokens_processed"
+    loss = log.series("train_loss")
+    if loss is None or not np.all(np.isfinite(loss)):
+        raise ReportError(f"{TRAINING_LOG_NAME} train_loss must be finite")
+    return log
 
 
-def _read_validation(path: Path, training: Sequence[Mapping[str, float]]) -> list[dict[str, Any]]:
+def _read_validation(path: Path, training: logpack.Log) -> list[dict[str, Any]]:
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         fields = reader.fieldnames
@@ -712,8 +618,7 @@ def _read_validation(path: Path, training: Sequence[Mapping[str, float]]) -> lis
         raw_rows = list(reader)
     rows: list[dict[str, Any]] = []
     prior_step = 0
-    final_step = int(training[-1]["step"])
-    training_tokens = {int(row["step"]): int(row["tokens_processed"]) for row in training}
+    final_step = int(training.steps[-1])
     for number, raw in enumerate(raw_rows, 2):
         step = _positive_int_text(raw.get("step"), f"validation.csv:{number} step")
         tokens = _positive_int_text(
@@ -721,9 +626,10 @@ def _read_validation(path: Path, training: Sequence[Mapping[str, float]]) -> lis
         )
         if step < prior_step or step > final_step:
             raise ReportError("validation.csv steps must be ordered and within training")
-        if training_tokens.get(step) != tokens:
+        if step * training.tokens_per_step != tokens:
             raise ReportError(
-                f"validation.csv:{number} token count disagrees with training.csv step {step}"
+                f"validation.csv:{number} token count disagrees with "
+                f"{TRAINING_LOG_NAME} step {step}"
             )
         kind, domain = raw.get("kind", "").strip(), raw.get("domain", "").strip()
         if not kind or not domain:
@@ -743,32 +649,26 @@ def _read_validation(path: Path, training: Sequence[Mapping[str, float]]) -> lis
     return rows
 
 
-def _flops_at_step(training: Sequence[Mapping[str, float]], step: int) -> float:
-    if step <= training[0]["step"]:
-        scale = step / training[0]["step"]
-        return float(training[0]["estimated_flops"] * scale)
-    for left, right in zip(training, training[1:]):
-        if step == int(left["step"]):
-            return float(left["estimated_flops"])
-        if left["step"] < step <= right["step"]:
-            fraction = (step - left["step"]) / (right["step"] - left["step"])
-            return float(
-                left["estimated_flops"]
-                + fraction * (right["estimated_flops"] - left["estimated_flops"])
-            )
-    return float(training[-1]["estimated_flops"])
+def _flops_at_step(training: logpack.Log, step: int) -> float:
+    """Cumulative FLOPs at any step, including one between recorded samples.
+
+    The axis is exactly linear in the step -- every step costs the same batch --
+    so what used to be a walk with interpolation is now a multiply.
+    """
+
+    return float(step) * training.tokens_per_step * training.flops_per_token
 
 
 def _validate_and_fill_evaluations(
     rows: list[dict[str, Any]],
     result: Mapping[str, Any],
-    final_training: Mapping[str, float],
+    training: logpack.Log,
 ) -> None:
     metrics = _object(result.get("metrics"), "result metrics")
     validation_loss = _finite(metrics.get("validation_loss"), "validation_loss")
-    final_step = int(final_training["step"])
-    final_tokens = int(final_training["tokens_processed"])
-    final_flops = float(final_training["estimated_flops"])
+    final_step = int(training.steps[-1])
+    final_tokens = int(training.axis("tokens_processed")[-1])
+    final_flops = _flops_at_step(training, final_step)
     fineweb_final = [
         row
         for row in rows
@@ -1037,7 +937,7 @@ def _report_payload(
                 "color": _COLORS[index % len(_COLORS)],
                 "ledger": run.record is not None,
                 "flopSource": run.flop_source,
-                "finalStep": int(run.training[-1]["step"]),
+                "finalStep": run.final_step,
                 "tokens": int(metrics["tokens_processed"]),
                 "trainSeconds": metrics.get("train_seconds"),
                 "trainLoss": metrics.get("train_loss"),
@@ -1045,7 +945,7 @@ def _report_payload(
                 "fresh10Loss": fresh_loss,
                 "qualified": qualified,
                 "hasLayerStats": bool(run.layer_stats)
-                or any(row["scope"] != "overall" for row in run.diagnostics),
+                or run.has_layer_diagnostics(),
             }
         )
 
@@ -1072,18 +972,16 @@ def _report_payload(
 
     time_charts = [chart for chart in time_charts if chart["series"]]
 
+    overall_scope = metrics_registry.scope("overall").id
     recorded_overall = {
-        (str(row["family"]), str(row["stat"]))
+        (entry.metric.family, entry.metric.stat)
         for run in runs
-        for row in run.diagnostics
-        if row["scope"] == "overall"
+        if run.diagnostics is not None
+        for entry in run.diagnostics.columns
+        if entry.scope_id == overall_scope
+        and entry.metric is not None
+        and entry.metric.family is not None
     }
-    recorded_overall.update(
-        identity
-        for run in runs
-        for metric in run.train_metrics
-        if (identity := _overall_metric_identity(metric)) is not None
-    )
     requested_overall = [
         (family, statistic)
         for family in ("grad", "update", "param")
@@ -1154,11 +1052,7 @@ def _training_chart(
 ) -> dict[str, Any]:
     series: list[dict[str, Any]] = []
     for run in runs:
-        points = [
-            [row["step"], row["estimated_flops"], row[metric]]
-            for row in run.training
-            if metric in row
-        ]
+        points = run.training_points(metric)
         if points:
             limit = int(run.result.get("_report_point_limit", _MAX_CHART_POINTS))
             # The report opens in equi-FLOP mode, so point selection must preserve
@@ -1186,36 +1080,7 @@ def _overall_diagnostic_charts(runs: Sequence[_Run]) -> list[dict[str, Any]]:
         for statistic in _DIAGNOSTIC_STATS:
             series: list[dict[str, Any]] = []
             for run in runs:
-                rows = [
-                    row
-                    for row in run.diagnostics
-                    if row["scope"] == "overall"
-                    and row["family"] == family
-                    and row["stat"] == statistic
-                ]
-                if rows:
-                    points = [
-                        [row["step"], row["estimated_flops"], row["value"]]
-                        for row in rows
-                    ]
-                else:
-                    legacy = next(
-                        (
-                            metric
-                            for metric in run.train_metrics
-                            if _overall_metric_identity(metric) == (family, statistic)
-                        ),
-                        None,
-                    )
-                    points = (
-                        [
-                            [row["step"], row["estimated_flops"], row[legacy]]
-                            for row in run.training
-                            if legacy in row
-                        ]
-                        if legacy is not None
-                        else []
-                    )
+                points = run.diagnostic_points(family, statistic)
                 if points:
                     limit = int(run.result.get("_report_point_limit", _MAX_CHART_POINTS))
                     series.append(
@@ -1250,18 +1115,6 @@ def _compact(value: Any) -> Any:
     return float(f"{value:.7g}")
 
 
-def _subsample_steps(steps: Sequence[int], limit: int) -> list[int]:
-    """Evenly thin a recorded step list, always keeping the first and last."""
-
-    total = len(steps)
-    if limit <= 0 or total <= limit:
-        return list(steps)
-    picked = {0, total - 1}
-    for index in range(limit):
-        picked.add(round(index * (total - 1) / (limit - 1)))
-    return [steps[index] for index in sorted(picked)]
-
-
 def _final_diagnostic_charts(
     runs: Sequence[_Run], snapshots: int = _MAX_LAYER_SNAPSHOTS
 ) -> list[dict[str, Any]]:
@@ -1278,46 +1131,32 @@ def _final_diagnostic_charts(
         for statistic in _DIAGNOSTIC_STATS:
             series: list[dict[str, Any]] = []
             for run in runs:
-                rows = [
-                    row
-                    for row in run.diagnostics
-                    if row["scope"] != "overall"
-                    and row["family"] == family
-                    and row["stat"] == statistic
-                ]
-                by_step: dict[int, list[Mapping[str, Any]]] = {}
-                for row in rows:
-                    by_step.setdefault(int(row["step"]), []).append(row)
-                recorded = sorted(by_step)
-                if recorded:
-                    # The last frame is the most complete, so it defines the
-                    # scope layout every other frame is aligned to.
-                    layout = [
-                        [point[0], point[2]]
-                        for point in _diagnostic_scope_points(by_step[recorded[-1]])
+                layout = _diagnostic_scope_layout(run.diagnostics, family, statistic)
+                if layout:
+                    # The column table fixes the scope layout for the whole run,
+                    # so every frame aligns without per-step reconciliation.
+                    assert run.diagnostics is not None
+                    keep = _subsample_indices(len(run.diagnostics), snapshots)
+                    order = [position for position, _, _ in layout]
+                    frame = run.diagnostics.values[
+                        np.ix_(keep, [index for _, _, index in layout])
                     ]
-                    if not layout:
-                        continue
-                    order = [position for position, _ in layout]
-                    steps = _subsample_steps(recorded, snapshots)
-                    values = []
-                    for step in steps:
-                        found = {
-                            point[0]: point[1]
-                            for point in _diagnostic_scope_points(by_step[step])
-                        }
-                        values.append([_compact(found.get(position)) for position in order])
                     series.append(
                         {
                             "run": run.run_id,
-                            "scopes": layout,
-                            "steps": steps,
-                            "values": values,
+                            "scopes": [
+                                [position, label] for position, label, _ in layout
+                            ],
+                            "steps": [int(run.diagnostics.steps[index]) for index in keep],
+                            "values": [
+                                [_compact(float(value)) for value in row]
+                                for row in frame
+                            ],
                         }
                     )
                     continue
-                # Checkpoint-derived arrays are a useful fallback for legacy
-                # runs, but diagnostics.csv wins whenever both exist.
+                # Checkpoint-derived arrays are a useful fallback for runs
+                # without diagnostics; the log wins whenever both exist.
                 legacy = [
                     [int(row["layer"]), row[statistic], f"block {int(row['layer'])}"]
                     for row in run.layer_stats.get(family, [])
@@ -1329,7 +1168,7 @@ def _final_diagnostic_charts(
                         {
                             "run": run.run_id,
                             "scopes": [[point[0], point[2]] for point in legacy],
-                            "steps": [int(run.training[-1]["step"])],
+                            "steps": [run.final_step],
                             "values": [[_compact(point[1]) for point in legacy]],
                         }
                     )
@@ -1347,25 +1186,55 @@ def _final_diagnostic_charts(
     return charts
 
 
-def _diagnostic_scope_points(rows: Sequence[Mapping[str, Any]]) -> list[list[Any]]:
-    block_layers = [int(row["layer"]) for row in rows if row["scope"] == "block"]
-    final_position = (max(block_layers) + 1) if block_layers else 1
-    positions = {
+def _diagnostic_scope_layout(
+    log: logpack.Log | None, family: str, statistic: str
+) -> list[tuple[int, str, int]]:
+    """Order one statistic's per-scope columns along the model axis.
+
+    Returns ``(position, label, column index)`` sorted by position, with the
+    embeddings pinned before layer 0 and the trailing scopes after the last
+    block, so the layer chart reads left to right through the network.
+    """
+
+    if log is None:
+        return []
+    wanted = metrics_registry.metric(f"{family}.{statistic}").id
+    block = metrics_registry.scope("block").id
+    selected = [
+        (index, entry)
+        for index, entry in enumerate(log.columns)
+        if entry.metric_id == wanted
+        and entry.scope_id != metrics_registry.scope("overall").id
+    ]
+    layers = [entry.layer for _, entry in selected if entry.scope_id == block]
+    final_position = (max(layers) + 1) if layers else 1
+    trailing = {
         "embeddings": (-1, "embeddings"),
         "final_norm": (final_position, "final norm"),
         "unembedding": (final_position + 1, "unembedding"),
     }
-    points: list[list[Any]] = []
-    for row in rows:
-        scope = str(row["scope"])
-        if scope == "block":
-            layer = int(row["layer"])
-            points.append([layer, row["value"], f"block {layer}"])
-        elif scope in positions:
-            position, label = positions[scope]
-            points.append([position, row["value"], label])
-    points.sort(key=lambda point: point[0])
-    return points
+    layout: list[tuple[int, str, int]] = []
+    for index, entry in selected:
+        if entry.scope_id == block:
+            layout.append((entry.layer, f"block {entry.layer}", index))
+            continue
+        scope = metrics_registry.scope_by_id(entry.scope_id)
+        if scope is not None and scope.name in trailing:
+            position, label = trailing[scope.name]
+            layout.append((position, label, index))
+    layout.sort(key=lambda item: item[0])
+    return layout
+
+
+def _subsample_indices(total: int, limit: int) -> list[int]:
+    """Evenly thin sample positions, always keeping the first and last."""
+
+    if limit <= 0 or total <= limit:
+        return list(range(total))
+    picked = {0, total - 1}
+    for index in range(limit):
+        picked.add(round(index * (total - 1) / (limit - 1)))
+    return sorted(picked)
 
 
 def _validation_chart(
@@ -1473,41 +1342,6 @@ def _diagnostic_metric(name: str) -> bool:
         )
     )
     return family and statistic
-
-
-def _overall_metric_identity(name: str) -> tuple[str, str] | None:
-    """Map a numeric diagnostic column name to the requested coverage grid."""
-
-    normalized = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
-    tokens = set(normalized.split("_"))
-    if tokens & {"grad", "grads", "gradient", "gradients"}:
-        family = "grad"
-    elif tokens & {"update", "updates"}:
-        family = "update"
-    elif tokens & {"param", "params", "parameter", "parameters"}:
-        family = "param"
-    else:
-        return None
-
-    compact = normalized.replace("_", "")
-    if "l1norm" in compact or "norml1" in compact:
-        statistic = "l1_norm"
-    elif "l2norm" in compact or "norml2" in compact:
-        statistic = "l2_norm"
-    elif "thirdmoment" in compact or "moment3" in compact or "m3" in tokens:
-        statistic = "third_moment"
-    elif "fourthmoment" in compact or "moment4" in compact or "m4" in tokens:
-        statistic = "fourth_moment"
-    elif tokens & {"std", "stdev", "stddev"}:
-        statistic = "std"
-    elif "mean" in tokens:
-        statistic = "mean"
-    elif "norm" in tokens or normalized.endswith("norm"):
-        # The existing reference `grad_norm` is the global L2 norm.
-        statistic = "l2_norm"
-    else:
-        return None
-    return family, statistic
 
 
 def _overall_metric_label(identity: tuple[str, str]) -> str:

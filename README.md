@@ -287,7 +287,16 @@ uv run --frozen --no-sync rig run reference \
 # Short diagnostic overrides follow --; experiment settings stay in config.yaml
 uv run --frozen --no-sync rig run reference --profile dev -- \
   --steps 100
+
+# Walk the first 100 steps of a full-horizon run, schedule untouched
+uv run --frozen --no-sync rig run reference --profile dev \
+  --tokens-per-parameter 20 --early-stopping-step 100
 ```
+
+Those last two are not the same run. `--steps 100` builds a 100-step schedule —
+`m_D = 1`, warmup 10 steps — while `--early-stopping-step 100` keeps the full
+horizon's peak learning rate and warmup and simply stops early, so its curve is
+the long run's prefix step for step.
 
 Sweeping a hyperparameter across the ladder is deliberately not built in. One
 run is one command, so a study is an ordinary shell loop over `rig run` with
@@ -312,10 +321,10 @@ JSONL record. The trainer's synchronized accelerator time is the open-track
 score; cold process wall time is recorded separately. Human progress is streamed
 live while the machine-readable result remains isolated on stdout.
 
-Every successful reference run also writes `training.csv` inside its run
-directory. It contains one row per optimizer step with step number, cumulative
-training tokens, cumulative analytic estimated FLOPs, loss, learning rate, and
-gradient norm. Scalars accumulate on the TPU and transfer only after timed
+Every successful reference run also writes `training.riglog` inside its run
+directory: one packed record per optimizer step holding loss, learning rate, and
+gradient norm, with cumulative tokens and FLOPs derived from the header rather
+than stored. Scalars accumulate on the TPU and transfer only after timed
 training, so retaining the complete curve does not add a synchronization to
 every step. Token, learning-rate, and FLOP columns are deterministic bookkeeping;
 they require no additional device logging. The harness records the CSV's
@@ -418,7 +427,7 @@ rather than silently dropped.
 
 One global selector switches every time-series chart
 between **equi-FLOP** (the default, using analytic cumulative estimated FLOPs)
-and **equi-step**. Official reference runs record `diagnostics.csv` at step 1,
+and **equi-step**. Official reference runs record `diagnostics.riglog` at step 1,
 every 250 steps, and the final step. The report exposes separate
 **Gradient / Update / Parameter** buttons, with one chart for each L1/L2 norm,
 mean, standard deviation, and centered third/fourth moment. Timeline charts use
@@ -442,7 +451,7 @@ interest can be located on the dragger. By default every recorded diagnostic
 step is kept, so the dragger moves at the granularity the run recorded;
 `make report LAYER_SNAPSHOTS=N` thins the step axis to N if you would rather
 have a smaller file. Compatible retained checkpoints are used only
-as a legacy fallback for runs that predate `diagnostics.csv`.
+as a fallback for runs recorded without diagnostics.
 
 Charts render into bounded, downsampled canvases only after an input or resize
 event—there is no animation loop or idle redraw. Hover inspects the nearest

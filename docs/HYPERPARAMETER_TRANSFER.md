@@ -133,13 +133,19 @@ They are neither seed-intrinsic nor data-driven:
   250M bs256 `2^-7` — which a shared batch cannot explain when the orders
   differ.
 
-What does predict them is position on the warmup ramp. Spiking runs peak at a
-median **10.5% of their own peak LR**, against 0.4% for non-spiking runs, and
-the step moves earlier as the target LR rises (60M bs128: step ~24 at `2^-7`,
-~19 at `2^-6`). So this is an early-training instability that every run passes
-through, whose severity is set by how high the LR has ramped by the time it
-arrives — and with `grad_clip: 0.0`, whatever lands goes into the weights at
+At 60M–250M what predicts them is position on the warmup ramp. Spiking runs
+peak at a median **10.5% of their own peak LR**, against 0.4% for non-spiking
+runs, and the step moves earlier as the target LR rises (60M bs128: step ~24 at
+`2^-7`, ~19 at `2^-6`). So this is an early-training instability that every run
+passes through, whose severity is set by how high the LR has ramped by the time
+it arrives — and with `grad_clip: 0.0`, whatever lands goes into the weights at
 full size.
+
+**500M does not fit that story.** Both of its spikes land 25–50% into the run,
+long past warmup, at 68–91% of peak LR. The 10.5% median above is a small-tier
+number that those two runs sit far outside of. Whether this is the same
+instability displaced by scale or a second mechanism is open on two runs; the
+per-run index is in [GRADIENT_SPIKES.md](GRADIENT_SPIKES.md).
 
 That reframes the seed variance throughout this note. It is not luck in the
 initialization so much as luck in how hard one unavoidable fragile phase hits,

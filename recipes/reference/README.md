@@ -59,18 +59,25 @@ inside timed training. See [the kernel notes](../../docs/KERNELS.md).
 
 Every accepted run writes:
 
-- `training.csv`: every optimizer step, cumulative tokens/FLOPs, train loss,
-  effective global LR, and gradient norm;
+- `training.riglog`: every optimizer step's train loss, effective global LR, and
+  gradient norm;
 - `validation.csv`: deterministic probes and canonical final validation;
-- `diagnostics.csv`: sparse parameter, gradient, and update statistics for every
-  supported model scope and statistic;
+- `diagnostics.riglog`: sparse parameter, gradient, and update statistics for
+  every supported model scope and statistic;
 - `checkpoint.npz`, except for explicit open/dev study runs using
   `--checkpoint-policy none`;
 - `metrics.json`, with the resolved tier, exact parameter count, Complete(d)P
   multipliers, data-sharding rule, system topology, and result protocol.
 
+Both logs are packed binary, not CSV: a header naming each column by its
+permanent id from `rig/metrics.py`, then fixed-width `float32` records. A 500M
+run's diagnostics are 6.4 MB instead of 144 MB, and the report reads them in
+milliseconds. Fixed stride also makes the file append-only, so a preempted run
+keeps every sample already written. Read one with `rig.logpack.read_log`, which
+returns the column table plus one `(samples x columns)` array.
+
 Curves accumulate on device and move to the host after synchronized training,
-so per-step CSV capture does not add a host synchronization. Dev and official
+so per-step capture does not add a host synchronization. Dev and official
 runs enable all diagnostics by default, every 10 and 500 steps respectively
 (plus the first and final steps); smoke runs keep them disabled. Official probes
 run every 500 steps and count inside `train_seconds`; canonical final FineWeb

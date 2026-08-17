@@ -40,6 +40,7 @@ from jax.experimental import multihost_utils
 import yaml
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from rig import logpack
 from rig.flops import (
     FlopBreakdown,
     count_training_flops,
@@ -62,9 +63,9 @@ from rig.kernels.autotune import (
 
 RESULT_PREFIX = "RIG_RESULT="
 CHECKPOINT_NAME = "checkpoint.npz"
-TRAINING_CSV_NAME = "training.csv"
+TRAINING_LOG_NAME = f"training{logpack.SUFFIX}"
 VALIDATION_CSV_NAME = "validation.csv"
-DIAGNOSTICS_CSV_NAME = "diagnostics.csv"
+DIAGNOSTICS_LOG_NAME = f"diagnostics{logpack.SUFFIX}"
 SCHEMA_VERSION = 1
 CONFIG_SCHEMA_VERSION = 2
 CONFIG_FILENAME = "config.yaml"
@@ -157,6 +158,16 @@ class Config:
     config_sha256: str
     config_profile: str
     config_overrides: tuple[tuple[str, int], ...]
+    # Optimizer step after which to stop. steps, warmup, and m_D still resolve
+    # from the full horizon, so the trajectory matches the untruncated run up
+    # to this point. None runs to completion.
+    early_stopping_step: int | None = None
+
+    @property
+    def final_step(self) -> int:
+        """Last optimizer step this run takes; steps stays the schedule horizon."""
+
+        return self.early_stopping_step or self.steps
 
 
 @dataclass(frozen=True)
@@ -1318,6 +1329,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=environment_tier,
         help="model-family size tier (smoke keeps its tiny inline model)",
     )
+    run.add_argument(
+        "--early-stopping-step",
+        type=positive_int,
+        default=None,
+        help=(
+            "stop after this optimizer step while keeping the full schedule; "
+            "requires --tokens-per-parameter so the horizon is unchanged"
+        ),
+    )
     duration = run.add_mutually_exclusive_group()
     duration.add_argument("--steps", type=positive_int, default=None)
     duration.add_argument(
@@ -1619,7 +1639,7 @@ def xprof_step_window(
     if start > total_steps or end > total_steps:
         raise ValueError(
             "XProf capture window must fit inside the training run; "
-            f"requested steps {start}..{end} with --steps {total_steps}"
+            f"requested steps {start}..{end} of a {total_steps}-step run"
         )
     return start, end
 
@@ -1696,6 +1716,15 @@ def resolve_config(
             else experiment.tokens_per_parameter
         )
     )
+    early_stop = getattr(args, "early_stopping_step", None)
+    if early_stop is not None and requested_tpp is None:
+        # --steps and --train-tokens rebuild the schedule around the length you
+        # ask for: m_D falls to 1 and warmup shrinks with it, so a truncated run
+        # would not reproduce the trajectory it is meant to sample.
+        raise ValueError(
+            "--early-stopping-step requires a tokens-per-parameter horizon; "
+            "it cannot be combined with --steps or --train-tokens"
+        )
     if requested_train_tokens is not None:
         if requested_train_tokens % tokens_per_step:
             raise ValueError(
@@ -1714,6 +1743,11 @@ def resolve_config(
         steps = args.steps if args.steps is not None else experiment.steps
         if steps is None:  # schema validation establishes a duration, defensively retain type.
             raise AssertionError("experiment duration did not resolve")
+    if early_stop is not None and early_stop > steps:
+        raise ValueError(
+            f"--early-stopping-step {early_stop:,} is past the {steps:,}-step "
+            "horizon this configuration resolves to"
+        )
     if profile == "official":
         validation_tokens = 10_485_760
         predictions_per_batch = batch_size * seq_len
@@ -1801,6 +1835,7 @@ def resolve_config(
         warmup_steps = 0
     return Config(
         steps=steps,
+        early_stopping_step=early_stop,
         batch_size=batch_size,
         seq_len=seq_len,
         sampling=experiment.sampling,
@@ -3078,7 +3113,7 @@ def should_run_validation_probe(step: int, config: Config) -> bool:
 
     return (
         config.val_every > 0
-        and step < config.steps
+        and step < config.final_step
         and step % config.val_every == 0
     )
 
@@ -3088,7 +3123,7 @@ def should_run_diagnostics(step: int, config: Config) -> bool:
 
     return config.diagnostics_every > 0 and (
         step == 1
-        or step == config.steps
+        or step == config.final_step
         or step % config.diagnostics_every == 0
     )
 
@@ -3381,115 +3416,33 @@ def write_result(output_dir: Path, result: Mapping[str, Any]) -> None:
     os.replace(temporary, destination)
 
 
-def write_training_csv(
-    output_dir: Path,
-    history: np.ndarray,
-    config: Config,
-    flops_per_token: int | None = None,
-) -> None:
-    """Atomically persist every optimizer step without timing host transfers."""
+def training_log_columns() -> tuple[logpack.Column, ...]:
+    """The per-step scalars, in the order ``history`` stores them."""
 
-    if history.shape != (config.steps, 3):
-        raise ValueError(
-            f"training history has shape {history.shape}; expected {(config.steps, 3)}"
-        )
-    if flops_per_token is not None and flops_per_token <= 0:
-        raise ValueError("flops_per_token must be positive when provided")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    destination = output_dir / TRAINING_CSV_NAME
-    temporary = output_dir / f".{TRAINING_CSV_NAME}.tmp"
-    tokens_per_step = config.batch_size * config.seq_len
-    with temporary.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle, lineterminator="\n")
-        writer.writerow(
-            (
-                "step",
-                "tokens_processed",
-                "cumulative_estimated_flops",
-                "train_loss",
-                "learning_rate",
-                "grad_norm",
-            )
-        )
-        for index, (loss, learning_rate_value, grad_norm) in enumerate(history, 1):
-            tokens_processed = index * tokens_per_step
-            writer.writerow(
-                (
-                    index,
-                    tokens_processed,
-                    (
-                        tokens_processed * flops_per_token
-                        if flops_per_token is not None
-                        else ""
-                    ),
-                    float(loss),
-                    float(learning_rate_value),
-                    float(grad_norm),
-                )
-            )
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, destination)
+    return (
+        logpack.column("train_loss"),
+        logpack.column("learning_rate"),
+        logpack.column("grad_norm"),
+    )
 
 
-def append_progress_row(
-    output_dir: Path,
-    step: int,
-    *,
-    loss: float,
-    learning_rate_value: float,
-    grad_norm: float,
-    config: Config,
-    flops_per_token: int | None,
-) -> None:
-    """Append one already-materialized step to training.csv, best effort.
+def diagnostic_log_columns(
+    scope_metadata: Sequence[tuple[str, int | None, int]],
+) -> tuple[logpack.Column, ...]:
+    """Flatten the ``[scope, family, stat]`` grid into registry-addressed columns.
 
-    Salvage for runs that never reach their final write: on preemptible
-    hardware the job can vanish at any step, and everything else is written
-    only after the loop exits. The rows land at ``log_every`` cadence rather
-    than every step, because this reuses the host metrics the progress line
-    already pulled -- so it costs no extra device synchronization. A run that
-    finishes is rewritten at full per-step resolution by ``write_training_csv``
-    and this file is superseded.
-
-    Never raises. A partial artifact is a convenience; failing the run because
-    a convenience could not be written would be worse than losing it.
+    Order matches ``diagnostic_values``' array layout exactly, so a captured
+    point flattens straight into a record with no per-value bookkeeping.
     """
 
-    tokens_processed = step * config.batch_size * config.seq_len
-    destination = output_dir / TRAINING_CSV_NAME
-    try:
-        new = not destination.exists()
-        with destination.open("a", encoding="utf-8", newline="") as handle:
-            writer = csv.writer(handle, lineterminator="\n")
-            if new:
-                writer.writerow(
-                    (
-                        "step",
-                        "tokens_processed",
-                        "cumulative_estimated_flops",
-                        "train_loss",
-                        "learning_rate",
-                        "grad_norm",
-                    )
-                )
-            writer.writerow(
-                (
-                    step,
-                    tokens_processed,
-                    (
-                        tokens_processed * flops_per_token
-                        if flops_per_token is not None
-                        else ""
-                    ),
-                    float(loss),
-                    float(learning_rate_value),
-                    float(grad_norm),
-                )
-            )
-            handle.flush()
-    except OSError:
-        return
+    return tuple(
+        logpack.column(
+            f"{family}.{stat}", scope, layer, element_count=element_count
+        )
+        for scope, layer, element_count in scope_metadata
+        for family in _DIAGNOSTIC_FAMILIES
+        for stat in _DIAGNOSTIC_STATS
+    )
 
 
 # How many diagnostic captures may sit on the accelerator before being pulled
@@ -3499,80 +3452,112 @@ def append_progress_row(
 DIAGNOSTIC_FLUSH_POINTS = 64
 
 
-def append_diagnostic_rows(
-    output_dir: Path,
-    points: Sequence[DiagnosticPoint],
-    scope_metadata: Sequence[tuple[str, int | None, int]],
+def open_log(
+    destination: Path,
+    columns: Sequence[logpack.Column],
     config: Config,
     flops_per_token: int | None,
-) -> None:
-    """Append already-materialized diagnostic captures, best effort.
+) -> logpack.LogWriter | None:
+    """Open a log for incremental appends, or None when it cannot be recorded.
 
-    Salvage counterpart to :func:`write_diagnostics_csv`, which runs only after
-    the training loop and so yields nothing on a preempted job. Row layout is
-    identical, so a partial file parses exactly like a complete one. A run that
-    finishes rewrites the file atomically and supersedes this.
-
-    Never raises: losing a convenience artifact must not fail a run.
+    Returning None rather than raising keeps logging a convenience: a run must
+    not die because its curve could not be opened.
     """
 
-    if not points or flops_per_token is None or flops_per_token <= 0:
-        return
-    tokens_per_step = config.batch_size * config.seq_len
-    destination = output_dir / DIAGNOSTICS_CSV_NAME
+    if flops_per_token is None or flops_per_token <= 0:
+        return None
     try:
-        new = not destination.exists()
-        with destination.open("a", encoding="utf-8", newline="") as handle:
-            writer = csv.writer(handle, lineterminator="\n")
-            if new:
-                writer.writerow(
-                    (
-                        "step",
-                        "tokens_processed",
-                        "cumulative_estimated_flops",
-                        "scope",
-                        "layer",
-                        "family",
-                        "stat",
-                        "value",
-                        "element_count",
-                    )
-                )
-            for point in points:
-                values = np.asarray(point.values, dtype=np.float32)
-                tokens_processed = point.step * tokens_per_step
-                cumulative_flops = tokens_processed * flops_per_token
-                for scope_index, (scope, layer, element_count) in enumerate(
-                    scope_metadata
-                ):
-                    for family_index, family in enumerate(_DIAGNOSTIC_FAMILIES):
-                        for stat_index, stat in enumerate(_DIAGNOSTIC_STATS):
-                            writer.writerow(
-                                (
-                                    point.step,
-                                    tokens_processed,
-                                    cumulative_flops,
-                                    scope,
-                                    "" if layer is None else layer,
-                                    family,
-                                    stat,
-                                    float(values[scope_index, family_index, stat_index]),
-                                    element_count,
-                                )
-                            )
-            handle.flush()
-    except (OSError, IndexError, ValueError):
+        return logpack.LogWriter(
+            destination,
+            columns,
+            tokens_per_step=config.batch_size * config.seq_len,
+            flops_per_token=float(flops_per_token),
+        )
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def append_log_row(
+    writer: logpack.LogWriter | None, step: int, values: Iterable[float]
+) -> None:
+    """Append one already-materialized sample, best effort.
+
+    Salvage for runs that never reach their final write: on preemptible
+    hardware the job can vanish at any step, and the complete artifacts are
+    written only after the loop exits. Because the log is append-only, whatever
+    reached disk stays readable with no repair, and a run that finishes replaces
+    the file at full resolution.
+
+    Never raises. A partial artifact is a convenience; failing the run because a
+    convenience could not be written would be worse than losing it.
+    """
+
+    if writer is None:
+        return
+    try:
+        writer.append(step, values)
+    except (OSError, ValueError):
         return
 
 
-def write_diagnostics_csv(
+def close_log(writer: logpack.LogWriter | None) -> None:
+    """Close a log writer, tolerating a handle that never opened."""
+
+    if writer is None:
+        return
+    try:
+        writer.close()
+    except OSError:
+        return
+
+
+def write_training_log(
+    output_dir: Path,
+    history: np.ndarray,
+    config: Config,
+    flops_per_token: int | None = None,
+) -> None:
+    """Atomically persist every optimizer step without timing host transfers.
+
+    Supersedes the coarser rows appended during the run: this writes the full
+    per-step history pulled from the device buffer once, at the end.
+    """
+
+    if history.shape[0] > config.final_step:
+        # The device buffer is sized for the full horizon; an early-stopped run
+        # fills only its prefix and the remainder is untouched zeros.
+        history = history[: config.final_step]
+    if history.shape != (config.final_step, 3):
+        raise ValueError(
+            f"training history has shape {history.shape}; "
+            f"expected {(config.final_step, 3)}"
+        )
+    if flops_per_token is not None and flops_per_token <= 0:
+        raise ValueError("flops_per_token must be positive when provided")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    destination = output_dir / TRAINING_LOG_NAME
+    temporary = output_dir / f".{TRAINING_LOG_NAME}.tmp"
+    with logpack.LogWriter(
+        temporary,
+        training_log_columns(),
+        tokens_per_step=config.batch_size * config.seq_len,
+        # Only the FLOP axis needs this; a run without a traced count still
+        # records its curve, and the axis is simply not meaningful.
+        flops_per_token=float(flops_per_token or 1.0),
+    ) as writer:
+        for index, row in enumerate(history, 1):
+            writer.append(index, row)
+    os.replace(temporary, destination)
+
+
+def write_diagnostics_log(
     output_dir: Path,
     points: Sequence[DiagnosticPoint],
     scope_metadata: Sequence[tuple[str, int | None, int]],
     config: Config,
     flops_per_token: int,
 ) -> None:
-    """Atomically persist long-form sparse optimizer diagnostics."""
+    """Atomically persist the sparse optimizer diagnostics."""
 
     if not points:
         raise ValueError("diagnostic history cannot be empty")
@@ -3583,30 +3568,20 @@ def write_diagnostics_csv(
         len(_DIAGNOSTIC_FAMILIES),
         len(_DIAGNOSTIC_STATS),
     )
-    if points[-1].step != config.steps:
+    if points[-1].step != config.final_step:
         raise ValueError("diagnostic history must include the final optimizer step")
     output_dir.mkdir(parents=True, exist_ok=True)
-    destination = output_dir / DIAGNOSTICS_CSV_NAME
-    temporary = output_dir / f".{DIAGNOSTICS_CSV_NAME}.tmp"
-    tokens_per_step = config.batch_size * config.seq_len
-    with temporary.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle, lineterminator="\n")
-        writer.writerow(
-            (
-                "step",
-                "tokens_processed",
-                "cumulative_estimated_flops",
-                "scope",
-                "layer",
-                "family",
-                "stat",
-                "value",
-                "element_count",
-            )
-        )
-        previous_step = 0
+    destination = output_dir / DIAGNOSTICS_LOG_NAME
+    temporary = output_dir / f".{DIAGNOSTICS_LOG_NAME}.tmp"
+    previous_step = 0
+    with logpack.LogWriter(
+        temporary,
+        diagnostic_log_columns(scope_metadata),
+        tokens_per_step=config.batch_size * config.seq_len,
+        flops_per_token=float(flops_per_token),
+    ) as writer:
         for point in points:
-            if point.step <= previous_step or point.step > config.steps:
+            if point.step <= previous_step or point.step > config.final_step:
                 raise ValueError("diagnostic steps must be unique and increasing")
             previous_step = point.step
             values = np.asarray(point.values, dtype=np.float32)
@@ -3619,26 +3594,7 @@ def write_diagnostics_csv(
                 raise FloatingPointError(
                     f"diagnostic values at step {point.step} must be finite"
                 )
-            tokens_processed = point.step * tokens_per_step
-            cumulative_flops = tokens_processed * flops_per_token
-            for scope_index, (scope, layer, element_count) in enumerate(scope_metadata):
-                for family_index, family in enumerate(_DIAGNOSTIC_FAMILIES):
-                    for stat_index, stat in enumerate(_DIAGNOSTIC_STATS):
-                        writer.writerow(
-                            (
-                                point.step,
-                                tokens_processed,
-                                cumulative_flops,
-                                scope,
-                                "" if layer is None else layer,
-                                family,
-                                stat,
-                                float(values[scope_index, family_index, stat_index]),
-                                element_count,
-                            )
-                        )
-        handle.flush()
-        os.fsync(handle.fileno())
+            writer.append(point.step, values.reshape(-1))
     os.replace(temporary, destination)
 
 
@@ -3910,7 +3866,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
 
     dataset, vocab_size = load_dataset(args, experiment)
     config = resolve_config(args, platform, vocab_size, experiment)
-    capture_window = xprof_step_window(args, config.steps)
+    capture_window = xprof_step_window(args, config.final_step)
     downstream_domains = load_downstream_domains(args, config.semantic_vocab_size)
     diagnostic_mode = args.no_final_validation and args.no_checkpoint
     needs_evaluation = should_compile_evaluation(args, config, downstream_domains)
@@ -3966,7 +3922,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     flops_per_token = flop_breakdown.per_token(config.seq_len)
     for warning in flop_breakdown.warnings:
         console.warn(f"FLOP accounting: {warning}")
-    tokens_processed = config.steps * config.batch_size * config.seq_len
+    tokens_processed = config.final_step * config.batch_size * config.seq_len
 
     console.table(
         "run configuration",
@@ -4029,6 +3985,15 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                     f"step 1 / every {config.diagnostics_every} / final"
                     if config.diagnostics_every
                     else "disabled"
+                ),
+            ),
+            (
+                "duration",
+                (
+                    f"{config.final_step:,} of {config.steps:,} scheduled steps "
+                    "(early stop)"
+                    if config.early_stopping_step is not None
+                    else f"{config.steps:,} steps"
                 ),
             ),
             ("train tokens", format_count(tokens_processed)),
@@ -4171,13 +4136,30 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     # the authoritative writer still sees every point.
     diagnostic_points_host: list[DiagnosticPoint] = []
     output_dir = args.output_dir.expanduser().resolve()
+    progress_log: logpack.LogWriter | None = None
+    diagnostic_log: logpack.LogWriter | None = None
     if is_controller:
         output_dir.mkdir(parents=True, exist_ok=True)
         # A stale file from a reused directory would be appended to.
-        (output_dir / TRAINING_CSV_NAME).unlink(missing_ok=True)
-        (output_dir / DIAGNOSTICS_CSV_NAME).unlink(missing_ok=True)
+        (output_dir / TRAINING_LOG_NAME).unlink(missing_ok=True)
+        (output_dir / DIAGNOSTICS_LOG_NAME).unlink(missing_ok=True)
+        progress_log = open_log(
+            output_dir / TRAINING_LOG_NAME,
+            training_log_columns(),
+            config,
+            flops_per_token,
+        )
+        diagnostic_log = open_log(
+            output_dir / DIAGNOSTICS_LOG_NAME,
+            diagnostic_log_columns(diagnostic_metadata),
+            config,
+            flops_per_token,
+        )
     try:
-        for step_index in range(1, config.steps + 1):
+        # final_step is the horizon unless --early-stopping-step truncates it.
+        # The schedule below still spans config.steps, so a truncated run walks
+        # exactly the prefix of the trajectory it samples.
+        for step_index in range(1, config.final_step + 1):
             if capture_window is not None and step_index == capture_window[0]:
                 # Drain earlier asynchronous work before opening the trace. The
                 # capture therefore begins at the requested steady-state step,
@@ -4251,13 +4233,13 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                         ]
                         diagnostic_device_points.clear()
                         diagnostic_points_host.extend(flushed)
-                        if is_controller:
-                            append_diagnostic_rows(
-                                output_dir,
-                                flushed,
-                                diagnostic_metadata,
-                                config,
-                                flops_per_token,
+                        for point in flushed:
+                            append_log_row(
+                                diagnostic_log,
+                                point.step,
+                                np.asarray(
+                                    point.values, dtype=np.float32
+                                ).reshape(-1),
                             )
                 else:
                     params, optimizer, last_metrics = executable(
@@ -4304,28 +4286,27 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                     )
                 should_log = (
                     step_index == 1
-                    or step_index == config.steps
+                    or step_index == config.final_step
                     or step_index % config.log_every == 0
                 )
                 if should_log:
                     host_metrics = local_device_get(last_metrics)
                     elapsed_so_far = max(time.perf_counter() - train_started, 1.0e-12)
                     seen_tokens = step_index * config.batch_size * config.seq_len
-                    if is_controller:
-                        # host_metrics is already on the host for the progress
-                        # line, so this adds no synchronization.
-                        append_progress_row(
-                            output_dir,
-                            step_index,
-                            loss=float(host_metrics["loss"]),
-                            learning_rate_value=float(host_metrics["learning_rate"]),
-                            grad_norm=float(host_metrics["grad_norm"]),
-                            config=config,
-                            flops_per_token=flops_per_token,
-                        )
+                    # host_metrics is already on the host for the progress
+                    # line, so this adds no synchronization.
+                    append_log_row(
+                        progress_log,
+                        step_index,
+                        (
+                            float(host_metrics["loss"]),
+                            float(host_metrics["learning_rate"]),
+                            float(host_metrics["grad_norm"]),
+                        ),
+                    )
                     console.step(
                         step_index,
-                        config.steps,
+                        config.final_step,
                         float(host_metrics["loss"]),
                         float(host_metrics["learning_rate"]),
                         float(host_metrics["grad_norm"]),
@@ -4355,6 +4336,10 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             # Avoid leaving process-global profiler state active when a sampled
             # batch or training step raises midway through the capture window.
             jax.profiler.stop_trace()
+        # Release both handles before the final writers replace these paths, so
+        # a salvage append can never land after the authoritative artifact.
+        close_log(progress_log)
+        close_log(diagnostic_log)
 
     if last_metrics is None:  # defensive: argparse prevents zero steps
         raise AssertionError("training produced no metrics")
@@ -4387,11 +4372,11 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     if diagnostic_mode:
         output_dir = args.output_dir.expanduser().resolve()
         if is_controller:
-            write_training_csv(
+            write_training_log(
                 output_dir, training_history, config, flops_per_token=flops_per_token
             )
             if diagnostic_points:
-                write_diagnostics_csv(
+                write_diagnostics_log(
                     output_dir,
                     diagnostic_points,
                     diagnostic_metadata,
@@ -4405,15 +4390,15 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         console.table(
             "profile complete",
             (
-                ("training steps", f"{config.steps:,}"),
+                ("training steps", f"{config.final_step:,}"),
                 ("captured steps", f"{capture_window[0]}..{capture_window[1]}"),
                 ("train loss", f"{train_loss:.4f}"),
                 ("diagnostic rate", f"{format_rate(diagnostic_rate)} tok/s"),
-                ("training curve", output_dir / TRAINING_CSV_NAME),
+                ("training curve", output_dir / TRAINING_LOG_NAME),
                 (
                     "diagnostics",
                     (
-                        output_dir / DIAGNOSTICS_CSV_NAME
+                        output_dir / DIAGNOSTICS_LOG_NAME
                         if diagnostic_points
                         else "disabled"
                     ),
@@ -4444,7 +4429,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     )
     validation_rows.append(
         ValidationRow(
-            step=config.steps,
+            step=config.final_step,
             tokens_processed=tokens_processed,
             kind="fineweb",
             domain="fineweb",
@@ -4476,7 +4461,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             downstream_results[domain.name] = domain_result
             validation_rows.append(
                 ValidationRow(
-                    step=config.steps,
+                    step=config.final_step,
                     tokens_processed=tokens_processed,
                     kind="downstream",
                     domain=domain.name,
@@ -4509,7 +4494,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         )
         validation_rows.append(
             ValidationRow(
-                step=config.steps,
+                step=config.final_step,
                 tokens_processed=tokens_processed,
                 kind="downstream_macro",
                 domain="fresh10_macro",
@@ -4531,18 +4516,18 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         console.phase("Fresh-domain validation", "skipped; no downstream data supplied")
 
     output_dir = args.output_dir.expanduser().resolve()
-    artifact_names = [TRAINING_CSV_NAME, VALIDATION_CSV_NAME]
+    artifact_names = [TRAINING_LOG_NAME, VALIDATION_CSV_NAME]
     if diagnostic_points:
-        artifact_names.append(DIAGNOSTICS_CSV_NAME)
+        artifact_names.append(DIAGNOSTICS_LOG_NAME)
     if not args.omit_checkpoint:
         artifact_names.append(CHECKPOINT_NAME)
     console.phase("Artifacts", " + ".join(artifact_names))
     if is_controller:
-        write_training_csv(
+        write_training_log(
             output_dir, training_history, config, flops_per_token=flops_per_token
         )
         if diagnostic_points:
-            write_diagnostics_csv(
+            write_diagnostics_log(
                 output_dir,
                 diagnostic_points,
                 diagnostic_metadata,
@@ -4595,10 +4580,10 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         "seed": int(args.seed),
         "checkpoint": None if args.omit_checkpoint else CHECKPOINT_NAME,
         "artifacts": {
-            "training_curve": TRAINING_CSV_NAME,
+            "training_curve": TRAINING_LOG_NAME,
             "validation_curve": VALIDATION_CSV_NAME,
             **(
-                {"diagnostics": DIAGNOSTICS_CSV_NAME}
+                {"diagnostics": DIAGNOSTICS_LOG_NAME}
                 if diagnostic_points
                 else {}
             ),
@@ -4623,7 +4608,13 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             "train_seconds": finite_metric("train_seconds", train_seconds, positive=True),
             "tokens_processed": int(tokens_processed),
             "training_token_budget": int(tokens_processed),
-            "training_steps": int(config.steps),
+            "training_steps": int(config.final_step),
+            "schedule_steps": int(config.steps),
+            "early_stopping_step": (
+                int(config.early_stopping_step)
+                if config.early_stopping_step is not None
+                else None
+            ),
             "model_tier": config.tier,
             "parameter_count": int(params_total),
             "tokens_per_parameter": (

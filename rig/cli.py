@@ -274,6 +274,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="research-only global batch override",
     )
     run.add_argument(
+        "--early-stopping-step",
+        type=_positive_int,
+        help=(
+            "stop after this optimizer step while keeping the full schedule; "
+            "requires --tokens-per-parameter"
+        ),
+    )
+    run.add_argument(
         "--name",
         help=(
             "short label folded into the run directory name; prompted for when "
@@ -758,6 +766,10 @@ def command_run(args: argparse.Namespace) -> int:
         )
     if args.study_batch_size is not None:
         passthrough.extend(("--study-batch-size", str(args.study_batch_size)))
+    if args.early_stopping_step is not None:
+        passthrough.extend(
+            ("--early-stopping-step", str(args.early_stopping_step))
+        )
     for train_file in prepared.train_files:
         passthrough.extend(("--train-data", str(train_file)))
     for validation_file in prepared.validation_files:
@@ -2112,6 +2124,7 @@ def _reject_reserved_trainer_args(arguments: Sequence[str]) -> None:
         "--tokens-per-parameter",
         "--base-learning-rate",
         "--study-batch-size",
+        "--early-stopping-step",
         "--omit-checkpoint",
         "--study-id",
         "--study-point",
