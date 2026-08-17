@@ -28,7 +28,7 @@ from .cluster import (
     terminate_distributed_workers,
 )
 from .errors import ConfigurationError, RecipeError, ResultValidationError
-from .models import Evaluator, RunConfig, RunOutcome
+from .models import RunConfig, RunOutcome
 from .records import append_record
 from .validation import (
     parse_result_line,
@@ -49,7 +49,7 @@ _RESERVED_PASSTHROUGH_FLAGS = (
 )
 
 
-def run_recipe(config: RunConfig, *, evaluator: Evaluator | None = None) -> RunOutcome:
+def run_recipe(config: RunConfig) -> RunOutcome:
     """Run, validate, record, and apply checkpoint retention for one recipe.
 
     This is process isolation for accidental mistakes, not a security sandbox. A
@@ -222,7 +222,6 @@ def run_recipe(config: RunConfig, *, evaluator: Evaluator | None = None) -> RunO
         expected_training_tokens=config.expected_training_tokens,
         expected_validation_tokens=config.expected_validation_tokens,
         expected_downstream_tokens=config.expected_downstream_tokens,
-        evaluator=evaluator,
         require_checkpoint=config.require_checkpoint,
     )
     # Preserve the exact accepted payload independently from potentially noisy logs.
@@ -245,7 +244,6 @@ def run_recipe(config: RunConfig, *, evaluator: Evaluator | None = None) -> RunO
             "train_seconds": validated.declared_train_seconds,
             "tokens_processed": validated.tokens_processed,
             "validation_loss": validated.validation_loss,
-            "evaluator": dict(validated.evaluator_metrics),
         }
     )
     record: dict[str, Any] = {
@@ -310,7 +308,7 @@ def run_recipe(config: RunConfig, *, evaluator: Evaluator | None = None) -> RunO
         # the entire accepted evaluation block without retaining caller aliases.
         record["evaluations"] = dict(validated.evaluations)
 
-    keep_checkpoint = config.checkpoint_retention == "all" or (
+    keep_checkpoint = config.checkpoint_retention in ("always", "all") or (
         config.checkpoint_retention == "qualifying" and qualified
     )
     checkpoint_path: Path | None = validated.checkpoint_path
@@ -551,7 +549,9 @@ def _validate_config(
         raise ConfigurationError("profile must be a non-empty simple name")
     if config.track not in ("open", "sample_efficiency"):
         raise ConfigurationError("track must be 'open' or 'sample_efficiency'")
-    if config.checkpoint_retention not in ("all", "qualifying", "none-after-validation"):
+    if config.checkpoint_retention not in (
+        "always", "qualifying", "none", "all", "none-after-validation"
+    ):
         raise ConfigurationError("invalid checkpoint retention policy")
     if not isinstance(config.require_checkpoint, bool):
         raise ConfigurationError("require_checkpoint must be boolean")

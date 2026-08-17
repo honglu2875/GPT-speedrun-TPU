@@ -13,7 +13,6 @@ _RUN_NAME_STRIP = re.compile(r"[^a-z0-9]+")
 
 Track = Literal["open", "sample_efficiency"]
 CheckpointRetention = Literal["all", "qualifying", "none-after-validation"]
-Evaluator = Callable[[Path, Mapping[str, Any]], Mapping[str, Any] | None]
 
 
 @dataclass(frozen=True)
@@ -91,7 +90,6 @@ class ValidationResult:
     tokens_processed: int
     validation_loss: float
     declared_metrics: Mapping[str, Any]
-    evaluator_metrics: Mapping[str, Any]
     evaluations: Mapping[str, Any] | None
     artifacts: Mapping[str, Path]
 

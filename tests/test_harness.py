@@ -175,14 +175,7 @@ class HarnessRunTests(unittest.TestCase):
         }
 
     def test_run_captures_validates_records_and_forwards_args(self) -> None:
-        evaluator_calls: list[Path] = []
-
-        def evaluator(checkpoint: Path, payload: object) -> dict[str, float]:
-            evaluator_calls.append(checkpoint)
-            self.assertTrue(checkpoint.exists())
-            return {"validation_loss": 2.45}
-
-        outcome = run_recipe(self.config(target_loss=2.48), evaluator=evaluator)
+        outcome = run_recipe(self.config(target_loss=2.6))
 
         self.assertEqual(json.loads((outcome.run_dir / "seen.json").read_text()), {
             "config": str(self.root / "recipes" / "tiny" / "config.yaml"),
@@ -192,7 +185,6 @@ class HarnessRunTests(unittest.TestCase):
             "tag": ["one", "two"],
             "seeded": False,
         })
-        self.assertEqual(evaluator_calls, [outcome.checkpoint_path])
         self.assertTrue((outcome.run_dir / "stdout.log").is_file())
         self.assertTrue((outcome.run_dir / "stderr.log").is_file())
         self.assertTrue((outcome.run_dir / "result.json").is_file())
@@ -202,9 +194,9 @@ class HarnessRunTests(unittest.TestCase):
         self.assertTrue(record["qualified"])
         self.assertGreater(record["timing"]["observed_wall_seconds"], 0)
         self.assertEqual(record["metrics"]["train_seconds"], 0.125)
-        self.assertEqual(record["target_loss"], 2.48)
-        self.assertEqual(record["metrics"]["validation_loss"], 2.45)
-        self.assertEqual(record["metrics"]["evaluator"]["validation_loss"], 2.45)
+        self.assertEqual(record["target_loss"], 2.6)
+        # The recipe's declared loss is authoritative; nothing recomputes it.
+        self.assertEqual(record["metrics"]["validation_loss"], 2.5)
         self.assertEqual(record["metrics"]["compile_seconds"], 0.75)
         self.assertEqual(record["metrics"]["diagnostics"]["gradient_scale"], -2.0)
         self.assertEqual(record["system"], {"platform": "test", "devices": 1})
@@ -566,16 +558,10 @@ class HarnessRunTests(unittest.TestCase):
         with self.assertRaisesRegex(ResultValidationError, "contract mismatch"):
             run_recipe(self.config(track="sample_efficiency", reference_contract=wrong))
 
-    def test_none_retention_deletes_only_after_evaluator(self) -> None:
-        seen_during_validation: list[bool] = []
-
-        def evaluator(checkpoint: Path, payload: object) -> None:
-            seen_during_validation.append(checkpoint.exists())
-
-        outcome = run_recipe(
-            self.config(checkpoint_retention="none-after-validation"), evaluator=evaluator
-        )
-        self.assertEqual(seen_during_validation, [True])
+    def test_none_retention_records_the_digest_then_deletes(self) -> None:
+        # The weights are still hashed into the record before removal, so the
+        # run remains attributable to a specific model even without them.
+        outcome = run_recipe(self.config(checkpoint_retention="none-after-validation"))
         self.assertIsNone(outcome.checkpoint_path)
         self.assertFalse((outcome.run_dir / "model.npz").exists())
         self.assertFalse(outcome.record["checkpoint"]["retained"])

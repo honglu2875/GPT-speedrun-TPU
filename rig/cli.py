@@ -84,7 +84,50 @@ _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _TRACKS = ("open", "sample_efficiency")
 _PROFILES = ("smoke", "dev", "official")
 _TIERS = ("60m", "125m", "250m", "500m", "1b")
-_RETENTION = ("all", "qualifying", "none-after-validation")
+# What happens to model weights. Deliberately named for the decision rather
+# than the outcome, so future options (a checkpointing frequency, keeping the
+# last N) extend this axis instead of adding another flag beside it.
+_CHECKPOINT_POLICIES = ("always", "qualifying", "none")
+# Superseded spellings. "all" read as "every step" rather than "keep it", and
+# --omit-checkpoint silently defeated --checkpoints, which cost a 5.7-hour
+# run its weights. Accepted so existing scripts keep working.
+_LEGACY_RETENTION = {
+    "all": "always",
+    "qualifying": "qualifying",
+    "none-after-validation": "none",
+}
+_RETENTION = tuple(_LEGACY_RETENTION)
+
+
+def _checkpoint_policy(args: argparse.Namespace, fallback: str) -> str:
+    """Resolve the policy from the new flag, the legacy flag, or settings."""
+
+    requested = getattr(args, "checkpoint_policy", None)
+    if requested is None:
+        legacy = getattr(args, "checkpoints", None)
+        requested = _LEGACY_RETENTION.get(legacy) if legacy else None
+    # Only an explicitly requested policy can contradict --omit-checkpoint.
+    # A saved default is a default: an explicit flag is entitled to override it.
+    chosen = requested if requested is not None else _LEGACY_RETENTION.get(
+        fallback, fallback
+    )
+    if getattr(args, "omit_checkpoint", False):
+        if requested not in (None, "none"):
+            # These could contradict each other, and --omit-checkpoint always
+            # won silently: "keep the weights" produced none. Cost a 5.7-hour
+            # run its checkpoint, so say so instead of picking a side.
+            raise ConfigError(
+                "--omit-checkpoint contradicts a checkpoint policy of "
+                f"{chosen!r}: it prevents weights from being written at all. "
+                "Use --checkpoint-policy none, or drop --omit-checkpoint."
+            )
+        chosen = "none"
+    if chosen not in _CHECKPOINT_POLICIES:
+        raise ConfigError(
+            f"unknown checkpoint policy {chosen!r}; expected one of "
+            + ", ".join(_CHECKPOINT_POLICIES)
+        )
+    return chosen
 _COLORS = ("auto", "always", "never")
 OFFICIAL_TARGET_LOSS = 3.28
 # Legacy v1 calibration fallback used only when re-verifying an old record that
@@ -165,7 +208,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     prepare.add_argument("--track", choices=_TRACKS, help="default competition track")
     prepare.add_argument("--run-profile", choices=_PROFILES, help="default run profile")
-    prepare.add_argument("--checkpoints", choices=_RETENTION, help="checkpoint retention policy")
+    prepare.add_argument(
+        "--checkpoint-policy",
+        choices=_CHECKPOINT_POLICIES,
+        help="default checkpoint policy for runs",
+    )
+    prepare.add_argument("--checkpoints", choices=_RETENTION, help=argparse.SUPPRESS)
     prepare.add_argument("--cluster", help="named cluster profile from .rig.toml")
     prepare.add_argument("--color", choices=_COLORS, help="terminal color preference")
     prepare.add_argument(
@@ -258,14 +306,22 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--seed", type=_nonnegative_int, default=1337)
     run.add_argument("--target-loss", type=_nonnegative_float)
     run.add_argument("--timeout", type=_positive_float, help="whole-process timeout in seconds")
-    run.add_argument("--checkpoints", choices=_RETENTION)
+    run.add_argument(
+        "--checkpoint-policy",
+        choices=_CHECKPOINT_POLICIES,
+        help="always keep weights, keep only when qualifying, or never write them",
+    )
+    run.add_argument("--checkpoints", choices=_RETENTION, help=argparse.SUPPRESS)
     run.add_argument("--cluster", help="named cluster profile from .rig.toml")
     run.add_argument("--color", choices=_COLORS)
     run.add_argument("--skip-data-check", action="store_true")
     run.add_argument(
         "--omit-checkpoint",
         action="store_true",
-        help="open/dev research only: retain metrics and curves without model weights",
+        # Superseded by --checkpoint-policy none, which says the same thing on
+        # the one axis instead of beside it. Hidden rather than removed only
+        # so scripts mid-flight keep working; delete once they have caught up.
+        help=argparse.SUPPRESS,
     )
     run.add_argument("--study-id", help=argparse.SUPPRESS)
     run.add_argument("--study-point", help=argparse.SUPPRESS)
@@ -739,11 +795,16 @@ def command_run(args: argparse.Namespace) -> int:
     _reject_reserved_trainer_args(forwarded)
     passthrough.extend(forwarded)
     timeout = args.timeout or {"smoke": 300.0, "dev": 3600.0, "official": 21600.0}[profile]
-    retention = args.checkpoints or config.checkpoint_retention
-    if args.omit_checkpoint and (track != "open" or profile != "dev"):
-        raise ConfigError("--omit-checkpoint is restricted to open/dev research runs")
-    if args.omit_checkpoint:
+    policy = _checkpoint_policy(args, config.checkpoint_retention)
+    if policy == "none" and (track != "open" or profile != "dev"):
+        raise ConfigError(
+            "--checkpoint-policy none is restricted to open/dev research runs"
+        )
+    if policy == "none":
+        # Skip writing rather than write-then-delete. Nothing reads the weights
+        # between those two points, so a 500M run would spend ~2 GB for nothing.
         passthrough.append("--omit-checkpoint")
+    retention = policy
     study_values = (args.study_id, args.study_point, args.study_suite_sha256)
     if any(value is not None for value in study_values) and not all(
         value is not None for value in study_values
@@ -824,7 +885,7 @@ def command_run(args: argparse.Namespace) -> int:
             },
             tpu_vm_count=config.tpu_vm_count,
             tpu_vm_hosts=config.tpu_vm_hosts,
-            require_checkpoint=not args.omit_checkpoint,
+            require_checkpoint=policy != "none",
         )
     )
     metrics = outcome.record["metrics"]

@@ -1,4 +1,4 @@
-"""Validation of result events, contracts, paths, and evaluator output."""
+"""Validation of result events, contracts, and artifact paths."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import re
 from typing import Any, Mapping
 
 from .errors import ResultValidationError
-from .models import Evaluator, ReferenceContract, ValidationResult
+from .models import ReferenceContract, ValidationResult
 
 
 RESULT_PREFIX = "RIG_RESULT="
@@ -321,7 +321,6 @@ def validate_result(
     expected_training_tokens: int | None = None,
     expected_validation_tokens: int | None = None,
     expected_downstream_tokens: Mapping[str, int] | None = None,
-    evaluator: Evaluator | None = None,
     require_checkpoint: bool = True,
 ) -> ValidationResult:
     """Validate a trainer result and, optionally, independently evaluate it."""
@@ -377,8 +376,6 @@ def validate_result(
     if declared_checkpoint is None:
         if require_checkpoint:
             raise ResultValidationError("checkpoint is required for this run")
-        if evaluator is not None:
-            raise ResultValidationError("an independent evaluator requires a checkpoint")
         checkpoint = None
     else:
         checkpoint = contained_file(run_dir, declared_checkpoint)
@@ -407,27 +404,6 @@ def validate_result(
     elif track != "open":
         raise ResultValidationError(f"unknown track: {track!r}")
 
-    evaluator_metrics: Mapping[str, Any] = {}
-    if evaluator is not None:
-        assert checkpoint is not None
-        try:
-            evaluated = evaluator(checkpoint, payload)
-        except ResultValidationError:
-            raise
-        except Exception as exc:
-            raise ResultValidationError(f"independent evaluator failed: {exc}") from exc
-        if evaluated is not None:
-            evaluator_metrics = _plain_object(evaluated, "evaluator result")
-            _ensure_json(evaluator_metrics, "evaluator result")
-            if "validation_loss" in evaluator_metrics:
-                # When a harness-owned evaluator is available, its loss is the
-                # canonical qualification value. The raw declared value remains
-                # preserved in result.json and inside declared_metrics.
-                loss = _finite_number(
-                    evaluator_metrics["validation_loss"],
-                    "evaluator result validation_loss",
-                )
-
     checkpoint_size = checkpoint.stat().st_size if checkpoint is not None else None
     return ValidationResult(
         payload=dict(payload),
@@ -438,7 +414,6 @@ def validate_result(
         tokens_processed=tokens,
         validation_loss=loss,
         declared_metrics=dict(metrics),
-        evaluator_metrics=dict(evaluator_metrics),
         evaluations=evaluations,
         artifacts=artifact_paths,
     )
@@ -459,7 +434,6 @@ def verify_run(
     expected_training_tokens: int | None = None,
     expected_validation_tokens: int | None = None,
     expected_downstream_tokens: Mapping[str, int] | None = None,
-    evaluator: Evaluator | None = None,
     require_checkpoint: bool = True,
 ) -> ValidationResult:
     """Re-validate an existing run from its captured stdout log."""
@@ -476,6 +450,5 @@ def verify_run(
         expected_training_tokens=expected_training_tokens,
         expected_validation_tokens=expected_validation_tokens,
         expected_downstream_tokens=expected_downstream_tokens,
-        evaluator=evaluator,
         require_checkpoint=require_checkpoint,
     )
