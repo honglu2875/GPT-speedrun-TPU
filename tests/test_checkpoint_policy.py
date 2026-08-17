@@ -58,3 +58,32 @@ def inspect_source(module) -> str:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RetiredFlagTests(unittest.TestCase):
+    """A removed flag must say what replaced it."""
+
+    def _run_cli(self, *argv: str) -> str:
+        import contextlib, io
+        from rig.cli import main
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            main(["run", "reference", *argv])
+        return err.getvalue()
+
+    def test_removed_checkpoint_flags_name_their_replacement(self) -> None:
+        # `rig run` forwards unknown arguments to the trainer, so a retired
+        # flag would otherwise surface as an argparse error from train.py
+        # about a flag the user had used correctly the day before.
+        self.assertIn(
+            "--checkpoint-policy", self._run_cli("--checkpoints", "always")
+        )
+        self.assertIn("--checkpoint-policy none", self._run_cli("--omit-checkpoint"))
+
+    def test_genuine_trainer_arguments_still_pass_through(self) -> None:
+        # The forwarding itself is deliberate; only retired flags are caught.
+        from rig.cli import _RETIRED_FLAGS
+
+        self.assertNotIn("--base-learning-rate", _RETIRED_FLAGS)
+        self.assertNotIn("--study-batch-size", _RETIRED_FLAGS)

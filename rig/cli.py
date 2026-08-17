@@ -87,6 +87,12 @@ _TIERS = ("60m", "125m", "250m", "500m", "1b")
 # What happens to model weights. Deliberately named for the decision rather
 # than the outcome, so future options (a checkpointing frequency, keeping the
 # last N) extend this axis instead of adding another flag beside it.
+# Flags removed from the surface. Kept only so their removal is explained at
+# the point of use rather than by a confusing error from the trainer.
+_RETIRED_FLAGS = {
+    "--checkpoints": "--checkpoint-policy {always,qualifying,none}",
+    "--omit-checkpoint": "--checkpoint-policy none",
+}
 _CHECKPOINT_POLICIES = ("always", "qualifying", "none")
 
 
@@ -398,6 +404,13 @@ def main(argv: Iterable[str] | None = None) -> int:
         parser.error("unrecognized arguments: " + " ".join(unknown))
     # Unknown arguments are legal only for `run`; conventionally they follow
     # `--`, but parse_known_args also makes common direct flags ergonomic.
+    # That forwarding hides retired flags: they stop being rig's problem and
+    # resurface as an unrelated argparse error from the trainer, naming a flag
+    # the user typed correctly a day earlier. Name them here instead.
+    for flag in unknown:
+        replacement = _RETIRED_FLAGS.get(flag.split("=", 1)[0])
+        if replacement:
+            parser.error(f"{flag.split('=', 1)[0]} was replaced by {replacement}")
     args.trainer_args = unknown if args.command == "run" else []
     try:
         if args.command == "prepare":
