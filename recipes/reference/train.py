@@ -41,6 +41,7 @@ import yaml
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from rig import logpack
+from rig.metrics import DIAGNOSTIC_FAMILIES, DIAGNOSTIC_STATS
 from rig.configfile import (
     config_choice,
     config_float,
@@ -49,6 +50,21 @@ from rig.configfile import (
     config_mapping,
     read_config_document,
     resolve_sibling_config_path,
+)
+from rig.evaluation import (
+    evaluate_downstream_domain,
+    evaluate_validation_prefix,
+    perplexity_from_loss,
+    should_run_diagnostics,
+    should_run_validation_probe,
+)
+from rig.nn import (
+    apply_rotary,
+    flatten_arrays,
+    linear,
+    normal,
+    parameter_count,
+    rms_norm,
 )
 from rig.tokens import (
     DownstreamDomain,
@@ -108,15 +124,6 @@ _VALID_TRACKS = ("open", "sample_efficiency")
 _VALID_PROFILES = ("smoke", "dev", "official")
 _VALID_TIERS = ("60m", "125m", "250m", "500m", "1b")
 _DOMAIN_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
-_DIAGNOSTIC_FAMILIES = ("param", "grad", "update")
-_DIAGNOSTIC_STATS = (
-    "l1_norm",
-    "l2_norm",
-    "mean",
-    "std",
-    "third_moment",
-    "fourth_moment",
-)
 
 
 # A deliberately small, original corpus for offline and smoke-test use.  The
@@ -1383,8 +1390,6 @@ def resolve_config(
 
 
 
-def normal(rng: np.random.Generator, shape: tuple[int, ...], scale: float) -> np.ndarray:
-    return rng.standard_normal(shape, dtype=np.float32) * np.float32(scale)
 
 
 def init_params(config: Config, seed: int) -> dict[str, Any]:
@@ -1428,37 +1433,10 @@ def init_params(config: Config, seed: int) -> dict[str, Any]:
     return result
 
 
-def rms_norm(x: jax.Array, scale: jax.Array, dtype: Any) -> jax.Array:
-    """Apply pre-normalization without mean centering in FP32."""
-
-    x32 = x.astype(jnp.float32)
-    normalized = x32 * jax.lax.rsqrt(
-        jnp.mean(jnp.square(x32), axis=-1, keepdims=True) + 1.0e-5
-    )
-    return normalized.astype(dtype) * scale.astype(dtype)
 
 
-def apply_rotary(x: jax.Array) -> jax.Array:
-    """Apply interleaved base-10,000 rotary positions to one BTHD tensor."""
-
-    length = x.shape[1]
-    head_dim = x.shape[-1]
-    if head_dim % 2:
-        raise ValueError("rotary attention requires an even head dimension")
-    fraction = jnp.arange(0, head_dim, 2, dtype=jnp.float32) / float(head_dim)
-    inverse_frequency = jnp.power(10000.0, -fraction)
-    angle = jnp.arange(length, dtype=jnp.float32)[:, None] * inverse_frequency[None, :]
-    cosine = jnp.cos(angle)[None, :, None, :].astype(x.dtype)
-    sine = jnp.sin(angle)[None, :, None, :].astype(x.dtype)
-    even = x[..., 0::2]
-    odd = x[..., 1::2]
-    return jnp.stack(
-        (even * cosine - odd * sine, even * sine + odd * cosine), axis=-1
-    ).reshape(x.shape)
 
 
-def linear(x: jax.Array, weight: jax.Array, bias: jax.Array, dtype: Any) -> jax.Array:
-    return jnp.einsum("...d,df->...f", x, weight.astype(dtype)) + bias.astype(dtype)
 
 
 AttentionCallable = Callable[[jax.Array, jax.Array, jax.Array], jax.Array]
@@ -2171,7 +2149,7 @@ def diagnostic_values(
             jnp.stack(
                 tuple(
                     _diagnostic_stat_vector(family_scopes[family][scope][2])
-                    for family in range(len(_DIAGNOSTIC_FAMILIES))
+                    for family in range(len(DIAGNOSTIC_FAMILIES))
                 )
             )
             for scope in range(scope_count)
@@ -2232,158 +2210,16 @@ def eval_step(
     )
 
 
-def should_run_validation_probe(step: int, config: Config) -> bool:
-    """Return whether this step gets a non-canonical fixed-prefix probe."""
-
-    return (
-        config.val_every > 0
-        and step < config.final_step
-        and step % config.val_every == 0
-    )
-
-
-def should_run_diagnostics(step: int, config: Config) -> bool:
-    """Capture the first/final updates plus the configured sparse cadence."""
-
-    return config.diagnostics_every > 0 and (
-        step == 1
-        or step == config.final_step
-        or step % config.diagnostics_every == 0
-    )
-
-
-def evaluate_validation_prefix(
-    params: Any,
-    dataset: TokenDataset,
-    compiled_eval: Any,
-    data_sharding: NamedSharding,
-    config: Config,
-    batches: int,
-    *,
-    mesh: Mesh | None = None,
-    process_index: int = 0,
-    process_count: int = 1,
-) -> tuple[float, float]:
-    """Synchronously evaluate batches ``0..batches-1`` of the fixed prefix."""
-
-    if batches <= 0:
-        raise ValueError("validation batch count must be positive")
-    started = time.perf_counter()
-    loss_sum = 0.0
-    scored_tokens = 0
-    if process_count > 1 and mesh is None:
-        raise ValueError("a global mesh is required for multi-process evaluation")
-    local_batch = local_batch_size(config.batch_size, process_count)
-    mask_host = np.ones((local_batch, config.seq_len), dtype=np.float32)
-    if mesh is None:
-        mask = jax.device_put(mask_host, data_sharding)
-    else:
-        mask = put_host_local_array(
-            mask_host, mesh, P("data", None), data_sharding, process_count
-        )
-    for eval_index in range(batches):
-        eval_x_host, eval_y_host = dataset.validation_batch(
-            eval_index,
-            config.batch_size,
-            config.seq_len,
-            config.semantic_vocab_size,
-        )
-        eval_x_host = rank_local_slice(eval_x_host, process_index, process_count)
-        eval_y_host = rank_local_slice(eval_y_host, process_index, process_count)
-        if mesh is None:
-            eval_x = jax.device_put(eval_x_host, data_sharding)
-            eval_y = jax.device_put(eval_y_host, data_sharding)
-        else:
-            eval_x = put_host_local_array(
-                eval_x_host, mesh, P("data", None), data_sharding, process_count
-            )
-            eval_y = put_host_local_array(
-                eval_y_host, mesh, P("data", None), data_sharding, process_count
-            )
-        batch_loss_sum, batch_scored = local_device_get(
-            compiled_eval(params, eval_x, eval_y, mask)
-        )
-        loss_sum += float(batch_loss_sum)
-        scored_tokens += int(batch_scored)
-    elapsed = max(time.perf_counter() - started, 1.0e-12)
-    expected_tokens = batches * config.batch_size * config.seq_len
-    if scored_tokens != expected_tokens:
-        raise RuntimeError(
-            f"validation executable scored {scored_tokens:,} tokens; expected "
-            f"{expected_tokens:,}"
-        )
-    return (
-        finite_metric("validation_loss", loss_sum / scored_tokens),
-        finite_metric("validation_seconds", elapsed, positive=True),
-    )
 
 
 
 
-def evaluate_downstream_domain(
-    params: Any,
-    domain: DownstreamDomain,
-    compiled_eval: Any,
-    data_sharding: NamedSharding,
-    config: Config,
-    *,
-    mesh: Mesh | None = None,
-    process_index: int = 0,
-    process_count: int = 1,
-) -> dict[str, float | int]:
-    """Evaluate one domain with exact masking and the shared eval executable."""
-
-    started = time.perf_counter()
-    loss_sum = 0.0
-    scored_tokens = 0
-    if process_count > 1 and mesh is None:
-        raise ValueError("a global mesh is required for multi-process evaluation")
-    for x_host, y_host, mask_host in downstream_batches(
-        domain, seq_len=config.seq_len, batch_size=config.batch_size
-    ):
-        x_host = rank_local_slice(x_host, process_index, process_count)
-        y_host = rank_local_slice(y_host, process_index, process_count)
-        mask_host = rank_local_slice(mask_host, process_index, process_count)
-        if mesh is None:
-            x = jax.device_put(x_host, data_sharding)
-            y = jax.device_put(y_host, data_sharding)
-            mask = jax.device_put(mask_host, data_sharding)
-        else:
-            x = put_host_local_array(
-                x_host, mesh, P("data", None), data_sharding, process_count
-            )
-            y = put_host_local_array(
-                y_host, mesh, P("data", None), data_sharding, process_count
-            )
-            mask = put_host_local_array(
-                mask_host, mesh, P("data", None), data_sharding, process_count
-            )
-        batch_loss_sum, batch_scored = local_device_get(
-            compiled_eval(params, x, y, mask)
-        )
-        loss_sum += float(batch_loss_sum)
-        scored_tokens += int(batch_scored)
-    elapsed = finite_metric(
-        f"downstream {domain.name} seconds",
-        max(time.perf_counter() - started, 1.0e-12),
-        positive=True,
-    )
-    if scored_tokens != domain.scored_tokens:
-        raise RuntimeError(
-            f"downstream {domain.name} scored {scored_tokens:,} tokens; expected "
-            f"{domain.scored_tokens:,}"
-        )
-    loss = finite_metric(f"downstream {domain.name} loss", loss_sum / scored_tokens)
-    return {
-        "loss": loss,
-        "perplexity": perplexity_from_loss(loss),
-        "scored_tokens": scored_tokens,
-        "seconds": elapsed,
-    }
 
 
-def parameter_count(params: Any) -> int:
-    return sum(int(value.size) for value in jax.tree_util.tree_leaves(params))
+
+
+
+
 
 
 def traced_flops(config: Config, params: Mapping[str, Any]) -> FlopBreakdown:
@@ -2430,21 +2266,6 @@ def traced_flops(config: Config, params: Mapping[str, Any]) -> FlopBreakdown:
     return count_training_flops(loss, params, rules=default_rules())
 
 
-def flatten_arrays(tree: Any, prefix: str = "params") -> dict[str, np.ndarray]:
-    flat: dict[str, np.ndarray] = {}
-
-    def visit(value: Any, path: str) -> None:
-        if isinstance(value, Mapping):
-            for key in sorted(value):
-                visit(value[key], f"{path}/{key}")
-        elif isinstance(value, (list, tuple)):
-            for index, child in enumerate(value):
-                visit(child, f"{path}/{index}")
-        else:
-            flat[path] = np.asarray(value)
-
-    visit(tree, prefix)
-    return flat
 
 
 def save_checkpoint(
@@ -2529,8 +2350,8 @@ def diagnostic_log_columns(
             f"{family}.{stat}", scope, layer, element_count=element_count
         )
         for scope, layer, element_count in scope_metadata
-        for family in _DIAGNOSTIC_FAMILIES
-        for stat in _DIAGNOSTIC_STATS
+        for family in DIAGNOSTIC_FAMILIES
+        for stat in DIAGNOSTIC_STATS
     )
 
 
@@ -2654,8 +2475,8 @@ def write_diagnostics_log(
         raise ValueError("flops_per_token must be positive")
     expected_shape = (
         len(scope_metadata),
-        len(_DIAGNOSTIC_FAMILIES),
-        len(_DIAGNOSTIC_STATS),
+        len(DIAGNOSTIC_FAMILIES),
+        len(DIAGNOSTIC_STATS),
     )
     if points[-1].step != config.final_step:
         raise ValueError("diagnostic history must include the final optimizer step")
@@ -2760,12 +2581,6 @@ def write_validation_csv(output_dir: Path, rows: Sequence[ValidationRow]) -> Non
 
 
 
-def perplexity_from_loss(loss: float) -> float:
-    try:
-        perplexity = math.exp(loss)
-    except OverflowError as exc:
-        raise FloatingPointError(f"loss {loss!r} overflows perplexity") from exc
-    return finite_metric("perplexity", perplexity, positive=True)
 
 
 def run(args: argparse.Namespace) -> dict[str, Any] | None:
@@ -3150,7 +2965,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                 batch_y = put_host_local_array(
                     batch_y, mesh, P("data", None), data_sharding, process_count
                 )
-                if should_run_diagnostics(step_index, config):
+                if should_run_diagnostics(step_index, every=config.diagnostics_every, final_step=config.final_step):
                     if diagnostic_executable is None:  # defensive invariant
                         raise AssertionError("diagnostic executable was not compiled")
                     params, optimizer, last_metrics, diagnostic_values_at_step = (
@@ -3183,7 +2998,11 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                     params, optimizer, last_metrics = executable(
                         params, optimizer, batch_x, batch_y
                     )
-                if should_run_validation_probe(step_index, config):
+                if should_run_validation_probe(
+                    step_index,
+                    every=config.val_every,
+                    final_step=config.final_step,
+                ):
                     # Attribute all preceding asynchronous training work to training,
                     # then start the probe's own honest wall clock inside the helper.
                     sync_tree((params, optimizer, last_metrics))
@@ -3194,8 +3013,10 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                         dataset,
                         compiled_eval,
                         data_sharding,
-                        config,
-                        config.val_probe_batches,
+                        batch_size=config.batch_size,
+                        seq_len=config.seq_len,
+                        semantic_vocab_size=config.semantic_vocab_size,
+                        batches=config.val_probe_batches,
                         mesh=mesh,
                         process_index=process_index,
                         process_count=process_count,
@@ -3359,8 +3180,10 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         dataset,
         compiled_eval,
         data_sharding,
-        config,
-        config.eval_batches,
+        batch_size=config.batch_size,
+        seq_len=config.seq_len,
+        semantic_vocab_size=config.semantic_vocab_size,
+        batches=config.eval_batches,
         mesh=mesh,
         process_index=process_index,
         process_count=process_count,
@@ -3391,7 +3214,8 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                 domain,
                 compiled_eval,
                 data_sharding,
-                config,
+                batch_size=config.batch_size,
+                seq_len=config.seq_len,
                 mesh=mesh,
                 process_index=process_index,
                 process_count=process_count,

@@ -103,6 +103,13 @@ def _diagnostic_metrics() -> tuple[Metric, ...]:
 
 METRICS: tuple[Metric, ...] = (*_AXES_AND_SCALARS, *_diagnostic_metrics())
 
+# The diagnostic grid, derived from the registry rather than restated. A recipe
+# that iterates families x statistics is iterating exactly the ids that exist.
+DIAGNOSTIC_FAMILIES: tuple[str, ...] = tuple(
+    family for family, _ in _DIAGNOSTIC_FAMILY_BASES
+)
+DIAGNOSTIC_STATS: tuple[str, ...] = (*_UNNORMALIZED_STATS, *_NORMALIZED_STATS)
+
 SCOPES: tuple[Scope, ...] = (
     Scope(1, "overall"),
     Scope(2, "embeddings"),

@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from rig import configfile, logpack
+from rig import configfile, evaluation, logpack, metrics
 from rig import tokens as rig_tokens
 
 
@@ -869,31 +869,25 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertNotIn("attention_backend", trainer.contract_model_metadata(config))
 
     def test_probe_schedule_excludes_final_step(self) -> None:
-        config = _fake_config(val_every=3, steps=9)
         selected = [
             step
-            for step in range(1, config.steps + 1)
-            if trainer.should_run_validation_probe(step, config)
+            for step in range(1, 10)
+            if evaluation.should_run_validation_probe(step, every=3, final_step=9)
         ]
         self.assertEqual(selected, [3, 6])
         self.assertFalse(
-            trainer.should_run_validation_probe(
-                1, _fake_config(val_every=0, steps=10)
-            )
+            evaluation.should_run_validation_probe(1, every=0, final_step=10)
         )
 
     def test_diagnostic_schedule_includes_first_cadence_and_final(self) -> None:
-        config = _fake_config(diagnostics_every=3, steps=8)
         selected = [
             step
-            for step in range(1, config.steps + 1)
-            if trainer.should_run_diagnostics(step, config)
+            for step in range(1, 9)
+            if evaluation.should_run_diagnostics(step, every=3, final_step=8)
         ]
         self.assertEqual(selected, [1, 3, 6, 8])
         self.assertFalse(
-            trainer.should_run_diagnostics(
-                1, _fake_config(diagnostics_every=0, steps=1)
-            )
+            evaluation.should_run_diagnostics(1, every=0, final_step=1)
         )
 
     def test_validation_prefix_always_starts_at_batch_zero(self) -> None:
@@ -910,10 +904,6 @@ class TrainerStaticTests(unittest.TestCase):
                 return values, values
 
         dataset = Dataset()
-        config = SimpleNamespace(
-            batch_size=2, seq_len=4, vocab_size=16, semantic_vocab_size=16
-        )
-
         def compiled_eval(
             params: object, x: np.ndarray, y: np.ndarray, mask: np.ndarray
         ) -> tuple[np.ndarray, np.ndarray]:
@@ -922,10 +912,17 @@ class TrainerStaticTests(unittest.TestCase):
             return np.asarray(loss, dtype=np.float32), np.asarray(mask.sum(), dtype=np.float32)
 
         with patch.object(
-            trainer.jax, "device_put", side_effect=lambda value, _sharding: value
+            evaluation.jax, "device_put", side_effect=lambda value, _sharding: value
         ):
-            loss, elapsed = trainer.evaluate_validation_prefix(
-                object(), dataset, compiled_eval, object(), config, 3
+            loss, elapsed = evaluation.evaluate_validation_prefix(
+                object(),
+                dataset,
+                compiled_eval,
+                object(),
+                batch_size=2,
+                seq_len=4,
+                semantic_vocab_size=16,
+                batches=3,
             )
         self.assertEqual(dataset.indices, [0, 1, 2])
         self.assertAlmostEqual(loss, 2.0)
@@ -1026,10 +1023,9 @@ class TrainerStaticTests(unittest.TestCase):
         np.testing.assert_array_equal(training.steps, [1, 2])
         np.testing.assert_array_equal(training.values, history[:2])
         np.testing.assert_array_equal(diagnostics.steps, [1, 2])
+        # An early-stopped run still fires on the step it stops at.
         self.assertTrue(
-            trainer.should_run_diagnostics(
-                2, _fake_config(diagnostics_every=100, steps=5, early_stopping_step=2)
-            )
+            evaluation.should_run_diagnostics(2, every=100, final_step=2)
         )
 
     def test_diagnostics_log_flattens_the_grid_and_lands_atomically(self) -> None:
@@ -1426,7 +1422,7 @@ class TrainerStaticTests(unittest.TestCase):
             ").lower(params, sample_x, sample_y, sample_mask).compile()",
             source,
         )
-        probe = source.index("if should_run_validation_probe(step_index, config):")
+        probe = source.index("if should_run_validation_probe(")
         synchronize = source.index(
             "sync_tree((params, optimizer, last_metrics))", probe
         )
@@ -1455,8 +1451,8 @@ class SalvageTests(unittest.TestCase):
     def _point(self, step: int):
         shape = (
             len(self._meta()),
-            len(trainer._DIAGNOSTIC_FAMILIES),
-            len(trainer._DIAGNOSTIC_STATS),
+            len(metrics.DIAGNOSTIC_FAMILIES),
+            len(metrics.DIAGNOSTIC_STATS),
         )
         return trainer.DiagnosticPoint(
             step, np.full(shape, step / 1000.0, dtype=np.float32)
