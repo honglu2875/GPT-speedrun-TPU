@@ -74,7 +74,8 @@ class LogPackTests(unittest.TestCase):
             path = Path(directory) / f"t{logpack.SUFFIX}"
             _write(path, [(step, (1.0, 2.0, 3.0, 4.0)) for step in range(1, 11)])
             whole = path.read_bytes()
-            for lost in (1, 7, 4 * 4 + 8 - 1):
+            # 1 byte, a partial field, and one byte short of a whole record.
+            for lost in (1, 3, logpack._record_size(4) - 1):
                 with self.subTest(bytes_lost=lost):
                     path.write_bytes(whole[:-lost])
                     log = logpack.read_log(path)
@@ -194,12 +195,13 @@ class LogPackTests(unittest.TestCase):
             path = Path(directory) / f"t{logpack.SUFFIX}"
             _write(path, [(step, (1.0, 2.0, 3.0, 4.0)) for step in range(1, rows + 1)])
             size = path.stat().st_size
-        header = (
-            len(logpack.MAGIC)
-            + logpack._HEADER_STRUCT.size
-            + columns * logpack.COLUMN_DTYPE.itemsize
+        self.assertEqual(
+            size,
+            logpack._header_size(columns) + rows * logpack._record_size(columns),
         )
-        self.assertEqual(size, header + rows * (8 + columns * 4))
+        # Spelled out once, so a layout change has to be deliberate.
+        self.assertEqual(logpack._header_size(columns), 8 + 24 + columns * 24)
+        self.assertEqual(logpack._record_size(columns), 4 + columns * 4)
 
 
 if __name__ == "__main__":  # pragma: no cover

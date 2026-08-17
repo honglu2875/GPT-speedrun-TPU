@@ -74,7 +74,9 @@ permanent id from `rig/metrics.py`, then fixed-width `float32` records. A 500M
 run's diagnostics are 6.4 MB instead of 144 MB, and the report reads them in
 milliseconds. Fixed stride also makes the file append-only, so a preempted run
 keeps every sample already written. Read one with `rig.logpack.read_log`, which
-returns the column table plus one `(samples x columns)` array.
+returns the column table plus one `(samples x columns)` array; the byte
+layout and the metric-id registry are in
+[docs/RIGLOG_FORMAT.md](../../docs/RIGLOG_FORMAT.md).
 
 Curves accumulate on device and move to the host after synchronized training,
 so per-step capture does not add a host synchronization. Dev and official

@@ -326,9 +326,9 @@ directory: one packed record per optimizer step holding loss, learning rate, and
 gradient norm, with cumulative tokens and FLOPs derived from the header rather
 than stored. Scalars accumulate on the TPU and transfer only after timed
 training, so retaining the complete curve does not add a synchronization to
-every step. Token, learning-rate, and FLOP columns are deterministic bookkeeping;
-they require no additional device logging. The harness records the CSV's
-SHA-256 for later collation across runs.
+every step. The harness records the artifact's SHA-256 for later collation
+across runs. The byte layout, the column schema, and the permanent metric ids
+are documented in [docs/RIGLOG_FORMAT.md](docs/RIGLOG_FORMAT.md).
 
 The reference also writes `validation.csv`. On the official profile it probes
 the first eight validation batches every 500 optimizer steps by default, then

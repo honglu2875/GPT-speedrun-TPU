@@ -10,17 +10,16 @@ Layout
 ------
 ``MAGIC`` then, little-endian throughout::
 
-    column_count   int32
+    column_count     int32      then 4 bytes of padding
     tokens_per_step  int64      global batch x sequence length
     flops_per_token  float64    from the traced FLOP count
-    columns        column_count x COLUMN_DTYPE
-    records        n x (step int64, values column_count x float32)
+    columns          column_count x COLUMN_DTYPE (24 bytes each)
+    records          n x (step int32, values column_count x float32)
 
-Everything after the header is a fixed stride, which buys three things at once:
-``np.frombuffer`` reads the whole value block as one memcpy, a single column can
-be sliced through ``np.memmap`` without reading the file, and the file is
-**append-only** -- a run killed mid-training keeps every record already on disk,
-so there is nothing to salvage afterwards.
+Everything after the header is a fixed stride, which buys two things:
+``np.frombuffer`` lifts the whole value block in one pass with no per-record
+work, and the file is **append-only** -- a run killed mid-training keeps every
+record already on disk, so there is nothing to salvage afterwards.
 
 Why the axes are not stored
 ---------------------------
@@ -55,7 +54,10 @@ import numpy as np
 from rig import metrics
 
 
-MAGIC = b"RIGLOG\x01"
+# Eight bytes, not seven: the column table and the record block both start
+# at a multiple of 8 only because this is, and every field inside them is
+# then naturally aligned. The trailing byte is the layout version.
+MAGIC = b"RIGLOG\x00\x01"
 SUFFIX = ".riglog"
 
 # metric id, scope id, layer (-1 when the scope is not layered), and the number
@@ -71,7 +73,10 @@ COLUMN_DTYPE = np.dtype(
     ]
 )
 _HEADER_STRUCT = struct.Struct("<ixxxxqd")  # column_count, pad, tokens_per_step, flops
-_STEP_DTYPE = np.dtype("<i8")
+# int32 keeps the record 4-aligned for any column count, where an int64 step
+# would leave odd-column records straddling. The bound is 2^31 optimizer
+# steps; the largest run this family can express is ~1.5e5.
+_STEP_DTYPE = np.dtype("<i4")
 _VALUE_DTYPE = np.dtype("<f4")
 
 
