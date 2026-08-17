@@ -147,8 +147,12 @@ class AttentionTilePlan:
         converted: dict[str, int | None] = {}
         for name in expected:
             item = value[name]
-            if item is not None and (isinstance(item, bool) or not isinstance(item, int)):
-                raise AutotuneSchemaError(f"tile field {name!r} must be an integer or null")
+            if item is not None and (
+                isinstance(item, bool) or not isinstance(item, int)
+            ):
+                raise AutotuneSchemaError(
+                    f"tile field {name!r} must be an integer or null"
+                )
             converted[name] = item
         return cls(**converted)  # type: ignore[arg-type]
 
@@ -221,7 +225,9 @@ class AutotuneKey:
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
         if not isinstance(self.causal, bool) or not self.causal:
-            raise ValueError("the current TPU Flash tuner supports causal attention only")
+            raise ValueError(
+                "the current TPU Flash tuner supports causal attention only"
+            )
         if self.backward_strategy not in ("none", "separate", "fused"):
             raise ValueError(
                 f"unsupported backward strategy: {self.backward_strategy!r}"
@@ -326,7 +332,10 @@ class CandidateMeasurement:
             expected_mad = statistics.median(
                 abs(sample - expected_median) for sample in self.samples_seconds
             )
-            if self.median_seconds != expected_median or self.mad_seconds != expected_mad:
+            if (
+                self.median_seconds != expected_median
+                or self.mad_seconds != expected_mad
+            ):
                 raise ValueError("median/MAD do not match timing samples")
         if self.status == "ok" and not self.samples_seconds:
             raise ValueError("successful measurement requires timing samples")
@@ -358,7 +367,9 @@ class CandidateMeasurement:
             "error",
         }
         if set(value) != expected:
-            raise AutotuneSchemaError("candidate measurement fields do not match schema")
+            raise AutotuneSchemaError(
+                "candidate measurement fields do not match schema"
+            )
         status = value["status"]
         if status not in ("ok", "error"):
             raise AutotuneSchemaError(f"invalid candidate status: {status!r}")
@@ -366,7 +377,9 @@ class CandidateMeasurement:
             samples = tuple(float(sample) for sample in value["samples_seconds"])
             compile_seconds = float(value["compile_seconds"])
             median = (
-                None if value["median_seconds"] is None else float(value["median_seconds"])
+                None
+                if value["median_seconds"] is None
+                else float(value["median_seconds"])
             )
             mad = None if value["mad_seconds"] is None else float(value["mad_seconds"])
             error = value["error"]
@@ -414,7 +427,9 @@ class AutotuneRecord:
         return {
             "key": self.key.to_dict(),
             "winner": self.winner.to_dict(),
-            "measurements": [measurement.to_dict() for measurement in self.measurements],
+            "measurements": [
+                measurement.to_dict() for measurement in self.measurements
+            ],
             "recorded_at": self.recorded_at,
         }
 
@@ -628,7 +643,9 @@ def kernel_implementation_hash(
     except FileNotFoundError:
         payload = f"missing:{KERNEL_REVISION}".encode("utf-8")
     except OSError as exc:
-        raise AutotuneError(f"cannot hash kernel implementation {source_path}: {exc}") from exc
+        raise AutotuneError(
+            f"cannot hash kernel implementation {source_path}: {exc}"
+        ) from exc
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -671,9 +688,7 @@ def make_runtime_key(
     normalized_backend = str(backend).strip().lower()
     if kernel_revision is None:
         kernel_revision = (
-            JAX_FLASH_REVISION
-            if normalized_backend == "jax_flash"
-            else KERNEL_REVISION
+            JAX_FLASH_REVISION if normalized_backend == "jax_flash" else KERNEL_REVISION
         )
     if backward_strategy is None:
         backward_strategy = "none" if mode == "forward" else "separate"
@@ -1120,9 +1135,7 @@ def benchmark_tile_candidates(
     return winner, tuple(measurements)
 
 
-AttentionFactory = Callable[
-    [AttentionTilePlan], Callable[[Any, Any, Any], Any]
-]
+AttentionFactory = Callable[[AttentionTilePlan], Callable[[Any, Any, Any], Any]]
 
 
 def make_jax_attention_compiler(
@@ -1178,9 +1191,9 @@ def make_jax_attention_compiler(
 
         # ``lower().compile()`` is the intentional AOT boundary.  The tile plan
         # is closed over before lowering and cannot change inside this program.
-        compiled = jax.jit(step, device=device).lower(
-            q, k, v, output_cotangent
-        ).compile()
+        compiled = (
+            jax.jit(step, device=device).lower(q, k, v, output_cotangent).compile()
+        )
 
         def run() -> Any:
             return compiled(q, k, v, output_cotangent)

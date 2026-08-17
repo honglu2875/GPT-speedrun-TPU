@@ -31,9 +31,7 @@ SCALED_SOURCE_INVENTORY_SHA256 = (
 SCALED_EXCLUSION_POLICY_SHA256 = (
     "ab25cabd0781b1046b7ad7b281b4147ff6e27d36977f4e842b8c92573399ad77"
 )
-SCALED_CORE_SHA256 = (
-    "4bbdcb76da837276f6f337b805d37a74e3272b476e01fd198f416097abe19241"
-)
+SCALED_CORE_SHA256 = "4bbdcb76da837276f6f337b805d37a74e3272b476e01fd198f416097abe19241"
 SCALED_BUILDER_SHA256 = (
     "26c61bc921af290e6beb28596feb2c50cac5b15a56a2f3adf921682317f6f109"
 )
@@ -350,8 +348,7 @@ def validate_scaled_manifest_contract(
     license_info = payload.get("license")
     if not isinstance(license_info, Mapping) or (
         license_info.get("dataset") != "ODC-By-1.0"
-        or license_info.get("url")
-        != "https://opendatacommons.org/licenses/by/1-0/"
+        or license_info.get("url") != "https://opendatacommons.org/licenses/by/1-0/"
         or license_info.get("code") != "Apache-2.0"
     ):
         raise DataError(f"{source}: scaled corpus/license attribution is incomplete")
@@ -360,10 +357,8 @@ def validate_scaled_manifest_contract(
         source_info.get("dataset") != SCALED_SOURCE_REPOSITORY
         or source_info.get("revision") != SCALED_SOURCE_REVISION
         or source_info.get("global_shuffle_seed") != 42
-        or source_info.get("inventory_sha256")
-        != SCALED_SOURCE_INVENTORY_SHA256
-        or source_info.get("exclusion_policy_sha256")
-        != SCALED_EXCLUSION_POLICY_SHA256
+        or source_info.get("inventory_sha256") != SCALED_SOURCE_INVENTORY_SHA256
+        or source_info.get("exclusion_policy_sha256") != SCALED_EXCLUSION_POLICY_SHA256
         or source_info.get("source_date_before") != "2024-04-01"
         or source_info.get("selection")
         != f"first {variant.total_tokens:,} prepared tokens"

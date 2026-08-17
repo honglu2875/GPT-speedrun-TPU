@@ -180,9 +180,7 @@ def reference_causal_attention(
     _validate_qkv(q, k, v)
     sequence = q.shape[2]
     scale = float(q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale)
-    scores = jnp.einsum(
-        "bhqd,bhkd->bhqk", q, k, preferred_element_type=jnp.float32
-    )
+    scores = jnp.einsum("bhqd,bhkd->bhqk", q, k, preferred_element_type=jnp.float32)
     scores = scores.astype(jnp.float32) * scale
     row = lax.broadcasted_iota(jnp.int32, (sequence, sequence), 0)
     column = lax.broadcasted_iota(jnp.int32, (sequence, sequence), 1)
@@ -252,9 +250,7 @@ def _tpu_flash_forward_kernel(
         )
 
     q_block_index = pl.program_id(2)
-    should_run = _below_or_on_diagonal(
-        q_block_index, block_q, kv_block_index, block_kv
-    )
+    should_run = _below_or_on_diagonal(q_block_index, block_q, kv_block_index, block_kv)
 
     @pl.when(should_run)
     def visit_kv_tile() -> None:
@@ -262,9 +258,7 @@ def _tpu_flash_forward_kernel(
         for start_kv in range(0, block_kv, block_kv_compute):
             max_previous = max_scratch_ref[0, 0, :, :]
             sum_previous = sum_scratch_ref[0, 0, :, :]
-            key_tile = k_ref[
-                0, 0, pl.dslice(start_kv, block_kv_compute), :
-            ]
+            key_tile = k_ref[0, 0, pl.dslice(start_kv, block_kv_compute), :]
             scores = lax.dot_general(
                 q_tile,
                 key_tile,
@@ -273,24 +267,16 @@ def _tpu_flash_forward_kernel(
             )
             scores *= softmax_scale
 
-            row_ids = lax.broadcasted_iota(
-                jnp.int32, (block_q, block_kv_compute), 0
-            )
+            row_ids = lax.broadcasted_iota(jnp.int32, (block_q, block_kv_compute), 0)
             row_ids += q_block_index * block_q
-            column_ids = lax.broadcasted_iota(
-                jnp.int32, (block_q, block_kv_compute), 1
-            )
+            column_ids = lax.broadcasted_iota(jnp.int32, (block_q, block_kv_compute), 1)
             column_ids += kv_block_index * block_kv + start_kv
-            mask = jnp.logical_and(
-                column_ids <= row_ids, column_ids < valid_sequence
-            )
+            mask = jnp.logical_and(column_ids <= row_ids, column_ids < valid_sequence)
             scores += jnp.where(mask, 0.0, _MASK_VALUE)
 
             max_current = jnp.max(scores, axis=1)[:, None]
             max_next = jnp.maximum(max_previous, max_current)
-            probabilities = jnp.exp(
-                scores - _broadcast_row(max_next, block_kv_compute)
-            )
+            probabilities = jnp.exp(scores - _broadcast_row(max_next, block_kv_compute))
             correction = jnp.exp(max_previous - max_next)
             corrected_sum = correction * sum_previous
             sum_next = jnp.sum(probabilities, axis=1)[:, None] + corrected_sum
@@ -299,9 +285,7 @@ def _tpu_flash_forward_kernel(
             accumulator_scratch_ref[0, 0, :, :] *= _broadcast_row(
                 corrected_sum * inverse_sum, q_tile.shape[-1]
             )
-            value_tile = v_ref[
-                0, 0, pl.dslice(start_kv, block_kv_compute), :
-            ]
+            value_tile = v_ref[0, 0, pl.dslice(start_kv, block_kv_compute), :]
             contribution = lax.dot(
                 probabilities.astype(value_tile.dtype),
                 value_tile,
@@ -354,14 +338,10 @@ def _tpu_flash_forward(
     def q_index(batch_index: Any, head_index: Any, q_index: Any, _: Any):
         return batch_index, head_index, q_index, 0
 
-    def kv_index(
-        batch_index: Any, head_index: Any, q_index: Any, kv_index: Any
-    ):
+    def kv_index(batch_index: Any, head_index: Any, q_index: Any, kv_index: Any):
         # Skipped causal tiles still need a legal prefetch address.
         visible_index = lax.select(
-            _below_or_on_diagonal(
-                q_index, tiles.block_q, kv_index, tiles.block_kv
-            ),
+            _below_or_on_diagonal(q_index, tiles.block_q, kv_index, tiles.block_kv),
             kv_index,
             0,
         )
@@ -370,14 +350,10 @@ def _tpu_flash_forward(
     q_spec = pl.BlockSpec((1, 1, tiles.block_q, head_dim), q_index)
     kv_spec = pl.BlockSpec((1, 1, tiles.block_kv, head_dim), kv_index)
     output_spec = pl.BlockSpec((1, 1, tiles.block_q, head_dim), q_index)
-    logsumexp_spec = pl.BlockSpec(
-        (1, 1, tiles.block_q, TPU_VECTOR_LANES), q_index
-    )
+    logsumexp_spec = pl.BlockSpec((1, 1, tiles.block_q, TPU_VECTOR_LANES), q_index)
     output_shapes = (
         jax.ShapeDtypeStruct(q.shape, q.dtype),
-        jax.ShapeDtypeStruct(
-            (batch, heads, sequence, TPU_VECTOR_LANES), jnp.float32
-        ),
+        jax.ShapeDtypeStruct((batch, heads, sequence, TPU_VECTOR_LANES), jnp.float32),
     )
     kernel = functools.partial(
         _tpu_flash_forward_kernel,
@@ -401,12 +377,8 @@ def _tpu_flash_forward(
                 in_specs=(q_spec, kv_spec, kv_spec),
                 out_specs=(output_spec, logsumexp_spec),
                 scratch_shapes=(
-                    pltpu.VMEM(
-                        (1, 1, tiles.block_q, TPU_VECTOR_LANES), jnp.float32
-                    ),
-                    pltpu.VMEM(
-                        (1, 1, tiles.block_q, TPU_VECTOR_LANES), jnp.float32
-                    ),
+                    pltpu.VMEM((1, 1, tiles.block_q, TPU_VECTOR_LANES), jnp.float32),
+                    pltpu.VMEM((1, 1, tiles.block_q, TPU_VECTOR_LANES), jnp.float32),
                     pltpu.VMEM((1, 1, tiles.block_q, head_dim), jnp.float32),
                 ),
             ),
@@ -447,9 +419,7 @@ def _tpu_flash_dq_kernel(
         dq_scratch_ref[...] = jnp.zeros(dq_scratch_ref.shape, jnp.float32)
 
     q_block_index = pl.program_id(2)
-    should_run = _below_or_on_diagonal(
-        q_block_index, block_q, kv_block_index, block_kv
-    )
+    should_run = _below_or_on_diagonal(q_block_index, block_q, kv_block_index, block_kv)
 
     @pl.when(should_run)
     def visit_kv_tile() -> None:
@@ -458,17 +428,12 @@ def _tpu_flash_dq_kernel(
         cotangent_tile = output_cotangent_ref[0, 0, :, :]
         logsumexp = logsumexp_ref[0, 0, :, :]
         delta = jnp.sum(
-            output_tile.astype(jnp.float32)
-            * cotangent_tile.astype(jnp.float32),
+            output_tile.astype(jnp.float32) * cotangent_tile.astype(jnp.float32),
             axis=1,
         )[:, None]
         for start_kv in range(0, block_kv, block_kv_compute):
-            key_tile = k_ref[
-                0, 0, pl.dslice(start_kv, block_kv_compute), :
-            ]
-            value_tile = v_ref[
-                0, 0, pl.dslice(start_kv, block_kv_compute), :
-            ]
+            key_tile = k_ref[0, 0, pl.dslice(start_kv, block_kv_compute), :]
+            value_tile = v_ref[0, 0, pl.dslice(start_kv, block_kv_compute), :]
             scores = lax.dot_general(
                 q_tile,
                 key_tile,
@@ -476,17 +441,11 @@ def _tpu_flash_dq_kernel(
                 preferred_element_type=jnp.float32,
             )
             scores *= softmax_scale
-            row_ids = lax.broadcasted_iota(
-                jnp.int32, (block_q, block_kv_compute), 0
-            )
+            row_ids = lax.broadcasted_iota(jnp.int32, (block_q, block_kv_compute), 0)
             row_ids += q_block_index * block_q
-            column_ids = lax.broadcasted_iota(
-                jnp.int32, (block_q, block_kv_compute), 1
-            )
+            column_ids = lax.broadcasted_iota(jnp.int32, (block_q, block_kv_compute), 1)
             column_ids += kv_block_index * block_kv + start_kv
-            mask = jnp.logical_and(
-                column_ids <= row_ids, column_ids < valid_sequence
-            )
+            mask = jnp.logical_and(column_ids <= row_ids, column_ids < valid_sequence)
             probabilities = jnp.exp(
                 scores - _broadcast_row(logsumexp, block_kv_compute)
             )
@@ -497,9 +456,7 @@ def _tpu_flash_dq_kernel(
                 _QK_DIM_NUMBERS,
                 preferred_element_type=jnp.float32,
             )
-            ds = (
-                dp - _broadcast_row(delta, block_kv_compute)
-            ) * probabilities
+            ds = (dp - _broadcast_row(delta, block_kv_compute)) * probabilities
             ds *= softmax_scale
             dq_scratch_ref[0, 0, :, :] += lax.dot(
                 ds.astype(key_tile.dtype),
@@ -542,35 +499,24 @@ def _tpu_flash_dkv_kernel(
         dv_scratch_ref[...] = jnp.zeros(dv_scratch_ref.shape, jnp.float32)
 
     kv_block_index = pl.program_id(2)
-    should_run = _below_or_on_diagonal(
-        q_block_index, block_q, kv_block_index, block_kv
-    )
+    should_run = _below_or_on_diagonal(q_block_index, block_q, kv_block_index, block_kv)
 
     @pl.when(should_run)
     def visit_q_tile() -> None:
         for start_q in range(0, block_q, block_q_compute):
             q_tile = q_ref[0, 0, pl.dslice(start_q, block_q_compute), :]
-            output_tile = output_ref[
-                0, 0, pl.dslice(start_q, block_q_compute), :
-            ]
+            output_tile = output_ref[0, 0, pl.dslice(start_q, block_q_compute), :]
             cotangent_tile = output_cotangent_ref[
                 0, 0, pl.dslice(start_q, block_q_compute), :
             ]
-            logsumexp = logsumexp_ref[
-                0, 0, pl.dslice(start_q, block_q_compute), :
-            ]
+            logsumexp = logsumexp_ref[0, 0, pl.dslice(start_q, block_q_compute), :]
             delta = jnp.sum(
-                output_tile.astype(jnp.float32)
-                * cotangent_tile.astype(jnp.float32),
+                output_tile.astype(jnp.float32) * cotangent_tile.astype(jnp.float32),
                 axis=1,
             )[:, None]
             for start_kv in range(0, block_kv, block_kv_compute):
-                key_tile = k_ref[
-                    0, 0, pl.dslice(start_kv, block_kv_compute), :
-                ]
-                value_tile = v_ref[
-                    0, 0, pl.dslice(start_kv, block_kv_compute), :
-                ]
+                key_tile = k_ref[0, 0, pl.dslice(start_kv, block_kv_compute), :]
+                value_tile = v_ref[0, 0, pl.dslice(start_kv, block_kv_compute), :]
                 scores = lax.dot_general(
                     q_tile,
                     key_tile,
@@ -593,12 +539,12 @@ def _tpu_flash_dkv_kernel(
                     scores - _broadcast_row(logsumexp, block_kv_compute)
                 )
                 probabilities = jnp.where(mask, probabilities, 0.0)
-                dv_scratch_ref[
-                    0, 0, pl.dslice(start_kv, block_kv_compute), :
-                ] += lax.dot(
-                    probabilities.T.astype(cotangent_tile.dtype),
-                    cotangent_tile,
-                    preferred_element_type=jnp.float32,
+                dv_scratch_ref[0, 0, pl.dslice(start_kv, block_kv_compute), :] += (
+                    lax.dot(
+                        probabilities.T.astype(cotangent_tile.dtype),
+                        cotangent_tile,
+                        preferred_element_type=jnp.float32,
+                    )
                 )
                 dp = lax.dot_general(
                     cotangent_tile,
@@ -606,16 +552,14 @@ def _tpu_flash_dkv_kernel(
                     _QK_DIM_NUMBERS,
                     preferred_element_type=jnp.float32,
                 )
-                ds = (
-                    dp - _broadcast_row(delta, block_kv_compute)
-                ) * probabilities
+                ds = (dp - _broadcast_row(delta, block_kv_compute)) * probabilities
                 ds *= softmax_scale
-                dk_scratch_ref[
-                    0, 0, pl.dslice(start_kv, block_kv_compute), :
-                ] += lax.dot(
-                    ds.T.astype(q_tile.dtype),
-                    q_tile,
-                    preferred_element_type=jnp.float32,
+                dk_scratch_ref[0, 0, pl.dslice(start_kv, block_kv_compute), :] += (
+                    lax.dot(
+                        ds.T.astype(q_tile.dtype),
+                        q_tile,
+                        preferred_element_type=jnp.float32,
+                    )
                 )
 
     @pl.when(q_block_index == sequence // block_q - 1)
@@ -658,9 +602,7 @@ def _tpu_flash_backward(
     def q_index(batch_index: Any, head_index: Any, q_index: Any, _: Any):
         return batch_index, head_index, q_index, 0
 
-    def dq_kv_index(
-        batch_index: Any, head_index: Any, q_index: Any, kv_index: Any
-    ):
+    def dq_kv_index(batch_index: Any, head_index: Any, q_index: Any, kv_index: Any):
         visible = lax.select(
             _below_or_on_diagonal(
                 q_index, tiles.block_q_dq, kv_index, tiles.block_kv_dq
@@ -672,9 +614,7 @@ def _tpu_flash_backward(
 
     dq_q_spec = pl.BlockSpec((1, 1, tiles.block_q_dq, head_dim), q_index)
     dq_kv_spec = pl.BlockSpec((1, 1, tiles.block_kv_dq, head_dim), dq_kv_index)
-    dq_lse_spec = pl.BlockSpec(
-        (1, 1, tiles.block_q_dq, TPU_VECTOR_LANES), q_index
-    )
+    dq_lse_spec = pl.BlockSpec((1, 1, tiles.block_q_dq, TPU_VECTOR_LANES), q_index)
     dq_kernel = functools.partial(
         _tpu_flash_dq_kernel,
         block_q=tiles.block_q_dq,
@@ -716,14 +656,10 @@ def _tpu_flash_backward(
         name="tpu_flash_causal_attention_bwd_dq",
     )(q, k, v, output, output_cotangent, logsumexp_replicated)
 
-    def dkv_kv_index(
-        batch_index: Any, head_index: Any, kv_index: Any, _: Any
-    ):
+    def dkv_kv_index(batch_index: Any, head_index: Any, kv_index: Any, _: Any):
         return batch_index, head_index, kv_index, 0
 
-    def dkv_q_index(
-        batch_index: Any, head_index: Any, kv_index: Any, q_index: Any
-    ):
+    def dkv_q_index(batch_index: Any, head_index: Any, kv_index: Any, q_index: Any):
         visible = lax.select(
             _below_or_on_diagonal(
                 q_index, tiles.block_q_dkv, kv_index, tiles.block_kv_dkv
@@ -733,15 +669,11 @@ def _tpu_flash_backward(
         )
         return batch_index, head_index, visible, 0
 
-    dkv_q_spec = pl.BlockSpec(
-        (1, 1, tiles.block_q_dkv, head_dim), dkv_q_index
-    )
+    dkv_q_spec = pl.BlockSpec((1, 1, tiles.block_q_dkv, head_dim), dkv_q_index)
     dkv_lse_spec = pl.BlockSpec(
         (1, 1, tiles.block_q_dkv, TPU_VECTOR_LANES), dkv_q_index
     )
-    dkv_kv_spec = pl.BlockSpec(
-        (1, 1, tiles.block_kv_dkv, head_dim), dkv_kv_index
-    )
+    dkv_kv_spec = pl.BlockSpec((1, 1, tiles.block_kv_dkv, head_dim), dkv_kv_index)
     dkv_kernel = functools.partial(
         _tpu_flash_dkv_kernel,
         block_q=tiles.block_q_dkv,
@@ -958,7 +890,9 @@ def make_causal_attention(config: AttentionConfig = AttentionConfig()) -> Callab
             logical_output = output[:, :, :original_sequence, :]
             return logical_output, (q_value, k_value, v_value, output, logsumexp)
 
-        def backward_rule(residuals: tuple[jax.Array, ...], output_cotangent: jax.Array):
+        def backward_rule(
+            residuals: tuple[jax.Array, ...], output_cotangent: jax.Array
+        ):
             q_value, k_value, v_value, output, logsumexp = residuals
             if padded_sequence != original_sequence:
                 output_cotangent = jnp.pad(

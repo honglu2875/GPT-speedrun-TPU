@@ -255,9 +255,7 @@ class ShuffledEpochBatchStream:
 
     def next_batch(self) -> tuple[np.ndarray, np.ndarray]:
         rank_start = self._global_cursor + self.process_index * self.local_batch_size
-        windows = np.empty(
-            (self.local_batch_size, self.seq_len + 1), dtype=np.int32
-        )
+        windows = np.empty((self.local_batch_size, self.seq_len + 1), dtype=np.int32)
         for row in range(self.local_batch_size):
             windows[row] = self._window(rank_start + row)
         self._global_cursor += self.global_batch_size
@@ -275,7 +273,9 @@ class ShuffledEpochBatchStream:
 
 
 class TokenDataset:
-    def __init__(self, train: ShardedTokens, validation: ShardedTokens, source: str) -> None:
+    def __init__(
+        self, train: ShardedTokens, validation: ShardedTokens, source: str
+    ) -> None:
         self.train = train
         self.validation = validation
         self.source = source
@@ -382,7 +382,9 @@ def load_token_file(path: Path, raw_dtype: str, data_format: str) -> np.ndarray:
         raise ValueError(f"{path} does not have an llm.c FineWeb header")
     if data_format != "raw" and is_llmc:
         if int(header[1]) != 1:
-            raise ValueError(f"unsupported llm.c data version {int(header[1])} in {path}")
+            raise ValueError(
+                f"unsupported llm.c data version {int(header[1])} in {path}"
+            )
         token_count = int(header[2])
         if token_count <= 0:
             raise ValueError(f"invalid llm.c token count {token_count} in {path}")
@@ -405,7 +407,9 @@ def split_shards(
     total = sum(len(shard) for shard in shards)
     train_limit = int(total * (1.0 - validation_fraction))
     if train_limit <= 0 or train_limit >= total:
-        raise ValueError("data is too short to create nonempty train and validation splits")
+        raise ValueError(
+            "data is too short to create nonempty train and validation splits"
+        )
     train: list[np.ndarray] = []
     validation: list[np.ndarray] = []
     cursor = 0
@@ -465,8 +469,7 @@ def load_dataset(
     ]
     if validation_paths:
         validation_shards = [
-            load_token_file(path, data_dtype, data_format)
-            for path in validation_paths
+            load_token_file(path, data_dtype, data_format) for path in validation_paths
         ]
     else:
         train_shards, validation_shards = split_shards(train_shards, val_fraction)
@@ -509,7 +512,9 @@ def _validate_domain(
         if not isinstance(document, Mapping):
             raise ValueError(f"fresh10 {name} document {index} must be an object")
         prefix = f"{name}.documents[{index}]"
-        token_offset = _manifest_integer(document.get("token_offset"), f"{prefix}.token_offset")
+        token_offset = _manifest_integer(
+            document.get("token_offset"), f"{prefix}.token_offset"
+        )
         token_count = _manifest_integer(
             document.get("token_count"), f"{prefix}.token_count", minimum=2
         )
@@ -584,7 +589,9 @@ def load_downstream_domains(
                 "downstream manifest must use schema_version=1 and kind='fresh10'"
             )
         tokenizer = payload.get("tokenizer")
-        tokenizer_vocab = tokenizer.get("vocab_size") if isinstance(tokenizer, dict) else None
+        tokenizer_vocab = (
+            tokenizer.get("vocab_size") if isinstance(tokenizer, dict) else None
+        )
         if (
             not isinstance(tokenizer, dict)
             or tokenizer.get("name") != "gpt2"
@@ -597,11 +604,7 @@ def load_downstream_domains(
                 "downstream manifest must use the 50,257-token GPT-2 tokenizer, "
                 f"which must fit the model vocabulary ({vocab_size})"
             )
-        root = (
-            root.expanduser().resolve()
-            if root is not None
-            else manifest_path.parent
-        )
+        root = root.expanduser().resolve() if root is not None else manifest_path.parent
         domain_payloads = payload.get("domains")
         if not isinstance(domain_payloads, list) or not domain_payloads:
             raise ValueError("downstream manifest domains must be a nonempty list")
@@ -628,10 +631,14 @@ def load_downstream_domains(
             except ValueError as exc:
                 raise ValueError(f"fresh10 {name}.path escapes the data root") from exc
             expected_bytes = entry.get("bytes")
-            if expected_bytes is not None and shard_path.stat().st_size != _manifest_integer(
-                expected_bytes, f"{name}.bytes", minimum=1
+            if (
+                expected_bytes is not None
+                and shard_path.stat().st_size
+                != _manifest_integer(expected_bytes, f"{name}.bytes", minimum=1)
             ):
-                raise ValueError(f"fresh10 {name} shard size does not match its manifest")
+                raise ValueError(
+                    f"fresh10 {name} shard size does not match its manifest"
+                )
             expected_hash = entry.get("sha256")
             if expected_hash is not None:
                 if not isinstance(expected_hash, str) or not re.fullmatch(
@@ -679,7 +686,9 @@ def load_downstream_domains(
         cursor = 0
         for shard in shards:
             if len(shard) < 2:
-                raise ValueError(f"downstream document for {name!r} has fewer than 2 tokens")
+                raise ValueError(
+                    f"downstream document for {name!r} has fewer than 2 tokens"
+                )
             documents_payload.append(
                 {
                     "token_offset": cursor,

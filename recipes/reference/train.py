@@ -246,12 +246,6 @@ class ExperimentProfile:
     log_every: int
 
 
-
-
-
-
-
-
 _STATIC_CLI_FIELDS = {
     "eval_batches": "--eval-batches",
     "val_probe_batches": "--val-probe-batches",
@@ -327,19 +321,7 @@ class DiagnosticPoint:
     values: np.ndarray
 
 
-
-
-
-
 _UINT64_MASK = (1 << 64) - 1
-
-
-
-
-
-
-
-
 
 
 def positive_int(text: str) -> int:
@@ -356,25 +338,19 @@ def nonnegative_int(text: str) -> int:
     return value
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 def _parse_model(value: Any, label: str) -> dict[str, Any]:
     model = config_keys(
         value,
         label,
         {
-            "layers", "heads", "d_model", "mlp_mult", "normalization",
-            "position_encoding", "mlp_activation", "vocab_size",
+            "layers",
+            "heads",
+            "d_model",
+            "mlp_mult",
+            "normalization",
+            "position_encoding",
+            "mlp_activation",
+            "vocab_size",
             "semantic_vocab_size",
         },
     )
@@ -394,9 +370,7 @@ def _parse_model(value: Any, label: str) -> dict[str, Any]:
         "mlp_activation": config_choice(
             model["mlp_activation"], f"{label}.mlp_activation", ("gelu",)
         ),
-        "vocab_size": config_int(
-            model["vocab_size"], f"{label}.vocab_size", minimum=1
-        ),
+        "vocab_size": config_int(model["vocab_size"], f"{label}.vocab_size", minimum=1),
         "semantic_vocab_size": config_int(
             model["semantic_vocab_size"],
             f"{label}.semantic_vocab_size",
@@ -410,9 +384,7 @@ def _parse_model(value: Any, label: str) -> dict[str, Any]:
     if parsed["d_model"] % parsed["heads"]:
         raise ValueError(f"config.yaml {label}.d_model must be divisible by heads")
     if (parsed["d_model"] // parsed["heads"]) % 2:
-        raise ValueError(
-            f"config.yaml {label} head dimension must be even for RoPE"
-        )
+        raise ValueError(f"config.yaml {label} head dimension must be even for RoPE")
     return parsed
 
 
@@ -430,12 +402,8 @@ def _declared_family_parameter_count(model: Mapping[str, Any]) -> int:
 def _parse_experiment_profile(
     payload: Mapping[str, Any], profile: str, source_sha256: str, tier: str
 ) -> ExperimentProfile:
-    top = config_keys(
-        payload, "document", {"schema_version", "family", "profiles"}
-    )
-    schema_version = config_int(
-        top["schema_version"], "schema_version", minimum=1
-    )
+    top = config_keys(payload, "document", {"schema_version", "family", "profiles"})
+    schema_version = config_int(top["schema_version"], "schema_version", minimum=1)
     if schema_version != CONFIG_SCHEMA_VERSION:
         raise ValueError(
             "unsupported config.yaml schema_version "
@@ -457,8 +425,13 @@ def _parse_experiment_profile(
         family["parameterization"],
         "family.parameterization",
         {
-            "name", "base_width", "base_depth", "depth_alpha", "init_std",
-            "attention_scale", "embeddings",
+            "name",
+            "base_width",
+            "base_depth",
+            "depth_alpha",
+            "init_std",
+            "attention_scale",
+            "embeddings",
         },
     )
     parameterization_name = config_choice(
@@ -588,8 +561,14 @@ def _parse_experiment_profile(
         selected["optimizer"],
         f"profiles.{profile}.optimizer",
         {
-            "learning_rate", "min_lr_ratio", "warmup_ratio", "weight_decay",
-            "adam_epsilon", "beta1", "beta2", "grad_clip",
+            "learning_rate",
+            "min_lr_ratio",
+            "warmup_ratio",
+            "weight_decay",
+            "adam_epsilon",
+            "beta1",
+            "beta2",
+            "grad_clip",
         },
     )
     evaluation = config_keys(
@@ -620,35 +599,50 @@ def _parse_experiment_profile(
     )
     beta1 = config_float(optimizer["beta1"], f"{prefix}.optimizer.beta1")
     beta2 = config_float(optimizer["beta2"], f"{prefix}.optimizer.beta2")
-    grad_clip = config_float(
-        optimizer["grad_clip"], f"{prefix}.optimizer.grad_clip"
-    )
+    grad_clip = config_float(optimizer["grad_clip"], f"{prefix}.optimizer.grad_clip")
     if learning_rate <= 0.0:
-        raise ValueError(f"config.yaml {prefix}.optimizer.learning_rate must be positive")
+        raise ValueError(
+            f"config.yaml {prefix}.optimizer.learning_rate must be positive"
+        )
     if not 0.0 <= min_lr_ratio <= 1.0:
-        raise ValueError(f"config.yaml {prefix}.optimizer.min_lr_ratio must be in [0, 1]")
+        raise ValueError(
+            f"config.yaml {prefix}.optimizer.min_lr_ratio must be in [0, 1]"
+        )
     if weight_decay < 0.0:
-        raise ValueError(f"config.yaml {prefix}.optimizer.weight_decay must be nonnegative")
+        raise ValueError(
+            f"config.yaml {prefix}.optimizer.weight_decay must be nonnegative"
+        )
     if adam_epsilon <= 0.0:
-        raise ValueError(f"config.yaml {prefix}.optimizer.adam_epsilon must be positive")
+        raise ValueError(
+            f"config.yaml {prefix}.optimizer.adam_epsilon must be positive"
+        )
     if not 0.0 <= warmup_ratio < 1.0:
-        raise ValueError(f"config.yaml {prefix}.optimizer.warmup_ratio must be in [0, 1)")
+        raise ValueError(
+            f"config.yaml {prefix}.optimizer.warmup_ratio must be in [0, 1)"
+        )
     if not 0.0 <= beta1 < 1.0 or not 0.0 <= beta2 < 1.0:
-        raise ValueError(f"config.yaml {prefix}.optimizer beta values must be in [0, 1)")
+        raise ValueError(
+            f"config.yaml {prefix}.optimizer beta values must be in [0, 1)"
+        )
     if grad_clip < 0.0:
-        raise ValueError(f"config.yaml {prefix}.optimizer.grad_clip must be nonnegative")
+        raise ValueError(
+            f"config.yaml {prefix}.optimizer.grad_clip must be nonnegative"
+        )
     result = ExperimentProfile(
         schema_version=schema_version,
         source_sha256=source_sha256,
         name=profile,
         steps=(
             config_int(training["steps"], f"{prefix}.training.steps", minimum=1)
-            if "steps" in training else None
+            if "steps" in training
+            else None
         ),
         train_tokens=(
             config_int(
                 training["train_tokens"], f"{prefix}.training.train_tokens", minimum=1
-            ) if "train_tokens" in training else None
+            )
+            if "train_tokens" in training
+            else None
         ),
         tokens_per_parameter=(
             config_float(
@@ -697,7 +691,9 @@ def _parse_experiment_profile(
             ("dense", "jax_flash", "tpu_flash"),
         ),
         loss_backend=config_choice(
-            kernels["loss_backend"], f"{prefix}.kernels.loss_backend", ("dense", "tiled")
+            kernels["loss_backend"],
+            f"{prefix}.kernels.loss_backend",
+            ("dense", "tiled"),
         ),
         vocab_tile_size=config_int(
             kernels["vocab_tile_size"], f"{prefix}.kernels.vocab_tile_size", minimum=1
@@ -722,7 +718,9 @@ def _parse_experiment_profile(
             minimum=1,
         ),
         diagnostics_every=config_int(
-            logging["diagnostics_every"], f"{prefix}.logging.diagnostics_every", minimum=0
+            logging["diagnostics_every"],
+            f"{prefix}.logging.diagnostics_every",
+            minimum=0,
         ),
         log_every=config_int(
             logging["log_every"], f"{prefix}.logging.log_every", minimum=1
@@ -843,12 +841,8 @@ def build_parser() -> argparse.ArgumentParser:
     if environment_profile not in _VALID_PROFILES:
         environment_profile = None
     run.add_argument("--track", choices=_VALID_TRACKS, default=environment_track)
-    run.add_argument(
-        "--profile", choices=_VALID_PROFILES, default=environment_profile
-    )
-    run.add_argument(
-        "--smoke", action="store_true", help="alias for --profile smoke"
-    )
+    run.add_argument("--profile", choices=_VALID_PROFILES, default=environment_profile)
+    run.add_argument("--smoke", action="store_true", help="alias for --profile smoke")
     run.add_argument(
         "--eval-batches", type=positive_int, default=None, help=argparse.SUPPRESS
     )
@@ -947,8 +941,12 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument(
         "--vocab-size", type=positive_int, default=None, help=argparse.SUPPRESS
     )
-    data.add_argument("--dataset-id", default=None, help="stable dataset identifier for records")
-    data.add_argument("--tokenizer-id", default=None, help="stable tokenizer identifier for records")
+    data.add_argument(
+        "--dataset-id", default=None, help="stable dataset identifier for records"
+    )
+    data.add_argument(
+        "--tokenizer-id", default=None, help="stable tokenizer identifier for records"
+    )
     data.add_argument(
         "--data-format",
         choices=("auto", "raw", "llmc"),
@@ -976,14 +974,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     model = parser.add_argument_group("model")
-    model.add_argument("--batch-size", type=positive_int, default=None, help=argparse.SUPPRESS)
-    model.add_argument("--seq-len", type=positive_int, default=None, help=argparse.SUPPRESS)
-    model.add_argument("--layers", type=positive_int, default=None, help=argparse.SUPPRESS)
-    model.add_argument("--heads", type=positive_int, default=None, help=argparse.SUPPRESS)
-    model.add_argument("--d-model", type=positive_int, default=None, help=argparse.SUPPRESS)
-    model.add_argument("--mlp-mult", type=positive_int, default=None, help=argparse.SUPPRESS)
     model.add_argument(
-        "--dtype", choices=("bfloat16", "float32"), default=None,
+        "--batch-size", type=positive_int, default=None, help=argparse.SUPPRESS
+    )
+    model.add_argument(
+        "--seq-len", type=positive_int, default=None, help=argparse.SUPPRESS
+    )
+    model.add_argument(
+        "--layers", type=positive_int, default=None, help=argparse.SUPPRESS
+    )
+    model.add_argument(
+        "--heads", type=positive_int, default=None, help=argparse.SUPPRESS
+    )
+    model.add_argument(
+        "--d-model", type=positive_int, default=None, help=argparse.SUPPRESS
+    )
+    model.add_argument(
+        "--mlp-mult", type=positive_int, default=None, help=argparse.SUPPRESS
+    )
+    model.add_argument(
+        "--dtype",
+        choices=("bfloat16", "float32"),
+        default=None,
         help=argparse.SUPPRESS,
     )
     model.add_argument(
@@ -1012,10 +1024,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     optim = parser.add_argument_group("optimization")
-    optim.add_argument("--learning-rate", type=float, default=None, help=argparse.SUPPRESS)
-    optim.add_argument("--min-lr-ratio", type=float, default=None, help=argparse.SUPPRESS)
-    optim.add_argument("--warmup-steps", type=nonnegative_int, default=None, help=argparse.SUPPRESS)
-    optim.add_argument("--weight-decay", type=float, default=None, help=argparse.SUPPRESS)
+    optim.add_argument(
+        "--learning-rate", type=float, default=None, help=argparse.SUPPRESS
+    )
+    optim.add_argument(
+        "--min-lr-ratio", type=float, default=None, help=argparse.SUPPRESS
+    )
+    optim.add_argument(
+        "--warmup-steps", type=nonnegative_int, default=None, help=argparse.SUPPRESS
+    )
+    optim.add_argument(
+        "--weight-decay", type=float, default=None, help=argparse.SUPPRESS
+    )
     optim.add_argument("--beta1", type=float, default=None, help=argparse.SUPPRESS)
     optim.add_argument("--beta2", type=float, default=None, help=argparse.SUPPRESS)
     optim.add_argument("--grad-clip", type=float, default=None, help=argparse.SUPPRESS)
@@ -1048,13 +1068,11 @@ def validate_args(args: argparse.Namespace) -> ExperimentProfile:
         selected_profile(args), args.config, tier=args.tier
     )
     if args.tokens_per_parameter is not None and (
-        not math.isfinite(args.tokens_per_parameter)
-        or args.tokens_per_parameter <= 0.0
+        not math.isfinite(args.tokens_per_parameter) or args.tokens_per_parameter <= 0.0
     ):
         raise ValueError("--tokens-per-parameter must be finite and positive")
     if args.base_learning_rate is not None and (
-        not math.isfinite(args.base_learning_rate)
-        or args.base_learning_rate <= 0.0
+        not math.isfinite(args.base_learning_rate) or args.base_learning_rate <= 0.0
     ):
         raise ValueError("--base-learning-rate must be finite and positive")
     if not 0.0 < args.val_fraction < 1.0:
@@ -1072,9 +1090,7 @@ def validate_args(args: argparse.Namespace) -> ExperimentProfile:
     xprof_window_args = (args.xprof_start_step, args.xprof_steps)
     if args.xprof_dir is None:
         if any(value is not None for value in xprof_window_args):
-            raise ValueError(
-                "--xprof-start-step and --xprof-steps require --xprof-dir"
-            )
+            raise ValueError("--xprof-start-step and --xprof-steps require --xprof-dir")
         if args.no_final_validation or args.no_checkpoint:
             raise ValueError(
                 "--no-final-validation and --no-checkpoint require --xprof-dir"
@@ -1150,9 +1166,7 @@ def should_compile_evaluation(
     """Return whether this invocation can execute any validation workload."""
 
     return (
-        not args.no_final_validation
-        or config.val_every > 0
-        or bool(downstream_domains)
+        not args.no_final_validation or config.val_every > 0 or bool(downstream_domains)
     )
 
 
@@ -1185,7 +1199,8 @@ def resolve_config(
     tokens_per_step = batch_size * seq_len
     requested_train_tokens = (
         args.train_tokens
-        if args.train_tokens is not None else (
+        if args.train_tokens is not None
+        else (
             None
             if args.steps is not None or args.tokens_per_parameter is not None
             else experiment.train_tokens
@@ -1218,14 +1233,14 @@ def resolve_config(
         steps = requested_train_tokens // tokens_per_step
     elif requested_tpp is not None:
         if experiment.declared_parameters is None:
-            raise ValueError(
-                "tokens-per-parameter requires a non-smoke family tier"
-            )
+            raise ValueError("tokens-per-parameter requires a non-smoke family tier")
         ideal_tokens = float(experiment.declared_parameters) * requested_tpp
         steps = max(1, int(math.floor(ideal_tokens / tokens_per_step + 0.5)))
     else:
         steps = args.steps if args.steps is not None else experiment.steps
-        if steps is None:  # schema validation establishes a duration, defensively retain type.
+        if (
+            steps is None
+        ):  # schema validation establishes a duration, defensively retain type.
             raise AssertionError("experiment duration did not resolve")
     if early_stop is not None and early_stop > steps:
         raise ValueError(
@@ -1279,10 +1294,14 @@ def resolve_config(
         for name, value in (
             ("steps", args.steps),
             ("train_tokens", args.train_tokens),
-            ("tokens_per_parameter_micros", (
-                round(args.tokens_per_parameter * 1_000_000)
-                if args.tokens_per_parameter is not None else None
-            )),
+            (
+                "tokens_per_parameter_micros",
+                (
+                    round(args.tokens_per_parameter * 1_000_000)
+                    if args.tokens_per_parameter is not None
+                    else None
+                ),
+            ),
             ("study_batch_size", args.study_batch_size),
             ("val_every", args.val_every),
             ("diagnostics_every", args.diagnostics_every),
@@ -1372,26 +1391,6 @@ def resolve_config(
     )
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def init_params(config: Config, seed: int) -> dict[str, Any]:
     rng = np.random.default_rng(seed)
     d_model = config.d_model
@@ -1418,9 +1417,7 @@ def init_params(config: Config, seed: int) -> dict[str, Any]:
             }
         )
     result = {
-        "token_embedding": normal(
-            rng, (config.vocab_size, d_model), config.init_std
-        ),
+        "token_embedding": normal(rng, (config.vocab_size, d_model), config.init_std),
         "blocks": blocks,
         "final_ln_scale": np.ones((d_model,), dtype=np.float32),
     }
@@ -1431,12 +1428,6 @@ def init_params(config: Config, seed: int) -> dict[str, Any]:
             config.init_std / config.width_multiplier,
         )
     return result
-
-
-
-
-
-
 
 
 AttentionCallable = Callable[[jax.Array, jax.Array, jax.Array], jax.Array]
@@ -1472,11 +1463,7 @@ def attention_console_rows(
             ("attention plan", "not applicable"),
         )
     digest = runtime.key_digest or "unknown"
-    timing = (
-        f" · {runtime.tune_seconds:.3f}s"
-        if runtime.tune_seconds > 0.0
-        else ""
-    )
+    timing = f" · {runtime.tune_seconds:.3f}s" if runtime.tune_seconds > 0.0 else ""
     tiles = runtime.tiles
     assert tiles.block_q_dkv is not None
     assert tiles.block_q_dkv_compute is not None
@@ -1501,8 +1488,7 @@ def attention_console_rows(
         ),
         (
             "attention dQ",
-            f"q{tiles.block_q_dq} · "
-            f"kv{tiles.block_kv_dq}/{tiles.block_kv_dq_compute}",
+            f"q{tiles.block_q_dq} · kv{tiles.block_kv_dq}/{tiles.block_kv_dq_compute}",
         ),
     )
 
@@ -1714,9 +1700,7 @@ def gpt_hidden(
         causal = None
     else:
         attention = None
-        causal = jnp.tril(
-            jnp.ones((length, length), dtype=jnp.bool_)
-        )[None, None, :, :]
+        causal = jnp.tril(jnp.ones((length, length), dtype=jnp.bool_))[None, None, :, :]
 
     for block in params["blocks"]:
         residual = x
@@ -1742,17 +1726,17 @@ def gpt_hidden(
             probabilities = jax.nn.softmax(scores, axis=-1).astype(dtype)
             attended = jnp.einsum("bhts,bshd->bthd", probabilities, value)
         attended = attended.reshape(tokens.shape[0], length, config.d_model)
-        x = residual + (
-            config.depth_multiplier ** (-config.depth_alpha)
-        ) * linear(attended, block["attn_w"], block["attn_b"], dtype)
+        x = residual + (config.depth_multiplier ** (-config.depth_alpha)) * linear(
+            attended, block["attn_w"], block["attn_b"], dtype
+        )
 
         residual = x
         x_norm = rms_norm(x, block["ln2_scale"], dtype)
         hidden = linear(x_norm, block["mlp_up_w"], block["mlp_up_b"], dtype)
         hidden = jax.nn.gelu(hidden, approximate=True)
-        x = residual + (
-            config.depth_multiplier ** (-config.depth_alpha)
-        ) * linear(hidden, block["mlp_down_w"], block["mlp_down_b"], dtype)
+        x = residual + (config.depth_multiplier ** (-config.depth_alpha)) * linear(
+            hidden, block["mlp_down_w"], block["mlp_down_b"], dtype
+        )
 
     return rms_norm(x, params["final_ln_scale"], dtype)
 
@@ -1789,7 +1773,9 @@ def cross_entropy(
             vocab_tile_size=config.vocab_tile_size,
             compute_dtype=config.compute_dtype,
         )
-    logits = gpt_logits(params, x, config, attention_fn)[..., : config.semantic_vocab_size]
+    logits = gpt_logits(params, x, config, attention_fn)[
+        ..., : config.semantic_vocab_size
+    ]
     log_probabilities = jax.nn.log_softmax(logits, axis=-1)
     selected = jnp.take_along_axis(log_probabilities, y[..., None], axis=-1)
     return -jnp.mean(selected, dtype=jnp.float32)
@@ -1953,7 +1939,9 @@ def _apply_training_update(
     )(params)
     gradients = jax.tree_util.tree_map(lambda grad: grad.astype(jnp.float32), gradients)
     raw_gradients = gradients
-    squared_norms = [jnp.sum(jnp.square(grad)) for grad in jax.tree_util.tree_leaves(gradients)]
+    squared_norms = [
+        jnp.sum(jnp.square(grad)) for grad in jax.tree_util.tree_leaves(gradients)
+    ]
     grad_norm = jnp.sqrt(sum(squared_norms))
     clip_scale = (
         jnp.minimum(1.0, config.grad_clip / (grad_norm + 1.0e-6))
@@ -1974,14 +1962,10 @@ def _apply_training_update(
         optimizer["v"],
         gradients,
     )
-    bias_correction1 = 1.0 - beta1**step.astype(jnp.float32)
-    bias_correction2 = 1.0 - beta2**step.astype(jnp.float32)
-    epsilon_horizon_scale = math.sqrt(
-        config.data_multiplier / config.batch_multiplier
-    )
-    decay_horizon_scale = math.sqrt(
-        config.batch_multiplier / config.data_multiplier
-    )
+    bias_correction1 = 1.0 - beta1 ** step.astype(jnp.float32)
+    bias_correction2 = 1.0 - beta2 ** step.astype(jnp.float32)
+    epsilon_horizon_scale = math.sqrt(config.data_multiplier / config.batch_multiplier)
+    decay_horizon_scale = math.sqrt(config.batch_multiplier / config.data_multiplier)
 
     def update(
         parameter: jax.Array,
@@ -1992,17 +1976,12 @@ def _apply_training_update(
         epsilon_multiplier: float,
         decay_multiplier: float,
     ) -> jax.Array:
-        epsilon = (
-            config.adam_epsilon * epsilon_horizon_scale * epsilon_multiplier
-        )
+        epsilon = config.adam_epsilon * epsilon_horizon_scale * epsilon_multiplier
         adam = (first / bias_correction1) / (
             jnp.sqrt(second / bias_correction2) + epsilon
         )
         decay = (
-            config.weight_decay
-            * decay_horizon_scale
-            * decay_multiplier
-            * parameter
+            config.weight_decay * decay_horizon_scale * decay_multiplier * parameter
             if should_decay
             else 0.0
         )
@@ -2047,7 +2026,9 @@ def train_step(
     return params, optimizer, metrics
 
 
-def diagnostic_scopes(tree: Mapping[str, Any]) -> tuple[tuple[str, int | None, tuple[Any, ...]], ...]:
+def diagnostic_scopes(
+    tree: Mapping[str, Any],
+) -> tuple[tuple[str, int | None, tuple[Any, ...]], ...]:
     """Group a parameter-shaped tree into stable logical report scopes."""
 
     embeddings = tuple(jax.tree_util.tree_leaves(tree["token_embedding"]))
@@ -2070,7 +2051,11 @@ def diagnostic_scopes(tree: Mapping[str, Any]) -> tuple[tuple[str, int | None, t
         output = (
             output[0],
             output[1],
-            ("unembedding", None, tuple(jax.tree_util.tree_leaves(tree["output_embedding"]))),
+            (
+                "unembedding",
+                None,
+                tuple(jax.tree_util.tree_leaves(tree["output_embedding"])),
+            ),
             *output[2:],
         )
     return output
@@ -2102,15 +2087,9 @@ def _diagnostic_stat_vector(values: Sequence[jax.Array]) -> jax.Array:
     # variance and higher moments from cancellation-prone raw power sums.
     l1_sum = sum((jnp.sum(jnp.abs(value)) for value in values32), zero)
     square_sum = sum((jnp.sum(jnp.square(value)) for value in values32), zero)
-    variance_sum = sum(
-        (jnp.sum(jnp.square(value - mean)) for value in values32), zero
-    )
-    third_sum = sum(
-        (jnp.sum(jnp.power(value - mean, 3)) for value in values32), zero
-    )
-    fourth_sum = sum(
-        (jnp.sum(jnp.power(value - mean, 4)) for value in values32), zero
-    )
+    variance_sum = sum((jnp.sum(jnp.square(value - mean)) for value in values32), zero)
+    third_sum = sum((jnp.sum(jnp.power(value - mean, 3)) for value in values32), zero)
+    fourth_sum = sum((jnp.sum(jnp.power(value - mean, 4)) for value in values32), zero)
     return jnp.stack(
         (
             l1_sum,
@@ -2140,8 +2119,7 @@ def diagnostic_values(
         lambda after, before: after - before, params_after, params_before
     )
     family_scopes = tuple(
-        diagnostic_scopes(tree)
-        for tree in (params_after, raw_gradients, updates)
+        diagnostic_scopes(tree) for tree in (params_after, raw_gradients, updates)
     )
     scope_count = len(family_scopes[0])
     return jnp.stack(
@@ -2197,29 +2175,17 @@ def eval_step(
             compute_dtype=config.compute_dtype,
         )
     else:
-        logits = gpt_logits(params, x, config, attention_fn)[..., : config.semantic_vocab_size]
+        logits = gpt_logits(params, x, config, attention_fn)[
+            ..., : config.semantic_vocab_size
+        ]
         log_probabilities = jax.nn.log_softmax(logits, axis=-1)
-        selected = jnp.take_along_axis(
-            log_probabilities, y[..., None], axis=-1
-        )[..., 0]
+        selected = jnp.take_along_axis(log_probabilities, y[..., None], axis=-1)[..., 0]
         losses = -selected
     mask = mask.astype(jnp.float32)
     return (
         jnp.sum(losses * mask, dtype=jnp.float32),
         jnp.sum(mask, dtype=jnp.float32),
     )
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def traced_flops(config: Config, params: Mapping[str, Any]) -> FlopBreakdown:
@@ -2264,8 +2230,6 @@ def traced_flops(config: Config, params: Mapping[str, Any]) -> FlopBreakdown:
         return cross_entropy(trainable, tokens, targets, config)
 
     return count_training_flops(loss, params, rules=default_rules())
-
-
 
 
 def save_checkpoint(
@@ -2346,9 +2310,7 @@ def diagnostic_log_columns(
     """
 
     return tuple(
-        logpack.column(
-            f"{family}.{stat}", scope, layer, element_count=element_count
-        )
+        logpack.column(f"{family}.{stat}", scope, layer, element_count=element_count)
         for scope, layer, element_count in scope_metadata
         for family in DIAGNOSTIC_FAMILIES
         for stat in DIAGNOSTIC_STATS
@@ -2513,7 +2475,9 @@ def write_validation_csv(output_dir: Path, rows: Sequence[ValidationRow]) -> Non
 
     canonical_rows = [row for row in rows if row.canonical]
     if len(canonical_rows) != 1 or canonical_rows[0].kind != "fineweb":
-        raise ValueError("validation history must contain one canonical in-distribution row")
+        raise ValueError(
+            "validation history must contain one canonical in-distribution row"
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     destination = output_dir / VALIDATION_CSV_NAME
     temporary = output_dir / f".{VALIDATION_CSV_NAME}.tmp"
@@ -2549,38 +2513,6 @@ def write_validation_csv(output_dir: Path, rows: Sequence[ValidationRow]) -> Non
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, destination)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def run(args: argparse.Namespace) -> dict[str, Any] | None:
@@ -2689,7 +2621,10 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             ("JAX processes", f"{process_count} (this rank {process_index})"),
             ("mesh", f"data={len(devices)} (replicated model)"),
             ("dataset", dataset.source),
-            ("train / val tokens", f"{len(dataset.train):,} / {len(dataset.validation):,}"),
+            (
+                "train / val tokens",
+                f"{len(dataset.train):,} / {len(dataset.validation):,}",
+            ),
             (
                 "downstream",
                 (
@@ -2754,8 +2689,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             (
                 "FLOP breakdown",
                 " · ".join(
-                    f"{label} {share}"
-                    for label, share in describe(flop_breakdown)
+                    f"{label} {share}" for label, share in describe(flop_breakdown)
                 )
                 or "none",
             ),
@@ -2779,9 +2713,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     optimizer = put_replicated_tree(host_optimizer, mesh, replicated, process_count)
     del host_params, host_optimizer
 
-    train_rng = np.random.default_rng(
-        args.seed + 1 + process_index * 1_000_003
-    )
+    train_rng = np.random.default_rng(args.seed + 1 + process_index * 1_000_003)
     # Compilation may not inspect real data. Shapes and dtypes are sufficient.
     sample_x_host = np.zeros((local_batch, config.seq_len), dtype=np.int32)
     sample_y_host = np.zeros((local_batch, config.seq_len), dtype=np.int32)
@@ -2793,9 +2725,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     )
 
     compiled_step = jax.jit(
-        lambda p, o, x, y: train_step(
-            p, o, x, y, config, decay_mask, attention_fn
-        ),
+        lambda p, o, x, y: train_step(p, o, x, y, config, decay_mask, attention_fn),
         in_shardings=(replicated, replicated, data_sharding, data_sharding),
         donate_argnums=(0, 1),
     )
@@ -2812,16 +2742,18 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             "separate executable; compilation is outside train_seconds",
         )
         diagnostic_compile_started = time.perf_counter()
-        diagnostic_executable = jax.jit(
-            lambda p, o, x, y: diagnostic_train_step(
-                p, o, x, y, config, decay_mask, attention_fn
-            ),
-            in_shardings=(replicated, replicated, data_sharding, data_sharding),
-            donate_argnums=(0, 1),
-        ).lower(params, optimizer, sample_x, sample_y).compile()
-        diagnostic_compile_seconds = (
-            time.perf_counter() - diagnostic_compile_started
+        diagnostic_executable = (
+            jax.jit(
+                lambda p, o, x, y: diagnostic_train_step(
+                    p, o, x, y, config, decay_mask, attention_fn
+                ),
+                in_shardings=(replicated, replicated, data_sharding, data_sharding),
+                donate_argnums=(0, 1),
+            )
+            .lower(params, optimizer, sample_x, sample_y)
+            .compile()
         )
+        diagnostic_compile_seconds = time.perf_counter() - diagnostic_compile_started
 
     # Compile evaluation exactly once when it is requested. Diagnostic XProf
     # runs can skip this executable entirely, keeping their setup focused on the
@@ -2830,9 +2762,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     sample_mask: jax.Array | None = None
     eval_compile_seconds = 0.0
     if needs_evaluation:
-        sample_mask_host = np.ones(
-            (local_batch, config.seq_len), dtype=np.float32
-        )
+        sample_mask_host = np.ones((local_batch, config.seq_len), dtype=np.float32)
         sample_mask = put_host_local_array(
             sample_mask_host,
             mesh,
@@ -2842,17 +2772,17 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         )
         console.phase("Compiling evaluation", "reused by probes and final validation")
         eval_compile_started = time.perf_counter()
-        compiled_eval = jax.jit(
-            lambda p, x, y, mask: eval_step(
-                p, x, y, mask, config, attention_fn
-            ),
-            in_shardings=(replicated, data_sharding, data_sharding, data_sharding),
-        ).lower(params, sample_x, sample_y, sample_mask).compile()
+        compiled_eval = (
+            jax.jit(
+                lambda p, x, y, mask: eval_step(p, x, y, mask, config, attention_fn),
+                in_shardings=(replicated, data_sharding, data_sharding, data_sharding),
+            )
+            .lower(params, sample_x, sample_y, sample_mask)
+            .compile()
+        )
         eval_compile_seconds = time.perf_counter() - eval_compile_started
     total_compile_seconds = (
-        train_compile_seconds
-        + diagnostic_compile_seconds
-        + eval_compile_seconds
+        train_compile_seconds + diagnostic_compile_seconds + eval_compile_seconds
     )
 
     sync_tree((params, optimizer, sample_x, sample_y, sample_mask))
@@ -2936,9 +2866,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                     )
                     trace_active = True
                 if process_count > 1:
-                    multihost_utils.sync_global_devices(
-                        "rig-xprof-capture-started"
-                    )
+                    multihost_utils.sync_global_devices("rig-xprof-capture-started")
 
             annotation = (
                 jax.profiler.StepTraceAnnotation("train", step_num=step_index)
@@ -2965,7 +2893,11 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                 batch_y = put_host_local_array(
                     batch_y, mesh, P("data", None), data_sharding, process_count
                 )
-                if should_run_diagnostics(step_index, every=config.diagnostics_every, final_step=config.final_step):
+                if should_run_diagnostics(
+                    step_index,
+                    every=config.diagnostics_every,
+                    final_step=config.final_step,
+                ):
                     if diagnostic_executable is None:  # defensive invariant
                         raise AssertionError("diagnostic executable was not compiled")
                     params, optimizer, last_metrics, diagnostic_values_at_step = (
@@ -2990,9 +2922,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                             append_log_row(
                                 diagnostic_log,
                                 point.step,
-                                np.asarray(
-                                    point.values, dtype=np.float32
-                                ).reshape(-1),
+                                np.asarray(point.values, dtype=np.float32).reshape(-1),
                             )
                 else:
                     params, optimizer, last_metrics = executable(
@@ -3079,17 +3009,13 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
 
             if capture_window is not None and step_index == capture_window[1]:
                 if process_count > 1:
-                    multihost_utils.sync_global_devices(
-                        "rig-xprof-capture-finished"
-                    )
+                    multihost_utils.sync_global_devices("rig-xprof-capture-finished")
                 if trace_active:
                     jax.profiler.stop_trace()
                     trace_active = False
                     console.phase("XProf capture saved", str(xprof_dir))
                 if process_count > 1:
-                    multihost_utils.sync_global_devices(
-                        "rig-xprof-capture-stopped"
-                    )
+                    multihost_utils.sync_global_devices("rig-xprof-capture-stopped")
     finally:
         if trace_active:
             # Avoid leaving process-global profiler state active when a sampled
@@ -3344,11 +3270,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         "artifacts": {
             "training_curve": TRAINING_LOG_NAME,
             "validation_curve": VALIDATION_CSV_NAME,
-            **(
-                {"diagnostics": DIAGNOSTICS_LOG_NAME}
-                if diagnostic_points
-                else {}
-            ),
+            **({"diagnostics": DIAGNOSTICS_LOG_NAME} if diagnostic_points else {}),
         },
         "system": {
             **system_metadata(devices),
@@ -3367,7 +3289,9 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         "implementation": implementation_metadata(config, attention_runtime),
         "evaluations": evaluations,
         "metrics": {
-            "train_seconds": finite_metric("train_seconds", train_seconds, positive=True),
+            "train_seconds": finite_metric(
+                "train_seconds", train_seconds, positive=True
+            ),
             "tokens_processed": int(tokens_processed),
             "training_token_budget": int(tokens_processed),
             "training_steps": int(config.final_step),
@@ -3480,9 +3404,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     if result is not None:
         print(
             RESULT_PREFIX
-            + json.dumps(
-                result, sort_keys=True, separators=(",", ":"), allow_nan=False
-            )
+            + json.dumps(result, sort_keys=True, separators=(",", ":"), allow_nan=False)
         )
     return 0
 

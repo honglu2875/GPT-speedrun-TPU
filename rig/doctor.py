@@ -137,8 +137,7 @@ def check_lockfile() -> CheckResult:
 def check_jax_install() -> CheckResult:
     try:
         versions = {
-            name: metadata.version(name)
-            for name in ("jax", "jaxlib", "libtpu")
+            name: metadata.version(name) for name in ("jax", "jaxlib", "libtpu")
         }
     except metadata.PackageNotFoundError as exc:
         return CheckResult(
@@ -185,7 +184,9 @@ def check_devices(
 
         devices = jax.devices()
     except Exception as exc:
-        return CheckResult("accelerator", "error", f"JAX device discovery failed: {exc}")
+        return CheckResult(
+            "accelerator", "error", f"JAX device discovery failed: {exc}"
+        )
     if not devices:
         return CheckResult("accelerator", "error", "JAX reported no devices")
     platforms = sorted({device.platform for device in devices})
@@ -214,7 +215,9 @@ def check_devices(
         )
     if not tpu_devices:
         status = "error" if require_tpu else "warning"
-        return CheckResult("accelerator", status, message, "CPU is valid only for smoke runs")
+        return CheckResult(
+            "accelerator", status, message, "CPU is valid only for smoke runs"
+        )
     if exact and expected_topology:
         return CheckResult("accelerator", "ok", message)
     return CheckResult(
@@ -262,14 +265,14 @@ def check_compilation() -> CheckResult:
             collective = jax.pmap(
                 lambda x: jax.lax.psum(x, "devices"), axis_name="devices"
             )
-            result = collective(
-                jnp.arange(jax.local_device_count(), dtype=jnp.float32)
-            )
+            result = collective(jnp.arange(jax.local_device_count(), dtype=jnp.float32))
             result.block_until_ready()
         elapsed = time.perf_counter() - started
     except Exception as exc:
         return CheckResult("compile probe", "error", str(exc))
-    return CheckResult("compile probe", "ok", f"BF16 matmul/collective in {elapsed:.2f}s")
+    return CheckResult(
+        "compile probe", "ok", f"BF16 matmul/collective in {elapsed:.2f}s"
+    )
 
 
 def source_digest(repo: Path) -> tuple[str, int]:
@@ -360,7 +363,11 @@ def check_storage(path: Path) -> CheckResult:
     try:
         resolved = path.expanduser().resolve(strict=False)
         if not resolved.exists():
-            parent = next(candidate for candidate in [resolved, *resolved.parents] if candidate.exists())
+            parent = next(
+                candidate
+                for candidate in [resolved, *resolved.parents]
+                if candidate.exists()
+            )
             usage = shutil.disk_usage(parent)
             return CheckResult(
                 "data cache",

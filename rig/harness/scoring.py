@@ -6,7 +6,6 @@ import math
 from typing import Any, Iterable, Mapping, Sequence
 
 
-
 def rank_records(
     records: Iterable[Mapping[str, Any]],
     *,
@@ -33,7 +32,10 @@ def rank_records(
         if target_loss is None:
             if not bool(record.get("qualified")):
                 continue
-        elif not _finite_nonnegative(validation_loss) or float(validation_loss) > target_loss:
+        elif (
+            not _finite_nonnegative(validation_loss)
+            or float(validation_loss) > target_loss
+        ):
             continue
         if not _finite_nonnegative(train_seconds):
             continue
@@ -46,7 +48,11 @@ def rank_records(
     def key(record: Mapping[str, Any]) -> tuple[Any, ...]:
         seconds = float(record["metrics"]["train_seconds"])
         if track == "sample_efficiency":
-            return (int(record["metrics"]["tokens_processed"]), seconds, record["run_id"])
+            return (
+                int(record["metrics"]["tokens_processed"]),
+                seconds,
+                record["run_id"],
+            )
         return (seconds, record["run_id"])
 
     candidates.sort(key=key)
@@ -90,7 +96,10 @@ def render_leaderboard(
     ]
 
     def format_row(row: Sequence[str]) -> str:
-        return "  ".join(value.rjust(widths[i]) if i in (0, 2, 3, 4) else value.ljust(widths[i]) for i, value in enumerate(row))
+        return "  ".join(
+            value.rjust(widths[i]) if i in (0, 2, 3, 4) else value.ljust(widths[i])
+            for i, value in enumerate(row)
+        )
 
     title = f"{track.replace('_', ' ').title()} leaderboard"
     if color:
@@ -104,7 +113,12 @@ def render_leaderboard(
 
 
 def _finite_nonnegative(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+    )
 
 
 def _positive_int(value: Any) -> bool:

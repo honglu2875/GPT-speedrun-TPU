@@ -239,9 +239,7 @@ def _tiled_losses_bwd(
         0.0,
     )
     grad_hidden = jnp.zeros(flat_hidden.shape, dtype=jnp.float32)
-    grad_embedding = jnp.zeros(
-        (padded_vocab, embedding.shape[1]), dtype=jnp.float32
-    )
+    grad_embedding = jnp.zeros((padded_vocab, embedding.shape[1]), dtype=jnp.float32)
 
     def tile_backward(
         tile_index: jax.Array, state: tuple[jax.Array, jax.Array]
@@ -337,9 +335,7 @@ def tiled_tied_cross_entropy_losses(
     semantic_vocab_size = int(semantic_vocab_size)
     vocab_tile_size = int(vocab_tile_size)
     compute_dtype = _normalize_compute_dtype(compute_dtype)
-    _validate_inputs(
-        hidden, embedding, targets, semantic_vocab_size, vocab_tile_size
-    )
+    _validate_inputs(hidden, embedding, targets, semantic_vocab_size, vocab_tile_size)
     return _tiled_losses(
         hidden,
         embedding,

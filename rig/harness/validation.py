@@ -53,7 +53,9 @@ def _finite_number(value: Any, name: str, *, minimum: float = 0.0) -> float:
     try:
         number = float(value)
     except OverflowError as exc:
-        raise ResultValidationError(f"{name} must be finite and >= {minimum:g}") from exc
+        raise ResultValidationError(
+            f"{name} must be finite and >= {minimum:g}"
+        ) from exc
     if not math.isfinite(number) or number < minimum:
         raise ResultValidationError(f"{name} must be finite and >= {minimum:g}")
     return number
@@ -76,7 +78,11 @@ def reference_contract_dict(
 ) -> dict[str, Any] | None:
     if contract is None:
         return None
-    value = contract.as_dict() if isinstance(contract, ReferenceContract) else dict(contract)
+    value = (
+        contract.as_dict()
+        if isinstance(contract, ReferenceContract)
+        else dict(contract)
+    )
     required = ("model_id", "dataset_id", "tokenizer_id", "sequence_length")
     missing = [key for key in required if key not in value]
     if missing:
@@ -98,14 +104,18 @@ def contained_file(run_dir: Path, relative: Any) -> Path:
         raise ResultValidationError("checkpoint must be a non-empty relative path")
     candidate = Path(relative)
     if candidate.is_absolute():
-        raise ResultValidationError("checkpoint path must be relative to the run directory")
+        raise ResultValidationError(
+            "checkpoint path must be relative to the run directory"
+        )
     root = run_dir.resolve()
     unresolved = root / candidate
     resolved = unresolved.resolve()
     try:
         resolved.relative_to(root)
     except ValueError as exc:
-        raise ResultValidationError("checkpoint path escapes the run directory") from exc
+        raise ResultValidationError(
+            "checkpoint path escapes the run directory"
+        ) from exc
     if not resolved.is_file():
         raise ResultValidationError("checkpoint is not a regular file")
     if unresolved.is_symlink():
@@ -169,7 +179,9 @@ def _evaluation_row(
     try:
         expected_perplexity = math.exp(loss)
     except OverflowError as exc:
-        raise ResultValidationError(f"{name}.loss is too large for finite perplexity") from exc
+        raise ResultValidationError(
+            f"{name}.loss is too large for finite perplexity"
+        ) from exc
     _require_close(perplexity, expected_perplexity, f"{name}.perplexity")
     scored_tokens = _positive_integer(row.get("scored_tokens"), f"{name}.scored_tokens")
     seconds = _finite_number(row.get("seconds"), f"{name}.seconds")
@@ -271,9 +283,7 @@ def _validate_evaluations(
         fresh10.get("macro_loss"), "evaluations.fresh10.macro_loss"
     )
     expected_macro_loss = math.fsum(losses) / FRESH10_DOMAIN_COUNT
-    _require_close(
-        macro_loss, expected_macro_loss, "evaluations.fresh10.macro_loss"
-    )
+    _require_close(macro_loss, expected_macro_loss, "evaluations.fresh10.macro_loss")
     macro_perplexity = _finite_number(
         fresh10.get("macro_perplexity"), "evaluations.fresh10.macro_perplexity"
     )
@@ -339,7 +349,9 @@ def validate_result(
     )
     if declared_time <= 0:
         raise ResultValidationError("metrics.train_seconds must be greater than zero")
-    tokens = _positive_integer(metrics.get("tokens_processed"), "metrics.tokens_processed")
+    tokens = _positive_integer(
+        metrics.get("tokens_processed"), "metrics.tokens_processed"
+    )
     if expected_training_tokens is not None and tokens != expected_training_tokens:
         raise ResultValidationError(
             "metrics.tokens_processed must match the fixed training-token budget: "
@@ -423,7 +435,9 @@ def _ensure_json(value: Any, name: str) -> None:
     try:
         json.dumps(value, allow_nan=False)
     except (TypeError, ValueError) as exc:
-        raise ResultValidationError(f"{name} must contain only finite JSON values") from exc
+        raise ResultValidationError(
+            f"{name} must contain only finite JSON values"
+        ) from exc
 
 
 def verify_run(
@@ -441,7 +455,9 @@ def verify_run(
     stdout_path = run_dir / "stdout.log"
     if not stdout_path.is_file():
         raise ResultValidationError(f"missing captured stdout log: {stdout_path}")
-    payload = parse_result_line(stdout_path.read_text(encoding="utf-8", errors="replace"))
+    payload = parse_result_line(
+        stdout_path.read_text(encoding="utf-8", errors="replace")
+    )
     return validate_result(
         payload,
         run_dir=run_dir,

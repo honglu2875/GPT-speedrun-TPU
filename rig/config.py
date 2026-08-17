@@ -88,7 +88,9 @@ class LocalConfig:
     training_tokens: int = 624_984_064
 
     def validate(self) -> "LocalConfig":
-        if isinstance(self.tpu_vm_count, bool) or not isinstance(self.tpu_vm_count, int):
+        if isinstance(self.tpu_vm_count, bool) or not isinstance(
+            self.tpu_vm_count, int
+        ):
             raise ConfigError("tpu_vm_count must be a positive integer")
         if self.tpu_vm_count <= 0:
             raise ConfigError("tpu_vm_count must be a positive integer")
@@ -97,7 +99,9 @@ class LocalConfig:
         if any(character in self.tpu_vm_hosts for character in "\x00\r\n"):
             raise ConfigError("tpu_vm_hosts must be a single-line pdsh expression")
         if self.tpu_vm_count > 1 and not self.tpu_vm_hosts.strip():
-            raise ConfigError("tpu_vm_hosts is required when tpu_vm_count is greater than 1")
+            raise ConfigError(
+                "tpu_vm_hosts is required when tpu_vm_count is greater than 1"
+            )
         if any(character.isspace() for character in self.tpu_vm_hosts):
             raise ConfigError("tpu_vm_hosts may not contain whitespace")
         if not isinstance(self.remote_controller, bool):
@@ -208,7 +212,9 @@ def load_config(root: Path | None = None, cluster: str | None = None) -> LocalCo
     path = config_path(root)
     if not path.exists():
         if cluster:
-            raise ConfigError(f"no {CONFIG_FILENAME}; cannot select cluster {cluster!r}")
+            raise ConfigError(
+                f"no {CONFIG_FILENAME}; cannot select cluster {cluster!r}"
+            )
         return LocalConfig().validate()
     payload = _read_payload(path)
     section = payload.get("rig")

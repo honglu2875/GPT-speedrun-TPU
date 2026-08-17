@@ -24,6 +24,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from rig import logpack
+
 # ``metrics`` is a local name in several readers, so the registry is
 # imported under a distinct one rather than being shadowed.
 from rig import metrics as metrics_registry
@@ -155,7 +156,11 @@ class _Run:
         return _points(self.training, values)
 
     def diagnostic_points(
-        self, family: str, statistic: str, scope: str = "overall", layer: int | None = None
+        self,
+        family: str,
+        statistic: str,
+        scope: str = "overall",
+        layer: int | None = None,
     ) -> list[list[float]]:
         if self.diagnostics is None:
             return []
@@ -208,7 +213,9 @@ def build_report(
     if not runs_dir.is_dir():
         raise ReportError(f"runs directory does not exist: {runs_dir}")
     if output_path.exists() and (output_path.is_dir() or output_path.is_symlink()):
-        raise ReportError("report output must be a regular file, not a directory or symlink")
+        raise ReportError(
+            "report output must be a regular file, not a directory or symlink"
+        )
 
     records, duplicate_record_ids, ledger_notices = _read_ledger(
         runs_dir / "records.jsonl"
@@ -216,7 +223,11 @@ def build_report(
     included: list[_Run] = []
     skipped: dict[str, str] = {}
     for candidate in sorted(runs_dir.iterdir()):
-        if not candidate.is_dir() or candidate.is_symlink() or candidate.name.startswith("."):
+        if (
+            not candidate.is_dir()
+            or candidate.is_symlink()
+            or candidate.name.startswith(".")
+        ):
             continue
         if not (candidate / "result.json").exists():
             # Failed/partial harness directories are expected and are not plot-able.
@@ -400,7 +411,9 @@ def _read_run(path: Path, record: dict[str, Any] | None, limit: int) -> _Run:
             "diagnostic plots are unavailable."
         )
     if record is None:
-        run.notices.append(f"{run_id}: not present in records.jsonl (shown as unledgered).")
+        run.notices.append(
+            f"{run_id}: not present in records.jsonl (shown as unledgered)."
+        )
     elif "qualified" in record and not isinstance(record["qualified"], bool):
         run.notices.append(f"{run_id}: invalid ledger qualified flag was ignored.")
     # Long-form diagnostics already contain final param/grad/update scope values.
@@ -434,8 +447,7 @@ def _read_diagnostics(path: Path, training: logpack.Log) -> logpack.Log:
         )
     if not _close(log.flops_per_token, training.flops_per_token):
         raise ReportError(
-            f"{DIAGNOSTICS_LOG_NAME} FLOP accounting disagrees with "
-            f"{TRAINING_LOG_NAME}"
+            f"{DIAGNOSTICS_LOG_NAME} FLOP accounting disagrees with {TRAINING_LOG_NAME}"
         )
     if len(log) == 0:
         raise ReportError(f"{DIAGNOSTICS_LOG_NAME} has no samples")
@@ -487,9 +499,7 @@ def _check_diagnostic_scopes(log: logpack.Log) -> None:
     for entry in log.columns:
         counts.setdefault((entry.scope_id, entry.layer), entry.element_count)
     total = counts.get((overall, -1))
-    parts = sum(
-        value for (scope_id, _), value in counts.items() if scope_id != overall
-    )
+    parts = sum(value for (scope_id, _), value in counts.items() if scope_id != overall)
     if total is not None and parts and total != parts:
         raise ReportError(
             f"{DIAGNOSTICS_LOG_NAME} overall element_count disagrees with its "
@@ -544,7 +554,9 @@ def _artifact_path(
         resolved = unresolved.resolve(strict=False)
         resolved.relative_to(run_dir.resolve())
     except (OSError, ValueError) as exc:
-        raise ReportError(f"artifact {artifact_name} escapes its run directory") from exc
+        raise ReportError(
+            f"artifact {artifact_name} escapes its run directory"
+        ) from exc
     if not resolved.exists():
         if declared is not None or required:
             raise ReportError(f"artifact {artifact_name} is missing")
@@ -625,7 +637,9 @@ def _read_validation(path: Path, training: logpack.Log) -> list[dict[str, Any]]:
             raw.get("tokens_processed"), f"validation.csv:{number} tokens"
         )
         if step < prior_step or step > final_step:
-            raise ReportError("validation.csv steps must be ordered and within training")
+            raise ReportError(
+                "validation.csv steps must be ordered and within training"
+            )
         if step * training.tokens_per_step != tokens:
             raise ReportError(
                 f"validation.csv:{number} token count disagrees with "
@@ -672,12 +686,15 @@ def _validate_and_fill_evaluations(
     fineweb_final = [
         row
         for row in rows
-        if row["kind"] == "fineweb" or (
-            row["domain"] == "fineweb" and str(row["kind"]).endswith("final")
-        )
+        if row["kind"] == "fineweb"
+        or (row["domain"] == "fineweb" and str(row["kind"]).endswith("final"))
     ]
-    if fineweb_final and not _close(fineweb_final[-1]["validation_loss"], validation_loss):
-        raise ReportError("validation.csv final FineWeb loss disagrees with result.json")
+    if fineweb_final and not _close(
+        fineweb_final[-1]["validation_loss"], validation_loss
+    ):
+        raise ReportError(
+            "validation.csv final FineWeb loss disagrees with result.json"
+        )
     if not fineweb_final:
         rows.append(
             {
@@ -710,7 +727,9 @@ def _validate_and_fill_evaluations(
     macro = _finite(fresh.get("macro_loss"), "Fresh10 macro_loss")
     macro_rows = [row for row in rows if row["kind"] == "downstream_macro"]
     if macro_rows and not _close(macro_rows[-1]["validation_loss"], macro):
-        raise ReportError("validation.csv Fresh10 macro loss disagrees with result.json")
+        raise ReportError(
+            "validation.csv Fresh10 macro loss disagrees with result.json"
+        )
     if not macro_rows:
         rows.append(
             {
@@ -733,12 +752,18 @@ def _validate_and_fill_evaluations(
     if not _close(macro, math.fsum(domain_losses) / len(domain_losses)):
         raise ReportError("Fresh10 macro loss disagrees with its ten domain losses")
     for domain, value in domains.items():
-        expected = _finite(_object(value, f"Fresh10 {domain}").get("loss"), f"Fresh10 {domain}")
+        expected = _finite(
+            _object(value, f"Fresh10 {domain}").get("loss"), f"Fresh10 {domain}"
+        )
         matches = [
-            row for row in rows if row["kind"] == "downstream" and row["domain"] == domain
+            row
+            for row in rows
+            if row["kind"] == "downstream" and row["domain"] == domain
         ]
         if matches and not _close(matches[-1]["validation_loss"], expected):
-            raise ReportError(f"validation.csv Fresh10 {domain} loss disagrees with result.json")
+            raise ReportError(
+                f"validation.csv Fresh10 {domain} loss disagrees with result.json"
+            )
         if not matches:
             rows.append(
                 {
@@ -769,21 +794,29 @@ def _read_checkpoint_layers(run_dir: Path, run: _Run) -> None:
             if isinstance(run.record, dict)
             else None
         )
-        policy = "retention policy removed it" if retained is False else "file is absent"
+        policy = (
+            "retention policy removed it" if retained is False else "file is absent"
+        )
         run.notices.append(f"{run.run_id}: per-layer plots unavailable ({policy}).")
         return
 
     if run.record is not None:
         ledger = run.record.get("checkpoint")
         if not isinstance(ledger, dict):
-            run.notices.append(f"{run.run_id}: checkpoint lacks a ledger record; layer scan skipped.")
+            run.notices.append(
+                f"{run.run_id}: checkpoint lacks a ledger record; layer scan skipped."
+            )
             return
         if ledger.get("bytes") != checkpoint.stat().st_size:
-            run.notices.append(f"{run.run_id}: checkpoint size differs from ledger; layer scan skipped.")
+            run.notices.append(
+                f"{run.run_id}: checkpoint size differs from ledger; layer scan skipped."
+            )
             return
         expected = ledger.get("sha256")
         if not isinstance(expected, str) or _sha256(checkpoint) != expected:
-            run.notices.append(f"{run.run_id}: checkpoint SHA-256 differs; layer scan skipped.")
+            run.notices.append(
+                f"{run.run_id}: checkpoint SHA-256 differs; layer scan skipped."
+            )
             return
     try:
         run.layer_stats = _checkpoint_layer_stats(checkpoint)
@@ -791,7 +824,9 @@ def _read_checkpoint_layers(run_dir: Path, run: _Run) -> None:
         run.notices.append(f"{run.run_id}: checkpoint layer scan failed ({exc}).")
         return
     if not run.layer_stats:
-        run.notices.append(f"{run.run_id}: checkpoint contains no recognized logical layer arrays.")
+        run.notices.append(
+            f"{run.run_id}: checkpoint contains no recognized logical layer arrays."
+        )
 
 
 def _contained_optional(run_dir: Path, relative: str) -> Path | None:
@@ -827,7 +862,9 @@ def _checkpoint_layer_stats(path: Path) -> dict[str, list[dict[str, float]]]:
             if identity is None:
                 continue
             array = archive[key]
-            numeric = np.issubdtype(array.dtype, np.number) or array.dtype.name == "bfloat16"
+            numeric = (
+                np.issubdtype(array.dtype, np.number) or array.dtype.name == "bfloat16"
+            )
             if not numeric or array.size == 0:
                 continue
             # count, sum(|x|), sum(x^2), sum(x), sum(x^3), sum(x^4), min, max
@@ -910,7 +947,8 @@ def _report_payload(
         fresh_loss = fresh.get("macro_loss") if isinstance(fresh, dict) else None
         recipe = (
             run.record.get("recipe")
-            if isinstance(run.record, dict) and isinstance(run.record.get("recipe"), str)
+            if isinstance(run.record, dict)
+            and isinstance(run.record.get("recipe"), str)
             else _recipe_from_run_id(run.run_id)
         )
         # Records began carrying a bare "recipe" field, which then won over the
@@ -944,8 +982,7 @@ def _report_payload(
                 "validationLoss": metrics.get("validation_loss"),
                 "fresh10Loss": fresh_loss,
                 "qualified": qualified,
-                "hasLayerStats": bool(run.layer_stats)
-                or run.has_layer_diagnostics(),
+                "hasLayerStats": bool(run.layer_stats) or run.has_layer_diagnostics(),
             }
         )
 
@@ -1082,7 +1119,9 @@ def _overall_diagnostic_charts(runs: Sequence[_Run]) -> list[dict[str, Any]]:
             for run in runs:
                 points = run.diagnostic_points(family, statistic)
                 if points:
-                    limit = int(run.result.get("_report_point_limit", _MAX_CHART_POINTS))
+                    limit = int(
+                        run.result.get("_report_point_limit", _MAX_CHART_POINTS)
+                    )
                     series.append(
                         {"run": run.run_id, "points": _lttb(points, limit, x_index=1)}
                     )
@@ -1147,7 +1186,9 @@ def _final_diagnostic_charts(
                             "scopes": [
                                 [position, label] for position, label, _ in layout
                             ],
-                            "steps": [int(run.diagnostics.steps[index]) for index in keep],
+                            "steps": [
+                                int(run.diagnostics.steps[index]) for index in keep
+                            ],
                             "values": [
                                 [_compact(float(value)) for value in row]
                                 for row in frame
@@ -1250,7 +1291,9 @@ def _validation_chart(
                 and row["kind"] in {"fineweb_probe", "fineweb", "fineweb_final"}
             ]
         elif identity == "fresh10_macro":
-            selected = [row for row in run.validation if row["kind"] == "downstream_macro"]
+            selected = [
+                row for row in run.validation if row["kind"] == "downstream_macro"
+            ]
         else:
             selected = [
                 row
@@ -1295,10 +1338,12 @@ def _lttb(
         average_end = min(int(math.floor((bucket + 2) * every)) + 1, len(points))
         average_range = points[average_start:average_end]
         if average_range:
-            average_x = (
-                math.fsum(point[x_index] for point in average_range) / len(average_range)
+            average_x = math.fsum(point[x_index] for point in average_range) / len(
+                average_range
             )
-            average_y = math.fsum(point[2] for point in average_range) / len(average_range)
+            average_y = math.fsum(point[2] for point in average_range) / len(
+                average_range
+            )
         else:
             average_x, average_y = points[-1][x_index], points[-1][2]
         range_start = int(math.floor(bucket * every)) + 1
@@ -1376,7 +1421,6 @@ def _default_run_selection(profile: str) -> tuple[bool, str]:
     return True, "smoke"
 
 
-
 def _metric_unit(name: str) -> str:
     lowered = name.lower()
     if "loss" in lowered:
@@ -1413,7 +1457,9 @@ def _render_html(payload: Mapping[str, Any]) -> str:
     ).encode("utf-8")
     # mtime=0 keeps an unchanged report byte-identical between builds.
     compressed = gzip.compress(encoded, compresslevel=9, mtime=0)
-    return _HTML.replace("__REPORT_DATA__", base64.b64encode(compressed).decode("ascii"))
+    return _HTML.replace(
+        "__REPORT_DATA__", base64.b64encode(compressed).decode("ascii")
+    )
 
 
 def _object(value: Any, name: str) -> dict[str, Any]:
@@ -1474,7 +1520,7 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-_HTML = r'''<!doctype html>
+_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -1793,4 +1839,4 @@ loadPayload().then(payload=>{
 </script>
 </body>
 </html>
-'''
+"""

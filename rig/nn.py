@@ -17,7 +17,9 @@ import jax.numpy as jnp
 import numpy as np
 
 
-def normal(rng: np.random.Generator, shape: tuple[int, ...], scale: float) -> np.ndarray:
+def normal(
+    rng: np.random.Generator, shape: tuple[int, ...], scale: float
+) -> np.ndarray:
     return rng.standard_normal(shape, dtype=np.float32) * np.float32(scale)
 
 

@@ -150,6 +150,7 @@ def run_recipe(config: RunConfig) -> RunOutcome:
         command = trainer_command
     started_at = datetime.now(timezone.utc)
     monotonic_start = time.perf_counter()
+
     def clean_distributed_workers() -> None:
         if not launch_remotely:
             return
@@ -169,7 +170,10 @@ def run_recipe(config: RunConfig) -> RunOutcome:
             )
 
     try:
-        with stdout_path.open("wb") as stdout_handle, stderr_path.open("wb") as stderr_handle:
+        with (
+            stdout_path.open("wb") as stdout_handle,
+            stderr_path.open("wb") as stderr_handle,
+        ):
             return_code, timed_out = _run_process(
                 command,
                 cwd=recipe_dir,
@@ -226,7 +230,10 @@ def run_recipe(config: RunConfig) -> RunOutcome:
     )
     # Preserve the exact accepted payload independently from potentially noisy logs.
     result_path.write_text(
-        json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n",
+        json.dumps(
+            payload, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False
+        )
+        + "\n",
         encoding="utf-8",
     )
     relative_checkpoint = (
@@ -234,7 +241,9 @@ def run_recipe(config: RunConfig) -> RunOutcome:
         if validated.checkpoint_path is not None
         else None
     )
-    contract = payload.get("contract") if isinstance(payload.get("contract"), dict) else None
+    contract = (
+        payload.get("contract") if isinstance(payload.get("contract"), dict) else None
+    )
     qualified = validated.validation_loss <= float(config.target_loss)
     recorded_metrics = dict(validated.declared_metrics)
     # These normalized values, rather than potentially surprising numeric JSON
@@ -443,7 +452,9 @@ def _run_process(
                 _kill_process_group(process)
                 return_code = process.wait()
 
-            wait_seconds = 0.0 if return_code is not None else min(0.1, max(0.0, remaining))
+            wait_seconds = (
+                0.0 if return_code is not None else min(0.1, max(0.0, remaining))
+            )
             for _key, _events in selector.select(wait_seconds):
                 _drain_stderr(descriptor, stderr_handle, live_stderr)
 
@@ -505,7 +516,11 @@ def _validate_payload_identity(payload: Mapping[str, Any], config: RunConfig) ->
     expected = {"track": config.track, "profile": config.profile, "seed": config.seed}
     for name, expected_value in expected.items():
         actual = payload.get(name)
-        if name not in payload or type(actual) is not type(expected_value) or actual != expected_value:
+        if (
+            name not in payload
+            or type(actual) is not type(expected_value)
+            or actual != expected_value
+        ):
             raise ResultValidationError(
                 f"result {name} must exactly match the run configuration: "
                 f"expected {expected_value!r}, got {actual!r}"
@@ -553,7 +568,9 @@ def _validate_config(
         raise ConfigurationError("invalid checkpoint retention policy")
     if not isinstance(config.require_checkpoint, bool):
         raise ConfigurationError("require_checkpoint must be boolean")
-    if not config.require_checkpoint and (config.track != "open" or config.profile != "dev"):
+    if not config.require_checkpoint and (
+        config.track != "open" or config.profile != "dev"
+    ):
         raise ConfigurationError(
             "checkpoint omission is restricted to open/dev research runs"
         )
@@ -573,7 +590,11 @@ def _validate_config(
         character in config.tpu_vm_hosts for character in "\x00\r\n"
     ):
         raise ConfigurationError("tpu_vm_hosts must be a whitespace-free single line")
-    if isinstance(config.seed, bool) or not isinstance(config.seed, int) or config.seed < 0:
+    if (
+        isinstance(config.seed, bool)
+        or not isinstance(config.seed, int)
+        or config.seed < 0
+    ):
         raise ConfigurationError("seed must be a non-negative integer")
     timeout_seconds = _finite_config_number(config.timeout_seconds)
     if timeout_seconds is None or timeout_seconds <= 0:
@@ -614,7 +635,9 @@ def _validate_config(
             f"recipe configuration file not found: {recipe_config}"
         )
 
-    runs_dir = _resolve_managed_path(repo_root, config.runs_dir, "runs_dir", directory=True)
+    runs_dir = _resolve_managed_path(
+        repo_root, config.runs_dir, "runs_dir", directory=True
+    )
     records_path = _resolve_managed_path(repo_root, config.records_path, "records_path")
     runs_dir.mkdir(parents=True, exist_ok=True)
     records_path.parent.mkdir(parents=True, exist_ok=True)
@@ -625,7 +648,9 @@ def _validate_config(
         or not isinstance(config.expected_validation_tokens, int)
         or config.expected_validation_tokens <= 0
     ):
-        raise ConfigurationError("expected_validation_tokens must be a positive integer")
+        raise ConfigurationError(
+            "expected_validation_tokens must be a positive integer"
+        )
     if config.expected_training_tokens is not None and (
         isinstance(config.expected_training_tokens, bool)
         or not isinstance(config.expected_training_tokens, int)
@@ -672,7 +697,9 @@ def _copy_finite_mapping(value: Any, label: str) -> dict[str, Any]:
         )
         copied = json.loads(encoded)
     except (TypeError, ValueError) as exc:
-        raise ConfigurationError(f"{label} must contain only finite JSON values: {exc}") from exc
+        raise ConfigurationError(
+            f"{label} must contain only finite JSON values: {exc}"
+        ) from exc
     if not isinstance(copied, dict):  # defensive: the input was already a mapping
         raise ConfigurationError(f"{label} must encode as a JSON object")
     return copied
@@ -742,7 +769,9 @@ def _file_provenance(repo_root: Path, path: Path) -> dict[str, Any]:
                 digest.update(chunk)
                 size += len(chunk)
     except OSError as exc:
-        raise ConfigurationError(f"could not hash provenance file {path}: {exc}") from exc
+        raise ConfigurationError(
+            f"could not hash provenance file {path}: {exc}"
+        ) from exc
     try:
         relative_path = path.relative_to(repo_root).as_posix()
     except ValueError:
@@ -752,9 +781,7 @@ def _file_provenance(repo_root: Path, path: Path) -> dict[str, Any]:
 
 def _git_provenance(repo_root: Path) -> dict[str, Any] | None:
     head = _git_output(repo_root, "rev-parse", "--verify", "HEAD")
-    status = _git_output(
-        repo_root, "status", "--porcelain=v1", "--untracked-files=all"
-    )
+    status = _git_output(repo_root, "status", "--porcelain=v1", "--untracked-files=all")
     if head is None and status is None:
         return None
     result: dict[str, Any] = {}
@@ -818,7 +845,9 @@ def _resolve_managed_path(
     try:
         resolved.relative_to(repo_root)
     except ValueError as exc:
-        raise ConfigurationError(f"{label} must be contained in the repository") from exc
+        raise ConfigurationError(
+            f"{label} must be contained in the repository"
+        ) from exc
     if not directory and resolved == repo_root:
         raise ConfigurationError(f"{label} must name a file below the repository root")
     return resolved

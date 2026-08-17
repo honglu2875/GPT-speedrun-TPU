@@ -23,7 +23,13 @@ from .models import (
 from .records import append_record, load_records
 from .runner import run_recipe
 from .scoring import rank_records, render_leaderboard
-from .validation import RESULT_PREFIX, SCHEMA_VERSION, parse_result_line, validate_result, verify_run
+from .validation import (
+    RESULT_PREFIX,
+    SCHEMA_VERSION,
+    parse_result_line,
+    validate_result,
+    verify_run,
+)
 
 __all__ = [
     "ConfigurationError",

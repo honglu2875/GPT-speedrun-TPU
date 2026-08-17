@@ -125,7 +125,9 @@ class Console:
         fraction = step / total
         slots = 18
         filled = min(slots, int(round(fraction * slots)))
-        bar = self.paint("━" * filled, "green") + self.paint("─" * (slots - filled), "dim")
+        bar = self.paint("━" * filled, "green") + self.paint(
+            "─" * (slots - filled), "dim"
+        )
         print(
             f"  {self.paint(f'{step:>4}/{total:<4}', 'white', 'bold')} "
             f"{bar}  loss {self.paint(f'{loss:.4f}', 'yellow', 'bold')}  "

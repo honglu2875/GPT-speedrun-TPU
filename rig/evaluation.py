@@ -34,19 +34,13 @@ from rig.tokens import DownstreamDomain, TokenDataset, downstream_batches
 def should_run_validation_probe(step: int, *, every: int, final_step: int) -> bool:
     """Return whether this step gets a non-canonical fixed-prefix probe."""
 
-    return (
-        every > 0
-        and step < final_step
-        and step % every == 0
-    )
+    return every > 0 and step < final_step and step % every == 0
 
 
 def should_run_diagnostics(step: int, *, every: int, final_step: int) -> bool:
     """Capture the first/final updates plus the configured sparse cadence."""
 
-    return every > 0 and (
-        step == 1 or step == final_step or step % every == 0
-    )
+    return every > 0 and (step == 1 or step == final_step or step % every == 0)
 
 
 def evaluate_validation_prefix(

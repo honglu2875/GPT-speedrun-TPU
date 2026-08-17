@@ -24,6 +24,8 @@ import yaml
 
 
 MAX_CONFIG_BYTES = 256 * 1024
+
+
 class StrictSafeLoader(yaml.SafeLoader):
     """Safe YAML loader which rejects duplicate mapping keys."""
 

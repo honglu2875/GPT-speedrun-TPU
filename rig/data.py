@@ -218,8 +218,7 @@ def validate_shard(
         )
     if expected_bytes is not None and actual_bytes != expected_bytes:
         raise DataError(
-            f"{shard}: length is {actual_bytes:,} bytes; expected "
-            f"{expected_bytes:,}"
+            f"{shard}: length is {actual_bytes:,} bytes; expected {expected_bytes:,}"
         )
     actual_sha256 = None
     if expected_sha256 is not None and verify_hash:
@@ -669,7 +668,9 @@ def _validate_fresh10_manifest(payload: Mapping[str, Any], source: Path) -> None
             raise DataError(f"{source}: duplicate Fresh10 shard path {relative!r}")
         seen_paths.add(relative)
         if Path(relative).suffix.lower() != ".bin":
-            raise DataError(f"{source}: Fresh10 shard must use a .bin path: {relative!r}")
+            raise DataError(
+                f"{source}: Fresh10 shard must use a .bin path: {relative!r}"
+            )
 
         tokens = domain.get("tokens")
         scored_tokens = domain.get("scored_tokens")
@@ -693,7 +694,10 @@ def _validate_fresh10_manifest(payload: Mapping[str, Any], source: Path) -> None
             )
 
         documents = domain.get("documents")
-        if not isinstance(documents, list) or len(documents) != FRESH10_DOCUMENTS_PER_DOMAIN:
+        if (
+            not isinstance(documents, list)
+            or len(documents) != FRESH10_DOCUMENTS_PER_DOMAIN
+        ):
             raise DataError(
                 f"{source}: {name} needs exactly "
                 f"{FRESH10_DOCUMENTS_PER_DOMAIN} documents"
@@ -709,10 +713,15 @@ def _validate_fresh10_manifest(payload: Mapping[str, Any], source: Path) -> None
                 or not document_id
                 or document_id in seen_documents
             ):
-                raise DataError(f"{source}: invalid or duplicate document id {document_id!r}")
+                raise DataError(
+                    f"{source}: invalid or duplicate document id {document_id!r}"
+                )
             seen_documents.add(document_id)
             for field in ("title", "publisher"):
-                if not isinstance(document.get(field), str) or not document[field].strip():
+                if (
+                    not isinstance(document.get(field), str)
+                    or not document[field].strip()
+                ):
                     raise DataError(f"{source}: {document_id} has invalid {field}")
             authors = document.get("authors")
             if (
@@ -744,10 +753,15 @@ def _validate_fresh10_manifest(payload: Mapping[str, Any], source: Path) -> None
             license_info = document.get("license")
             if not isinstance(license_info, dict):
                 raise DataError(f"{source}: {document_id} needs license metadata")
-            if not isinstance(license_info.get("name"), str) or not license_info["name"]:
+            if (
+                not isinstance(license_info.get("name"), str)
+                or not license_info["name"]
+            ):
                 raise DataError(f"{source}: {document_id} has invalid license name")
             license_url = license_info.get("url")
-            if not isinstance(license_url, str) or not license_url.startswith("https://"):
+            if not isinstance(license_url, str) or not license_url.startswith(
+                "https://"
+            ):
                 raise DataError(f"{source}: {document_id} needs an HTTPS license URL")
             if (
                 not isinstance(document.get("extraction_notes"), str)
@@ -784,8 +798,7 @@ def _validate_fresh10_manifest(payload: Mapping[str, Any], source: Path) -> None
                 + FRESH10_CONTEXT_TOKENS_PER_DOCUMENT
                 or document.get("score_offset")
                 != cursor + FRESH10_CONTEXT_TOKENS_PER_DOCUMENT
-                or document.get("scored_tokens")
-                != FRESH10_SCORED_TOKENS_PER_DOCUMENT
+                or document.get("scored_tokens") != FRESH10_SCORED_TOKENS_PER_DOCUMENT
             ):
                 raise DataError(f"{source}: invalid fixed token span for {document_id}")
             cursor += int(document["token_count"])
@@ -853,7 +866,9 @@ def _safe_target(root: Path, relative: str) -> Path:
     return target
 
 
-def _validate_entry(path: Path, entry: Mapping[str, Any], verify_hash: bool) -> ShardInfo:
+def _validate_entry(
+    path: Path, entry: Mapping[str, Any], verify_hash: bool
+) -> ShardInfo:
     return validate_shard(
         path,
         expected_tokens=int(entry["tokens"]),
@@ -863,9 +878,7 @@ def _validate_entry(path: Path, entry: Mapping[str, Any], verify_hash: bool) -> 
     )
 
 
-def _validate_fresh10_boundaries(
-    path: Path, domain: Mapping[str, Any]
-) -> None:
+def _validate_fresh10_boundaries(path: Path, domain: Mapping[str, Any]) -> None:
     """Prove every token is GPT-2-valid and each document starts at EOT."""
 
     try:
@@ -1118,7 +1131,9 @@ def _download_entry(
     try:
         response = urlopen(request, timeout=timeout)
     except HTTPError as exc:
-        raise DataError(f"download failed for {entry['path']}: HTTP {exc.code}") from exc
+        raise DataError(
+            f"download failed for {entry['path']}: HTTP {exc.code}"
+        ) from exc
     except OSError as exc:
         raise DataError(f"download failed for {entry['path']}: {exc}") from exc
 

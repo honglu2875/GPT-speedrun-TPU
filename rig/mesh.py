@@ -89,7 +89,9 @@ def system_metadata(devices: Sequence[jax.Device]) -> dict[str, Any]:
         "process_count": int(jax.process_count()),
         "device_kinds": sorted({str(device.device_kind) for device in devices}),
         "device_ids": [optional_int(device, "id") for device in devices],
-        "process_indices": [optional_int(device, "process_index") for device in devices],
+        "process_indices": [
+            optional_int(device, "process_index") for device in devices
+        ],
     }
 
 
@@ -185,12 +187,12 @@ def put_host_local_array(
 
     if process_count == 1:
         return jax.device_put(value, sharding)
-    return multihost_utils.host_local_array_to_global_array(
-        value, mesh, partition_spec
-    )
+    return multihost_utils.host_local_array_to_global_array(value, mesh, partition_spec)
 
 
-def put_replicated_tree(tree: Any, mesh: Mesh, sharding: NamedSharding, process_count: int) -> Any:
+def put_replicated_tree(
+    tree: Any, mesh: Mesh, sharding: NamedSharding, process_count: int
+) -> Any:
     """Create identical global replicas from the same host value on every rank."""
 
     if process_count == 1:
@@ -211,7 +213,11 @@ def local_device_get(tree: Any) -> Any:
 
 def finite_metric(name: str, value: float, *, positive: bool = False) -> float:
     value = float(value)
-    if not math.isfinite(value) or (positive and value <= 0.0) or (not positive and value < 0.0):
+    if (
+        not math.isfinite(value)
+        or (positive and value <= 0.0)
+        or (not positive and value < 0.0)
+    ):
         qualifier = "finite and positive" if positive else "finite and nonnegative"
         raise FloatingPointError(f"{name} must be {qualifier}, got {value!r}")
     return value

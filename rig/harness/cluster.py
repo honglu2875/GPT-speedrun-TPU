@@ -164,7 +164,9 @@ def expand_host_expression(
             timeout=15.0,
         )
     except subprocess.TimeoutExpired as exc:
-        raise ClusterError("timed out while expanding the TPU VM host expression") from exc
+        raise ClusterError(
+            "timed out while expanding the TPU VM host expression"
+        ) from exc
     if completed.returncode != 0:
         raise ClusterError(_command_failure("could not expand TPU VM hosts", completed))
     hosts = tuple(
@@ -392,26 +394,26 @@ def prepare_ram_cache(
     )
     valid_link = (
         f"[ -d {quoted_cache} ] && [ -L {quoted_link} ] && "
-        f"[ \"$(readlink -f {quoted_link} 2>/dev/null || true)\" = {quoted_cache} ]"
+        f'[ "$(readlink -f {quoted_link} 2>/dev/null || true)" = {quoted_cache} ]'
     )
     if create_link:
         cache_setup = (
             # id -g is 0 when this fragment runs as root, which would make the
-        # cache root:root and lock out the user it exists to serve.
-        # SUDO_GID carries the invoking user's group through sudo.
-        'group="${SUDO_GID:-$(id -g)}"; '
+            # cache root:root and lock out the user it exists to serve.
+            # SUDO_GID carries the invoking user's group through sudo.
+            'group="${SUDO_GID:-$(id -g)}"; '
             'if [ "$(id -u)" -eq 0 ]; then '
-            f"install -d -o root -g \"$group\" -m 0775 {quoted_cache} || exit 5; "
+            f'install -d -o root -g "$group" -m 0775 {quoted_cache} || exit 5; '
             "elif command -v sudo >/dev/null 2>&1 && "
             "sudo -n true >/dev/null 2>&1; then "
-            f"sudo -n install -d -o root -g \"$group\" -m 0775 {quoted_cache} "
+            f'sudo -n install -d -o root -g "$group" -m 0775 {quoted_cache} '
             "|| exit 5; else "
             "echo 'ERROR: passwordless sudo is required to protect the RAM cache' "
             ">&2; exit 5; fi; "
         )
         legacy_link = (
             f"[ -L {quoted_link} ] && "
-            f"[ \"$(readlink -f {quoted_link} 2>/dev/null || true)\" = /dev/shm ]"
+            f'[ "$(readlink -f {quoted_link} 2>/dev/null || true)" = /dev/shm ]'
         )
         link_command = (
             f"{cache_setup}if {valid_link}; then exit 0; "
@@ -425,8 +427,7 @@ def prepare_ram_cache(
         )
     else:
         link_command = (
-            f"if {valid_link}; then exit 0; fi; "
-            f"echo {missing_error} >&2; exit 4"
+            f"if {valid_link}; then exit 0; fi; echo {missing_error} >&2; exit 4"
         )
     try:
         run_pdsh(
@@ -447,11 +448,11 @@ def seal_ram_cache_command() -> str:
 
     cache = shlex.quote(str(RAM_CACHE_ROOT))
     protect_direct = (
-        f"chown -R root:\"$group\" -- {cache} && "
+        f'chown -R root:"$group" -- {cache} && '
         f"find {cache} -type d -exec chmod 0775 {{}} +"
     )
     protect_sudo = (
-        f"sudo -n chown -R root:\"$group\" -- {cache} && "
+        f'sudo -n chown -R root:"$group" -- {cache} && '
         f"sudo -n find {cache} -type d -exec chmod 0775 {{}} +"
     )
     return (
@@ -606,9 +607,7 @@ def ship_uv_binary(
         except (OSError, subprocess.TimeoutExpired):
             failures.append(host)
     if failures:
-        raise ClusterError(
-            "could not copy uv to: " + ", ".join(failures)
-        )
+        raise ClusterError("could not copy uv to: " + ", ".join(failures))
     return version or None
 
 
@@ -659,15 +658,18 @@ def ship_uv_python(
     failures: list[str] = []
     for host in hosts:
         try:
-            if subprocess.run(
-                _ssh_command(host, f"mkdir -p {shlex.quote(remote_root)}"),
-                env=pdsh_environment(environment),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-                timeout=60.0,
-            ).returncode != 0:
+            if (
+                subprocess.run(
+                    _ssh_command(host, f"mkdir -p {shlex.quote(remote_root)}"),
+                    env=pdsh_environment(environment),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                    timeout=60.0,
+                ).returncode
+                != 0
+            ):
                 failures.append(host)
                 continue
             copied = subprocess.run(
@@ -832,7 +834,9 @@ def ship_dataset(
                 timeout=120.0,
             )
             if made.returncode != 0:
-                failures.append(_transfer_failure(host, "create the cache directory", made))
+                failures.append(
+                    _transfer_failure(host, "create the cache directory", made)
+                )
                 continue
             unsealed = subprocess.run(
                 _ssh_command(host, unseal_ram_cache_command()),
@@ -903,16 +907,13 @@ def bootstrap_uv(
     missing = (
         "echo 'uv is missing on a peer and --offline forbids installation' >&2; exit 2"
         if offline
-        else (
-            "curl -LsSf https://astral.sh/uv/install.sh | "
-            "env UV_NO_MODIFY_PATH=1 sh"
-        )
+        else ("curl -LsSf https://astral.sh/uv/install.sh | env UV_NO_MODIFY_PATH=1 sh")
     )
     sync_flags = "--frozen --offline" if offline else "--frozen"
     command = (
         'UV_BIN="$HOME/.local/bin/uv"; '
         'if [ ! -x "$UV_BIN" ]; then '
-        'if command -v uv >/dev/null 2>&1; then UV_BIN=uv; '
+        "if command -v uv >/dev/null 2>&1; then UV_BIN=uv; "
         f"else {missing}; fi; fi; "
         f"cd {quoted_root} && "
         f'"$UV_BIN" --cache-dir /tmp/uv-cache sync {sync_flags}'
@@ -1034,9 +1035,7 @@ def terminate_distributed_workers(
         + re.escape(str(output_dir))
         + "([[:space:]]|$)"
     )
-    remote_command = (
-        f"pkill -KILL -f -- {shlex.quote(pattern)} >/dev/null 2>&1 || true"
-    )
+    remote_command = f"pkill -KILL -f -- {shlex.quote(pattern)} >/dev/null 2>&1 || true"
     try:
         completed = subprocess.run(
             _pdsh_command(expression, host_count, remote_command, labels=False),
@@ -1094,9 +1093,7 @@ def fetch_run_artifacts(
             timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
-        raise ClusterError(
-            f"timed out pulling run artifacts from {host}"
-        ) from exc
+        raise ClusterError(f"timed out pulling run artifacts from {host}") from exc
     if completed.returncode != 0:
         raise ClusterError(
             _command_failure(f"could not pull run artifacts from {host}", completed)
@@ -1238,13 +1235,13 @@ def _require_program(name: str) -> str:
     return path
 
 
-def _command_failure(
-    label: str, completed: subprocess.CompletedProcess[str]
-) -> str:
+def _command_failure(label: str, completed: subprocess.CompletedProcess[str]) -> str:
     detail = " ".join((completed.stderr or completed.stdout or "").strip().split())
     if len(detail) > 360:
         detail = detail[-360:]
-    return f"{label} (status {completed.returncode})" + (f": {detail}" if detail else "")
+    return f"{label} (status {completed.returncode})" + (
+        f": {detail}" if detail else ""
+    )
 
 
 __all__ = [

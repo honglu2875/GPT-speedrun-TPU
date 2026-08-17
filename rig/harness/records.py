@@ -13,7 +13,11 @@ from .errors import RecordError
 def canonical_json(value: Mapping[str, Any]) -> str:
     try:
         return json.dumps(
-            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
         )
     except (TypeError, ValueError) as exc:
         raise RecordError(f"record is not finite JSON: {exc}") from exc
@@ -58,11 +62,14 @@ def load_records(path: Path) -> list[dict[str, Any]]:
                 try:
                     value = json.loads(line)
                 except json.JSONDecodeError as exc:
-                    raise RecordError(f"invalid JSONL at {path}:{line_number}: {exc}") from exc
+                    raise RecordError(
+                        f"invalid JSONL at {path}:{line_number}: {exc}"
+                    ) from exc
                 if not isinstance(value, dict):
-                    raise RecordError(f"record at {path}:{line_number} is not an object")
+                    raise RecordError(
+                        f"record at {path}:{line_number} is not an object"
+                    )
                 records.append(value)
     except OSError as exc:
         raise RecordError(f"could not read {path}: {exc}") from exc
     return records
-
