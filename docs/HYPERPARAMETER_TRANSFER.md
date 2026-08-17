@@ -349,8 +349,17 @@ initialization and data order, not run-to-run nondeterminism.
 ## Data
 
 Run records live in `runs/records.jsonl` alongside per-run `metrics.json` and
-`training.csv`. Completed studies are moved to `~/rig-run-archive/<date>-<name>/`
-with their ledger lines, each carrying a README. Dashboards for individual
-sweeps are committed under `docs/reports/`. FLOP figures recorded before commit
-`21eab99` come from the former hand-maintained formula and are not comparable
-with the traced figures that replaced them — see [FLOPS.md](FLOPS.md).
+`training.riglog`. Completed studies are moved to
+`~/rig-run-archive/<date>-<name>/` with their ledger lines, each carrying a
+README. Dashboards for individual sweeps are committed under `docs/reports/`.
+
+Two artifact-format changes make older runs non-comparable in specific ways:
+
+- FLOP figures recorded before commit `21eab99` come from the former
+  hand-maintained formula, not the traced count that replaced it — see
+  [FLOPS.md](FLOPS.md).
+- Runs recorded before commit `75f0b22` wrote `training.csv` and
+  `diagnostics.csv` in long form. Nothing converts them, so reading one needs a
+  checkout at or before `8936b51`. Every study in this note predates the
+  change; their archived dashboards under `docs/reports/` are the durable
+  record.

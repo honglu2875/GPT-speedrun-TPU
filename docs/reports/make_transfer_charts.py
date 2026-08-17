@@ -6,6 +6,11 @@ sizes, and where the sweeps were archived. It reads only `metrics.json`
 and `training.csv` from run directories, so it stays reproducible as long
 as those are kept.
 
+Every study it covers was recorded before commit `75f0b22`, when runs still
+wrote long-form CSV. Current runs write `training.riglog` instead, so this
+script reads the archive and not `runs/`. Pointing it at a current study
+means reading the packed log through `rig.logpack` rather than `csv`.
+
     python docs/reports/make_transfer_charts.py \
         --runs runs \
         --archive ~/rig-run-archive \
