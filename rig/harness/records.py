@@ -66,9 +66,3 @@ def load_records(path: Path) -> list[dict[str, Any]]:
         raise RecordError(f"could not read {path}: {exc}") from exc
     return records
 
-
-def iter_records(paths: Iterable[Path]) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    for path in paths:
-        records.extend(load_records(path))
-    return records

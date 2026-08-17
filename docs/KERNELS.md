@@ -104,11 +104,12 @@ runs pin that 50,304-class value in their model contract. A 50,257-class run is
 therefore an open-track algorithm experiment. `vocab_tile_size=2_048` is the
 measured v4 seed.
 
-The explicit Pallas experiment in
-[`pallas_linear_cross_entropy.py`](../rig/kernels/pallas_linear_cross_entropy.py)
-is not exported as a production kernel: it is correctness checked, but its
-current value-plus-backward microbenchmark is slower than the pure-JAX tiled
-custom VJP.
+A hand-written Pallas version of this loss was tried and removed. It was
+correctness-checked but its value-plus-backward microbenchmark ran slower than
+the pure-JAX tiled custom VJP above, so at this scale the fusion does not pay
+for itself. The code is in git history (removed 2026-08-17) rather than
+carried unused; recreating it from this description is the cheaper path if a
+larger vocabulary or a different chip changes that balance.
 
 ## Tile resolution and autotuning
 

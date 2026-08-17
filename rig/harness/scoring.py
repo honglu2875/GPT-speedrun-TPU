@@ -6,9 +6,6 @@ import math
 from typing import Any, Iterable, Mapping, Sequence
 
 
-def is_qualifying(record: Mapping[str, Any]) -> bool:
-    return bool(record.get("qualified")) and record.get("status") == "ok"
-
 
 def rank_records(
     records: Iterable[Mapping[str, Any]],

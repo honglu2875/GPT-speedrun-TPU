@@ -1542,11 +1542,6 @@ def _default_run_selection(profile: str) -> tuple[bool, str]:
     return True, "smoke"
 
 
-def _metric_sort_key(name: str) -> tuple[int, str]:
-    lowered = name.lower()
-    family = 0 if "grad" in lowered else 1 if "update" in lowered else 2
-    return family, lowered
-
 
 def _metric_unit(name: str) -> str:
     lowered = name.lower()
