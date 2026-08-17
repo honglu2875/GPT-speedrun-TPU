@@ -19,6 +19,7 @@ from unittest.mock import patch
 import numpy as np
 
 from rig import configfile, logpack
+from rig import tokens as rig_tokens
 
 
 TRAINER_PATH = Path(__file__).parents[1] / "recipes" / "reference" / "train.py"
@@ -588,9 +589,9 @@ class TrainerStaticTests(unittest.TestCase):
 
     def test_batches_reject_tokens_outside_semantic_vocabulary(self) -> None:
         tokens = np.asarray([0, 1, 2, 7, 3, 0, 1, 2], dtype=np.int32)
-        dataset = trainer.TokenDataset(
-            trainer.ShardedTokens((tokens,)),
-            trainer.ShardedTokens((tokens,)),
+        dataset = rig_tokens.TokenDataset(
+            rig_tokens.ShardedTokens((tokens,)),
+            rig_tokens.ShardedTokens((tokens,)),
             "test",
         )
         rng = np.random.default_rng(3)
@@ -600,7 +601,7 @@ class TrainerStaticTests(unittest.TestCase):
             dataset.validation_batch(0, 1, 7, 7)
 
     def test_shuffled_epoch_stream_is_bijective_deterministic_and_rank_disjoint(self) -> None:
-        shards = trainer.ShardedTokens(
+        shards = rig_tokens.ShardedTokens(
             (
                 np.arange(9, dtype=np.int32),
                 np.arange(20, 29, dtype=np.int32),
@@ -610,7 +611,7 @@ class TrainerStaticTests(unittest.TestCase):
 
         def epoch(seed: int) -> tuple[list[int], list[int]]:
             streams = tuple(
-                trainer.ShuffledEpochBatchStream(
+                rig_tokens.ShuffledEpochBatchStream(
                     shards,
                     global_batch_size=4,
                     seq_len=2,
@@ -636,7 +637,7 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertNotEqual(first, epoch(18))
 
         for size in range(1, 80):
-            permuted = [trainer._permute_bounded(i, size, 1234) for i in range(size)]
+            permuted = [rig_tokens._permute_bounded(i, size, 1234) for i in range(size)]
             self.assertEqual(set(permuted), set(range(size)))
 
     def test_trainable_flash_attention_backends_are_tpu_only(self) -> None:
@@ -1186,16 +1187,15 @@ class TrainerStaticTests(unittest.TestCase):
                 trainer.write_validation_csv(Path(directory), (rows[0], rows[2]))
 
     def test_downstream_batches_mask_document_boundaries_and_exact_targets(self) -> None:
-        domain = trainer.DownstreamDomain(
+        domain = rig_tokens.DownstreamDomain(
             "science",
             np.asarray([99, 10, 11, 12, 99, 20, 21], dtype=np.uint16),
             (
-                trainer.DocumentSpan(0, 4, 1, 3),
-                trainer.DocumentSpan(4, 3, 5, 2),
+                rig_tokens.DocumentSpan(0, 4, 1, 3),
+                rig_tokens.DocumentSpan(4, 3, 5, 2),
             ),
         )
-        config = SimpleNamespace(batch_size=2, seq_len=2)
-        batches = trainer.downstream_batches(domain, config)
+        batches = rig_tokens.downstream_batches(domain, seq_len=2, batch_size=2)
         pairs = []
         for x, y, mask in batches:
             flat_x, flat_y, flat_mask = x.ravel(), y.ravel(), mask.ravel()
@@ -1221,7 +1221,10 @@ class TrainerStaticTests(unittest.TestCase):
                     "--downstream-data", f"science={second}",
                 ]
             )
-            domains = trainer.load_downstream_domains(args, 256)
+            domains = rig_tokens.load_downstream_domains(
+                manifest=args.downstream_manifest, root=args.downstream_root,
+                documents=args.downstream_data, vocab_size=256,
+            )
         self.assertEqual(len(domains), 1)
         self.assertEqual(domains[0].name, "science")
         self.assertEqual(domains[0].scored_tokens, 5)
@@ -1266,10 +1269,16 @@ class TrainerStaticTests(unittest.TestCase):
                 encoding="utf-8",
             )
             args = parser.parse_args(["--downstream-manifest", str(manifest)])
-            domains = trainer.load_downstream_domains(args, 50_304)
+            domains = rig_tokens.load_downstream_domains(
+                manifest=args.downstream_manifest, root=args.downstream_root,
+                documents=args.downstream_data, vocab_size=50_304,
+            )
             self.assertEqual(domains[0].scored_tokens, 2)
             with self.assertRaisesRegex(ValueError, "must fit the model vocabulary"):
-                trainer.load_downstream_domains(args, 50_000)
+                rig_tokens.load_downstream_domains(
+                    manifest=args.downstream_manifest, root=args.downstream_root,
+                    documents=args.downstream_data, vocab_size=50_000,
+                )
 
     def test_console_writes_only_to_stderr(self) -> None:
         stdout = StringIO()
