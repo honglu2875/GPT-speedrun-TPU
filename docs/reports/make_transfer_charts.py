@@ -43,6 +43,13 @@ BATCH_COLOR = {
     32: "#64748b", 64: "#38bdf8", 128: "#34d399",
     256: "#fbbf24", 512: "#f87171",
 }
+# Where tier and batch appear together, batch moves to shape so the two
+# variables stay separable; BATCH_COLOR aliases TIER_COLOR at 250M/256 and
+# 500M/128.
+BATCH_SHAPE = {
+    32: "cross", 64: "triangle", 128: "circle",
+    256: "square", 512: "diamond",
+}
 INK, MUTED, GRID, PANEL = "#e6edf7", "#91a0b8", "#253047", "#111827"
 
 
@@ -203,6 +210,40 @@ class Plot:
                 f'fill="{color}" opacity="{opacity}"/>'
             )
 
+    def marker(self, x, y, color, shape="circle", r=4.0, opacity=0.95):
+        """Draw one point as a glyph, so a second variable can ride on shape.
+
+        Colour alone cannot carry two variables at once: tier and batch each
+        need their own channel or the reader has to hold a two-palette key in
+        their head and the two palettes collide.
+        """
+
+        cx, cy = self.X(x), self.Y(y)
+        fill = f'fill="{color}" opacity="{opacity}"'
+        if shape == "circle":
+            part = f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r:.1f}" {fill}/>'
+        elif shape == "square":
+            side = r * 1.8
+            part = (f'<rect x="{cx - side / 2:.1f}" y="{cy - side / 2:.1f}" '
+                    f'width="{side:.1f}" height="{side:.1f}" {fill}/>')
+        elif shape == "triangle":
+            part = (f'<polygon points="{cx:.1f},{cy - r * 1.2:.1f} '
+                    f'{cx + r * 1.1:.1f},{cy + r * 0.85:.1f} '
+                    f'{cx - r * 1.1:.1f},{cy + r * 0.85:.1f}" {fill}/>')
+        elif shape == "diamond":
+            part = (f'<polygon points="{cx:.1f},{cy - r * 1.3:.1f} '
+                    f'{cx + r * 1.3:.1f},{cy:.1f} {cx:.1f},{cy + r * 1.3:.1f} '
+                    f'{cx - r * 1.3:.1f},{cy:.1f}" {fill}/>')
+        else:  # cross
+            arm, thick = r * 1.25, r * 0.42
+            part = (f'<path d="M{cx - arm:.1f},{cy - thick:.1f} '
+                    f'h{arm - thick:.1f} v{-(arm - thick):.1f} '
+                    f'h{thick * 2:.1f} v{arm - thick:.1f} h{arm - thick:.1f} '
+                    f'v{thick * 2:.1f} h{-(arm - thick):.1f} v{arm - thick:.1f} '
+                    f'h{-thick * 2:.1f} v{-(arm - thick):.1f} '
+                    f'h{-(arm - thick):.1f} Z" {fill}/>')
+        self.parts.append(part)
+
     def errbar(self, x, lo, hi, color, width=1.4):
         self.parts.append(
             f'<line x1="{self.X(x):.1f}" y1="{self.Y(lo):.1f}" '
@@ -223,14 +264,30 @@ class Plot:
         )
 
     def legend(self, entries, x=None, y=None):
+        """Key the swatches. An entry may be (label, color) or, when shape
+        carries a second variable, (label, color, shape)."""
+
         x = self.w - PAD["r"] - 8 if x is None else x
         y = PAD["t"] + 6 if y is None else y
-        for i, (label, color) in enumerate(entries):
+        for i, entry in enumerate(entries):
+            label, color = entry[0], entry[1]
+            shape = entry[2] if len(entry) > 2 else None
             yy = y + i * 15
-            self.parts.append(
-                f'<rect x="{x-9:.1f}" y="{yy-7:.1f}" width="8" height="8" '
-                f'rx="2" fill="{color}"/>'
-            )
+            if shape is None:
+                self.parts.append(
+                    f'<rect x="{x-9:.1f}" y="{yy-7:.1f}" width="8" height="8" '
+                    f'rx="2" fill="{color}"/>'
+                )
+            else:
+                # Glyph swatches are drawn in data space, so borrow the axes.
+                saved = len(self.parts)
+                self.marker(0, 0, color, shape, r=3.6, opacity=1.0)
+                drawn = self.parts.pop()
+                del self.parts[saved:]
+                self.parts.append(
+                    f'<g transform="translate({x - 5 - self.X(0):.1f},'
+                    f'{yy - 3 - self.Y(0):.1f})">{drawn}</g>'
+                )
             self.parts.append(
                 f'<text x="{x-14:.1f}" y="{yy:.1f}" fill="{MUTED}" font-size="10" '
                 f'text-anchor="end">{html.escape(label)}</text>'
@@ -353,9 +410,20 @@ def fig_heatmaps(c) -> list[str]:
     return out
 
 
-def fig_pareto(runs, c) -> str:
-    """Loss vs wall clock. Every cell is a point; the frontier is traced."""
-    p = None
+def fig_wall_clock(runs, c) -> str:
+    """Loss vs wall clock, one point per (tier, batch, LR) cell.
+
+    Tier rides on colour and batch on shape. They are independent variables,
+    so giving each its own channel is the only way to read a point without a
+    two-palette key -- and the earlier single-colour version aliased 250M
+    against batch 256 and 500M against batch 128.
+
+    No frontier is traced. A running minimum over this grid would connect
+    points that differ in learning rate as well as batch, so it would not
+    isolate the batch/time trade it appeared to describe -- and nobody
+    operates along it, since the sweep ends by picking one batch.
+    """
+
     pts_by_tier = {}
     for tier in TIERS:
         secs = {}
@@ -381,15 +449,12 @@ def fig_pareto(runs, c) -> str:
         for (b, _l), (s, y) in d.items():
             if y > p.y1:
                 continue
-            p.dots([(math.log10(s), y)], BATCH_COLOR.get(b, "#888"), 3.6, 0.95)
-        front, best = [], math.inf
-        for (_b, _l), (s, y) in sorted(d.items(), key=lambda kv: kv[1][0]):
-            if y < best:
-                best = y
-                front.append((math.log10(s), y))
-        p.line(sorted(front), TIER_COLOR[tier], 1.6, dash="5,4", opacity=0.9)
-    p.legend([(f"batch {b}", BATCH_COLOR[b]) for b in sorted(BATCH_COLOR)]
-             + [(t, TIER_COLOR[t]) for t in pts_by_tier])
+            p.marker(math.log10(s), y, TIER_COLOR[tier],
+                     BATCH_SHAPE.get(b, "circle"))
+    batches = sorted({b for d in pts_by_tier.values() for b, _ in d})
+    p.legend([(t, TIER_COLOR[t]) for t in pts_by_tier]
+             + [(f"batch {b}", MUTED, BATCH_SHAPE.get(b, "circle"))
+                for b in batches])
     return p.render()
 
 
@@ -425,33 +490,6 @@ def fig_penalty(c) -> str:
         p.line(pts, col, 2.4)
         p.dots(pts, col, 4)
     p.legend([(f"batch {b}", BATCH_COLOR[b]) for b in series])
-    return p.render()
-
-
-def fig_steps(c) -> str:
-    """Loss vs optimizer steps. If steps were binding these would align."""
-    p = Plot("Loss vs optimizer steps (curves do NOT align)",
-             "optimizer steps (log)", "Δ nats vs that tier's best",
-             (2.6, 4.4), (-0.05, 0.55))
-    p.frame([2.7, 3.0, 3.3, 3.7, 4.0, 4.3], ticks(0, 0.5, 5),
-            xfmt=lambda v: f"{10**v:,.0f}", yfmt=lambda v: f"{v:.2f}")
-    for tier in TIERS:
-        pts = []
-        for b in sorted({k[1] for k in c if k[0] == tier}):
-            v = c.get((tier, b, -8))
-            if not v or len(v) < 3:
-                continue
-            steps = TOKENS[tier] / (b * 1024)
-            pts.append((math.log10(steps), st.mean(v)))
-        if not pts:
-            continue
-        floor = min(y for _, y in pts)
-        pts = [(x, min(y - floor, 0.52)) for x, y in pts]
-        p.line(pts, TIER_COLOR[tier], 2.4)
-        p.dots(pts, TIER_COLOR[tier])
-        best = min(pts, key=lambda q: q[1])
-        p.dots([best], "#fff", 5.5, 0.25)
-    p.legend([(t, TIER_COLOR[t]) for t in TIERS])
     return p.render()
 
 
@@ -589,17 +627,13 @@ def main() -> None:
     body.append('<div class="row">'
                 + "".join(f'<div class="card">{s}</div>' for s in fig_heatmaps(c))
                 + "</div>")
-    body.append("<h2>Why it is batch size, not step count</h2>")
-    body.append(card(
-        "Re-indexed by optimizer steps. If a minimum step count were binding, "
-        "these curves would align; instead each tier's optimum sits at a "
-        "different step count (2,286 / 4,709 / 9,325) while batch stays at 128.",
-        fig_steps(c)))
-    body.append("<h2>Practical tradeoff</h2>")
+    body.append("<h2>What batch size buys</h2>")
     body.append('<div class="row">'
-                + card("Dashed lines trace each tier's Pareto frontier. At 250M, "
-                       "batch 256 costs 0.016 nats for 11% wall clock; at 60M the "
-                       "same trade costs 0.45.", fig_pareto(runs, c))
+                + card("Colour is tier, shape is batch. Larger batches sit left "
+                       "(faster) and the tiers stack by loss; how far a batch "
+                       "moves you left is a throughput fact, what it costs in "
+                       "loss is the penalty chart below.",
+                       fig_wall_clock(runs, c))
                 + card("Throughput saturates around batch 256, which is why the "
                        "larger batches finish sooner on an identical token budget.",
                        fig_utilization(runs))
