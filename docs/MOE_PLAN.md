@@ -1,5 +1,7 @@
 # Mixture of experts: design for `recipes/reference_moe`
 
+Author: Opus 5
+
 A plan, not code. Nothing here is in the tree yet, and it should not be until
 the phase that needs it is being built.
 
