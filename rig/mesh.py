@@ -25,6 +25,7 @@ import jax
 import jaxlib
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental import multihost_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from rig.console import device_label
@@ -92,9 +93,11 @@ def system_metadata(devices: Sequence[jax.Device]) -> dict[str, Any]:
     }
 
 
-def inferred_peak_tflops(args: argparse.Namespace, devices: Sequence[jax.Device]) -> float | None:
-    if args.peak_tflops is not None:
-        return args.peak_tflops
+def inferred_peak_tflops(
+    declared: float | None, devices: Sequence[jax.Device]
+) -> float | None:
+    if declared is not None:
+        return declared
     labels = " ".join(str(device.device_kind).lower() for device in devices)
     # A JAX-visible device on a v4-8 is one full 275-TFLOP/s TPU v4 chip. This
     # only feeds an explicitly labeled theoretical-utilization estimate.

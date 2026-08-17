@@ -3307,7 +3307,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     achieved_tflops = finite_metric(
         "achieved_tflops", total_flops / train_seconds / 1.0e12
     )
-    peak_tflops = inferred_peak_tflops(args, devices)
+    peak_tflops = inferred_peak_tflops(args.peak_tflops, devices)
     mfu = achieved_tflops / peak_tflops if peak_tflops is not None else 0.0
     smoke_contract = profile == "smoke" or using_builtin_data
     dataset_id = args.dataset_id or (

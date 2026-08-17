@@ -19,7 +19,7 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import Mesh, NamedSharding
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from rig.mesh import (
     finite_metric,
