@@ -10,7 +10,7 @@ from rig.config import ConfigError
 
 
 def _args(**overrides) -> argparse.Namespace:
-    base = dict(checkpoint_policy=None, checkpoints=None, omit_checkpoint=False)
+    base = dict(checkpoint_policy=None)
     base.update(overrides)
     return argparse.Namespace(**base)
 
@@ -22,56 +22,14 @@ class PolicyTests(unittest.TestCase):
     def test_settings_supply_the_default(self) -> None:
         self.assertEqual(_checkpoint_policy(_args(), "qualifying"), "qualifying")
 
-    def test_legacy_spellings_map_onto_the_new_axis(self) -> None:
-        # "all" read as "every step" rather than "keep it", which is why it
-        # was renamed; scripts using it must keep working.
-        for legacy, expected in (
-            ("all", "always"),
-            ("qualifying", "qualifying"),
-            ("none-after-validation", "none"),
-        ):
-            with self.subTest(legacy=legacy):
-                self.assertEqual(
-                    _checkpoint_policy(_args(checkpoints=legacy), "qualifying"), expected
-                )
-
-    def test_legacy_settings_values_are_accepted_as_the_default(self) -> None:
-        self.assertEqual(_checkpoint_policy(_args(), "none-after-validation"), "none")
-        self.assertEqual(_checkpoint_policy(_args(), "all"), "always")
-
-    def test_omit_checkpoint_alone_still_means_none(self) -> None:
-        self.assertEqual(_checkpoint_policy(_args(omit_checkpoint=True), "all"), "none")
-
-    def test_agreeing_legacy_pair_is_accepted(self) -> None:
-        # The sweep scripts pass both; they agree, so nothing is ambiguous.
-        self.assertEqual(
-            _checkpoint_policy(
-                _args(checkpoints="none-after-validation", omit_checkpoint=True),
-                "qualifying",
-            ),
-            "none",
-        )
-
-    def test_contradiction_is_refused_rather_than_silently_resolved(self) -> None:
-        # This combination reads as "keep every checkpoint" and produced none.
-        # It cost a 5.7-hour run its weights, so it must not be quietly picked.
-        for contradiction in (
-            _args(checkpoints="all", omit_checkpoint=True),
-            _args(checkpoint_policy="always", omit_checkpoint=True),
-            _args(checkpoint_policy="qualifying", omit_checkpoint=True),
-        ):
-            with self.subTest(args=contradiction):
-                with self.assertRaisesRegex(ConfigError, "contradicts"):
-                    _checkpoint_policy(contradiction, "qualifying")
-
-    def test_the_new_flag_wins_over_the_legacy_one(self) -> None:
-        self.assertEqual(
-            _checkpoint_policy(
-                _args(checkpoint_policy="always", checkpoints="none-after-validation"),
-                "qualifying",
-            ),
-            "always",
-        )
+    def test_legacy_spellings_are_no_longer_accepted(self) -> None:
+        # "all"/"none-after-validation" and --omit-checkpoint are gone rather
+        # than aliased: no legacy runs exist on these nodes, and keeping both
+        # spellings is what allowed a contradiction to be expressed at all.
+        for gone in ("all", "none-after-validation"):
+            with self.subTest(value=gone):
+                with self.assertRaisesRegex(ConfigError, "unknown checkpoint policy"):
+                    _checkpoint_policy(_args(), gone)
 
     def test_an_unknown_policy_is_refused(self) -> None:
         with self.assertRaisesRegex(ConfigError, "unknown checkpoint policy"):

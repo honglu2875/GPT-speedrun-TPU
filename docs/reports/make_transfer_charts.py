@@ -29,8 +29,11 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
-TIERS = ("60m", "125m", "250m")
-TIER_COLOR = {"60m": "#7dd3fc", "125m": "#f0abfc", "250m": "#fbbf24"}
+TIERS = ("60m", "125m", "250m", "500m")
+TIER_COLOR = {
+    "60m": "#7dd3fc", "125m": "#f0abfc",
+    "250m": "#fbbf24", "500m": "#4ade80",
+}
 BATCH_COLOR = {
     32: "#64748b", 64: "#38bdf8", 128: "#34d399",
     256: "#fbbf24", 512: "#f87171",
@@ -387,7 +390,10 @@ def fig_pareto(runs, c) -> str:
 
 def fig_penalty(c) -> str:
     """Penalty for exceeding batch 128, per tier, log scale."""
-    params = {"60m": 59_918_208, "125m": 123_456_640, "250m": 244_444_032}
+    params = {
+        "60m": 59_918_208, "125m": 123_456_640,
+        "250m": 244_444_032, "500m": 502_602_240,
+    }
     series = {}
     for over in (256, 512):
         pts = []
@@ -444,7 +450,10 @@ def fig_steps(c) -> str:
     return p.render()
 
 
-TOKENS = {"60m": 5 * 59_918_208, "125m": 5 * 123_456_640, "250m": 5 * 244_444_032}
+TOKENS = {
+    "60m": 5 * 59_918_208, "125m": 5 * 123_456_640,
+    "250m": 5 * 244_444_032, "500m": 5 * 502_602_240,
+}
 
 
 def fig_spread(c) -> str:

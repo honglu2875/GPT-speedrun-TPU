@@ -132,12 +132,10 @@ class LocalConfig:
             raise ConfigError("default_profile must be smoke, dev, or official")
         if self.default_track not in {"open", "sample_efficiency"}:
             raise ConfigError("default_track must be open or sample_efficiency")
-        if self.checkpoint_retention not in {
-            "all",
-            "qualifying",
-            "none-after-validation",
-        }:
-            raise ConfigError("invalid checkpoint_retention")
+        if self.checkpoint_retention not in {"always", "qualifying", "none"}:
+            raise ConfigError(
+                "checkpoint_retention must be always, qualifying, or none"
+            )
         if self.color not in {"auto", "always", "never"}:
             raise ConfigError("color must be auto, always, or never")
         if not math.isfinite(self.target_loss) or self.target_loss < 0:

@@ -88,40 +88,13 @@ _TIERS = ("60m", "125m", "250m", "500m", "1b")
 # than the outcome, so future options (a checkpointing frequency, keeping the
 # last N) extend this axis instead of adding another flag beside it.
 _CHECKPOINT_POLICIES = ("always", "qualifying", "none")
-# Superseded spellings. "all" read as "every step" rather than "keep it", and
-# --omit-checkpoint silently defeated --checkpoints, which cost a 5.7-hour
-# run its weights. Accepted so existing scripts keep working.
-_LEGACY_RETENTION = {
-    "all": "always",
-    "qualifying": "qualifying",
-    "none-after-validation": "none",
-}
-_RETENTION = tuple(_LEGACY_RETENTION)
+
 
 
 def _checkpoint_policy(args: argparse.Namespace, fallback: str) -> str:
-    """Resolve the policy from the new flag, the legacy flag, or settings."""
+    """Resolve the policy from the flag, falling back to saved settings."""
 
-    requested = getattr(args, "checkpoint_policy", None)
-    if requested is None:
-        legacy = getattr(args, "checkpoints", None)
-        requested = _LEGACY_RETENTION.get(legacy) if legacy else None
-    # Only an explicitly requested policy can contradict --omit-checkpoint.
-    # A saved default is a default: an explicit flag is entitled to override it.
-    chosen = requested if requested is not None else _LEGACY_RETENTION.get(
-        fallback, fallback
-    )
-    if getattr(args, "omit_checkpoint", False):
-        if requested not in (None, "none"):
-            # These could contradict each other, and --omit-checkpoint always
-            # won silently: "keep the weights" produced none. Cost a 5.7-hour
-            # run its checkpoint, so say so instead of picking a side.
-            raise ConfigError(
-                "--omit-checkpoint contradicts a checkpoint policy of "
-                f"{chosen!r}: it prevents weights from being written at all. "
-                "Use --checkpoint-policy none, or drop --omit-checkpoint."
-            )
-        chosen = "none"
+    chosen = getattr(args, "checkpoint_policy", None) or fallback
     if chosen not in _CHECKPOINT_POLICIES:
         raise ConfigError(
             f"unknown checkpoint policy {chosen!r}; expected one of "
@@ -213,7 +186,6 @@ def build_parser() -> argparse.ArgumentParser:
         choices=_CHECKPOINT_POLICIES,
         help="default checkpoint policy for runs",
     )
-    prepare.add_argument("--checkpoints", choices=_RETENTION, help=argparse.SUPPRESS)
     prepare.add_argument("--cluster", help="named cluster profile from .rig.toml")
     prepare.add_argument("--color", choices=_COLORS, help="terminal color preference")
     prepare.add_argument(
@@ -311,18 +283,9 @@ def build_parser() -> argparse.ArgumentParser:
         choices=_CHECKPOINT_POLICIES,
         help="always keep weights, keep only when qualifying, or never write them",
     )
-    run.add_argument("--checkpoints", choices=_RETENTION, help=argparse.SUPPRESS)
     run.add_argument("--cluster", help="named cluster profile from .rig.toml")
     run.add_argument("--color", choices=_COLORS)
     run.add_argument("--skip-data-check", action="store_true")
-    run.add_argument(
-        "--omit-checkpoint",
-        action="store_true",
-        # Superseded by --checkpoint-policy none, which says the same thing on
-        # the one axis instead of beside it. Hidden rather than removed only
-        # so scripts mid-flight keep working; delete once they have caught up.
-        help=argparse.SUPPRESS,
-    )
     run.add_argument("--study-id", help=argparse.SUPPRESS)
     run.add_argument("--study-point", help=argparse.SUPPRESS)
     run.add_argument("--study-suite-sha256", help=argparse.SUPPRESS)
@@ -492,7 +455,7 @@ def command_prepare(args: argparse.Namespace) -> int:
             "data_profile": args.profile,
             "default_profile": args.run_profile,
             "default_track": args.track,
-            "checkpoint_retention": args.checkpoints,
+            "checkpoint_retention": args.checkpoint_policy,
             "color": args.color,
             "target_loss": args.target_loss,
             "training_tokens": args.training_tokens,
@@ -1505,7 +1468,7 @@ def _run_cluster_prepare(
         config.default_track,
         "--run-profile",
         config.default_profile,
-        "--checkpoints",
+        "--checkpoint-policy",
         config.checkpoint_retention,
         "--color",
         "never",
@@ -1731,14 +1694,14 @@ def _prepare_wizard(
     track = _choose("Default track", _TRACKS, config.default_track, style)
     run_profile = _choose("Default run profile", _PROFILES, data_profile, style)
     retention = _choose(
-        "Checkpoint retention",
-        _RETENTION,
+        "Checkpoint policy",
+        _CHECKPOINT_POLICIES,
         config.checkpoint_retention,
         style,
         descriptions={
-            "all": "keep every checkpoint",
-            "qualifying": "keep checkpoints at or below the target",
-            "none-after-validation": "remove after harness validation",
+            "always": "keep the final weights",
+            "qualifying": "keep them only at or below the target loss",
+            "none": "never write weights; keep metrics and curves",
         },
     )
     color = _choose("Terminal colors", _COLORS, config.color, style)
