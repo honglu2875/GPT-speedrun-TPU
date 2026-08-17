@@ -148,23 +148,66 @@ Under `shard_map` over the `expert` axis:
 Both collectives differentiate natively, so the backward pass needs no
 special handling.
 
-### The capacity subtlety, stated plainly
+### There is no capacity factor, and no token is ever dropped
 
-`gmm` is dropless, but `ragged_all_to_all` writes into a **statically sized**
-output buffer. So there is a device-level capacity even though there is no
-expert-level one. Each device sends `T_local * K` assignments and receives
-`T_local * K` in expectation, but the realized count varies with routing skew.
+`ragged_all_to_all` writes into a statically sized buffer, which invites a
+capacity factor. **Do not add one.** Size the buffer for the provable worst
+case instead — every peer in the expert group sending everything to one
+device, `P * T_local * K` rows — and the question disappears.
 
-The buffer must be `ceil(T_local * K * C)` for some `C > 1`. This is far weaker
-than classic per-expert capacity — it is an average over `E_local` experts and
-all `P` sources, so the law of large numbers is working for us rather than
-against — but it is not nothing, and a policy is required:
+That worst case is affordable at every configuration the ladder needs:
 
-- start at `C = 1.5`, and **record the realized maximum every step** as
-  `router.max_recv_fraction` so the margin is measured rather than assumed;
-- on overflow, drop the tail and count it in `router.dropped_fraction` rather
-  than failing the run — but treat any nonzero value as a result to explain,
-  not a nuisance to tune away.
+| tier | P | worst-case rows | buffer, all layers | optimizer state | total |
+|---|--:|--:|--:|--:|--:|
+| 500M | 1 | 16,384 | — | 15.0 GB | 15.0 GB |
+| 500M | 2 | 32,768 | 1.6 GB | 9.0 GB | 10.6 GB |
+| 1B | 1 | 16,384 | — | 31.3 GB | 31.3 GB |
+| 1B | 2 | 32,768 | 2.5 GB | 18.4 GB | **20.8 GB** |
+| 1B | 4 | 65,536 | 4.9 GB | 11.9 GB | 16.8 GB |
+
+(bf16 activations, 32 GB of HBM.) Sizing for the worst case costs 2.5 GB at
+the tier that needs sharding at all, against 13.6 GB of headroom — and note
+the 1B row where `P = 2` with worst-case buffers beats `P = 1` outright,
+because sharding the optimizer state saves more than the buffers cost.
+
+**Why this matters more than the memory.** Dropping breaks causality. Token
+choice is per-token independent: token `i` picks its experts from its own
+hidden state and nothing else, so the routed model factorizes exactly as the
+autoregressive loss assumes. A capacity factor destroys that. Whether token
+`i` is served depends on how many *other* tokens chose the same expert — which
+in the usual position-ordered implementation means tokens at later positions
+in the same sequence, and always means other sequences in the batch. Two
+distinct failures follow:
+
+- **Position leakage.** The output at position `i` becomes a function of
+  positions `j > i`. The loss still factorizes as if it were not.
+- **Batch dependence.** The same token in the same sequence gets a different
+  answer depending on what it was batched with, so training and inference
+  disagree, and nothing is reproducible across a batch-size change.
+
+Both are silent. Neither raises, neither shows up in the loss curve as
+anything but slightly worse numbers, and a capacity factor tuned until
+`dropped_fraction` reads zero on average still drops on the tail steps that
+matter. The only safe amount of dropping is none.
+
+### Why not enforce balance algorithmically
+
+The tempting fix is a routing rule that balances by construction — Expert
+Choice, where each expert takes its top-`c` tokens, or BASE/Sinkhorn, which
+solve an assignment problem. All of them make group sizes exactly `T*K/E`,
+static, with no buffer question at all.
+
+**They break causality in a subtler place.** If expert `e` ranks the sequence
+and keeps its top `c`, whether token `i` is selected depends on the scores of
+tokens `j > i`. That is the same leak as dropping, moved from the capacity
+check into the routing rule, and it is harder to see. These schemes are sound
+for encoders and masked objectives; they are not sound for a decoder-only LM.
+
+Under token choice, **exact balance and causality are incompatible** — any
+rule that couples tokens to equalize loads is a rule that lets one token's
+assignment depend on another's. So balance is *encouraged* by the auxiliary
+loss and never *enforced*, imbalance is measured rather than clipped, and the
+dispatch buffer simply absorbs whatever the router produces.
 
 ## Constraints found by testing
 
@@ -253,8 +296,7 @@ getting right once):
 | `router.z_loss` | logit drift |
 | `router.entropy` | mean routing entropy; collapse detector |
 | `router.max_load_fraction` | worst expert's share of assignments |
-| `router.max_recv_fraction` | realized dispatch buffer occupancy |
-| `router.dropped_fraction` | overflow, expected to be 0 |
+| `router.max_recv_fraction` | peak dispatch-buffer occupancy, as a skew diagnostic — never a safety margin, since the buffer is sized for the worst case |
 
 Per-expert diagnostics need a **second index**: statistics are per (layer,
 expert) and the column table carries only one `layer` field. The `reserved`
@@ -270,10 +312,12 @@ Each phase ends at a gate that must pass before the next begins.
 No collectives, no mesh change. Delivers the router, the sort, `gmm` wiring,
 the aux loss, the FLOP rule, and the registry ids.
 *Gate:* equi-FLOP with the dense tier to within 1%, loss curve tracking dense
-within seed noise, `dropped_fraction == 0`, and a re-swept base LR.
+within seed noise, a re-swept base LR, and every routed token accounted for —
+`counts.sum() == T * K` exactly, asserted, not sampled.
 
 **Phase 2 — expert parallelism.** The 2D mesh, `ragged_all_to_all` dispatch,
-`group_offset`, capacity policy. Needed for 500M/1B and for 250M on v5e.
+`group_offset`, worst-case dispatch buffers. Needed for 1B, and for 500M on
+v5e.
 *Gate:* bit-identical loss to `P = 1` on 60M at the same seed — the dispatch is
 a permutation and must change nothing. This is the single most valuable test in
 the plan.
@@ -290,14 +334,21 @@ collectives at the same time, which is the main way this goes wrong.
    three seeds. Everything downstream assumes it.
 2. **Is the sort the bottleneck?** `argsort` versus counting sort at
    `m = 16384`, measured, before optimizing either.
-3. **How skewed does routing actually get?** `max_load_fraction` over a 60M run
-   sets the capacity factor honestly instead of by folklore.
+3. **How skewed does routing actually get?** `max_load_fraction` over a 60M
+   run says whether the auxiliary loss is doing its job. Nothing depends on the
+   answer for correctness — the buffers hold regardless — but a router that
+   collapses onto two experts is wasting six, and the loss curve alone will not
+   say so.
 
 ## Open questions
 
 - Sparsify every layer, or every other layer? Interleaving is common and halves
   the parameter cost; it also breaks the clean "active == dense tier" identity.
-- Shared expert (always-on, alongside the routed ones)? Cheap and usually
-  helps, but it changes active FLOPs and so the equi-FLOP comparison.
 - Does `E = 8` stay fixed across the ladder, or scale with width? Fixing it is
   the simpler experiment and the one the current tiers support.
+
+**Settled: no shared expert.** An always-on expert alongside the routed ones is
+cheap and usually helps, which is exactly why it does not belong in a baseline
+— it adds active FLOPs and so breaks the equi-FLOP identity against the dense
+ladder, and it confounds "did sparsity help" with "did extra dense capacity
+help". If it is worth measuring later it is worth measuring as its own arm.
