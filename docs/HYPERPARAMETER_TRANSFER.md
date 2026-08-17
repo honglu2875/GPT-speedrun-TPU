@@ -36,6 +36,8 @@ Supersedes the former `LR_TRANSFER.md`.
 | **tier** | a named size rung of the family: 60m, 125m, 250m, 500m, 1b. Measured here: 60m through 500m |
 | **nat** | unit of the loss (natural-log cross-entropy) |
 | **separated** | Welch's t between two 3-seed means exceeds 2.5 in magnitude. Anything below that is reported as unresolved, not as a ranking |
+| **spread** | the *range* — max minus min — of validation loss over a cell's three seeds. A crude stand-in for the standard deviation; see the caveat below before comparing two of them |
+| **penalty** | the extra validation loss from training at a larger batch than the optimum: a cell's 3-seed mean minus the 3-seed mean at batch 128, both at base LR `2^-8` and the same token budget. Positive means worse |
 | **bracketed** | the best point has measured neighbours on both sides. An optimum at a grid edge is not a result |
 | **dev profile** | short diagnostic run. Validation is 8 probe batches — *not* the official metric |
 
@@ -151,6 +153,40 @@ That reframes the seed variance throughout this note. It is not luck in the
 initialization so much as luck in how hard one unavoidable fragile phase hits,
 which is why the spread grows with LR and why it is largest exactly at the
 optimum.
+
+### What "spread" is, and what it supports
+
+Every spread quoted here is the **range**: the largest of a cell's three seed
+losses minus the smallest. It is not a standard deviation, and three samples do
+not support one worth printing. The range at least uses every draw there is.
+
+It is a reasonable stand-in. For normal draws the expected range at `n = 3` is
+`1.69σ`, so `range / 1.69` is an unbiased estimate of `σ`, and validation loss
+is thin-tailed enough here for that to roughly hold — which is the only reason
+the quantity is reported at all.
+
+What it is not is *precise*, and the limit is severe enough to change how the
+numbers may be read:
+
+| at n = 3 | |
+|---|--:|
+| `E[range]` | `1.69σ` |
+| `sd[range]` | `0.89σ` |
+| relative error of `σ̂ = range / 1.69` | **53%** |
+| P(two cells with identical `σ` differ by >2x in range) | **40%** |
+| P(… differ by >3x) | **20%** |
+
+So a single cell's spread pins `σ` only to about a factor of two, and a 2x gap
+between two cells is the *typical* outcome of pure noise, not evidence of
+anything. Three tail draws also see less of a distribution than thirty do: the
+expected range grows from `1.69σ` at `n = 3` to `3.08σ` at `n = 10`, so these
+figures systematically understate the spread a larger seed set would show.
+
+**The supported use is structural**: a trend that holds across many cells at
+once — spread rising toward the optimum, across tiers and batches
+simultaneously — survives this noise, because it is many weak measurements
+agreeing rather than one being trusted. Ranking two individual cells by their
+spread does not, and is not done anywhere in this note.
 
 ## Study 2 — batch size x learning rate
 

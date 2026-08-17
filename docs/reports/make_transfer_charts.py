@@ -351,7 +351,7 @@ def fig_batch_normalized(c) -> str:
             series[tier] = [(x, y - floor) for x, y in pts]
     top = max(y for s in series.values() for _, y in s)
     p = Plot("Loss above each tier's own optimum",
-             "global batch size", "Δ nats vs that tier's best",
+             "global batch size", "loss above that tier's best (nats)",
              (4.6, 9.4), (-0.05, top * 1.08))
     p.frame([5, 6, 7, 8, 9], ticks(0, top, 4),
             xfmt=lambda v: str(int(2 ** v)), yfmt=lambda v: f"{v:.2f}")
@@ -459,7 +459,13 @@ def fig_wall_clock(runs, c) -> str:
 
 
 def fig_penalty(c) -> str:
-    """Penalty for exceeding batch 128, per tier, log scale."""
+    """Extra loss from training at a batch larger than the optimum, per tier.
+
+    Penalty is the 3-seed mean validation loss at batch B minus the 3-seed
+    mean at batch 128, both at base LR 2^-8. Positive means the larger batch
+    finished worse. Same token budget on both sides, so this is a sample
+    efficiency cost, not a time cost.
+    """
     params = {
         "60m": 59_918_208, "125m": 123_456_640,
         "250m": 244_444_032, "500m": 502_602_240,
@@ -478,7 +484,7 @@ def fig_penalty(c) -> str:
             series[over] = pts
     ys = [y for s in series.values() for _, y in s]
     p = Plot("Penalty for exceeding batch 128", "parameters (log)",
-             "Δ nats vs batch 128 (log)",
+             "extra loss vs batch 128, nats (log)",
              (7.7, 8.45), (min(ys) - 0.25, max(ys) + 0.25))
     p.frame([math.log10(params[t]) for t in TIERS],
             ticks(min(ys) - 0.2, max(ys) + 0.2, 4),
@@ -500,9 +506,23 @@ TOKENS = {
 
 
 def fig_spread(c) -> str:
-    """Seed spread by LR, one line per (tier, batch). Noise peaks near the optimum."""
-    p = Plot("Seed spread (max-min over 3 seeds)", "base learning rate",
-             "loss spread, nats", (-10.4, -5.6), (0, 0.36))
+    """Seed range by LR, one line per (tier, batch). Noise peaks near the optimum.
+
+    The plotted quantity is the range -- max minus min of validation loss over
+    the cell's three seeds -- not a standard deviation. Three samples do not
+    support an sd worth printing, and the range uses every draw there is.
+
+    For normal draws E[range] = 1.69 sigma at n=3, so range/1.69 is an unbiased
+    estimate of sigma, and validation loss is thin-tailed enough for that to
+    roughly hold. What it is not is a precise estimate: the range's own
+    standard deviation is 0.89 sigma, which is 53% of what it estimates. Two cells
+    with identical true variance differ by more than 2x in range about 40% of
+    the time. The chart is therefore readable for gross structure across many
+    cells at once, and not for ranking one cell against another.
+    """
+
+    p = Plot("Seed range (max - min over 3 seeds)", "base learning rate",
+             "loss range, nats", (-10.4, -5.6), (0, 0.36))
     p.frame([-10, -9, -8, -7, -6], ticks(0, 0.35, 5),
             xfmt=lambda v: f"2^{int(v)}", yfmt=lambda v: f"{v:.2f}")
     for tier in TIERS:
@@ -521,7 +541,15 @@ def fig_spread(c) -> str:
 
 
 def fig_spikes(spikes) -> str:
-    """Gradient spike vs loss excess within each LR, 250M reseed."""
+    """How far a seed's final loss lands from its own LR group's average.
+
+    Each point is one run. Vertical position is that run's final validation
+    loss minus the mean of the three seeds sharing its learning rate, so zero
+    is its group's average and positive is worse than its two siblings.
+    Comparing within the group is the point: the loss level itself moves with
+    the learning rate, which would swamp the seed-to-seed effect being looked
+    at here.
+    """
     by_lr = defaultdict(list)
     for lg, seed, ratio, loss in spikes:
         by_lr[lg].append((seed, ratio, loss))
@@ -532,8 +560,9 @@ def fig_spikes(spikes) -> str:
             pts.append((math.log10(ratio), loss - mean, lg))
     if not pts:
         return ""
-    p = Plot("Gradient spike vs loss excess (250M reseed)",
-             "peak / median gradient norm (log)", "Δ nats within its LR group",
+    p = Plot("Gradient spike vs final loss, within each LR (250M reseed)",
+             "peak / median gradient norm (log)",
+             "final loss - mean of its 3 seeds (nats)",
              (0.9, 3.6), (-0.05, 0.05))
     lo = min(y for _, y, _ in pts)
     hi = max(y for _, y, _ in pts)
@@ -640,18 +669,32 @@ def main() -> None:
                 + "</div>")
     body.append("<h2>Noise structure</h2>")
     body.append('<div class="row">'
-                + card("Seed spread by LR; batch 128 drawn brighter. Noise is "
+                + card("Range (max - min) of validation loss over each cell's "
+                       "three seeds, by LR; batch 128 drawn brighter. Noise is "
                        "largest near the optimum, which is why single-seed "
-                       "comparisons there are unreliable.", fig_spread(c))
-                + (card("Within each LR group, larger gradient spikes track worse "
-                        "loss. Pooled across LRs the correlation is only +0.17 — "
-                        "the effect is within-group.", fig_spikes(spikes))
+                       "comparisons there are unreliable. Read the shape across "
+                       "cells, not one cell against another: at n=3 the range "
+                       "estimates sigma to within about 53%, and two cells with "
+                       "identical variance differ by 2x roughly 40% of the time.",
+                       fig_spread(c))
+                + (card("One point per run. Height is that run's final "
+                        "validation loss minus the average of the three seeds "
+                        "sharing its learning rate, so zero is its group's "
+                        "average. Within a group, bigger gradient spikes go with "
+                        "worse loss; pooled across learning rates the rank "
+                        "correlation is only +0.17, because the spikes grow with "
+                        "LR while these differences are centred inside each group.",
+                        fig_spikes(spikes))
                    if spikes else "")
                 + "</div>")
     body.append("<h2>Penalty scaling</h2>")
     body.append(card(
-        "Both axes log. If this stays log-linear it predicts the 500M and 1B "
-        "penalty, i.e. whether larger tiers can simply adopt batch 256.",
+        "Penalty is the extra validation loss from using a larger batch than "
+        "the optimum: the three-seed mean at batch B minus the three-seed mean "
+        "at batch 128, both at base LR 2^-8, on the same token budget. Positive "
+        "means worse. Both axes log. If this stays log-linear it predicts the "
+        "500M and 1B penalty, i.e. whether larger tiers can simply adopt "
+        "batch 256.",
         fig_penalty(c)))
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
