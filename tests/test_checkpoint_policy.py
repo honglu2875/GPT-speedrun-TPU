@@ -76,9 +76,7 @@ class RetiredFlagTests(unittest.TestCase):
         # `rig run` forwards unknown arguments to the trainer, so a retired
         # flag would otherwise surface as an argparse error from train.py
         # about a flag the user had used correctly the day before.
-        self.assertIn(
-            "--checkpoint-policy", self._run_cli("--checkpoints", "always")
-        )
+        self.assertIn("--checkpoint-policy", self._run_cli("--checkpoints", "always"))
         self.assertIn("--checkpoint-policy none", self._run_cli("--omit-checkpoint"))
 
     def test_genuine_trainer_arguments_still_pass_through(self) -> None:

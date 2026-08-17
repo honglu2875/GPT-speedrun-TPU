@@ -9,6 +9,7 @@ import inspect
 from io import StringIO
 import json
 import math
+import re
 from pathlib import Path
 import sys
 import tempfile
@@ -18,7 +19,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from rig import configfile, evaluation, logpack, metrics
+from rig import configfile, evaluation, logpack, metrics, runlog
 from rig import tokens as rig_tokens
 
 
@@ -112,7 +113,10 @@ class TrainerStaticTests(unittest.TestCase):
                     experiment,
                 )
                 self.assertEqual(config.declared_parameters, parameters)
-                self.assertEqual((config.layers, config.d_model, config.heads), (layers, width, heads))
+                self.assertEqual(
+                    (config.layers, config.d_model, config.heads),
+                    (layers, width, heads),
+                )
                 self.assertEqual(config.d_model // config.heads, 64)
                 self.assertEqual(config.attention_scale, "inverse_head_dim")
                 self.assertAlmostEqual(
@@ -209,14 +213,16 @@ class TrainerStaticTests(unittest.TestCase):
                 with self.subTest(label=label):
                     path = root / "config.yaml"
                     path.write_text(contents, encoding="utf-8")
-                    with patch.object(trainer, "CONFIG_PATH", path), self.assertRaises(
-                        ValueError
+                    with (
+                        patch.object(trainer, "CONFIG_PATH", path),
+                        self.assertRaises(ValueError),
                     ):
                         trainer.load_experiment_profile("smoke")
             path = root / "config.yaml"
             path.write_bytes(b"#" * (configfile.MAX_CONFIG_BYTES + 1))
-            with patch.object(trainer, "CONFIG_PATH", path), self.assertRaisesRegex(
-                ValueError, "safety limit"
+            with (
+                patch.object(trainer, "CONFIG_PATH", path),
+                self.assertRaisesRegex(ValueError, "safety limit"),
             ):
                 trainer.load_experiment_profile("smoke")
 
@@ -224,8 +230,9 @@ class TrainerStaticTests(unittest.TestCase):
             target.write_text(source, encoding="utf-8")
             symlink = root / "config-link.yaml"
             symlink.symlink_to(target)
-            with patch.object(trainer, "CONFIG_PATH", symlink), self.assertRaisesRegex(
-                ValueError, "non-symlink"
+            with (
+                patch.object(trainer, "CONFIG_PATH", symlink),
+                self.assertRaisesRegex(ValueError, "non-symlink"),
             ):
                 trainer.load_experiment_profile("smoke")
 
@@ -246,7 +253,9 @@ class TrainerStaticTests(unittest.TestCase):
                     "random_windows",
                 )
 
-    def test_static_cli_values_are_rejected_but_diagnostic_overrides_resolve(self) -> None:
+    def test_static_cli_values_are_rejected_but_diagnostic_overrides_resolve(
+        self,
+    ) -> None:
         parser = trainer.build_parser()
         for option in (
             ("--layers", "13"),
@@ -254,8 +263,9 @@ class TrainerStaticTests(unittest.TestCase):
             ("--learning-rate", "0.001"),
             ("--eval-batches", "1"),
         ):
-            with self.subTest(option=option), self.assertRaisesRegex(
-                ValueError, "defined by sibling config.yaml"
+            with (
+                self.subTest(option=option),
+                self.assertRaisesRegex(ValueError, "defined by sibling config.yaml"),
             ):
                 trainer.resolve_config(
                     parser.parse_args(["--profile", "official", *option]),
@@ -265,9 +275,16 @@ class TrainerStaticTests(unittest.TestCase):
         config = trainer.resolve_config(
             parser.parse_args(
                 [
-                    "--profile", "official", "--steps", "100",
-                    "--val-every", "0", "--diagnostics-every", "0",
-                    "--log-every", "100",
+                    "--profile",
+                    "official",
+                    "--steps",
+                    "100",
+                    "--val-every",
+                    "0",
+                    "--diagnostics-every",
+                    "0",
+                    "--log-every",
+                    "100",
                 ]
             ),
             "tpu",
@@ -285,8 +302,10 @@ class TrainerStaticTests(unittest.TestCase):
         config = trainer.resolve_config(
             parser.parse_args(
                 [
-                    "--profile", "official",
-                    "--train-tokens", "655360",
+                    "--profile",
+                    "official",
+                    "--train-tokens",
+                    "655360",
                 ]
             ),
             "tpu",
@@ -297,8 +316,10 @@ class TrainerStaticTests(unittest.TestCase):
             trainer.resolve_config(
                 parser.parse_args(
                     [
-                        "--profile", "official",
-                        "--train-tokens", "655361",
+                        "--profile",
+                        "official",
+                        "--train-tokens",
+                        "655361",
                     ]
                 ),
                 "tpu",
@@ -318,9 +339,7 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertEqual(config.warmup_steps, 10)
         with self.assertRaisesRegex(ValueError, "defined by sibling config.yaml"):
             trainer.resolve_config(
-                parser.parse_args(
-                    ["--profile", "official", "--warmup-steps", "100"]
-                ),
+                parser.parse_args(["--profile", "official", "--warmup-steps", "100"]),
                 "tpu",
                 50_304,
             )
@@ -330,9 +349,12 @@ class TrainerStaticTests(unittest.TestCase):
         defaults = parser.parse_args([])
         valid = parser.parse_args(
             [
-                "--xprof-dir", "trace",
-                "--xprof-start-step", "11",
-                "--xprof-steps", "20",
+                "--xprof-dir",
+                "trace",
+                "--xprof-start-step",
+                "11",
+                "--xprof-steps",
+                "20",
                 "--no-final-validation",
                 "--no-checkpoint",
             ]
@@ -357,30 +379,38 @@ class TrainerStaticTests(unittest.TestCase):
         )
         self.assertEqual(trainer.xprof_step_window(valid, 100), (11, 30))
         self.assertFalse(
-            trainer.should_compile_evaluation(
-                valid, SimpleNamespace(val_every=0), ()
-            )
+            trainer.should_compile_evaluation(valid, SimpleNamespace(val_every=0), ())
         )
 
         normal = parser.parse_args([])
         trainer.validate_args(normal)
         self.assertIsNone(trainer.xprof_step_window(normal, 100))
         self.assertTrue(
-            trainer.should_compile_evaluation(
-                normal, SimpleNamespace(val_every=0), ()
-            )
+            trainer.should_compile_evaluation(normal, SimpleNamespace(val_every=0), ())
         )
 
         invalid_commands = (
             ["--xprof-start-step", "1"],
             ["--xprof-dir", "trace", "--xprof-start-step", "1"],
-            ["--xprof-dir", "trace", "--xprof-start-step", "1", "--xprof-steps", "1", "--no-checkpoint"],
+            [
+                "--xprof-dir",
+                "trace",
+                "--xprof-start-step",
+                "1",
+                "--xprof-steps",
+                "1",
+                "--no-checkpoint",
+            ],
             ["--no-final-validation", "--no-checkpoint"],
             [
-                "--profile", "official",
-                "--xprof-dir", "trace",
-                "--xprof-start-step", "1",
-                "--xprof-steps", "1",
+                "--profile",
+                "official",
+                "--xprof-dir",
+                "trace",
+                "--xprof-start-step",
+                "1",
+                "--xprof-steps",
+                "1",
                 "--no-final-validation",
                 "--no-checkpoint",
             ],
@@ -511,8 +541,9 @@ class TrainerStaticTests(unittest.TestCase):
             ("--seq-len", "16384"),
             ("--val-probe-batches", "9"),
         ):
-            with self.subTest(option=option), self.assertRaisesRegex(
-                ValueError, "defined by sibling config.yaml"
+            with (
+                self.subTest(option=option),
+                self.assertRaisesRegex(ValueError, "defined by sibling config.yaml"),
             ):
                 trainer.resolve_config(
                     parser.parse_args(["--profile", "official", *option]),
@@ -528,7 +559,9 @@ class TrainerStaticTests(unittest.TestCase):
                 50_304,
             )
 
-    def test_tiled_loss_resolves_semantic_vocab_and_counts_recompute_flops(self) -> None:
+    def test_tiled_loss_resolves_semantic_vocab_and_counts_recompute_flops(
+        self,
+    ) -> None:
         parser = trainer.build_parser()
         dense = trainer.resolve_config(
             parser.parse_args(["--profile", "official"]),
@@ -560,7 +593,8 @@ class TrainerStaticTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "defined by sibling config.yaml"):
             trainer.resolve_config(
                 parser.parse_args(["--profile", "official", "--loss-backend", "tiled"]),
-                "tpu", 50_304,
+                "tpu",
+                50_304,
             )
 
     def test_flash_flops_include_right_padding_for_odd_sequences(self) -> None:
@@ -600,7 +634,9 @@ class TrainerStaticTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "do not fit"):
             dataset.validation_batch(0, 1, 7, 7)
 
-    def test_shuffled_epoch_stream_is_bijective_deterministic_and_rank_disjoint(self) -> None:
+    def test_shuffled_epoch_stream_is_bijective_deterministic_and_rank_disjoint(
+        self,
+    ) -> None:
         shards = rig_tokens.ShardedTokens(
             (
                 np.arange(9, dtype=np.int32),
@@ -658,12 +694,12 @@ class TrainerStaticTests(unittest.TestCase):
                         parser.parse_args(["--profile", "dev"]),
                         "tpu",
                         50_304,
-                        replace(
-                            base, attention_backend=backend, dtype_name="float32"
-                        ),
+                        replace(base, attention_backend=backend, dtype_name="float32"),
                     )
 
-    def test_attention_backend_comes_from_the_profile_with_no_tuning_flags(self) -> None:
+    def test_attention_backend_comes_from_the_profile_with_no_tuning_flags(
+        self,
+    ) -> None:
         # The tuning cache and the runtime autotuner were removed: a per-host
         # cache was the only way two processes in one SPMD job could select
         # different tiles for the same program.
@@ -694,9 +730,7 @@ class TrainerStaticTests(unittest.TestCase):
         args = parser.parse_args(["--profile", "official"])
         config = trainer.resolve_config(args, "tpu", 50_304)
         devices = [FakeDevice("tpu", "TPU v4") for _ in range(4)]
-        tiles = trainer.AttentionTiles(
-            512, 512, 256, 512, 256, 512, 256, 256, 512, 256
-        )
+        tiles = trainer.AttentionTiles(512, 512, 256, 512, 256, 512, 256, 256, 512, 256)
         key = SimpleNamespace(digest="a" * 64)
         resolved = SimpleNamespace(source="shipped", tiles=tiles)
         with (
@@ -749,9 +783,7 @@ class TrainerStaticTests(unittest.TestCase):
             "tpu",
             50_304,
         )
-        tiles = trainer.AttentionTiles(
-            512, 512, 256, 512, 256, 512, 256, 256, 512, 256
-        )
+        tiles = trainer.AttentionTiles(512, 512, 256, 512, 256, 512, 256, 256, 512, 256)
         local_attention = object()
         with (
             patch.object(
@@ -779,9 +811,7 @@ class TrainerStaticTests(unittest.TestCase):
         config = trainer.resolve_config(
             parser.parse_args(["--profile", "smoke"]), "cpu", 256
         )
-        tiles = trainer.AttentionTiles(
-            512, 512, 256, 512, 256, 512, 256, 256, 512, 256
-        )
+        tiles = trainer.AttentionTiles(512, 512, 256, 512, 256, 512, 256, 256, 512, 256)
         runtime = trainer.AttentionRuntime("c" * 64, "cache", tiles, 0.0)
         expected = trainer.attention_runtime_metadata(runtime)
         self.assertEqual(expected["key_digest"], "c" * 64)
@@ -790,23 +820,17 @@ class TrainerStaticTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
-            trainer.save_checkpoint(
+            runlog.save_checkpoint(
                 output,
                 {"weight": np.zeros((2, 2), dtype=np.float32)},
-                config,
-                7,
-                runtime,
+                trainer.checkpoint_metadata(config, 7, runtime),
             )
-            with np.load(output / trainer.CHECKPOINT_NAME) as checkpoint:
+            with np.load(output / runlog.CHECKPOINT_NAME) as checkpoint:
                 metadata = json.loads(bytes(checkpoint["metadata.json"]).decode())
         self.assertEqual(metadata["model"]["attention_tuning"], expected)
         self.assertEqual(metadata["configuration"]["path"], "config.yaml")
-        self.assertEqual(
-            metadata["configuration"]["sha256"], config.config_sha256
-        )
-        self.assertEqual(
-            metadata["configuration"]["resolved"]["model"]["layers"], 2
-        )
+        self.assertEqual(metadata["configuration"]["sha256"], config.config_sha256)
+        self.assertEqual(metadata["configuration"]["resolved"]["model"]["layers"], 2)
 
         implementation = trainer.implementation_metadata(config, runtime)
         self.assertEqual(implementation["attention_tuning"], expected)
@@ -841,9 +865,7 @@ class TrainerStaticTests(unittest.TestCase):
             50_304,
             experiment,
         )
-        tiles = trainer.AttentionTiles(
-            512, 512, 256, 512, 256, 512, 256, 256, 512, 256
-        )
+        tiles = trainer.AttentionTiles(512, 512, 256, 512, 256, 512, 256, 256, 512, 256)
         runtime = trainer.AttentionRuntime("d" * 64, "shipped", tiles, 0.0)
         self.assertEqual(
             trainer.contract_model_metadata(config),
@@ -886,9 +908,7 @@ class TrainerStaticTests(unittest.TestCase):
             if evaluation.should_run_diagnostics(step, every=3, final_step=8)
         ]
         self.assertEqual(selected, [1, 3, 6, 8])
-        self.assertFalse(
-            evaluation.should_run_diagnostics(1, every=0, final_step=1)
-        )
+        self.assertFalse(evaluation.should_run_diagnostics(1, every=0, final_step=1))
 
     def test_validation_prefix_always_starts_at_batch_zero(self) -> None:
         class Dataset:
@@ -904,12 +924,15 @@ class TrainerStaticTests(unittest.TestCase):
                 return values, values
 
         dataset = Dataset()
+
         def compiled_eval(
             params: object, x: np.ndarray, y: np.ndarray, mask: np.ndarray
         ) -> tuple[np.ndarray, np.ndarray]:
             del params, y
             loss = np.sum((x.astype(np.float32) + 1.0) * mask)
-            return np.asarray(loss, dtype=np.float32), np.asarray(mask.sum(), dtype=np.float32)
+            return np.asarray(loss, dtype=np.float32), np.asarray(
+                mask.sum(), dtype=np.float32
+            )
 
         with patch.object(
             evaluation.jax, "device_put", side_effect=lambda value, _sharding: value
@@ -934,10 +957,14 @@ class TrainerStaticTests(unittest.TestCase):
         )
         config = _fake_config(steps=2, batch_size=4, seq_len=8)
         with tempfile.TemporaryDirectory() as directory:
-            trainer.write_training_log(
-                Path(directory), history, config, flops_per_token=10
+            runlog.write_training_log(
+                Path(directory),
+                history,
+                tokens_per_step=32,
+                final_step=2,
+                flops_per_token=10,
             )
-            log = logpack.read_log(Path(directory) / trainer.TRAINING_LOG_NAME)
+            log = logpack.read_log(Path(directory) / runlog.TRAINING_LOG_NAME)
         self.assertEqual(
             [entry.describe() for entry in log.columns],
             ["overall/train_loss", "overall/learning_rate", "overall/grad_norm"],
@@ -980,8 +1007,15 @@ class TrainerStaticTests(unittest.TestCase):
                 ):
                     trainer.resolve_config(
                         parser.parse_args(
-                            ["--profile", "dev", "--tier", "250m", *duration,
-                             "--early-stopping-step", "60"]
+                            [
+                                "--profile",
+                                "dev",
+                                "--tier",
+                                "250m",
+                                *duration,
+                                "--early-stopping-step",
+                                "60",
+                            ]
                         ),
                         "tpu",
                         50_304,
@@ -996,9 +1030,7 @@ class TrainerStaticTests(unittest.TestCase):
             )
 
     def test_early_stopped_artifacts_cover_only_the_steps_taken(self) -> None:
-        config = _fake_config(
-            steps=5, early_stopping_step=2, batch_size=4, seq_len=8
-        )
+        config = _fake_config(steps=5, early_stopping_step=2, batch_size=4, seq_len=8)
         # The device history buffer is sized for the full horizon and only its
         # prefix is written, so the writer must drop the trailing zeros.
         history = np.zeros((5, 3), dtype=np.float32)
@@ -1006,27 +1038,28 @@ class TrainerStaticTests(unittest.TestCase):
         values = np.arange(2 * 3 * 6, dtype=np.float32).reshape((2, 3, 6))
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            trainer.write_training_log(root, history, config, flops_per_token=10)
-            training = logpack.read_log(root / trainer.TRAINING_LOG_NAME)
-            trainer.write_diagnostics_log(
+            runlog.write_training_log(
+                root, history, tokens_per_step=32, final_step=2, flops_per_token=10
+            )
+            training = logpack.read_log(root / runlog.TRAINING_LOG_NAME)
+            runlog.write_diagnostics_log(
                 root,
                 (
-                    trainer.DiagnosticPoint(1, values),
-                    trainer.DiagnosticPoint(2, values + 1.0),
+                    runlog.DiagnosticPoint(1, values),
+                    runlog.DiagnosticPoint(2, values + 1.0),
                 ),
                 (("overall", None, 7), ("block", 0, 4)),
-                config,
-                10,
+                tokens_per_step=32,
+                final_step=2,
+                flops_per_token=10,
             )
-            diagnostics = logpack.read_log(root / trainer.DIAGNOSTICS_LOG_NAME)
+            diagnostics = logpack.read_log(root / runlog.DIAGNOSTICS_LOG_NAME)
         self.assertEqual(len(training), 2)
         np.testing.assert_array_equal(training.steps, [1, 2])
         np.testing.assert_array_equal(training.values, history[:2])
         np.testing.assert_array_equal(diagnostics.steps, [1, 2])
         # An early-stopped run still fires on the step it stops at.
-        self.assertTrue(
-            evaluation.should_run_diagnostics(2, every=100, final_step=2)
-        )
+        self.assertTrue(evaluation.should_run_diagnostics(2, every=100, final_step=2))
 
     def test_diagnostics_log_flattens_the_grid_and_lands_atomically(self) -> None:
         metadata = (("overall", None, 7), ("block", 0, 4))
@@ -1034,14 +1067,21 @@ class TrainerStaticTests(unittest.TestCase):
         values = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
         config = _fake_config(steps=2, batch_size=4, seq_len=8)
         points = (
-            trainer.DiagnosticPoint(1, values),
-            trainer.DiagnosticPoint(2, values + 1.0),
+            runlog.DiagnosticPoint(1, values),
+            runlog.DiagnosticPoint(2, values + 1.0),
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            trainer.write_diagnostics_log(root, points, metadata, config, 10)
-            destination = root / trainer.DIAGNOSTICS_LOG_NAME
-            self.assertFalse((root / f".{trainer.DIAGNOSTICS_LOG_NAME}.tmp").exists())
+            runlog.write_diagnostics_log(
+                root,
+                points,
+                metadata,
+                tokens_per_step=32,
+                final_step=2,
+                flops_per_token=10,
+            )
+            destination = root / runlog.DIAGNOSTICS_LOG_NAME
+            self.assertFalse((root / f".{runlog.DIAGNOSTICS_LOG_NAME}.tmp").exists())
             log = logpack.read_log(destination)
 
         # Column order is the [scope, family, stat] grid flattened in place, so
@@ -1060,12 +1100,12 @@ class TrainerStaticTests(unittest.TestCase):
             float(log.series("update.fourth_moment", "block", 0)[0]), 35.0
         )
 
-    def test_diagnostic_statistics_use_postupdate_param_raw_gradient_and_signed_delta(self) -> None:
+    def test_diagnostic_statistics_use_postupdate_param_raw_gradient_and_signed_delta(
+        self,
+    ) -> None:
         params = {
             "token_embedding": np.asarray([[1.0, 2.0]], dtype=np.float32),
-            "blocks": [
-                {"weight": np.asarray([-1.0, 1.0], dtype=np.float32)}
-            ],
+            "blocks": [{"weight": np.asarray([-1.0, 1.0], dtype=np.float32)}],
             "final_ln_scale": np.asarray([2.0], dtype=np.float32),
         }
         gradients = trainer.jax.tree_util.tree_map(
@@ -1078,8 +1118,12 @@ class TrainerStaticTests(unittest.TestCase):
         metadata = trainer.diagnostic_scope_metadata(params)
         self.assertEqual(
             metadata,
-            (("overall", None, 5), ("embeddings", None, 2),
-             ("block", 0, 2), ("final_norm", None, 1)),
+            (
+                ("overall", None, 5),
+                ("embeddings", None, 2),
+                ("block", 0, 2),
+                ("final_norm", None, 1),
+            ),
         )
         flattened = np.concatenate(
             [np.ravel(value) for value in trainer.jax.tree_util.tree_leaves(after)]
@@ -1098,28 +1142,29 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertAlmostEqual(float(values[0, 1, 2]), 2.0)
         self.assertAlmostEqual(float(values[0, 2, 2]), -0.25)
 
-    def test_diagnostic_executable_preserves_ordinary_optimizer_trajectory(self) -> None:
+    def test_diagnostic_executable_preserves_ordinary_optimizer_trajectory(
+        self,
+    ) -> None:
         parser = trainer.build_parser()
         config = trainer.resolve_config(
             parser.parse_args(
-                [
-                    "--profile", "smoke", "--steps", "2", "--diagnostics-every", "1"
-                ]
+                ["--profile", "smoke", "--steps", "2", "--diagnostics-every", "1"]
             ),
             "cpu",
             256,
         )
         host_params = trainer.init_params(config, 7)
         decay_mask = trainer.weight_decay_mask(host_params)
-        x = np.arange(config.batch_size * config.seq_len, dtype=np.int32).reshape(
-            config.batch_size, config.seq_len
-        ) % config.vocab_size
+        x = (
+            np.arange(config.batch_size * config.seq_len, dtype=np.int32).reshape(
+                config.batch_size, config.seq_len
+            )
+            % config.vocab_size
+        )
         y = (x + 1) % config.vocab_size
 
         ordinary = trainer.jax.jit(
-            lambda p, o, bx, by: trainer.train_step(
-                p, o, bx, by, config, decay_mask
-            )
+            lambda p, o, bx, by: trainer.train_step(p, o, bx, by, config, decay_mask)
         )
         diagnostic = trainer.jax.jit(
             lambda p, o, bx, by: trainer.diagnostic_train_step(
@@ -1143,23 +1188,44 @@ class TrainerStaticTests(unittest.TestCase):
             np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
 
     def test_validation_csv_contains_probes_and_canonical_final_row(self) -> None:
-        rows: list[trainer.ValidationRow] = [
-            trainer.ValidationRow(
-                250, 8_192_000, "fineweb_probe", "fineweb",
-                262_144, 4.0, np.exp(4.0), 0.25, False
+        rows: list[runlog.ValidationRow] = [
+            runlog.ValidationRow(
+                250,
+                8_192_000,
+                "fineweb_probe",
+                "fineweb",
+                262_144,
+                4.0,
+                np.exp(4.0),
+                0.25,
+                False,
             ),
-            trainer.ValidationRow(
-                500, 16_384_000, "fineweb", "fineweb",
-                10_485_760, 3.5, np.exp(3.5), 8.0, True
+            runlog.ValidationRow(
+                500,
+                16_384_000,
+                "fineweb",
+                "fineweb",
+                10_485_760,
+                3.5,
+                np.exp(3.5),
+                8.0,
+                True,
             ),
-            trainer.ValidationRow(
-                500, 16_384_000, "downstream", "science",
-                8_192, 3.0, np.exp(3.0), 0.03, False
+            runlog.ValidationRow(
+                500,
+                16_384_000,
+                "downstream",
+                "science",
+                8_192,
+                3.0,
+                np.exp(3.0),
+                0.03,
+                False,
             ),
         ]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            trainer.write_validation_csv(root, rows)
+            runlog.write_validation_csv(root, rows)
             contents = (root / trainer.VALIDATION_CSV_NAME).read_text().splitlines()
             temporary = root / f".{trainer.VALIDATION_CSV_NAME}.tmp"
             self.assertFalse(temporary.exists())
@@ -1180,9 +1246,11 @@ class TrainerStaticTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ValueError, "canonical"):
-                trainer.write_validation_csv(Path(directory), (rows[0], rows[2]))
+                runlog.write_validation_csv(Path(directory), (rows[0], rows[2]))
 
-    def test_downstream_batches_mask_document_boundaries_and_exact_targets(self) -> None:
+    def test_downstream_batches_mask_document_boundaries_and_exact_targets(
+        self,
+    ) -> None:
         domain = rig_tokens.DownstreamDomain(
             "science",
             np.asarray([99, 10, 11, 12, 99, 20, 21], dtype=np.uint16),
@@ -1213,13 +1281,17 @@ class TrainerStaticTests(unittest.TestCase):
             np.save(second, np.asarray([99, 3, 4, 5], dtype=np.uint16))
             args = parser.parse_args(
                 [
-                    "--downstream-data", f"science={first}",
-                    "--downstream-data", f"science={second}",
+                    "--downstream-data",
+                    f"science={first}",
+                    "--downstream-data",
+                    f"science={second}",
                 ]
             )
             domains = rig_tokens.load_downstream_domains(
-                manifest=args.downstream_manifest, root=args.downstream_root,
-                documents=args.downstream_data, vocab_size=256,
+                manifest=args.downstream_manifest,
+                root=args.downstream_root,
+                documents=args.downstream_data,
+                vocab_size=256,
             )
         self.assertEqual(len(domains), 1)
         self.assertEqual(domains[0].name, "science")
@@ -1249,7 +1321,9 @@ class TrainerStaticTests(unittest.TestCase):
                                 "bytes": shard.stat().st_size,
                                 "tokens": 3,
                                 "scored_tokens": 2,
-                                "sha256": hashlib.sha256(shard.read_bytes()).hexdigest(),
+                                "sha256": hashlib.sha256(
+                                    shard.read_bytes()
+                                ).hexdigest(),
                                 "documents": [
                                     {
                                         "token_offset": 0,
@@ -1266,14 +1340,18 @@ class TrainerStaticTests(unittest.TestCase):
             )
             args = parser.parse_args(["--downstream-manifest", str(manifest)])
             domains = rig_tokens.load_downstream_domains(
-                manifest=args.downstream_manifest, root=args.downstream_root,
-                documents=args.downstream_data, vocab_size=50_304,
+                manifest=args.downstream_manifest,
+                root=args.downstream_root,
+                documents=args.downstream_data,
+                vocab_size=50_304,
             )
             self.assertEqual(domains[0].scored_tokens, 2)
             with self.assertRaisesRegex(ValueError, "must fit the model vocabulary"):
                 rig_tokens.load_downstream_domains(
-                    manifest=args.downstream_manifest, root=args.downstream_root,
-                    documents=args.downstream_data, vocab_size=50_000,
+                    manifest=args.downstream_manifest,
+                    root=args.downstream_root,
+                    documents=args.downstream_data,
+                    vocab_size=50_000,
                 )
 
     def test_console_writes_only_to_stderr(self) -> None:
@@ -1294,9 +1372,7 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertIn("synchronized training 12.500s", stderr.getvalue())
         self.assertIn("compilation excluded", stderr.getvalue())
         self.assertIn("validation loss", stderr.getvalue())
-        table_lines = [
-            line for line in stderr.getvalue().splitlines() if "│" in line
-        ]
+        table_lines = [line for line in stderr.getvalue().splitlines() if "│" in line]
         self.assertTrue(table_lines)
         self.assertLessEqual(max(map(len, table_lines)), 80)
         self.assertIn("…", stderr.getvalue())
@@ -1356,9 +1432,15 @@ class TrainerStaticTests(unittest.TestCase):
         for devices, local_devices, process_count, device_count in invalid_cases:
             with self.subTest(devices=devices, process_count=process_count):
                 with (
-                    patch.object(trainer.jax, "local_devices", return_value=local_devices),
-                    patch.object(trainer.jax, "process_count", return_value=process_count),
-                    patch.object(trainer.jax, "device_count", return_value=device_count),
+                    patch.object(
+                        trainer.jax, "local_devices", return_value=local_devices
+                    ),
+                    patch.object(
+                        trainer.jax, "process_count", return_value=process_count
+                    ),
+                    patch.object(
+                        trainer.jax, "device_count", return_value=device_count
+                    ),
                     self.assertRaisesRegex(RuntimeError, "4 local TPU v4"),
                 ):
                     trainer.validate_official_topology("official", devices)
@@ -1416,11 +1498,14 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertIn('"eval_compile_seconds":', source)
         self.assertIn('"total_compile_seconds":', source)
         self.assertNotIn('"compile_seconds":', source)
-        self.assertEqual(source.count("compiled_eval = jax.jit("), 1)
+        self.assertEqual(source.count("compiled_eval = "), 1)
         self.assertIn('"validation_curve": VALIDATION_CSV_NAME', source)
+        # Whitespace-insensitive: a formatter may reflow the call chain across
+        # lines, and what matters is that the eval executable is lowered from
+        # the sample shapes and compiled once, not how it is laid out.
+        compact = re.sub(r"\s+", "", source)
         self.assertIn(
-            ").lower(params, sample_x, sample_y, sample_mask).compile()",
-            source,
+            ").lower(params,sample_x,sample_y,sample_mask).compile()", compact
         )
         probe = source.index("if should_run_validation_probe(")
         synchronize = source.index(
@@ -1454,15 +1539,15 @@ class SalvageTests(unittest.TestCase):
             len(metrics.DIAGNOSTIC_FAMILIES),
             len(metrics.DIAGNOSTIC_STATS),
         )
-        return trainer.DiagnosticPoint(
+        return runlog.DiagnosticPoint(
             step, np.full(shape, step / 1000.0, dtype=np.float32)
         )
 
     def test_device_residency_is_bounded_by_a_constant(self) -> None:
         # Without a cap the capture list grows with the run: one small device
         # allocation per capture, all live until the loop ends.
-        self.assertIsInstance(trainer.DIAGNOSTIC_FLUSH_POINTS, int)
-        self.assertGreater(trainer.DIAGNOSTIC_FLUSH_POINTS, 0)
+        self.assertIsInstance(runlog.DIAGNOSTIC_FLUSH_POINTS, int)
+        self.assertGreater(runlog.DIAGNOSTIC_FLUSH_POINTS, 0)
         source = inspect.getsource(trainer.run)
         self.assertIn(
             "len(diagnostic_device_points) >= DIAGNOSTIC_FLUSH_POINTS", source
@@ -1480,26 +1565,27 @@ class SalvageTests(unittest.TestCase):
         config, meta = self._config(), self._meta()
         with tempfile.TemporaryDirectory() as directory:
             out = Path(directory)
-            destination = out / trainer.DIAGNOSTICS_LOG_NAME
-            writer = trainer.open_log(
+            destination = out / runlog.DIAGNOSTICS_LOG_NAME
+            writer = runlog.open_log(
                 destination,
-                trainer.diagnostic_log_columns(meta),
-                config,
-                341_312_256,
+                runlog.diagnostic_log_columns(meta),
+                tokens_per_step=config.batch_size * config.seq_len,
+                flops_per_token=341_312_256,
             )
             for step in (10, 20):
-                trainer.append_log_row(
+                runlog.append_log_row(
                     writer, step, self._point(step).values.reshape(-1)
                 )
-            trainer.close_log(writer)
+            runlog.close_log(writer)
             partial = logpack.read_log(destination)
 
-            trainer.write_diagnostics_log(
+            runlog.write_diagnostics_log(
                 out,
                 [self._point(s) for s in range(10, 201, 10)],
                 meta,
-                config,
-                341_312_256,
+                tokens_per_step=config.batch_size * config.seq_len,
+                final_step=config.final_step,
+                flops_per_token=341_312_256,
             )
             complete = logpack.read_log(destination)
 
@@ -1515,18 +1601,25 @@ class SalvageTests(unittest.TestCase):
         config = self._config(25)
         with tempfile.TemporaryDirectory() as directory:
             out = Path(directory)
-            destination = out / trainer.TRAINING_LOG_NAME
-            writer = trainer.open_log(
-                destination, trainer.training_log_columns(), config, 341_312_256
+            destination = out / runlog.TRAINING_LOG_NAME
+            writer = runlog.open_log(
+                destination,
+                runlog.training_log_columns(),
+                tokens_per_step=config.batch_size * config.seq_len,
+                flops_per_token=341_312_256,
             )
             for step in (1, 10, 20):
-                trainer.append_log_row(writer, step, (1.0, 1e-4, 0.5))
-            trainer.close_log(writer)
+                runlog.append_log_row(writer, step, (1.0, 1e-4, 0.5))
+            runlog.close_log(writer)
             partial = logpack.read_log(destination)
 
             history = np.zeros((config.steps, 3), dtype=np.float32)
-            trainer.write_training_log(
-                out, history, config, flops_per_token=341_312_256
+            runlog.write_training_log(
+                out,
+                history,
+                tokens_per_step=config.batch_size * config.seq_len,
+                final_step=config.final_step,
+                flops_per_token=341_312_256,
             )
             complete = logpack.read_log(destination)
 
@@ -1539,18 +1632,24 @@ class SalvageTests(unittest.TestCase):
         config, meta = self._config(), self._meta()
         missing = Path("/nonexistent/rig-salvage")
         for columns in (
-            trainer.training_log_columns(),
-            trainer.diagnostic_log_columns(meta),
+            runlog.training_log_columns(),
+            runlog.diagnostic_log_columns(meta),
         ):
             with self.subTest(columns=len(columns)):
-                writer = trainer.open_log(
-                    missing / "x.riglog", columns, config, 341_312_256
+                writer = runlog.open_log(
+                    missing / "x.riglog",
+                    columns,
+                    tokens_per_step=config.batch_size * config.seq_len,
+                    flops_per_token=341_312_256,
                 )
-                trainer.append_log_row(writer, 1, np.zeros(len(columns)))
-                trainer.close_log(writer)
+                runlog.append_log_row(writer, 1, np.zeros(len(columns)))
+                runlog.close_log(writer)
         # A run with no traced FLOP count still trains; it just has no log.
         self.assertIsNone(
-            trainer.open_log(
-                missing / "x.riglog", trainer.training_log_columns(), config, None
+            runlog.open_log(
+                missing / "x.riglog",
+                runlog.training_log_columns(),
+                tokens_per_step=config.batch_size * config.seq_len,
+                flops_per_token=None,
             )
         )

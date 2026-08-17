@@ -32,12 +32,16 @@ from rig.data import (
 )
 
 
-def write_shard(path: Path, tokens: list[int], *, magic: int = MAGIC, version: int = 1) -> None:
+def write_shard(
+    path: Path, tokens: list[int], *, magic: int = MAGIC, version: int = 1
+) -> None:
     header = [0] * 256
     header[0] = magic
     header[1] = version
     header[2] = len(tokens)
-    path.write_bytes(struct.pack("<256i", *header) + struct.pack(f"<{len(tokens)}H", *tokens))
+    path.write_bytes(
+        struct.pack("<256i", *header) + struct.pack(f"<{len(tokens)}H", *tokens)
+    )
 
 
 def fresh10_tokens() -> list[int]:
@@ -173,8 +177,12 @@ class ShardTests(unittest.TestCase):
             path = Path(directory) / "tiny.bin"
             write_shard(path, [0, 1, 50256, 42])
             header = read_header(path)
-            self.assertEqual((header.magic, header.version, header.token_count), (MAGIC, 1, 4))
-            info = validate_shard(path, expected_tokens=4, expected_bytes=HEADER_BYTES + 8)
+            self.assertEqual(
+                (header.magic, header.version, header.token_count), (MAGIC, 1, 4)
+            )
+            info = validate_shard(
+                path, expected_tokens=4, expected_bytes=HEADER_BYTES + 8
+            )
             self.assertEqual(info.token_count, 4)
 
     def test_rejects_truncated_header(self) -> None:
@@ -261,10 +269,13 @@ class ManifestTests(unittest.TestCase):
 
     def test_relative_shard_paths_must_be_canonical_posix(self) -> None:
         for relative in ("a/./b.bin", "a//b.bin", "a\\b.bin", "./a.bin"):
-            with self.subTest(relative=relative), self.assertRaisesRegex(
-                DataError, "unsafe shard path"
+            with (
+                self.subTest(relative=relative),
+                self.assertRaisesRegex(DataError, "unsafe shard path"),
             ):
-                data_module._validate_relative_shard_path(relative, Path("manifest.json"))
+                data_module._validate_relative_shard_path(
+                    relative, Path("manifest.json")
+                )
 
     def test_fresh10_shard_rejects_out_of_vocabulary_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -291,7 +302,9 @@ class Fresh10Tests(unittest.TestCase):
                 FRESH10_DOMAINS,
             )
             prepared = verify_fresh10(root, manifest)
-            self.assertEqual(tuple(domain.name for domain in prepared.domains), FRESH10_DOMAINS)
+            self.assertEqual(
+                tuple(domain.name for domain in prepared.domains), FRESH10_DOMAINS
+            )
             self.assertEqual(prepared.scored_tokens, 10 * 8_192)
             self.assertEqual(
                 [document.token_offset for document in prepared.domains[0].documents],
@@ -378,16 +391,31 @@ class Fresh10Tests(unittest.TestCase):
                 with self.subTest(repository=repository):
                     invalid = copy.deepcopy(manifest)
                     invalid["prepared_source"]["repository"] = repository  # type: ignore[index]
-                    with self.assertRaisesRegex(DataError, "invalid prepared repository"):
+                    with self.assertRaisesRegex(
+                        DataError, "invalid prepared repository"
+                    ):
                         load_fresh10_manifest(invalid)
 
     def test_rejects_bad_spans_counts_and_hash_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manifest = materialize_fresh10(Path(directory))
             mutations = (
-                ("span", lambda value: value["domains"][0]["documents"][1].__setitem__("token_offset", 2_048)),
-                ("count", lambda value: value["domains"][0].__setitem__("tokens", 8_195)),
-                ("hash", lambda value: value["domains"][0]["documents"][0].__setitem__("text_sha256", "not-a-hash")),
+                (
+                    "span",
+                    lambda value: value["domains"][0]["documents"][1].__setitem__(
+                        "token_offset", 2_048
+                    ),
+                ),
+                (
+                    "count",
+                    lambda value: value["domains"][0].__setitem__("tokens", 8_195),
+                ),
+                (
+                    "hash",
+                    lambda value: value["domains"][0]["documents"][0].__setitem__(
+                        "text_sha256", "not-a-hash"
+                    ),
+                ),
             )
             for label, mutate in mutations:
                 with self.subTest(label=label):
@@ -450,20 +478,27 @@ class Fresh10Tests(unittest.TestCase):
             with patch("rig.data.urlopen", side_effect=open_fixture) as opener:
                 prepared = prepare_fresh10(root, manifest)
             self.assertEqual(opener.call_count, 10)
-            self.assertEqual(tuple(domain.name for domain in prepared.domains), FRESH10_DOMAINS)
+            self.assertEqual(
+                tuple(domain.name for domain in prepared.domains), FRESH10_DOMAINS
+            )
             self.assertTrue(all(domain.path.is_file() for domain in prepared.domains))
 
 
 class SmokeTests(unittest.TestCase):
     def test_smoke_generation_is_deterministic_and_idempotent(self) -> None:
-        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
             one = prepare_smoke(first)
             two = prepare_smoke(second)
             self.assertEqual(one.train_tokens, 32768)
             self.assertEqual(one.validation_tokens, 8192)
             paths_one = one.validation_files + one.train_files
             paths_two = two.validation_files + two.train_files
-            self.assertEqual([sha256_file(p) for p in paths_one], [sha256_file(p) for p in paths_two])
+            self.assertEqual(
+                [sha256_file(p) for p in paths_one], [sha256_file(p) for p in paths_two]
+            )
             self.assertEqual(
                 [sha256_file(p) for p in paths_one],
                 [
@@ -675,7 +710,9 @@ class DownloadTests(unittest.TestCase):
             response = FakeResponse([b"partial", IncompleteRead(b"", 100)])
 
             with patch("rig.data.urlopen", return_value=response):
-                with self.assertRaisesRegex(DataError, "download interrupted for val.bin"):
+                with self.assertRaisesRegex(
+                    DataError, "download interrupted for val.bin"
+                ):
                     prepare(root, manifest)
             self.assertEqual((root / "val.bin.part").read_bytes(), b"partial")
 

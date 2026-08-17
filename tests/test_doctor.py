@@ -15,8 +15,12 @@ def _tree(root: Path) -> None:
     (root / "rig" / "__init__.py").write_text("x = 1\n", encoding="utf-8")
     (root / "rig" / "kernels" / "a.py").write_text("y = 2\n", encoding="utf-8")
     (root / "recipes" / "reference").mkdir(parents=True)
-    (root / "recipes" / "reference" / "train.py").write_text("z = 3\n", encoding="utf-8")
-    (root / "recipes" / "reference" / "config.yaml").write_text("k: v\n", encoding="utf-8")
+    (root / "recipes" / "reference" / "train.py").write_text(
+        "z = 3\n", encoding="utf-8"
+    )
+    (root / "recipes" / "reference" / "config.yaml").write_text(
+        "k: v\n", encoding="utf-8"
+    )
 
 
 class SourceDigestTests(unittest.TestCase):
@@ -47,7 +51,9 @@ class SourceDigestTests(unittest.TestCase):
                     _tree(root)
                     before, _ = source_digest(root)
                     path = root / "recipes" / "reference" / name
-                    path.write_text(path.read_text(encoding="utf-8") + "# edit\n", encoding="utf-8")
+                    path.write_text(
+                        path.read_text(encoding="utf-8") + "# edit\n", encoding="utf-8"
+                    )
                     self.assertNotEqual(before, source_digest(root)[0])
 
     def test_renaming_a_file_changes_the_digest(self) -> None:
@@ -56,7 +62,9 @@ class SourceDigestTests(unittest.TestCase):
             root = Path(directory)
             _tree(root)
             before, _ = source_digest(root)
-            (root / "rig" / "kernels" / "a.py").rename(root / "rig" / "kernels" / "b.py")
+            (root / "rig" / "kernels" / "a.py").rename(
+                root / "rig" / "kernels" / "b.py"
+            )
             self.assertNotEqual(before, source_digest(root)[0])
 
     def test_unrelated_files_are_ignored(self) -> None:

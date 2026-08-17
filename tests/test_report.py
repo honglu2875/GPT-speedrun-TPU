@@ -58,9 +58,7 @@ class ReportTests(unittest.TestCase):
 
         self.assertEqual(summary.included, tuple(sorted(cases)))
         self.assertEqual(summary.skipped, {})
-        classifications = {
-            run["id"]: run["classification"] for run in payload["runs"]
-        }
+        classifications = {run["id"]: run["classification"] for run in payload["runs"]}
         self.assertEqual(classifications["official-good"], "official")
         self.assertEqual(classifications["official-poor"], "official")
         self.assertEqual(classifications["development"], "diagnostic")
@@ -87,7 +85,9 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(summary.included, ())
         self.assertIn("track is invalid", summary.skipped["bad-track"])
 
-    def test_long_form_diagnostics_build_all_family_and_final_scope_charts(self) -> None:
+    def test_long_form_diagnostics_build_all_family_and_final_scope_charts(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runs = root / "runs"
@@ -192,7 +192,9 @@ class ReportTests(unittest.TestCase):
         self.assertTrue(payload["runs"][0]["selected"])
         self.assertEqual(payload["runs"][0]["classification"], "official")
         self.assertEqual(payload["runs"][0]["flopSource"], "traced")
-        train = next(chart for chart in payload["timeCharts"] if chart["key"] == "train_loss")
+        train = next(
+            chart for chart in payload["timeCharts"] if chart["key"] == "train_loss"
+        )
         self.assertEqual(train["series"][0]["points"][-1], [2.0, 2000.0, 4.0])
         # Shell strings stay in the markup; chart titles now live in the
         # compressed payload, so they are asserted through the decoder.
@@ -214,7 +216,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("gradient L2 norm", coverage)
         self.assertIn("update fourth moment", coverage)
         self.assertIn("parameter fourth moment", coverage)
-        self.assertNotRegex(html, r'<script[^>]+src=|<link[^>]+href=')
+        self.assertNotRegex(html, r"<script[^>]+src=|<link[^>]+href=")
         self.assertNotIn(".slice(0,10)", html)
         self.assertNotIn("Math.min(...xs)", html)
         self.assertIn("filter(r=>r.selected)", html)
@@ -314,7 +316,9 @@ class ReportTests(unittest.TestCase):
         self.assertFalse(summary.included)
         self.assertIn("SHA-256", summary.skipped["tampered-run"])
 
-    def test_malformed_unledgered_timing_is_skipped_without_aborting_report(self) -> None:
+    def test_malformed_unledgered_timing_is_skipped_without_aborting_report(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runs = root / "runs"
@@ -438,7 +442,9 @@ class ReportTests(unittest.TestCase):
                     }
                 },
             }
-            (runs / "records.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
+            (runs / "records.jsonl").write_text(
+                json.dumps(record) + "\n", encoding="utf-8"
+            )
             build_report(runs, root / "report.html")
             html = (root / "report.html").read_text(encoding="utf-8")
             payload = _payload(html)
@@ -483,8 +489,11 @@ def _write_result(
 
 
 def _write_training(
-    run: Path, rows: Sequence[Sequence[float]], *, tokens_per_step: int = 10,
-    flops_per_token: float = 100.0
+    run: Path,
+    rows: Sequence[Sequence[float]],
+    *,
+    tokens_per_step: int = 10,
+    flops_per_token: float = 100.0,
 ) -> Path:
     """Write a packed training log; rows are ``(loss, learning_rate, grad_norm)``."""
 
@@ -504,8 +513,9 @@ def _write_training(
     return path
 
 
-def _write_diagnostics(path: Path, *, tokens_per_step: int = 10,
-                       flops_per_token: float = 100.0) -> None:
+def _write_diagnostics(
+    path: Path, *, tokens_per_step: int = 10, flops_per_token: float = 100.0
+) -> None:
     families = ("param", "grad", "update")
     statistics = (
         "l1_norm",
@@ -622,7 +632,9 @@ class LayerSnapshotTests(unittest.TestCase):
             run.mkdir(parents=True)
             _write_training(run, [(4.5, 1e-4, 0.5), (4.0, 9e-5, 0.4)])
             _write_diagnostics(run / DIAGNOSTICS_LOG_NAME)
-            _write_result(run, validation_artifact=False, tokens=20, validation_loss=3.0)
+            _write_result(
+                run, validation_artifact=False, tokens=20, validation_loss=3.0
+            )
             build_report(runs, root / "report.html")
             payload = _payload((root / "report.html").read_text(encoding="utf-8"))
 
@@ -644,10 +656,10 @@ class PayloadPackingTests(unittest.TestCase):
             runs = root / "runs"
             run = runs / "packed"
             run.mkdir(parents=True)
-            _write_training(
-                run, [(4.5 - i / 1000, 1e-4, 0.5) for i in range(1, 400)]
+            _write_training(run, [(4.5 - i / 1000, 1e-4, 0.5) for i in range(1, 400)])
+            _write_result(
+                run, validation_artifact=False, tokens=3990, validation_loss=3.0
             )
-            _write_result(run, validation_artifact=False, tokens=3990, validation_loss=3.0)
             build_report(runs, root / "report.html")
             html = (root / "report.html").read_text(encoding="utf-8")
 
@@ -695,7 +707,9 @@ class ClientSourceGuardTests(unittest.TestCase):
             runs.mkdir()
             build_report(runs, root / "report.html")
             html = (root / "report.html").read_text(encoding="utf-8")
-        scripts = re.findall(r"<script(?![^>]*id=)[^>]*>(.*?)</script>", html, re.DOTALL)
+        scripts = re.findall(
+            r"<script(?![^>]*id=)[^>]*>(.*?)</script>", html, re.DOTALL
+        )
         return max(scripts, key=len)
 
     def test_draw_never_reaches_for_series_points(self) -> None:

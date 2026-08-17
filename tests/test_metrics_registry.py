@@ -18,9 +18,7 @@ def _assignments(lines) -> dict[tuple[str, int], str]:
 def _snapshot() -> list[str]:
     text = metrics.REGISTRY_PATH.read_text(encoding="utf-8")
     return [
-        line
-        for line in text.splitlines()
-        if line.strip() and not line.startswith("#")
+        line for line in text.splitlines() if line.strip() and not line.startswith("#")
     ]
 
 
@@ -60,7 +58,9 @@ class MetricsRegistryTests(unittest.TestCase):
             [],
             "new entries are registered but not snapshotted; append to "
             f"{metrics.REGISTRY_PATH.name}:\n"
-            + "\n".join(f"{kind}\t{value}\t{current[(kind, value)]}" for kind, value in added),
+            + "\n".join(
+                f"{kind}\t{value}\t{current[(kind, value)]}" for kind, value in added
+            ),
         )
 
     def test_ids_and_names_are_unique_positive_int32(self) -> None:

@@ -88,7 +88,9 @@ class ClusterTests(unittest.TestCase):
             patch("rig.harness.cluster.subprocess.run", return_value=completed),
             patch("rig.harness.cluster.time.sleep"),
         ):
-            with self.assertRaisesRegex(ClusterAccessError, "authorized_keys") as raised:
+            with self.assertRaisesRegex(
+                ClusterAccessError, "authorized_keys"
+            ) as raised:
                 probe_cluster("slice-w-[0-1]", 2)
         self.assertEqual(str(raised.exception), SSH_SETUP_GUIDANCE)
 
@@ -130,7 +132,9 @@ class ClusterTests(unittest.TestCase):
         remote_failure = subprocess.CompletedProcess([], 5, "", "setup failed")
         with (
             patch("rig.harness.cluster.shutil.which", return_value="/usr/bin/pdsh"),
-            patch("rig.harness.cluster.subprocess.run", return_value=remote_failure) as run,
+            patch(
+                "rig.harness.cluster.subprocess.run", return_value=remote_failure
+            ) as run,
             patch("rig.harness.cluster.time.sleep") as sleep,
         ):
             with self.assertRaisesRegex(ClusterError, "setup failed"):
@@ -144,11 +148,18 @@ class ClusterTests(unittest.TestCase):
                 host_expression="slice-w-[0-3]",
                 host_count=4,
                 cwd=Path("/repo with space/recipes/reference"),
-                command=("/repo with space/.venv/bin/python", "train.py", "--seed", "7"),
+                command=(
+                    "/repo with space/.venv/bin/python",
+                    "train.py",
+                    "--seed",
+                    "7",
+                ),
                 environment={"SAFE_VALUE": "value with space", "RANK_COUNT": "4"},
             )
 
-        self.assertEqual(command[:8], ["pdsh", "-S", "-R", "ssh", "-f", "4", "-w", "slice-w-[0-3]"])
+        self.assertEqual(
+            command[:8], ["pdsh", "-S", "-R", "ssh", "-f", "4", "-w", "slice-w-[0-3]"]
+        )
         self.assertEqual(command[8], "-N")
         self.assertIn("cd '/repo with space/recipes/reference'", command[-1])
         self.assertIn("SAFE_VALUE='value with space'", command[-1])
@@ -205,7 +216,9 @@ class ClusterTests(unittest.TestCase):
         # The critical safety property: excluded paths are protected from
         # deletion, which is exactly what --delete-excluded would undo.
         self.assertTrue(all("--delete-excluded" not in command for command in commands))
-        self.assertTrue(all(".git/" in command and "/runs/" in command for command in commands))
+        self.assertTrue(
+            all(".git/" in command and "/runs/" in command for command in commands)
+        )
         # Derived caches are excluded from transfer but marked "risk" so they
         # can still be deleted. Without this, a package directory deleted on
         # the controller survives on the peer as a bytecode-only directory that
@@ -215,9 +228,7 @@ class ClusterTests(unittest.TestCase):
         for command in commands:
             self.assertIn("--filter", command)
             self.assertIn("R __pycache__/", command)
-            self.assertLess(
-                command.index("--filter"), command.index("--exclude")
-            )
+            self.assertLess(command.index("--filter"), command.index("--exclude"))
         self.assertEqual(
             {command[-1] for command in commands},
             {"slice-w-1:/repo/", "slice-w-2:/repo/"},
@@ -236,7 +247,9 @@ class ClusterTests(unittest.TestCase):
             self.assertIn(critical, _PROTECTED_RSYNC_EXCLUDES)
             self.assertNotIn(critical, _DERIVED_CACHE_EXCLUDES)
 
-    def test_ram_cache_preflight_checks_mount_then_creates_link_on_all_hosts(self) -> None:
+    def test_ram_cache_preflight_checks_mount_then_creates_link_on_all_hosts(
+        self,
+    ) -> None:
         inventory = ClusterInventory(
             host_expression="slice-w-[0-1]",
             hosts=("slice-w-0", "slice-w-1"),
@@ -263,7 +276,7 @@ class ClusterTests(unittest.TestCase):
         self.assertIn(str(RAM_CACHE_ROOT), command)
         self.assertIn("sudo -n chown", command)
         self.assertIn("find /dev/shm/.speedrun-cache -type d", command)
-        self.assertNotIn("chown -R root:\"$group\" -- /dev/shm ", command)
+        self.assertNotIn('chown -R root:"$group" -- /dev/shm ', command)
 
     def test_ram_cache_preflight_reports_mount_instruction(self) -> None:
         inventory = ClusterInventory(
@@ -275,13 +288,17 @@ class ClusterTests(unittest.TestCase):
             reported_hostnames={"slice-w-0": "slice-w-0", "slice-w-1": "slice-w-1"},
         )
         with (
-            patch("rig.harness.cluster.run_pdsh", side_effect=ClusterError("mount failed")),
+            patch(
+                "rig.harness.cluster.run_pdsh", side_effect=ClusterError("mount failed")
+            ),
             self.assertRaisesRegex(ClusterError, "mount.*make prepare") as raised,
         ):
             prepare_ram_cache(Path("/repo"), inventory)
         self.assertEqual(str(raised.exception), RAM_CACHE_SETUP_GUIDANCE)
 
-    def test_rsync_bootstrap_attempts_noninteractive_apt_get_on_every_host(self) -> None:
+    def test_rsync_bootstrap_attempts_noninteractive_apt_get_on_every_host(
+        self,
+    ) -> None:
         inventory = ClusterInventory(
             host_expression="slice-w-[0-1]",
             hosts=("slice-w-0", "slice-w-1"),
@@ -312,7 +329,7 @@ class ClusterConfigTests(unittest.TestCase):
             self.assertEqual(load_config(root), configured)
 
             (root / ".rig.toml").write_text(
-                "[rig]\ndata_path = \"shm\"\nartifacts_path = \"runs\"\n",
+                '[rig]\ndata_path = "shm"\nartifacts_path = "runs"\n',
                 encoding="utf-8",
             )
             self.assertEqual(load_config(root).tpu_vm_count, 1)

@@ -144,9 +144,7 @@ class AttentionTilePolicyTests(unittest.TestCase):
             kernel_implementation_hash(backend="jax_flash"),
             JAX_FLASH_SOURCE_SHA256,
         )
-        expected = AttentionTilePlan(
-            512, 512, 256, 512, 256, 512, 256, 256, 512, 256
-        )
+        expected = AttentionTilePlan(512, 512, 256, 512, 256, 512, 256, 256, 512, 256)
         self.assertEqual(lookup_shipped_tuning(make_key()), expected)
         self.assertIsNone(lookup_shipped_tuning(make_key(jax_version="0.11.1")))
         self.assertIsNone(
@@ -173,14 +171,10 @@ class AttentionTilePolicyTests(unittest.TestCase):
 class AutotuneCacheTests(unittest.TestCase):
     def test_key_digest_is_order_independent_and_sensitive(self) -> None:
         key = make_key()
-        reordered = AutotuneKey.from_dict(
-            dict(reversed(list(key.to_dict().items())))
-        )
+        reordered = AutotuneKey.from_dict(dict(reversed(list(key.to_dict().items()))))
         self.assertEqual(key.digest, reordered.digest)
         self.assertNotEqual(key.digest, make_key(sequence=512).digest)
-        self.assertNotEqual(
-            key.digest, make_key(conditional_rescale=True).digest
-        )
+        self.assertNotEqual(key.digest, make_key(conditional_rescale=True).digest)
 
     def test_resolution_is_shipped_then_heuristic_and_purely_key_derived(self) -> None:
         # Both tiers are pure functions of the key. That is what lets every
@@ -290,9 +284,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
         with self.assertRaisesRegex(
             NoSuccessfulCandidateError, "RuntimeError"
         ) as caught:
-            benchmark_tile_candidates(
-                (bad,), fail, warmup_runs=0, measured_runs=1
-            )
+            benchmark_tile_candidates((bad,), fail, warmup_runs=0, measured_runs=1)
         self.assertEqual(len(caught.exception.measurements), 1)
         self.assertEqual(caught.exception.measurements[0].status, "error")
 

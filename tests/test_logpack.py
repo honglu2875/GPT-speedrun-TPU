@@ -185,9 +185,7 @@ class LogPackTests(unittest.TestCase):
                             },
                         )
             with self.assertRaisesRegex(ValueError, "at least one column"):
-                logpack.LogWriter(
-                    path, [], tokens_per_step=1_024, flops_per_token=1.0
-                )
+                logpack.LogWriter(path, [], tokens_per_step=1_024, flops_per_token=1.0)
 
     def test_size_is_the_declared_layout(self) -> None:
         rows, columns = 100, 4

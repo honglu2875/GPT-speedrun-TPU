@@ -101,11 +101,11 @@ class ClusterProfileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             path = root / ".rig.toml"
-            path.write_text('[rig]\n\n[cluster.x]\nwat = 1\n', encoding="utf-8")
+            path.write_text("[rig]\n\n[cluster.x]\nwat = 1\n", encoding="utf-8")
             with self.assertRaisesRegex(ConfigError, "unknown setting"):
                 load_clusters(root)
             path.write_text(
-                '[rig]\n\n[cluster.x]\ntpu_vm_count = 2\n'
+                "[rig]\n\n[cluster.x]\ntpu_vm_count = 2\n"
                 'tpu_vm_hosts = "a-[0-1]"\nchips_per_host = 0\n',
                 encoding="utf-8",
             )
@@ -116,9 +116,11 @@ class ClusterProfileTests(unittest.TestCase):
 class AcceleratorContractTests(unittest.TestCase):
     def test_v5e_passes_its_own_contract_and_fails_the_v4_one(self) -> None:
         devices = [_Device("TPU v5 lite") for _ in range(4)]
-        with unittest.mock.patch("jax.devices", return_value=devices), unittest.mock.patch(
-            "jax.process_count", return_value=1
-        ), unittest.mock.patch("jax.local_device_count", return_value=4):
+        with (
+            unittest.mock.patch("jax.devices", return_value=devices),
+            unittest.mock.patch("jax.process_count", return_value=1),
+            unittest.mock.patch("jax.local_device_count", return_value=4),
+        ):
             ok = check_devices(
                 require_tpu=True, accelerator="TPU v5 lite", chips_per_host=4
             )
@@ -131,9 +133,11 @@ class AcceleratorContractTests(unittest.TestCase):
 
     def test_wrong_chip_count_is_rejected(self) -> None:
         devices = [_Device("TPU v5 lite") for _ in range(2)]
-        with unittest.mock.patch("jax.devices", return_value=devices), unittest.mock.patch(
-            "jax.process_count", return_value=1
-        ), unittest.mock.patch("jax.local_device_count", return_value=2):
+        with (
+            unittest.mock.patch("jax.devices", return_value=devices),
+            unittest.mock.patch("jax.process_count", return_value=1),
+            unittest.mock.patch("jax.local_device_count", return_value=2),
+        ):
             result = check_devices(
                 require_tpu=True, accelerator="TPU v5 lite", chips_per_host=4
             )

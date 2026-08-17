@@ -38,11 +38,11 @@ def _probe(hosts, *, local, remote_controller=False, artifact_host=""):
     """Run probe_cluster against a fake slice, without ssh or pdsh."""
 
     reported = {host: host for host in hosts}
-    with patch(
-        "rig.harness.cluster.expand_host_expression", return_value=tuple(hosts)
-    ), patch("rig.harness.cluster.socket.gethostname", return_value=local), patch(
-        "rig.harness.cluster.subprocess.run"
-    ) as run:
+    with (
+        patch("rig.harness.cluster.expand_host_expression", return_value=tuple(hosts)),
+        patch("rig.harness.cluster.socket.gethostname", return_value=local),
+        patch("rig.harness.cluster.subprocess.run") as run,
+    ):
         run.return_value = type(
             "R", (), {"returncode": 0, "stdout": "", "stderr": ""}
         )()
@@ -331,7 +331,7 @@ class SingleRemoteHostTests(unittest.TestCase):
         )
         # ...but takes no distributed initialization.
         self.assertIn("distributed = config.tpu_vm_count > 1", source)
-        self.assertIn('if distributed:', source)
+        self.assertIn("if distributed:", source)
 
 
 if __name__ == "__main__":

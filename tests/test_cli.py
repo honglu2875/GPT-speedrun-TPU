@@ -33,9 +33,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(smoke.tokenizer_id, "synthetic-byte-v1")
         contract = cli._reference_contract("official")
         self.assertEqual(contract.extra["model"]["vocab_size"], 50_304)
-        self.assertEqual(
-            contract.extra["model"]["semantic_vocab_size"], 50_304
-        )
+        self.assertEqual(contract.extra["model"]["semantic_vocab_size"], 50_304)
 
     def test_reserved_trainer_arguments_cannot_override_harness(self) -> None:
         for arguments in (
@@ -53,8 +51,11 @@ class CliTests(unittest.TestCase):
             ["--down", "other.json"],
             ["--train-tokens", "100"],
         ):
-            with self.subTest(arguments=arguments), self.assertRaisesRegex(
-                ConfigError, "harness-controlled|controlled by the harness"
+            with (
+                self.subTest(arguments=arguments),
+                self.assertRaisesRegex(
+                    ConfigError, "harness-controlled|controlled by the harness"
+                ),
             ):
                 cli._reject_reserved_trainer_args(arguments)
 
@@ -91,7 +92,9 @@ class CliTests(unittest.TestCase):
             args = cli.build_parser().parse_args(["clone", "source", "variant"])
 
             with patch("rig.cli.repo_root", return_value=root):
-                with self.assertRaisesRegex(ConfigError, "configuration does not exist"):
+                with self.assertRaisesRegex(
+                    ConfigError, "configuration does not exist"
+                ):
                     cli.command_clone(args)
 
             self.assertFalse((root / "recipes" / "variant").exists())
@@ -237,7 +240,9 @@ class CliTests(unittest.TestCase):
         remote = run.call_args.args[1]
         self.assertIn("--training-tokens 3900000000", remote)
         self.assertIn("--profile official", remote)
-        self.assertEqual(run.call_args.kwargs["timeout"], cli._remote_prepare_timeout(config, args))
+        self.assertEqual(
+            run.call_args.kwargs["timeout"], cli._remote_prepare_timeout(config, args)
+        )
 
     def test_remote_prepare_timeout_scales_with_routed_corpus_bytes(self) -> None:
         args = cli.build_parser().parse_args(["prepare", "--non-interactive"])
@@ -353,7 +358,9 @@ class CliTests(unittest.TestCase):
             self.assertTrue(cli._uses_repo_shm_cache("/dev/shm", root))
             self.assertFalse(cli._uses_repo_shm_cache("data", root))
 
-    def test_profile_launches_every_configured_host_with_controller_identity(self) -> None:
+    def test_profile_launches_every_configured_host_with_controller_identity(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             recipe = root / "recipes" / "variant"
@@ -427,8 +434,11 @@ class CliTests(unittest.TestCase):
         self.assertFalse(hasattr(LocalConfig(), "report_admission_loss"))
         prepare = cli.build_parser().parse_args(["prepare"])
         target_action = next(
-            action for action in cli.build_parser()._subparsers._group_actions[0]
-            .choices["prepare"]._actions
+            action
+            for action in cli.build_parser()
+            ._subparsers._group_actions[0]
+            .choices["prepare"]
+            ._actions
             if action.dest == "target_loss"
         )
         self.assertIn("smoke/development", target_action.help)
@@ -527,15 +537,17 @@ class CliTests(unittest.TestCase):
         self.assertIsNone(cli._recorded_downstream_tokens({"provenance": {}}))
         with self.assertRaisesRegex(cli.HarnessError, "invalid domain row"):
             cli._recorded_downstream_tokens(
-                {"provenance": {"fresh10": {"domains": {"science": {"scored_tokens": 0}}}}}
+                {
+                    "provenance": {
+                        "fresh10": {"domains": {"science": {"scored_tokens": 0}}}
+                    }
+                }
             )
 
     def test_verify_recovers_training_budget_without_retroactive_default(self) -> None:
         self.assertIsNone(cli._recorded_training_tokens({}))
         self.assertIsNone(
-            cli._recorded_training_tokens(
-                {"constraints": {"training_tokens": None}}
-            )
+            cli._recorded_training_tokens({"constraints": {"training_tokens": None}})
         )
         self.assertEqual(
             cli._recorded_training_tokens(
@@ -544,9 +556,7 @@ class CliTests(unittest.TestCase):
             624_984_064,
         )
         with self.assertRaisesRegex(cli.HarnessError, "training-token"):
-            cli._recorded_training_tokens(
-                {"constraints": {"training_tokens": 0}}
-            )
+            cli._recorded_training_tokens({"constraints": {"training_tokens": 0}})
 
 
 if __name__ == "__main__":

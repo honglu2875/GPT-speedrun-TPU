@@ -73,9 +73,7 @@ class TiledTiedCrossEntropyTests(unittest.TestCase):
     def setUp(self) -> None:
         hidden_rng = np.random.default_rng(7)
         embedding_rng = np.random.default_rng(11)
-        self.hidden = jnp.asarray(
-            hidden_rng.normal(size=(2, 3, 5)).astype(np.float32)
-        )
+        self.hidden = jnp.asarray(hidden_rng.normal(size=(2, 3, 5)).astype(np.float32))
         # Deliberately use a semantic vocabulary, padded storage, and a tile
         # size that divides neither one.
         self.embedding = jnp.asarray(
@@ -157,9 +155,7 @@ class TiledTiedCrossEntropyTests(unittest.TestCase):
         """Catch target reductions that silently differ from the MXU dot."""
 
         rng = np.random.default_rng(29)
-        hidden = jnp.asarray(
-            rng.normal(0.0, 0.5, size=(2, 3, 768)).astype(np.float32)
-        )
+        hidden = jnp.asarray(rng.normal(0.0, 0.5, size=(2, 3, 768)).astype(np.float32))
         embedding = jnp.asarray(
             rng.normal(0.0, 0.5, size=(259, 768)).astype(np.float32)
         )
@@ -243,16 +239,13 @@ class TiledTiedCrossEntropyTests(unittest.TestCase):
 
         def dense(hidden: jax.Array, embedding: jax.Array) -> jax.Array:
             return jnp.sum(
-                dense_losses(hidden, embedding, self.targets, 11, jnp.float32)
-                * weights
+                dense_losses(hidden, embedding, self.targets, 11, jnp.float32) * weights
             )
 
         expected = jax.value_and_grad(dense, argnums=(0, 1))(
             self.hidden, self.embedding
         )
-        actual = jax.value_and_grad(tiled, argnums=(0, 1))(
-            self.hidden, self.embedding
-        )
+        actual = jax.value_and_grad(tiled, argnums=(0, 1))(self.hidden, self.embedding)
         np.testing.assert_allclose(actual[0], expected[0], rtol=2e-6, atol=2e-6)
         np.testing.assert_allclose(actual[1][0], expected[1][0], rtol=3e-6, atol=3e-6)
         np.testing.assert_allclose(actual[1][1], expected[1][1], rtol=3e-6, atol=3e-6)
@@ -268,13 +261,9 @@ class TiledTiedCrossEntropyTests(unittest.TestCase):
                 compute_dtype=jnp.float32,
             )
 
-        forward_shapes = jaxpr_shapes(
-            jax.make_jaxpr(loss)(self.hidden, self.embedding)
-        )
+        forward_shapes = jaxpr_shapes(jax.make_jaxpr(loss)(self.hidden, self.embedding))
         backward_shapes = jaxpr_shapes(
-            jax.make_jaxpr(jax.grad(loss, argnums=(0, 1)))(
-                self.hidden, self.embedding
-            )
+            jax.make_jaxpr(jax.grad(loss, argnums=(0, 1)))(self.hidden, self.embedding)
         )
         for shapes in (forward_shapes, backward_shapes):
             self.assertNotIn((6, 11), shapes)
