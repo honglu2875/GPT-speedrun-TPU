@@ -54,7 +54,7 @@ uv --cache-dir /tmp/uv-cache run --frozen --no-sync rig prepare \
 ```
 
 It asks for the data-cache root, data and run profiles, persistent artifact
-directory, TPU VM host count, default track, checkpoint retention, colors, a
+directory, TPU VM host count, default track, checkpoint policy, colors, a
 smoke/development loss target, and an immutable corpus-capacity budget. The
 saved budget selects the dataset used by every non-smoke run; the default 2.6B
 request routes to the 4B corpus and covers the 500M × 5-TPP transfer point.
@@ -147,9 +147,83 @@ For automation on a four-host v4-32, bypass the questions:
 ```bash
 uv run --frozen --no-sync rig prepare \
   --non-interactive --path shm/ --profile official \
-  --run-profile official --track open --checkpoints qualifying \
+  --run-profile official --track open --checkpoint-policy qualifying \
   --tpu-vm-count 4 --tpu-vm-hosts 't1v-n-a09f5679-w-[0-3]'
 ```
+
+### Named corpora
+
+`rig dataset` prepares and distributes corpora by name, independently of any
+saved settings:
+
+```bash
+rig dataset list                        # capacities, and what is present here
+rig dataset prepare hero --shards 105   # download and verify only what you need
+rig dataset ship hero --cluster v6e-8   # send it to hosts that cannot download
+rig dataset status --cluster v6e-8      # presence here and on the cluster
+```
+
+`--shards` matters: 500M at 20 TPP needs 101 of hero's 749 shards, about
+19 GiB rather than 140 GiB. Shipping is idempotent, so an interrupted transfer
+resumes rather than failing.
+
+A cluster can name the corpus it expects:
+
+```toml
+[cluster.v6e-8]
+dataset = "hero"
+```
+
+When set, that name is authoritative: a missing corpus stops the run with the
+commands that fix it, instead of quietly falling back to whichever corpus the
+`training_tokens` capacity happens to select. Leaving it empty keeps the
+capacity routing described above, so existing clusters are unaffected.
+
+### Orchestrating a slice you are not part of
+
+Hosts that are reachable by SSH but have no internet — preemptible pods, for
+instance — can be driven from a machine that holds no accelerator:
+
+```toml
+[cluster.v6e-8]
+tpu_vm_hosts      = "10.164.15.196"
+tpu_vm_count      = 1
+accelerator       = "TPU v6 lite"
+chips_per_host    = 8
+remote_controller = true
+artifact_host     = "10.164.15.196"   # optional; defaults to the first host
+```
+
+`remote_controller` says this machine orchestrates without taking a JAX rank.
+One host is designated to write run artifacts, which are pulled back here when
+the run ends and periodically while it runs, so a job that dies still leaves a
+usable partial curve. A single remote host is a valid target: it launches
+remotely but takes no distributed initialization.
+
+For a peer with no route to PyPI, `rig prepare` ships what it needs from here
+rather than expecting it to download:
+
+```bash
+rig prepare --cluster v6e-8 --non-interactive --yes --offline --ship-data
+```
+
+That sends the uv binary, the uv-managed interpreter, the package cache, the
+source tree, and (with `--ship-data`) the prepared corpus. `--offline` matters:
+`--frozen` alone still consults the package index, so the cache is not enough
+on its own.
+
+### Checkpoints
+
+One flag decides what happens to model weights:
+
+```bash
+rig run reference --checkpoint-policy always      # keep them
+rig run reference --checkpoint-policy qualifying  # keep only at or below target
+rig run reference --checkpoint-policy none        # never write them
+```
+
+`none` skips the write rather than writing and deleting, which matters at 500M
+where a checkpoint is about 2 GB. It is restricted to open/dev research runs.
 
 ## Data profiles
 

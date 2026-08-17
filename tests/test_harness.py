@@ -561,7 +561,7 @@ class HarnessRunTests(unittest.TestCase):
     def test_none_retention_records_the_digest_then_deletes(self) -> None:
         # The weights are still hashed into the record before removal, so the
         # run remains attributable to a specific model even without them.
-        outcome = run_recipe(self.config(checkpoint_retention="none-after-validation"))
+        outcome = run_recipe(self.config(checkpoint_retention="none"))
         self.assertIsNone(outcome.checkpoint_path)
         self.assertFalse((outcome.run_dir / "model.npz").exists())
         self.assertFalse(outcome.record["checkpoint"]["retained"])

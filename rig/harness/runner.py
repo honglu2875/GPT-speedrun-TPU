@@ -308,7 +308,7 @@ def run_recipe(config: RunConfig) -> RunOutcome:
         # the entire accepted evaluation block without retaining caller aliases.
         record["evaluations"] = dict(validated.evaluations)
 
-    keep_checkpoint = config.checkpoint_retention in ("always", "all") or (
+    keep_checkpoint = config.checkpoint_retention == "always" or (
         config.checkpoint_retention == "qualifying" and qualified
     )
     checkpoint_path: Path | None = validated.checkpoint_path
@@ -549,9 +549,7 @@ def _validate_config(
         raise ConfigurationError("profile must be a non-empty simple name")
     if config.track not in ("open", "sample_efficiency"):
         raise ConfigurationError("track must be 'open' or 'sample_efficiency'")
-    if config.checkpoint_retention not in (
-        "always", "qualifying", "none", "all", "none-after-validation"
-    ):
+    if config.checkpoint_retention not in ("always", "qualifying", "none"):
         raise ConfigurationError("invalid checkpoint retention policy")
     if not isinstance(config.require_checkpoint, bool):
         raise ConfigurationError("require_checkpoint must be boolean")

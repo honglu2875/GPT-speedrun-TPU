@@ -65,7 +65,7 @@ Every accepted run writes:
 - `diagnostics.csv`: sparse parameter, gradient, and update statistics for every
   supported model scope and statistic;
 - `checkpoint.npz`, except for explicit open/dev study runs using
-  `--omit-checkpoint`;
+  `--checkpoint-policy none`;
 - `metrics.json`, with the resolved tier, exact parameter count, Complete(d)P
   multipliers, data-sharding rule, system topology, and result protocol.
 
@@ -76,10 +76,11 @@ runs enable all diagnostics by default, every 10 and 500 steps respectively
 run every 500 steps and count inside `train_seconds`; canonical final FineWeb
 and Fresh10 evaluation run outside it.
 
-`--omit-checkpoint` is restricted to open/dev research. It preserves metrics,
-curves, immutable records, and re-verification while avoiding hundreds of
-megabytes of weights at every sweep point. Official and sample-efficiency runs
-still require a checkpoint.
+`--checkpoint-policy none` is restricted to open/dev research. It preserves
+metrics, curves, immutable records, and re-verification while never writing
+hundreds of megabytes of weights at every sweep point. `qualifying` keeps them
+only at or below the target loss; `always` keeps them regardless. Official and
+sample-efficiency runs still require a checkpoint.
 
 Use the harness rather than invoking `train.py` directly:
 
