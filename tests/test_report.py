@@ -895,6 +895,16 @@ class ClientSourceGuardTests(unittest.TestCase):
         self.assertIn("frameCache.get(s)", script[start:end])
         self.assertIn("frameCache.set(s,", script[start:end])
 
+    def _body_payload(self) -> dict:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "runs"
+            (runs / "a").mkdir(parents=True)
+            _write_training(runs / "a", [(4.5, 1e-4, 0.5), (4.0, 9e-5, 0.4)])
+            _write_result(runs / "a", validation_artifact=False)
+            build_report(runs, root / "report.html")
+            return _payload((root / "report.html").read_text(encoding="utf-8"))
+
     def _body(self) -> str:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -948,6 +958,34 @@ class ClientSourceGuardTests(unittest.TestCase):
         body = script[start:end]
         self.assertIn("back-to-studies", body)
         self.assertIn("location.reload()", body)
+
+    def test_a_panel_with_nothing_to_draw_is_hidden(self) -> None:
+        """Metrics come and go, so most reports carry charts that do not apply.
+
+        A routed run records routing series a dense one never will. Leaving an
+        empty frame with a caption for each of them buries the charts that do
+        have data, so the panel is hidden instead -- and hidden rather than
+        removed, so it returns when the selection changes.
+        """
+
+        script = self._script()
+        start = script.index("function draw(item){")
+        end = script.index("function axisToStep(", start)
+        body = script[start:end]
+        self.assertIn("item.article.hidden=true", body)
+        self.assertIn("item.article.hidden=false", body)
+
+    def test_only_recorded_series_reach_the_payload(self) -> None:
+        """A declared chart nobody recorded must not ship as an empty chart."""
+
+        from rig.report import _ROUTER_CHARTS
+
+        self.assertTrue(_ROUTER_CHARTS)
+        payload = self._body_payload()
+        keys = {chart["key"] for chart in payload["timeCharts"]}
+        # The fixture runs are dense, so no routing series exists for them.
+        for spec in _ROUTER_CHARTS:
+            self.assertNotIn(spec.metric, keys)
 
     def test_notice_fold_stays_hidden_when_there_is_nothing_to_say(self) -> None:
         body = self._body()

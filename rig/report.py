@@ -1029,6 +1029,17 @@ def _report_payload(
         if chart["series"]:
             time_charts.append(chart)
     time_charts.append(_training_chart(runs, "learning_rate", "Learning rate", "rate"))
+    # Routing, for mixture-of-experts runs. Every one of these is empty for a
+    # dense run and dropped by the filter below, so adding them costs those
+    # runs nothing. Without them a routed report shows a loss curve and no
+    # sign of whether the router was doing anything, which is the one question
+    # a routed run exists to answer.
+    for spec in _ROUTER_CHARTS:
+        if spec.kind != "line":
+            # No other kind is rendered yet; drawing it as a timeline would be
+            # worse than not drawing it, because it would look correct.
+            continue
+        time_charts.append(_training_chart(runs, spec.metric, spec.title, spec.unit))
 
     time_charts = [chart for chart in time_charts if chart["series"]]
 
@@ -1105,6 +1116,41 @@ def _report_payload(
         "notices": list(dict.fromkeys(notices)),
         "skipped": [{"run": key, "reason": value} for key, value in skipped.items()],
     }
+
+
+@dataclass(frozen=True)
+class SeriesChart:
+    """One model-wide series to plot, and how to plot it.
+
+    The registry below is meant to grow. A metric added to
+    ``rig/metrics.py`` records itself into every artifact automatically, but
+    nothing plots it until it appears here -- which is deliberate, because how
+    a quantity should be drawn is a judgement the registry has no way to make.
+
+    ``kind`` carries that judgement. Everything so far is a line against the
+    time axis; a quantity that is a distribution rather than a scalar -- a
+    routing histogram, say -- wants bars against expert index, with counts on
+    the other axis, and would arrive here as a new kind rather than being bent
+    into a timeline. A chart whose metric no run recorded is dropped before the
+    payload is written, so declaring one costs nothing to runs without it.
+    """
+
+    metric: str
+    title: str
+    unit: str
+    kind: str = "line"
+
+
+# Model-wide routing series, in the order they are worth reading: is the load
+# even, is the router deciding, and is anything running away.
+_ROUTER_CHARTS = (
+    SeriesChart("router.balance_loss", "Router balance loss", "1.0 even, E collapsed"),
+    SeriesChart("router.max_load", "Busiest expert's share", "fraction of assignments"),
+    SeriesChart("router.min_load", "Idlest expert's share", "fraction of assignments"),
+    SeriesChart("router.entropy", "Routing entropy", "nats; ln(E) is no preference"),
+    SeriesChart("router.top1_gate", "Mean top-1 gate weight", "weight"),
+    SeriesChart("router.logit_rms", "Router logit RMS", "RMS"),
+)
 
 
 def _training_chart(
@@ -2034,7 +2080,17 @@ function draw(item){
  const c=item.canvas,rect=c.getBoundingClientRect(),dpr=Math.min(devicePixelRatio||1,2),w=Math.max(1,rect.width),h=Math.max(1,rect.height);
  if(c.width!==Math.round(w*dpr)||c.height!==Math.round(h*dpr)){c.width=Math.round(w*dpr);c.height=Math.round(h*dpr)}
  const g=c.getContext('2d');g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,w,h);const m={l:54,r:14,t:12,b:31},b=bounds(item);
- if(!b){g.fillStyle='#91a0b8';g.font='12px system-ui';g.textAlign='center';g.fillText('No selected run has this metric',w/2,h/2);item._plot=null;return}
+ if(!b){
+  // Hide the whole panel rather than leaving an empty frame with a caption.
+  // Metrics come and go -- a routed run records routing series a dense one
+  // never will -- so a report is normally full of charts that do not apply to
+  // whatever is selected, and a grid of empty frames buries the ones that do.
+  // The panel is hidden rather than removed so it comes straight back when the
+  // selection changes.
+  if(item.article){item.article.hidden=true;item._plot=null;return}
+  g.fillStyle='#91a0b8';g.font='12px system-ui';g.textAlign='center';
+  g.fillText('No selected run has this metric',w/2,h/2);item._plot=null;return}
+ if(item.article)item.article.hidden=false;
  const tx0=transformX(item,b.x0),tx1=transformX(item,b.x1),X=x=>m.l+(transformX(item,x)-tx0)/(tx1-tx0)*(w-m.l-m.r),Y=y=>m.t+(b.y1-y)/(b.y1-b.y0)*(h-m.t-m.b),IX=x=>untransformX(item,tx0+(x-m.l)/(w-m.l-m.r)*(tx1-tx0)),IY=y=>b.y1-(y-m.t)/(h-m.t-m.b)*(b.y1-b.y0);
  g.strokeStyle='#253047';g.lineWidth=1;g.fillStyle='#7e8da6';g.font='10px ui-monospace,monospace';
  for(let i=0;i<=4;i++){const y=m.t+(h-m.t-m.b)*i/4,v=b.y1-(b.y1-b.y0)*i/4;g.beginPath();g.moveTo(m.l,y);g.lineTo(w-m.r,y);g.stroke();g.textAlign='right';g.fillText(fmt(v,3),m.l-7,y+3)}

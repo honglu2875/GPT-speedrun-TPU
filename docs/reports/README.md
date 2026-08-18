@@ -46,6 +46,7 @@ by-product:
 | lr-batch-sweep-125M | 1,440 | 8 | 8.2 MB |
 | 3-seed-gradient-spike | 1,440 | 8 | 6.6 MB |
 | 8k-lr-sweep-60M | 1,440 | 8 | 2.4 MB |
+| moe-lr-sweep-8k | 1,440 | 8 | 7.2 MB |
 
 The two large ones carry layer detail because gradient spikes are visible in
 it, and studying them is the point. This is deliberate discretion, not a
@@ -55,6 +56,19 @@ Charts resample against the visible span as you zoom, keeping each pixel
 bucket's minimum and maximum rather than one representative point — so a spike
 inside the embedded data stays visible at every zoom level. It cannot recover a
 sample that thinning already dropped.
+
+Charts are per-metric, and a metric no selected run recorded is not drawn at
+all — the panel is hidden rather than left as an empty frame. Routed runs
+record routing series a dense run never will, so most reports carry charts that
+do not apply to part of the selection, and a grid of empty frames would bury
+the ones that do.
+
+Which metrics get charted is a declared list in `rig/report.py`, separate from
+the metric registry, because how a quantity should be drawn is a judgement the
+registry cannot make. Everything so far is a line against the time axis; a
+distribution rather than a scalar — a routing histogram, say — wants bars
+against expert index and would arrive as a new chart kind rather than being
+bent into a timeline.
 
 ## The study browser
 
@@ -77,6 +91,7 @@ understand the packed log format — the two only have to agree about JSON.
 | [batch-size-sweep-500M](batch-size-sweep-500M.html) | 12 | 500M | batch × LR × seed, 5 and 20 TPP | [`batch-sweep-500M`](https://huggingface.co/datasets/quintic/rig-logs/tree/main/batch-sweep-500M) |
 | [3-seed-gradient-spike](3-seed-gradient-spike.html) | 12 | 250M | LR × seed | [`lr-transfer-250M`](https://huggingface.co/datasets/quintic/rig-logs/tree/main/lr-transfer-250M) |
 | [8k-lr-sweep-60M](8k-lr-sweep-60M.html) | 15 | 60M | LR × seed at 8k context | [`lr-sweep-8k-60M`](https://huggingface.co/datasets/quintic/rig-logs/tree/main/lr-sweep-8k-60M) |
+| [moe-lr-sweep-8k](moe-lr-sweep-8k.html) | 18 | 60M/125M | LR × seed, top-2 of 8 experts | [`moe-lr-sweep-8k`](https://huggingface.co/datasets/quintic/rig-logs/tree/main/moe-lr-sweep-8k) |
 | [transfer-charts](transfer-charts.html) | — | — | derived figures, not a run dashboard | — |
 
 Each study also carries a `snapshot.json.gz` (loss curves only, 0.05–0.30 MB)
@@ -224,6 +239,33 @@ for lr in 0.015625 0.0078125 0.00390625 0.001953125 0.0009765625; do
       --tier 60m --tokens-per-parameter 5 \
       --base-learning-rate "$lr" --seed "$seed" --checkpoint-policy none \
       --name "60m-bs16-lr${lr}-s${seed}"
+  done
+done
+```
+
+## moe-lr-sweep-8k.html
+
+18 runs of [`reference_moe`](../../recipes/reference_moe/) — top-2 of 8
+experts at 8,192 context, forked from the dense 8k ladder. 60M at five learning
+rates × three seeds, plus 125M spot runs at three learning rates.
+
+The routed ladder peaks at `2^-8`, the same learning rate the dense one does,
+and beats it at every learning rate by 0.07–0.12 nats at equal *active*
+parameters and matched compute, for about 1.7x the memory. No expert in any of
+the 12 layers finished below 1% of assignments in any of the 18 runs.
+
+This report carries six routing series the dense reports do not have: balance
+loss, busiest and idlest expert share, routing entropy, mean top-1 gate, and
+router logit RMS. They are recorded model-wide and per layer, with per-expert
+load for all 8 experts in all 12 layers, at every step.
+
+```bash
+for lr in 0.015625 0.0078125 0.00390625 0.001953125 0.0009765625; do
+  for seed in 1337 1338 1339; do
+    rig run reference_moe --cluster v4-32 --profile dev --track open \
+      --tier 60m --tokens-per-parameter 5 \
+      --base-learning-rate "$lr" --seed "$seed" --checkpoint-policy none \
+      --name "60m-moe-lr${lr}-s${seed}"
   done
 done
 ```

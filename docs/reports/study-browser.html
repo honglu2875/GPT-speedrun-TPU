@@ -100,7 +100,7 @@
     <div class="focus-canvas"><canvas id="focus-canvas"></canvas></div>
   </div>
 </dialog>
-<script type="application/gzip-base64" id="report-data">H4sIAAAAAAACA32Uz46bMBDGX8XytdDaBmPDbVu1p1RdtT1UinJwYEKs8K/GdFOt8hx9lN7bF1tDSAJZJTdmPs/n34xtnnEJVuHkGedQgVEWsgeLE8wIi3wifSq/M5qEYUKDt1wENGJvCEkIwR7WVVp0GWQ4IR5ud7ppxu8MNqor7I+HvW6d1aaomxZf0t9SVYDLF3XusoO6UGsoXOpja3XZM6C0K7tCWf0L0KfFl8e+vlT7D1tl7GOtK+uMaUjcZo2pN3rwqzcbnWpV4IOHDZS1hb4tA03txJ+dK9LpO6Nz323c+7W2yzQ4o+UzrlTZW6yVTbd++wTQ+BH57BZZbQfz972C/v9Bi69IWXQSwTjtGJiucl6CO+NKNe22dmNksZScuda1yqvaNZe6JQFnkjHpWu8K1zQnlMVxSA7eGaMw/pSEMn4H5awOLGN0hGFiCkNpJEJ5BUNOGEwSRyKiCcaUgfF74zirA8MYHRmCaMbAuRQ3GSIRCxZzcYOBk3sMveoh+1SjdZflYNsL0Fh4BKJsCiQJe8VD3RwEj05UNJCE0CCg8xOyRlXtBsz1aBagTKWrHPWP6TQcDwWoBcjaG1OaQ3EWSHHzoDiJaUyCOc1xQnJ3dW1fwcgdSuvKwt7O7i/699dJF5zZLY5IxG+fWSBoKNhhdTgVL1e9cwnDYx3jS+00W6jfYKaJqnYrYAzOv5Tl6vAC9Rwo2KcEAAA=</script>
+<script type="application/gzip-base64" id="report-data">H4sIAAAAAAACA32Uz26cMBDGX8XytUtrG4wNt7RKTxs1SnuoFOXgwLCxFjA1ptkq2ufoo/TevliH/ctutLkx89mffzNj80IbCIbmL3QBLXgToLwKNKeCiTRiOuL6mxB5HOeMv094whV/x1jOGJ1R2xb1UEJJczaj/dJ23e67hMoMdfh+tbI9WlW163p6TH8tTA2Yr90Csxt1bh6hxtR1H2wzMpBiaIbaBPsTyOf5l9txf2NWn56MD7fOtgGNecLwsM67ym78XFXZwpqarmfUQ+MCjGV56ByKPwbcZIsP3i4iPHj068NQWkCj+xfamma0eDSheIr6Z4AuStkNLgo2bMw/jgr595vM74gJZC+CR20b+KFFLyXRuDVd/+SwjSLTWgos3ZpF67C4ApfEUmghNJY+1Fi0ZFxkWcLWswNG7aMpCRfyDZSDumHZRVsYoaYwnKcq0WcwbI8hNEMSlU4wpgxCvtWOg7ph2EVbhjg9YZBSq4sMqcqUyKS6wCDZWwyjOiPh2ZHHoVxA6I9Au41bIC6mQJqJVzwc+6BkuqfisWaMxzE/nVDwpu0r8OetmYPxrW0XZHxM++bMSEx6gLK/0KVTKClirS4OSrKMZyw+pdl2SC/Pru0rGL0khWsDrMLJ/SV//6B0xDm5xSlL5eWZxYonSkxoGgfRhGhCc+eG8W3rZU6CwztFXEU0gVUHfjou5Pkw3uMR6sZdH6n0lCpJU87jMyyZCIFEh9ElSmdS6/XDem9y/zCe08DmV7KLjxbTbG1+gZ8mWocrYBccfnj3D+v/N8zNGEUFAAA=</script>
 <script>
 (()=>{'use strict';
 let D, runMap, visible, cameFromPicker=false;
@@ -332,7 +332,17 @@ function draw(item){
  const c=item.canvas,rect=c.getBoundingClientRect(),dpr=Math.min(devicePixelRatio||1,2),w=Math.max(1,rect.width),h=Math.max(1,rect.height);
  if(c.width!==Math.round(w*dpr)||c.height!==Math.round(h*dpr)){c.width=Math.round(w*dpr);c.height=Math.round(h*dpr)}
  const g=c.getContext('2d');g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,w,h);const m={l:54,r:14,t:12,b:31},b=bounds(item);
- if(!b){g.fillStyle='#91a0b8';g.font='12px system-ui';g.textAlign='center';g.fillText('No selected run has this metric',w/2,h/2);item._plot=null;return}
+ if(!b){
+  // Hide the whole panel rather than leaving an empty frame with a caption.
+  // Metrics come and go -- a routed run records routing series a dense one
+  // never will -- so a report is normally full of charts that do not apply to
+  // whatever is selected, and a grid of empty frames buries the ones that do.
+  // The panel is hidden rather than removed so it comes straight back when the
+  // selection changes.
+  if(item.article){item.article.hidden=true;item._plot=null;return}
+  g.fillStyle='#91a0b8';g.font='12px system-ui';g.textAlign='center';
+  g.fillText('No selected run has this metric',w/2,h/2);item._plot=null;return}
+ if(item.article)item.article.hidden=false;
  const tx0=transformX(item,b.x0),tx1=transformX(item,b.x1),X=x=>m.l+(transformX(item,x)-tx0)/(tx1-tx0)*(w-m.l-m.r),Y=y=>m.t+(b.y1-y)/(b.y1-b.y0)*(h-m.t-m.b),IX=x=>untransformX(item,tx0+(x-m.l)/(w-m.l-m.r)*(tx1-tx0)),IY=y=>b.y1-(y-m.t)/(h-m.t-m.b)*(b.y1-b.y0);
  g.strokeStyle='#253047';g.lineWidth=1;g.fillStyle='#7e8da6';g.font='10px ui-monospace,monospace';
  for(let i=0;i<=4;i++){const y=m.t+(h-m.t-m.b)*i/4,v=b.y1-(b.y1-b.y0)*i/4;g.beginPath();g.moveTo(m.l,y);g.lineTo(w-m.r,y);g.stroke();g.textAlign='right';g.fillText(fmt(v,3),m.l-7,y+3)}
