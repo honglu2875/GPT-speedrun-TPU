@@ -35,8 +35,8 @@ Supersedes the former `LR_TRANSFER.md`.
 | **m_B** | batch multiplier — global batch over the 128 baseline |
 | **TPP** | tokens per parameter — training tokens divided by parameter count. Sets the token horizon |
 | **µP** | Maximal Update Parameterization. Rescales initialization, LR, and multipliers so activation and update magnitudes stay width-invariant |
-| **CompleteP** | µP extended so the rules also hold as *depth* grows |
-| **Complete(d)P** | this repo's corrected CompleteP: input-embedding Adam epsilon is `1/m_N`, and the unembedding's forward multiplier is absorbed into init and LR. Rules in [COMPLETEP.md](COMPLETEP.md) |
+| **CompleteP** | µP extended so the rules also hold as *depth* grows ([Dey et al.](https://arxiv.org/abs/2505.01618)) |
+| **Complete(d)P** | a *separate, later* paper ([Mlodozeniec et al.](https://arxiv.org/abs/2512.22382)) extending CompleteP to **batch** and **duration** — the `(d)` is duration, not depth. It also corrects CompleteP's input-embedding Adam epsilon to `1/m_N` and absorbs the unembedding's forward multiplier into init and LR; both corrections are implemented here, its QK-norm extension is not. Rules in [COMPLETEP.md](COMPLETEP.md) |
 | **m_N / m_L / m_D** | width, depth, and data multipliers relative to the 60M anchor (`D384`, `L12`) |
 | **tier** | a named size rung of the family: 60m, 125m, 250m, 500m, 1b. Measured here: 60m through 500m |
 | **nat** | unit of the loss (natural-log cross-entropy) |

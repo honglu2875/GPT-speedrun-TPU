@@ -5,17 +5,52 @@
 This repository currently uses **Complete(d)P, α = 1** for the
 baseline family.
 
+## Two papers, not one
+
+These are distinct publications, and the difference decides which scaling
+axes are covered:
+
+| | paper | axes |
+|---|---|---|
+| **CompleteP** | [Don't be lazy: CompleteP enables compute-efficient deep transformers](https://arxiv.org/abs/2505.01618) (Dey et al.) | width, **depth** |
+| **Complete(d)P** | [Completed Hyperparameter Transfer across Modules, Width, Depth, Batch and Duration](https://arxiv.org/abs/2512.22382) (Mlodozeniec, Ablin, Béthune, Busbridge, Klein, Ramapuram, Cuturi) | width, depth, **batch**, **duration** |
+
+The `(d)` marks the added axes — token **d**uration and batch size — reading
+as both "CompleteP" and "Complete**d**P". It is *not* depth; CompleteP already
+had depth. That is why `m_D` here is the data/duration multiplier and why
+`sqrt(m_B / m_D)` exists at all: both come from the second paper.
+
+In its own words: *"we propose the Complete(d) Parameterisation that unifies
+scaling in width & depth — using an adaptation of CompleteP (Dey et al. 2025) —
+as well as in batch-size and training duration."*
+
 muP established a useful width-scaling framework and a practical
 proxy-to-target workflow. Later work found that transfer is approximate at
 finite width, that multiple parameterizations can
 transfer with the right layerwise rules, and that the original transformer
 recipe did not cover depth, Adam epsilon, weight decay, batch size, or
-training duration completely. CompleteP adds depth scaling; the August 11, 2026 revision
-of Complete(d)P corrects implementation details and unifies width/depth rules
-with approximate SDE rules for batch and token horizon.
+training duration completely.
 
-Here we do observe the learning-rate and batch size transfer after implemented
-CompleteP.
+Here we do observe the learning-rate and batch size transfer after implementing
+Complete(d)P.
+
+## What Complete(d)P changes in CompleteP, and what is implemented here
+
+The paper makes three modifications. Two are implemented and covered by
+`tests/test_trainer_static.py::test_complete_d_p_tensor_and_horizon_multipliers`;
+the third is deliberately out of scope for this reproduction.
+
+| # | Change | Here |
+|---|---|---|
+| 1 | Extends the parameterization to **QK-normalization** layers, which CompleteP did not cover | **not implemented** — this family uses no QK norm |
+| 2 | Corrects CompleteP's **AdamW epsilon for input embeddings** | **implemented**: `epsilon["token_embedding"] = 1 / m_N` |
+| 3 | **Reparameterizes the output layer**, removing the explicit unembedding forward multiplier by absorbing it into learning rate and initialization | **implemented**: `gpt_logits` applies no multiplier; the unembedding gets `lr = 1/m_N`, `epsilon = 1`, and init `init_std / m_N` |
+
+Beyond those three, the `(d)` itself — the batch and duration rules — is what
+the runtime applies globally as `sqrt(m_B / m_D)` and friends, tabulated below.
+Nothing in this section is a local invention: it is the second paper's
+prescription, and where this repository departs from it that is stated
+explicitly.
 
 Primary sources:
 
@@ -88,15 +123,18 @@ stops there; 500M and 1B are reserved for later reproduction or hero runs.
 
 - Global gradient clipping is disabled. Clipping introduces another
   scale-dependent axis unless its threshold is parameterized and validated.
-- QK normalization is not mixed into this first reproduction. The latest paper
-  reports improved stability with it but also reports that removing it does not
-  break transfer. It can be tested later as a family-level candidate.
+- QK normalization is not mixed into this first reproduction — this is
+  Complete(d)P change 1 above, left out. That paper reports improved stability
+  with it but also that removing it does not break transfer. It can be tested
+  later as a family-level candidate.
 - The fixed-head attention temperature follows nanoGPT-mup's executable
   `1 / d_head` rule. The conflicting `1 / d_model` sentence in the CompleteP
   paper is not used; with width scaled by adding heads it would introduce an
   extra inverse-head-count factor.
 - We do not combine Complete(d)P with u-µP, Adam-atan2, GQA-specific µP, Muon,
-  or per-module learning-rate tuning in the baseline. Each is a meaningful
+  or per-module learning-rate tuning in the baseline. (Per-module tuning is one
+  of the second paper's results — hyperparameters transfer even when tuned per
+  module — but it is a tuning protocol, not a rule this family has to apply.) Each is a meaningful
   alternative, not a free patch that can be layered on without a control.
 - Warmup is 10% of each run and cosine decay ends at 10% of peak. Schedule shape,
   weight decay, and batch remain fixed during the learning-rate study.

@@ -9,9 +9,18 @@ leaderboards.
 Just copy the `recipes/reference` and start hacking.
 
 This is largely inspired by nano-GPT speedrun. The baseline is a GPT-2 with slightly modernized architecture choices (RoPE, GELU, etc).
-To ensure hyperparameter transfer, I also let Codex implemented [CompleteP](https://arxiv.org/html/2505.01618) which is an extension of muP by two additional aspects that completes the training recipe:
-1. Depth scaling for pre-LN transformer (using α=1 for L^{-α}). c.f. [1]
-2. AdamW ϵ, weight decay, residual block, embeddings.
+To ensure hyperparameter transfer, the family implements **Complete(d)P**, which is
+two papers rather than one:
+
+1. [CompleteP](https://arxiv.org/abs/2505.01618) extends muP with depth scaling for
+   the pre-LN transformer (α=1 for L^{-α}), plus AdamW ϵ, weight decay, residual
+   block, and embedding rules.
+2. [Complete(d)P](https://arxiv.org/abs/2512.22382) adds the two axes CompleteP left
+   out — **batch size and token duration** — as `sqrt(m_B / m_D)` scaling. The `(d)`
+   is *duration*, not depth. It also corrects two things in CompleteP, both
+   implemented here: the input-embedding AdamW ϵ (now `1/m_N`) and the unembedding's
+   forward multiplier (absorbed into init and learning rate). Its third change, a
+   QK-norm extension, is deliberately not implemented — this family uses no QK norm.
 
 I did successfully observe the optimal learning-rate on the 60M, 125M, 250M ladder with 5 token-per-parameter (TPP). I cannot try 20 TPP or higher ladders because of compute. The compute I used is a v4-32 multi-slice VM from Google TPU Research Cloud (TRC) program.
 
