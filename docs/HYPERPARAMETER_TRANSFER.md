@@ -353,36 +353,53 @@ and trending toward the larger batch.
 
 Studies 1 and 2 were run at 5 TPP. Complete(d)P's `m_D` correction is supposed
 to hold the optimum in place as the token horizon grows, so this tests it
-directly: 500M at **20 TPP**, four points, one seed each, on a v6e-8.
+directly: 500M at **20 TPP**, six points on a v6e-8.
 
-| batch | base LR | effective peak LR | steps | val loss | wall | tok/s |
+*Effective peak LR* is the rate the schedule actually reaches, after the batch
+and duration corrections are applied to the base LR. *Val loss* is
+cross-entropy in nats on held-out FineWeb; lower is better.
+
+| batch | base LR | effective peak LR | steps | seed | val loss | tok/s |
 |---|---|--:|--:|--:|--:|--:|
-| 128 | **2^-8** | 0.0013487 | 76,691 | **2.9759** | 5.68h | 492K |
-| 128 | 2^-7 | 0.0026975 | 76,691 | 2.9766 | 5.68h | 492K |
-| 256 | 2^-8 | 0.0019074 | 38,346 | 2.9788 | 5.59h | 500K |
-| 128 | 2^-9 | 0.0006744 | 76,691 | 2.9961 | 5.68h | 492K |
+| 128 | **2^-8** | 0.0013487 | 76,691 | 1338 | **2.9755** | 492K |
+| 128 | **2^-8** | 0.0013487 | 76,691 | 1337 | **2.9759** | 492K |
+| 128 | 2^-7 | 0.0026975 | 76,691 | 1337 | 2.9766 | 492K |
+| 256 | 2^-8 | 0.0019074 | 38,346 | 1337 | 2.9788 | 500K |
+| 128 | 2^-9 | 0.0006744 | 76,691 | 1337 | 2.9961 | 492K |
+| 64 | 2^-8 | 0.0009537 | 153,382 | 1337 | 3.0204 | 484K |
 
-**What this establishes.** `2^-9` is out by 0.0202 nats, which is 29x the gap
-between the two leaders, so the optimum is bracketed at or above `2^-8`. That
-is the same bracket study 1 produced at 5 TPP, four times shorter — the
-horizon moved 4x and the answer did not.
+**The learning-rate optimum survives the longer horizon.** `2^-9` is out by
+0.020 nats and `2^-7` by 0.001, so the optimum is bracketed at `2^-8`. That is
+the same bracket study 1 produced at 5 TPP, four times shorter — the horizon
+moved 4x and the answer did not.
 
-**What it does not.** `2^-8` leads `2^-7` by **0.0007 nats at one seed each**,
-and one seed resolves nothing at that separation: study 2 measured seed ranges
-of 0.005–0.06 around the optimum, an order of magnitude larger. The supported
-claim is that the 20-TPP optimum lies in `{2^-8, 2^-7}` with `2^-8` nominally
-ahead — which is *verbatim* the claim study 1 reached at 250M. Reading a winner
-out of 0.0007 would repeat exactly the single-seed mistake that produced the
-original v3 250M result.
+**The batch optimum is now interior rather than an edge.** Adding batch 64
+closed the bracket downward:
 
-Batch 256 costs 0.0030 nats against batch 128 at the same base LR, continuing
-the collapse traced in study 2 (0.45 at 60M, 0.016 at 250M) and still well
-inside the noise floor at this scale.
+| batch | val loss at `2^-8` | cost against batch 128 |
+|---|--:|--:|
+| 64 | 3.0204 | +0.0447 |
+| **128** | **2.9757** (mean of 2 seeds) | — |
+| 256 | 2.9788 | +0.0031 |
+
+Batch 128 wins from both sides, and the penalty is lopsided: halving the batch
+costs 14x what doubling it does. Study 2 found batch 128 best at 5 TPP too, so
+the batch optimum transfers across the 4x horizon change alongside the learning
+rate. Establishing that is what the second seed and the batch-64 point bought.
+
+**What is still not settled.** `2^-8` leads `2^-7` by 0.0009 nats with **two
+seeds against one**. Both `2^-8` seeds land below the single `2^-7` point,
+which is the right ordering, but two seeds is a poor estimate of spread and one
+seed is no estimate at all. The range across the two `2^-8` seeds is 0.0004,
+much tighter than the 0.005–0.06 study 2 saw at smaller scales — encouraging,
+though two points cannot establish that the spread really is that small here.
+The supported claim is that the 20-TPP optimum lies in `{2^-8, 2^-7}` with
+`2^-8` ahead on every seed run so far.
 
 ### Settling it
 
-Three seeds at `2^-8` and three at `2^-7`, batch 128. At 5.7h each that is
-~34 TPU-hours to convert "nominally ahead" into a result — the same price
+A third seed at `2^-8` and three at `2^-7`, batch 128. At 5.7h each that is
+~23 TPU-hours to convert "ahead on every seed" into a result — the same price
 study 1's reseed paid, and for the same reason.
 
 ## Study 4 — the optimum does not move with context length
@@ -495,13 +512,17 @@ Two artifact-format changes make older runs non-comparable in specific ways:
   hand-maintained formula, not the traced count that replaced it — see
   [FLOPS.md](FLOPS.md).
 - Runs recorded before commit `75f0b22` wrote `training.csv` and
-  `diagnostics.csv` in long form. Nothing converts them, so reading one needs a
-  checkout at or before `8936b51`. Studies 1 and 2 predate the change entirely,
-  as do three of study 3's four points; their archived dashboards under
-  `docs/reports/` are the durable record. Note the consequence for study 3 in
-  particular: no single reader can plot all four of its points, which is why
-  its table is built from `metrics.json` — result-level data is
-  format-independent, only the curves are not.
+  `diagnostics.csv` in long form, which the current reader refuses. Studies 1
+  and 2 predate the change entirely, as do four of study 3's six points.
+  [`rig/legacy.py`](../rig/legacy.py) now converts a long-form training curve
+  into the packed format without touching the original, so those runs are
+  ordinary inputs again and a rendered dashboard is a cache rather than the
+  only surviving copy. Their diagnostics stay in CSV: at 140–290 MB each they
+  carry per-layer statistics that no learning-rate or batch-size comparison is
+  made of.
 
-Study 3's dashboard, covering its three legacy-format points, is
-[500M-20tpp-v6e.html](reports/500M-20tpp-v6e.html).
+Study 3's dashboard is
+[batch-size-sweep-500M.html](reports/batch-size-sweep-500M.html), which plots
+all twelve 500M runs — both token budgets, both artifact formats, and all three
+archives — in one place. Rebuild it with
+[`docs/reports/build_500m_report.py`](reports/build_500m_report.py).
