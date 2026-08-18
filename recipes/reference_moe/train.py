@@ -1770,7 +1770,10 @@ class RouterStats:
     """What the routed blocks report back for logging and the auxiliary loss."""
 
     balance_loss: jax.Array
+    # [layers, experts]: the fraction of assignments each expert received.
     load: jax.Array
+    # [layers, 3]: entropy, top-1 gate, logit RMS, in ROUTER_SUMMARY_METRICS order.
+    summary: jax.Array
 
 
 def active_parameter_count(params: Any, config: Config) -> int:
@@ -1822,7 +1825,7 @@ def routed_mlp_local(
     top_k: int,
     dtype: Any,
     axis_name: str | None,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Top-k routed experts via a grouped matmul, on one device's tokens.
 
     Returns the block output, the mean router probability per expert, and the
@@ -1872,10 +1875,22 @@ def routed_mlp_local(
 
     mean_probability = probabilities.mean(axis=0)
     load = counts.astype(jnp.float32) / jnp.float32(batch * length * top_k)
+    # Standard routing diagnostics, all reduced to one number per layer. Every
+    # one is a by-product of tensors this function already has, so the cost is
+    # a handful of reductions rather than a second pass.
+    entropy = -jnp.sum(probabilities * jnp.log(probabilities + 1.0e-9), axis=-1).mean()
+    top1_gate = gate.max(axis=-1).mean()
+    # The mean square crosses the collective, not the root of it: averaging
+    # per-device roots is not the root of the global average, which would make
+    # this number depend on how many devices the run happened to use.
+    logit_mean_square = jnp.mean(jnp.square(logits))
+    summary = jnp.stack((entropy, top1_gate, logit_mean_square))
     if axis_name is not None:
         mean_probability = jax.lax.pmean(mean_probability, axis_name)
         load = jax.lax.pmean(load, axis_name)
-    return combined.reshape(batch, length, width), mean_probability, load
+        summary = jax.lax.pmean(summary, axis_name)
+    summary = summary.at[2].set(jnp.sqrt(summary[2]))
+    return combined.reshape(batch, length, width), mean_probability, load, summary
 
 
 def make_mesh_routed_mlp(config: Config, mesh: Mesh) -> Any:
@@ -1910,7 +1925,7 @@ def make_mesh_routed_mlp(config: Config, mesh: Mesh) -> Any:
             replicated,
             replicated,
         ),
-        out_specs=(batch_partition, replicated, replicated),
+        out_specs=(batch_partition, replicated, replicated, replicated),
         check_vma=False,
     )
 
@@ -1981,6 +1996,7 @@ def gpt_hidden(
     )
     router_losses: list[jax.Array] = []
     router_loads: list[jax.Array] = []
+    router_summaries: list[jax.Array] = []
 
     for block in params["blocks"]:
         residual = x
@@ -2025,7 +2041,7 @@ def gpt_hidden(
                 dtype=dtype,
                 axis_name=None,
             )
-            mlp_out, mean_probability, load = routed(
+            mlp_out, mean_probability, load, summary = routed(
                 x_norm,
                 block["router_w"],
                 block["expert_up_w"],
@@ -2035,6 +2051,7 @@ def gpt_hidden(
             )
             router_losses.append(load_balance_loss(mean_probability, load))
             router_loads.append(load)
+            router_summaries.append(summary)
         else:
             hidden = linear(x_norm, block["mlp_up_w"], block["mlp_up_b"], dtype)
             hidden = jax.nn.gelu(hidden, approximate=True)
@@ -2046,6 +2063,7 @@ def gpt_hidden(
         RouterStats(
             balance_loss=jnp.mean(jnp.stack(router_losses)),
             load=jnp.stack(router_loads),
+            summary=jnp.stack(router_summaries),
         )
         if config.experts
         else None
@@ -2060,13 +2078,31 @@ def gpt_logits(
     attention_fn: AttentionCallable | None = None,
     routed_fn: Any = None,
 ) -> jax.Array:
-    x, _ = gpt_hidden(params, tokens, config, attention_fn, routed_fn)
+    return gpt_logits_and_router(params, tokens, config, attention_fn, routed_fn)[0]
+
+
+def gpt_logits_and_router(
+    params: Mapping[str, Any],
+    tokens: jax.Array,
+    config: Config,
+    attention_fn: AttentionCallable | None = None,
+    routed_fn: Any = None,
+) -> tuple[jax.Array, "RouterStats | None"]:
+    """Logits, and the router statistics the balance loss needs.
+
+    Exists because discarding the statistics here is invisible: the model still
+    trains, the loss still falls, and the auxiliary term is simply never
+    applied. The dense loss backend did exactly that.
+    """
+
+    x, router = gpt_hidden(params, tokens, config, attention_fn, routed_fn)
     output_embedding = params.get("output_embedding", params["token_embedding"])
-    return jnp.einsum(
+    logits = jnp.einsum(
         "btd,vd->btv",
         x,
         output_embedding.astype(config.compute_dtype),
     ).astype(jnp.float32)
+    return logits, router
 
 
 def cross_entropy(
@@ -2095,16 +2131,59 @@ def cross_entropy(
             compute_dtype=config.compute_dtype,
         )
     else:
-        logits = gpt_logits(params, x, config, attention_fn, routed_fn)[
-            ..., : config.semantic_vocab_size
-        ]
+        logits, router = gpt_logits_and_router(
+            params, x, config, attention_fn, routed_fn
+        )
+        logits = logits[..., : config.semantic_vocab_size]
         log_probabilities = jax.nn.log_softmax(logits, axis=-1)
         selected = jnp.take_along_axis(log_probabilities, y[..., None], axis=-1)
         loss = -jnp.mean(selected, dtype=jnp.float32)
-        router = None
     if router is not None and config.router_aux_coefficient:
         loss = loss + config.router_aux_coefficient * router.balance_loss
     return loss
+
+
+def cross_entropy_and_router(
+    params: Mapping[str, Any],
+    x: jax.Array,
+    y: jax.Array,
+    config: Config,
+    attention_fn: AttentionCallable | None = None,
+    routed_fn: Any = None,
+) -> tuple[jax.Array, tuple[jax.Array, jax.Array, jax.Array] | None]:
+    """The training objective, plus the balance loss and per-layer expert load.
+
+    Carried out of the update as ``value_and_grad`` aux so logging costs an
+    already-computed array rather than a second forward pass. Dense models
+    return ``None`` and log nothing.
+    """
+
+    if not config.experts:
+        return cross_entropy(params, x, y, config, attention_fn, routed_fn), None
+
+    hidden, router = gpt_hidden(params, x, config, attention_fn, routed_fn)
+    if config.loss_backend == "tiled":
+        loss = tiled_tied_cross_entropy(
+            hidden,
+            params.get("output_embedding", params["token_embedding"]),
+            y,
+            semantic_vocab_size=config.semantic_vocab_size,
+            vocab_tile_size=config.vocab_tile_size,
+            compute_dtype=config.compute_dtype,
+        )
+    else:
+        output_embedding = params.get("output_embedding", params["token_embedding"])
+        logits = jnp.einsum(
+            "btd,vd->btv", hidden, output_embedding.astype(config.compute_dtype)
+        ).astype(jnp.float32)[..., : config.semantic_vocab_size]
+        log_probabilities = jax.nn.log_softmax(logits, axis=-1)
+        selected = jnp.take_along_axis(log_probabilities, y[..., None], axis=-1)
+        loss = -jnp.mean(selected, dtype=jnp.float32)
+
+    assert router is not None
+    if config.router_aux_coefficient:
+        loss = loss + config.router_aux_coefficient * router.balance_loss
+    return loss, (router.balance_loss, router.load, router.summary)
 
 
 def learning_rate(step: jax.Array, config: Config) -> jax.Array:
@@ -2261,10 +2340,11 @@ def _apply_training_update(
         optimizer_hyperparameter_trees(params, config)
     )
     beta1, beta2 = effective_adam_betas(config)
-    loss, gradients = jax.value_and_grad(
-        lambda candidate: cross_entropy(
+    (loss, router_aux), gradients = jax.value_and_grad(
+        lambda candidate: cross_entropy_and_router(
             candidate, x, y, config, attention_fn, routed_fn
-        )
+        ),
+        has_aux=True,
     )(params)
     gradients = jax.tree_util.tree_map(lambda grad: grad.astype(jnp.float32), gradients)
     raw_gradients = gradients
@@ -2335,6 +2415,17 @@ def _apply_training_update(
             "loss": loss,
             "grad_norm": grad_norm,
             "learning_rate": lr,
+            # [layers, experts] and a scalar, or absent for a dense model. The
+            # shapes are static, so this does not vary the executable.
+            **(
+                {}
+                if router_aux is None
+                else {
+                    "router_balance_loss": router_aux[0],
+                    "router_load": router_aux[1],
+                    "router_summary": router_aux[2],
+                }
+            ),
         },
         raw_gradients,
     )
@@ -2389,6 +2480,35 @@ def diagnostic_scopes(
             *output[2:],
         )
     return output
+
+
+def router_log_values(host_metrics: Mapping[str, Any]) -> tuple[float, ...]:
+    """Flatten the router statistics in exactly the order the columns name them.
+
+    Empty for a dense run, whose metrics dict carries no routing keys at all.
+    Everything here is already averaged over every device, so the model-wide
+    numbers are plain reductions over the per-layer ones.
+    """
+
+    load = host_metrics.get("router_load")
+    if load is None:
+        return ()
+    load = np.asarray(load, dtype=np.float32)
+    summary = np.asarray(host_metrics["router_summary"], dtype=np.float32)
+    return (
+        float(host_metrics["router_balance_loss"]),
+        float(load.max()),
+        float(load.min()),
+        *(float(value) for value in summary.mean(axis=0)),
+        # Per layer: the three summary statistics, then the whole load vector.
+        # Per-expert load is the exact distribution, so max, min, and any
+        # histogram of it are derivable from it and none are stored.
+        *(
+            float(value)
+            for layer in range(load.shape[0])
+            for value in (*summary[layer], *load[layer])
+        ),
+    )
 
 
 def diagnostic_scope_metadata(
@@ -2888,7 +3008,9 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         (output_dir / DIAGNOSTICS_LOG_NAME).unlink(missing_ok=True)
         progress_log = open_log(
             output_dir / TRAINING_LOG_NAME,
-            training_log_columns(),
+            training_log_columns(
+                config.layers if config.experts else 0, config.experts
+            ),
             tokens_per_step=config.batch_size * config.seq_len,
             flops_per_token=flops_per_token,
         )
@@ -3051,6 +3173,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                             float(host_metrics["loss"]),
                             float(host_metrics["learning_rate"]),
                             float(host_metrics["grad_norm"]),
+                            *router_log_values(host_metrics),
                         ),
                     )
                     console.step(

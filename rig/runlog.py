@@ -126,14 +126,52 @@ def write_result(output_dir: Path, result: Mapping[str, Any]) -> None:
     os.replace(temporary, destination)
 
 
-def training_log_columns() -> tuple[logpack.Column, ...]:
-    """The per-step scalars, in the order ``history`` stores them."""
+# The per-layer routing statistics, in the order the recipe stacks them.
+ROUTER_SUMMARY_METRICS = ("router.entropy", "router.top1_gate", "router.logit_rms")
 
-    return (
+
+def training_log_columns(
+    routing_layers: int = 0, experts: int = 0
+) -> tuple[logpack.Column, ...]:
+    """The per-step scalars, in the order ``history`` stores them.
+
+    A routed run appends its routing statistics after the three dense ones:
+    first model-wide, then per layer, and per layer the full per-expert load
+    vector. Per layer matters because routing does not collapse uniformly --
+    one layer can send everything to a single expert while the model-wide
+    average still looks even, and the loss curve alone never shows it.
+
+    Per-expert load is stored rather than summarized because with a handful of
+    experts the vector *is* the distribution: max, min, and any histogram of it
+    are derivable, so storing those too would only be storing them twice.
+
+    Dense runs pass no routing arguments and get exactly the three columns they
+    always had, so nothing about their artifacts changes.
+    """
+
+    columns = [
         logpack.column("train_loss"),
         logpack.column("learning_rate"),
         logpack.column("grad_norm"),
-    )
+    ]
+    if not routing_layers:
+        return tuple(columns)
+
+    columns += [
+        logpack.column("router.balance_loss"),
+        logpack.column("router.max_load"),
+        logpack.column("router.min_load"),
+        *(logpack.column(name) for name in ROUTER_SUMMARY_METRICS),
+    ]
+    for layer in range(routing_layers):
+        columns += [
+            logpack.column(name, "block", layer) for name in ROUTER_SUMMARY_METRICS
+        ]
+        columns += [
+            logpack.column("router.load", "expert", layer, index=expert)
+            for expert in range(experts)
+        ]
+    return tuple(columns)
 
 
 def diagnostic_log_columns(

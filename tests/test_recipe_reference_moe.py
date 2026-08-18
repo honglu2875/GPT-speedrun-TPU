@@ -101,7 +101,7 @@ class RoutedMlpTests(unittest.TestCase):
             np.random.default_rng(1).normal(size=(2, 32, WIDTH)) * 0.5, jnp.float32
         )
         weights = _weights()
-        got, _, _ = _routed(x, weights)
+        got, _, _, _ = _routed(x, weights)
         want = _dense_reference(x, weights)
         self.assertLess(float(jnp.abs(got - want).max()), 1e-5)
 
@@ -116,7 +116,7 @@ class RoutedMlpTests(unittest.TestCase):
         x = jnp.asarray(
             np.random.default_rng(2).normal(size=(4, 32, WIDTH)) * 3.0, jnp.float32
         )
-        _, _, load = _routed(x, _weights())
+        _, _, load, _ = _routed(x, _weights())
         self.assertAlmostEqual(float(load.sum()), 1.0, places=5)
         self.assertTrue(bool((load >= 0).all()))
 
@@ -152,8 +152,8 @@ class RoutedMlpTests(unittest.TestCase):
 
         sharded = trainer.make_mesh_routed_mlp(config, mesh)
         with jax.set_mesh(mesh):
-            got, got_probability, got_load = jax.jit(sharded)(x, *weights)
-        want, want_probability, want_load = _routed(x, weights)
+            got, got_probability, got_load, got_summary = jax.jit(sharded)(x, *weights)
+        want, want_probability, want_load, want_summary = _routed(x, weights)
 
         self.assertLess(float(jnp.abs(got - want).max()), 1e-5)
         # The two statistics are pmean'd across the data axis, so the sharded
@@ -161,6 +161,7 @@ class RoutedMlpTests(unittest.TestCase):
         # device's view of it.
         self.assertLess(float(jnp.abs(got_load - want_load).max()), 1e-6)
         self.assertLess(float(jnp.abs(got_probability - want_probability).max()), 1e-6)
+        self.assertLess(float(jnp.abs(got_summary - want_summary).max()), 1e-5)
 
     def test_dense_mlp_is_untouched_when_experts_is_zero(self) -> None:
         config = trainer.Config.__new__(trainer.Config)
@@ -312,6 +313,78 @@ class RoutedModelTests(unittest.TestCase):
                     bool((per_expert > 0).all()), f"dead experts: {per_expert}"
                 )
         self.assertGreater(float(jnp.abs(grads["token_embedding"]).max()), 0.0)
+
+
+class RouterLoggingTests(unittest.TestCase):
+    """The columns and the values are declared in two places; they must agree.
+
+    A mismatch here is silent and total: every routing series in the artifact
+    is shifted by one, so entropy is plotted as a gate weight and expert 7's
+    load is read as expert 6's. Nothing crashes and no number looks absurd.
+    """
+
+    LAYERS = 3
+
+    def _metrics(self):
+        rng = np.random.default_rng(11)
+        load = rng.dirichlet(np.ones(EXPERTS), size=self.LAYERS).astype(np.float32)
+        summary = rng.uniform(size=(self.LAYERS, 3)).astype(np.float32)
+        return (
+            {
+                "router_balance_loss": np.float32(1.25),
+                "router_load": load,
+                "router_summary": summary,
+            },
+            load,
+            summary,
+        )
+
+    def test_value_count_matches_the_column_count(self) -> None:
+        from rig.runlog import training_log_columns
+
+        columns = training_log_columns(self.LAYERS, EXPERTS)
+        values = trainer.router_log_values(self._metrics()[0])
+        # Three dense scalars are written ahead of the routing ones.
+        self.assertEqual(len(columns), 3 + len(values))
+
+    def test_every_value_lands_in_the_column_that_names_it(self) -> None:
+        from rig import metrics as rig_metrics
+        from rig.runlog import training_log_columns
+
+        host, load, summary = self._metrics()
+        columns = training_log_columns(self.LAYERS, EXPERTS)[3:]
+        values = trainer.router_log_values(host)
+
+        expected = {}
+        for index, name in enumerate(
+            ("router.entropy", "router.top1_gate", "router.logit_rms")
+        ):
+            expected[(name, -1, -1)] = float(summary[:, index].mean())
+            for layer in range(self.LAYERS):
+                expected[(name, layer, -1)] = float(summary[layer, index])
+        expected[("router.balance_loss", -1, -1)] = 1.25
+        expected[("router.max_load", -1, -1)] = float(load.max())
+        expected[("router.min_load", -1, -1)] = float(load.min())
+        for layer in range(self.LAYERS):
+            for expert in range(EXPERTS):
+                expected[("router.load", layer, expert)] = float(load[layer, expert])
+
+        self.assertEqual(len(columns), len(expected))
+        for column, value in zip(columns, values, strict=True):
+            key = (
+                rig_metrics.metric_by_id(column.metric_id).name,
+                column.layer,
+                column.index,
+            )
+            with self.subTest(column=column.describe()):
+                self.assertIn(key, expected)
+                self.assertAlmostEqual(value, expected[key], places=5)
+
+    def test_a_dense_run_logs_no_routing_columns(self) -> None:
+        from rig.runlog import training_log_columns
+
+        self.assertEqual(len(training_log_columns()), 3)
+        self.assertEqual(trainer.router_log_values({"loss": 1.0}), ())
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -50,7 +50,7 @@ offset  size          field
 +0      4             metric_id              int32   rig/metrics.py
 +4      4             scope_id               int32   rig/metrics.py
 +8      4             layer                  int32   -1 when not layered
-+12     4             (reserved, written 0)
++12     4             index    int32   second index inside the scope, -1 when unused
 +16     8             element_count          int64   scalars in this scope
 ```
 
@@ -71,6 +71,14 @@ the record block begins 8-aligned for any `n`; the record is `4 + 4n`, so every
 This is not decoration. At a seven-byte magic the table began at 31, which put
 every `int64` at offset ≡ 7 (mod 8) and made a `memmap` view of the value block
 impossible. The layout was corrected before any run was recorded in it.
+
+
+The `index` field was `reserved`, written 0 by every writer before routing
+metrics existed. It now carries a second coordinate whose meaning belongs to
+the scope -- for `expert` it is the expert ordinal, so per-expert load is
+addressed as `(layer, expert)` instead of needing one metric id per expert.
+No bytes moved, and no scope that existed while the field was reserved reads
+it, so logs written earlier still decode exactly as they did.
 
 ## What the header carries, and why
 

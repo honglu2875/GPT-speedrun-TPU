@@ -60,15 +60,22 @@ from rig import metrics
 MAGIC = b"RIGLOG\x00\x01"
 SUFFIX = ".riglog"
 
-# metric id, scope id, layer (-1 when the scope is not layered), and the number
-# of scalars the scope covers. Explicit little-endian so a file written on one
-# host reads identically on another.
+# metric id, scope id, layer (-1 when the scope is not layered), a second index
+# whose meaning belongs to the scope, and the number of scalars the scope
+# covers. Explicit little-endian so a file written on one host reads
+# identically on another.
+#
+# ``index`` occupies what earlier writers filled with zero and called reserved.
+# Giving it meaning moves no bytes and rewrites no history: a scope defines
+# whether it uses the slot, and every scope that existed while the field was
+# reserved does not. So a log written before this still decodes exactly as it
+# did, and its zeros are never read as an index.
 COLUMN_DTYPE = np.dtype(
     [
         ("metric_id", "<i4"),
         ("scope_id", "<i4"),
         ("layer", "<i4"),
-        ("reserved", "<i4"),
+        ("index", "<i4"),
         ("element_count", "<i8"),
     ]
 )
@@ -92,6 +99,10 @@ class Column:
     scope_id: int
     layer: int = -1
     element_count: int = 0
+    # Second index within the scope, -1 when the scope does not use one. For
+    # ``expert`` it is the expert ordinal, so a routed block is addressed as
+    # (layer, expert) rather than needing one metric id per expert.
+    index: int = -1
 
     @property
     def metric(self) -> metrics.Metric | None:
@@ -110,6 +121,8 @@ class Column:
         where = scope.name if scope is not None else f"scope:{self.scope_id}"
         if self.layer >= 0:
             where = f"{where}[{self.layer}]"
+        if self.index >= 0:
+            where = f"{where}#{self.index}"
         return f"{where}/{name}"
 
 
@@ -118,6 +131,7 @@ def column(
     scope_name: str = "overall",
     layer: int | None = None,
     element_count: int = 0,
+    index: int | None = None,
 ) -> Column:
     """Build a column from registry names, failing fast on an unregistered one."""
 
@@ -126,11 +140,16 @@ def column(
         raise ValueError(f"scope {scope_name!r} requires a layer index")
     if not resolved_scope.layered and layer is not None:
         raise ValueError(f"scope {scope_name!r} does not take a layer index")
+    if resolved_scope.indexed and index is None:
+        raise ValueError(f"scope {scope_name!r} requires a second index")
+    if not resolved_scope.indexed and index is not None:
+        raise ValueError(f"scope {scope_name!r} does not take a second index")
     return Column(
         metric_id=metrics.metric(metric_name).id,
         scope_id=resolved_scope.id,
         layer=-1 if layer is None else layer,
         element_count=element_count,
+        index=-1 if index is None else index,
     )
 
 
@@ -189,7 +208,7 @@ class LogWriter:
                 entry.metric_id,
                 entry.scope_id,
                 entry.layer,
-                0,
+                entry.index,
                 entry.element_count,
             )
         handle.write(MAGIC)
