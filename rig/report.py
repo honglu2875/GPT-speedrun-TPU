@@ -194,12 +194,20 @@ def build_report(
     *,
     max_chart_points: int = _MAX_CHART_POINTS,
     layer_snapshots: int = _MAX_LAYER_SNAPSHOTS,
+    select: str | None = None,
 ) -> ReportSummary:
     """Scan ``runs_dir`` and write one portable report HTML file.
 
     Every successful run is plotted, whatever its profile, token budget, or
     loss. ``max_chart_points`` bounds the embedded data and canvas work per
     series; the first and last points are always retained.
+
+    ``select`` is an optional regular expression matched against the run id.
+    One report per line of research is the working pattern here -- a short note
+    plus a single self-contained page, after which the raw logs can be cleared
+    -- and that needs a way to crystallize one family without disturbing runs
+    that are still in flight. Non-matching directories are omitted silently
+    rather than reported as skipped: they were never candidates.
     """
 
     runs_dir = Path(runs_dir).expanduser().resolve()
@@ -217,6 +225,11 @@ def build_report(
             "report output must be a regular file, not a directory or symlink"
         )
 
+    try:
+        selector = re.compile(select) if select is not None else None
+    except re.error as error:
+        raise ReportError(f"invalid --select regular expression: {error}") from error
+
     records, duplicate_record_ids, ledger_notices = _read_ledger(
         runs_dir / "records.jsonl"
     )
@@ -228,6 +241,8 @@ def build_report(
             or candidate.is_symlink()
             or candidate.name.startswith(".")
         ):
+            continue
+        if selector is not None and not selector.search(candidate.name):
             continue
         if not (candidate / "result.json").exists():
             # Failed/partial harness directories are expected and are not plot-able.

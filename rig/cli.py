@@ -454,6 +454,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=1_400,
         help="maximum embedded points per run and scalar series",
     )
+    report.add_argument(
+        "--select",
+        help=(
+            "regular expression matched against the run id; plot only those. "
+            "One line of research per report, so a family can be crystallized "
+            "into a page and its logs cleared without disturbing runs still in "
+            "flight"
+        ),
+    )
 
     clone = commands.add_parser(
         "clone", help="clone one recipe into a new algorithm folder"
@@ -1417,6 +1426,7 @@ def command_report(args: argparse.Namespace) -> int:
         output,
         max_chart_points=args.max_points,
         layer_snapshots=args.layer_snapshots,
+        select=args.select,
     )
     relative = (
         summary.output_path.relative_to(root)

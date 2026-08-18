@@ -819,3 +819,47 @@ class ClientSourceGuardTests(unittest.TestCase):
         end = script.index("function bounds(item){", start)
         self.assertNotIn("s.values.map(row=>", script[start:end])
         self.assertIn("const pts=seriesPoints(item,s);", script[start:end])
+
+
+class SelectFilterTests(unittest.TestCase):
+    """One line of research per report, without disturbing runs in flight."""
+
+    def _three_runs(self, root: Path) -> Path:
+        runs = root / "runs"
+        for name in ("alpha-lr2e-8", "alpha-lr2e-9", "beta-lr2e-8"):
+            run = runs / name
+            run.mkdir(parents=True)
+            _write_training(run, [(4.5, 1e-4, 0.5), (4.0, 9e-5, 0.4)])
+            _write_result(run, validation_artifact=False)
+        return runs
+
+    def test_a_regex_selects_a_family(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = self._three_runs(root)
+            summary = build_report(runs, root / "r.html", select="^alpha-")
+        self.assertEqual(summary.included, ("alpha-lr2e-8", "alpha-lr2e-9"))
+        # Non-matching runs are omitted, not reported as skipped: they were
+        # never candidates, and listing them would bury real skip reasons.
+        self.assertEqual(summary.skipped, {})
+
+    def test_no_selector_keeps_every_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = self._three_runs(root)
+            summary = build_report(runs, root / "r.html")
+        self.assertEqual(len(summary.included), 3)
+
+    def test_an_invalid_expression_is_refused_by_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = self._three_runs(root)
+            with self.assertRaisesRegex(ReportError, "invalid --select"):
+                build_report(runs, root / "r.html", select="alpha(")
+
+    def test_the_expression_searches_rather_than_anchors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = self._three_runs(root)
+            summary = build_report(runs, root / "r.html", select="lr2e-8")
+        self.assertEqual(summary.included, ("alpha-lr2e-8", "beta-lr2e-8"))

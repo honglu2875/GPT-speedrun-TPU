@@ -21,7 +21,8 @@ before the optimum does.
 
 The horizon does not move it either. At 500M and 20 TPP the optimum is again
 bracketed at or above `2^-8`, four times further out than anything studies 1
-and 2 measured (study 3).
+and 2 measured (study 3). Neither does context length: at 8,192 tokens with
+document masking, `2^-8` wins again and is separated on both sides (study 4).
 
 Supersedes the former `LR_TRANSFER.md`.
 
@@ -383,6 +384,64 @@ inside the noise floor at this scale.
 Three seeds at `2^-8` and three at `2^-7`, batch 128. At 5.7h each that is
 ~34 TPU-hours to convert "nominally ahead" into a result — the same price
 study 1's reseed paid, and for the same reason.
+
+## Study 4 — the optimum does not move with context length
+
+Studies 1-3 all trained at 1,024 tokens. [`reference_8k`](../recipes/reference_8k/)
+trains at **8,192** with document masking, holding tokens per step (131,072)
+and optimizer steps (2,286) identical to `reference`, so the only differences
+are how tokens are arranged into sequences and whether attention crosses
+document boundaries. 60M, 5 TPP, five learning rates x three seeds, v4-32.
+
+| base LR | effective peak LR | mean | range | seeds 1337 / 1338 / 1339 |
+|---|--:|--:|--:|---|
+| 2^-6 | 0.0156250 | 4.1174 | 0.0390 | 4.1312 4.0921 4.1288 |
+| 2^-7 | 0.0078125 | 4.0935 | 0.0764 | 4.0436 4.1200 4.1169 |
+| **2^-8** | **0.0039062** | **4.0030** | **0.0022** | 4.0020 4.0042 4.0027 |
+| 2^-9 | 0.0019531 | 4.0469 | 0.0176 | 4.0394 4.0445 4.0569 |
+| 2^-10 | 0.0009766 | 4.2458 | 0.0483 | 4.2244 4.2728 4.2401 |
+
+| comparison | difference | t | verdict |
+|---|--:|--:|---|
+| 2^-8 vs 2^-7 | +0.0905 | 3.6 | separated |
+| 2^-8 vs 2^-9 | +0.0439 | 8.4 | separated |
+| 2^-8 vs 2^-6 | +0.1144 | 9.0 | separated |
+| 2^-8 vs 2^-10 | +0.2428 | 17.0 | separated |
+
+**`2^-8` again, bracketed and separated on both sides** — a cleaner result than
+study 1 obtained at 250M, where `2^-8` and `2^-7` never separated. Both
+families run at `m_B = 1` at their own configured batch, so the effective peak
+LR is the base LR in each and the comparison is like-for-like in both.
+
+An eight-fold change in context length does not move the learning-rate
+optimum, at least at 60M with tokens per step held fixed.
+
+### Seed spread inverts, and so do the spikes
+
+Study 2 found seed noise **largest near the optimum** at 1k. At 8k it is
+smallest there — 0.0022 at `2^-8` against 0.0764 at `2^-7` — and the gradient
+spikes are monotone in learning rate rather than peaked:
+
+| base LR | peak/median gradient, per seed |
+|---|---|
+| 2^-6 | 1930x  148x  1803x |
+| 2^-7 | 65x  224x  1069x |
+| **2^-8** | **75x  18x  21x** |
+| 2^-9 | 15x  13x  16x |
+| 2^-10 | 10x  9x  11x |
+
+At 1k the fragile phase sat at the optimum, which is what made single-seed
+comparisons there unreliable. Here the optimum is the calmest point measured.
+
+**Two candidate causes, not separated by this sweep.** Document masking may
+remove an instability that cross-document attention was producing, or the
+eight-fold longer sequence may change the gradient statistics directly. The
+control that would distinguish them is a masked run at 1,024 tokens —
+deliberately not the `reference` default, since that family is kept unmasked
+for bit-reproducibility, but cheap as a one-off arm.
+
+Until that runs, the honest statement is that the 1k noise structure does not
+carry to this configuration, and the reason is unidentified.
 
 ## Reproducibility
 
