@@ -96,16 +96,35 @@ _RETIRED_FLAGS = {
 _CHECKPOINT_POLICIES = ("always", "qualifying", "none")
 
 
-def _checkpoint_policy(args: argparse.Namespace, fallback: str) -> str:
-    """Resolve the policy from the flag, falling back to saved settings."""
+def _checkpoint_policy(
+    args: argparse.Namespace, fallback: str, *, track: str, profile: str
+) -> str:
+    """Resolve the policy from the flag, falling back to saved settings.
 
-    chosen = getattr(args, "checkpoint_policy", None) or fallback
+    A saved default of ``none`` means "do not keep sweep weights", which is
+    about research runs. It must not silently refuse an official run, whose
+    checkpoint is required, so the fallback yields to ``qualifying`` where
+    ``none`` is not legal. An *explicit* ``--checkpoint-policy none`` there is
+    still an error: that is the caller asking for something disallowed, rather
+    than a default reaching somewhere it was not meant to.
+    """
+
+    explicit = getattr(args, "checkpoint_policy", None)
+    chosen = explicit or fallback
     if chosen not in _CHECKPOINT_POLICIES:
         raise ConfigError(
             f"unknown checkpoint policy {chosen!r}; expected one of "
             + ", ".join(_CHECKPOINT_POLICIES)
         )
+    if explicit is None and chosen == "none" and not _is_research_run(track, profile):
+        return "qualifying"
     return chosen
+
+
+def _is_research_run(track: str, profile: str) -> bool:
+    """Whether weights may be skipped entirely for this run."""
+
+    return track == "open" and profile == "dev"
 
 
 _COLORS = ("auto", "always", "never")
@@ -835,8 +854,10 @@ def command_run(args: argparse.Namespace) -> int:
     timeout = (
         args.timeout or {"smoke": 300.0, "dev": 3600.0, "official": 21600.0}[profile]
     )
-    policy = _checkpoint_policy(args, config.checkpoint_retention)
-    if policy == "none" and (track != "open" or profile != "dev"):
+    policy = _checkpoint_policy(
+        args, config.checkpoint_retention, track=track, profile=profile
+    )
+    if policy == "none" and not _is_research_run(track, profile):
         raise ConfigError(
             "--checkpoint-policy none is restricted to open/dev research runs"
         )
