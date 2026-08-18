@@ -261,20 +261,28 @@ def write_training_log(
     tokens_per_step: int,
     final_step: int,
     flops_per_token: int | None = None,
+    columns: Sequence[logpack.Column] | None = None,
 ) -> None:
     """Atomically persist every optimizer step without timing host transfers.
 
     Supersedes the coarser rows appended during the run: this writes the full
     per-step history pulled from the device buffer once, at the end.
+
+    Because it supersedes rather than merges, anything a run appends live but
+    does not also keep in the device history is silently dropped when this
+    runs. Whatever ``columns`` describes must therefore be exactly what the
+    history rows carry -- which is why the width is checked against them.
     """
 
     if history.shape[0] > final_step:
         # The device buffer is sized for the full horizon; an early-stopped run
         # fills only its prefix and the remainder is untouched zeros.
         history = history[:final_step]
-    if history.shape != (final_step, 3):
+    resolved = tuple(training_log_columns() if columns is None else columns)
+    if history.shape != (final_step, len(resolved)):
         raise ValueError(
-            f"training history has shape {history.shape}; expected {(final_step, 3)}"
+            f"training history has shape {history.shape}; "
+            f"expected {(final_step, len(resolved))}"
         )
     if flops_per_token is not None and flops_per_token <= 0:
         raise ValueError("flops_per_token must be positive when provided")
@@ -283,7 +291,7 @@ def write_training_log(
     temporary = output_dir / f".{TRAINING_LOG_NAME}.tmp"
     with logpack.LogWriter(
         temporary,
-        training_log_columns(),
+        resolved,
         tokens_per_step=tokens_per_step,
         # Only the FLOP axis needs this; a run without a traced count still
         # records its curve, and the axis is simply not meaningful.

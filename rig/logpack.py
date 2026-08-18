@@ -339,6 +339,7 @@ def read_log(path: Path) -> Log:
                 scope_id=int(row["scope_id"]),
                 layer=int(row["layer"]),
                 element_count=int(row["element_count"]),
+                index=int(row["index"]),
             )
             for row in table
         ),

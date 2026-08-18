@@ -69,6 +69,7 @@ from rig.runlog import (
     open_log,
     profiler_options,
     save_checkpoint,
+    ROUTER_SUMMARY_METRICS,
     training_log_columns,
     write_diagnostics_log,
     write_result,
@@ -2150,7 +2151,7 @@ def cross_entropy_and_router(
     config: Config,
     attention_fn: AttentionCallable | None = None,
     routed_fn: Any = None,
-) -> tuple[jax.Array, tuple[jax.Array, jax.Array, jax.Array] | None]:
+) -> tuple[jax.Array, "RouterStats | None"]:
     """The training objective, plus the balance loss and per-layer expert load.
 
     Carried out of the update as ``value_and_grad`` aux so logging costs an
@@ -2183,7 +2184,7 @@ def cross_entropy_and_router(
     assert router is not None
     if config.router_aux_coefficient:
         loss = loss + config.router_aux_coefficient * router.balance_loss
-    return loss, (router.balance_loss, router.load, router.summary)
+    return loss, router
 
 
 def learning_rate(step: jax.Array, config: Config) -> jax.Array:
@@ -2406,7 +2407,10 @@ def _apply_training_update(
         epsilon_multipliers,
         decay_multipliers,
     )
-    history_row = jnp.stack((loss, lr, grad_norm)).astype(jnp.float32)
+    routing = router_row(router_aux)
+    history_row = jnp.concatenate(
+        (jnp.stack((loss, lr, grad_norm)).astype(jnp.float32), routing)
+    )
     history = optimizer["history"].at[step - 1].set(history_row)
     return (
         params,
@@ -2415,17 +2419,9 @@ def _apply_training_update(
             "loss": loss,
             "grad_norm": grad_norm,
             "learning_rate": lr,
-            # [layers, experts] and a scalar, or absent for a dense model. The
-            # shapes are static, so this does not vary the executable.
-            **(
-                {}
-                if router_aux is None
-                else {
-                    "router_balance_loss": router_aux[0],
-                    "router_load": router_aux[1],
-                    "router_summary": router_aux[2],
-                }
-            ),
+            # Empty for a dense model. The shape is static either way, so
+            # this does not vary the executable.
+            "router_row": routing,
         },
         raw_gradients,
     )
@@ -2482,33 +2478,42 @@ def diagnostic_scopes(
     return output
 
 
-def router_log_values(host_metrics: Mapping[str, Any]) -> tuple[float, ...]:
-    """Flatten the router statistics in exactly the order the columns name them.
+def router_row(router: "RouterStats | None") -> jax.Array:
+    """Flatten the router statistics into the order training_log_columns names.
 
-    Empty for a dense run, whose metrics dict carries no routing keys at all.
-    Everything here is already averaged over every device, so the model-wide
-    numbers are plain reductions over the per-layer ones.
+    Built on device and stored in the optimizer history, so every step is
+    recorded rather than only the sampled ones, and so the live rows and the
+    authoritative end-of-run rewrite are necessarily the same numbers in the
+    same order. Empty for a dense model.
     """
 
-    load = host_metrics.get("router_load")
-    if load is None:
-        return ()
-    load = np.asarray(load, dtype=np.float32)
-    summary = np.asarray(host_metrics["router_summary"], dtype=np.float32)
-    return (
-        float(host_metrics["router_balance_loss"]),
-        float(load.max()),
-        float(load.min()),
-        *(float(value) for value in summary.mean(axis=0)),
-        # Per layer: the three summary statistics, then the whole load vector.
-        # Per-expert load is the exact distribution, so max, min, and any
-        # histogram of it are derivable from it and none are stored.
-        *(
-            float(value)
+    if router is None:
+        return jnp.zeros((0,), jnp.float32)
+    load, summary = router.load, router.summary
+    per_layer = jnp.concatenate(
+        [
+            jnp.concatenate((summary[layer], load[layer]))
             for layer in range(load.shape[0])
-            for value in (*summary[layer], *load[layer])
-        ),
+        ]
     )
+    return jnp.concatenate(
+        (
+            jnp.stack((router.balance_loss, load.max(), load.min())),
+            summary.mean(axis=0),
+            # Per layer: the three summary statistics, then the whole load
+            # vector. Per-expert load is the exact distribution, so max, min,
+            # and any histogram of it are derivable and none are stored.
+            per_layer,
+        )
+    ).astype(jnp.float32)
+
+
+def router_row_width(config: Config) -> int:
+    """How many columns router_row emits, for sizing the history buffer."""
+
+    if not config.experts:
+        return 0
+    return 6 + config.layers * (len(ROUTER_SUMMARY_METRICS) + config.experts)
 
 
 def diagnostic_scope_metadata(
@@ -2999,6 +3004,9 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     # the authoritative writer still sees every point.
     diagnostic_points_host: list[DiagnosticPoint] = []
     output_dir = args.output_dir.expanduser().resolve()
+    training_columns = training_log_columns(
+        config.layers if config.experts else 0, config.experts
+    )
     progress_log: logpack.LogWriter | None = None
     diagnostic_log: logpack.LogWriter | None = None
     if is_controller:
@@ -3008,9 +3016,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         (output_dir / DIAGNOSTICS_LOG_NAME).unlink(missing_ok=True)
         progress_log = open_log(
             output_dir / TRAINING_LOG_NAME,
-            training_log_columns(
-                config.layers if config.experts else 0, config.experts
-            ),
+            training_columns,
             tokens_per_step=config.batch_size * config.seq_len,
             flops_per_token=flops_per_token,
         )
@@ -3173,7 +3179,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                             float(host_metrics["loss"]),
                             float(host_metrics["learning_rate"]),
                             float(host_metrics["grad_norm"]),
-                            *router_log_values(host_metrics),
+                            *(float(v) for v in host_metrics["router_row"]),
                         ),
                     )
                     console.step(
@@ -3246,6 +3252,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                 tokens_per_step=config.batch_size * config.seq_len,
                 final_step=config.final_step,
                 flops_per_token=flops_per_token,
+                columns=training_columns,
             )
             if diagnostic_points:
                 write_diagnostics_log(
@@ -3405,6 +3412,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             tokens_per_step=config.batch_size * config.seq_len,
             final_step=config.final_step,
             flops_per_token=flops_per_token,
+            columns=training_columns,
         )
         if diagnostic_points:
             write_diagnostics_log(

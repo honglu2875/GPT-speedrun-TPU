@@ -325,40 +325,52 @@ class RouterLoggingTests(unittest.TestCase):
 
     LAYERS = 3
 
-    def _metrics(self):
+    def _router(self):
         rng = np.random.default_rng(11)
         load = rng.dirichlet(np.ones(EXPERTS), size=self.LAYERS).astype(np.float32)
         summary = rng.uniform(size=(self.LAYERS, 3)).astype(np.float32)
-        return (
-            {
-                "router_balance_loss": np.float32(1.25),
-                "router_load": load,
-                "router_summary": summary,
-            },
-            load,
-            summary,
+        stats = trainer.RouterStats(
+            balance_loss=jnp.float32(1.25),
+            load=jnp.asarray(load),
+            summary=jnp.asarray(summary),
         )
+        return stats, load, summary
 
-    def test_value_count_matches_the_column_count(self) -> None:
+    def test_row_width_matches_the_column_count(self) -> None:
         from rig.runlog import training_log_columns
 
         columns = training_log_columns(self.LAYERS, EXPERTS)
-        values = trainer.router_log_values(self._metrics()[0])
+        row = trainer.router_row(self._router()[0])
         # Three dense scalars are written ahead of the routing ones.
-        self.assertEqual(len(columns), 3 + len(values))
+        self.assertEqual(len(columns), 3 + int(row.shape[0]))
+
+    def test_declared_width_matches_the_row_it_sizes(self) -> None:
+        """The history buffer is allocated from the declared width alone.
+
+        If it disagrees with the row, the run dies at the first step with a
+        shape error -- or worse, silently truncates.
+        """
+
+        config = trainer.Config.__new__(trainer.Config)
+        object.__setattr__(config, "experts", EXPERTS)
+        object.__setattr__(config, "layers", self.LAYERS)
+        self.assertEqual(
+            trainer.router_row_width(config),
+            int(trainer.router_row(self._router()[0]).shape[0]),
+        )
+        object.__setattr__(config, "experts", 0)
+        self.assertEqual(trainer.router_row_width(config), 0)
 
     def test_every_value_lands_in_the_column_that_names_it(self) -> None:
         from rig import metrics as rig_metrics
-        from rig.runlog import training_log_columns
+        from rig.runlog import ROUTER_SUMMARY_METRICS, training_log_columns
 
-        host, load, summary = self._metrics()
+        stats, load, summary = self._router()
         columns = training_log_columns(self.LAYERS, EXPERTS)[3:]
-        values = trainer.router_log_values(host)
+        values = np.asarray(trainer.router_row(stats))
 
         expected = {}
-        for index, name in enumerate(
-            ("router.entropy", "router.top1_gate", "router.logit_rms")
-        ):
+        for index, name in enumerate(ROUTER_SUMMARY_METRICS):
             expected[(name, -1, -1)] = float(summary[:, index].mean())
             for layer in range(self.LAYERS):
                 expected[(name, layer, -1)] = float(summary[layer, index])
@@ -378,13 +390,47 @@ class RouterLoggingTests(unittest.TestCase):
             )
             with self.subTest(column=column.describe()):
                 self.assertIn(key, expected)
-                self.assertAlmostEqual(value, expected[key], places=5)
+                self.assertAlmostEqual(float(value), expected[key], places=5)
 
     def test_a_dense_run_logs_no_routing_columns(self) -> None:
         from rig.runlog import training_log_columns
 
         self.assertEqual(len(training_log_columns()), 3)
-        self.assertEqual(trainer.router_log_values({"loss": 1.0}), ())
+        self.assertEqual(int(trainer.router_row(None).shape[0]), 0)
+
+    def test_the_end_of_run_rewrite_keeps_the_routing_columns(self) -> None:
+        """The bug this whole path exists for: the rewrite superseded them.
+
+        write_training_log replaces the file from the device history buffer at
+        the end of a run. When it did not know about the routing columns it
+        wrote three, discarding every routing row the run had appended -- and
+        the run still finished clean, so only the artifact showed it.
+        """
+
+        import tempfile
+        from rig import logpack
+        from rig.runlog import training_log_columns, write_training_log
+
+        columns = training_log_columns(self.LAYERS, EXPERTS)
+        steps = 4
+        history = np.arange(steps * len(columns), dtype=np.float32).reshape(
+            steps, len(columns)
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            write_training_log(
+                Path(directory),
+                history,
+                tokens_per_step=1024,
+                final_step=steps,
+                flops_per_token=1,
+                columns=columns,
+            )
+            log = logpack.read_log(Path(directory) / "training.riglog")
+            self.assertEqual(len(log.columns), len(columns))
+            self.assertEqual(len(log), steps)
+            names = {c.describe() for c in log.columns}
+            self.assertIn("expert[2]#7/router.load", names)
+            self.assertIn("block[0]/router.entropy", names)
 
 
 if __name__ == "__main__":  # pragma: no cover
