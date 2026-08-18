@@ -1616,6 +1616,7 @@ _HTML = r"""<!doctype html>
 .study-warn{color:#d7a44a;font-size:12px;flex:1 1 260px}
 .study-status{color:#91a0b8;font-size:13px;min-height:18px}
 .study-status.bad{color:#e0736b}
+#back-to-studies{margin-bottom:8px}
 .md-h{font-size:15px;margin:18px 0 6px}
 .md-p{margin:6px 0;font-size:13px;line-height:1.55}
 .md-list{margin:6px 0 6px 18px;font-size:13px;line-height:1.6}
@@ -1653,7 +1654,7 @@ _HTML = r"""<!doctype html>
     <label class="smooth-level" for="smoothing-level"><span id="smoothing-level-label">Span</span><input id="smoothing-level" type="number" min="1" max="1400" step="1" value="21" inputmode="numeric" disabled><span>samples</span></label>
     <div class="smoothing-hint" id="smoothing-hint" aria-live="polite"></div>
   </div>
-  <details class="fold" id="summary-fold" open>
+  <details class="fold" id="summary-fold">
     <summary class="section-title fold-head">Run summary</summary>
     <div id="summary"></div>
   </details>
@@ -1688,7 +1689,7 @@ _HTML = r"""<!doctype html>
 <script type="application/gzip-base64" id="report-data">__REPORT_DATA__</script>
 <script>
 (()=>{'use strict';
-let D, runMap, visible;
+let D, runMap, visible, cameFromPicker=false;
 const families=['grad','update','param'];
 const HF='https://huggingface.co/datasets/';
 function mdToHtml(src){
@@ -1758,7 +1759,7 @@ function chooseStudy(remote){
         +mb(study.full)+')</button><span class="study-warn">Downloads '+mb(study.full)
         +' from HuggingFace. Nothing is fetched until you click.</span>':'')
       +'</div><div class="study-status" id="study-progress"></div>';
-     detail.querySelector('#study-go').onclick=()=>{root.remove();resolve(payload)};
+     detail.querySelector('#study-go').onclick=()=>{cameFromPicker=true;root.remove();resolve(payload)};
      const fullButton=detail.querySelector('#study-full');
      if(fullButton)fullButton.onclick=async()=>{
       fullButton.disabled=true;
@@ -1766,7 +1767,7 @@ function chooseStudy(remote){
       try{
        const full=await fetchGzipJson(base+'full.json.gz',(got,total)=>{
         status.textContent='Downloading '+mb(got)+(total?' of '+mb(total):'')+'…'});
-       status.textContent='Rendering…';root.remove();resolve(full)}
+       status.textContent='Rendering…';cameFromPicker=true;root.remove();resolve(full)}
       catch(error){status.textContent='Download failed: '+String(error&&error.message||error);
        fullButton.disabled=false}}}
     catch(error){detail.innerHTML='<div class="study-status bad">Could not load: '
@@ -1802,7 +1803,15 @@ function init(){
  $('notices-count').textContent=D.notices.length?'('+D.notices.length+')':'';
  $('notices-fold').hidden=!D.notices.length;
  buildRuns(); buildSummary(); buildCharts(); buildSkipped(); updateSmoothingControls(true); updateAxisHint();
- $('footer').textContent=`Generated ${new Date(D.meta.generatedAt).toLocaleString()} · portable HTML · no network or external JavaScript`;
+ if(cameFromPicker){
+  const back=document.createElement('button');
+  back.className='ghost';back.id='back-to-studies';back.textContent='← All studies';
+  back.onclick=()=>location.reload();
+  const eyebrow=document.querySelector('.top .eyebrow');
+  if(eyebrow&&eyebrow.parentNode)eyebrow.parentNode.insertBefore(back,eyebrow);}
+ $('footer').textContent=cameFromPicker
+  ?`Generated ${new Date(D.meta.generatedAt).toLocaleString()} · fetched from HuggingFace`
+  :`Generated ${new Date(D.meta.generatedAt).toLocaleString()} · portable HTML · no network or external JavaScript`;
  document.querySelectorAll('input[name=axis]').forEach(r=>r.addEventListener('change',()=>{if(!r.checked)return;axis=r.value;resetViews();updateAxisHint();schedule()}));
  document.querySelectorAll('input[name=x-scale]').forEach(r=>r.addEventListener('change',()=>{if(!r.checked)return;xScale=r.value;resetViews();updateAxisHint();schedule()}));
  document.querySelectorAll('input[name=smoothing]').forEach(r=>r.addEventListener('change',()=>{if(!r.checked)return;smoothing=r.value;updateSmoothingControls(true);schedule()}));

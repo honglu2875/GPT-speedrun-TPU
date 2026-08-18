@@ -827,14 +827,42 @@ class ClientSourceGuardTests(unittest.TestCase):
             body.index('id="notices-fold"'), body.index('id="layer-charts"')
         )
 
-    def test_summary_fold_is_open_so_a_load_failure_is_visible(self) -> None:
-        # The payload error handler writes into #summary; a collapsed fold
-        # would hide the only report of why the page is empty.
+    def test_summary_starts_collapsed_but_opens_on_a_load_failure(self) -> None:
+        """The charts are what the page is for; the table is reference.
+
+        The fold must still spring open when the payload fails to load, since
+        the error handler writes into #summary and a collapsed fold would hide
+        the only report of why the page is empty. That guarantee comes from the
+        handler forcing it open, not from the markup, which is what lets the
+        default be collapsed at all.
+        """
+
         body = self._body()
-        self.assertIn('id="summary-fold" open', body)
+        self.assertIn('id="summary-fold"', body)
+        self.assertNotIn('id="summary-fold" open', body)
         script = self._script()
         start = script.index("}).catch(error=>{")
         self.assertIn("fold.open=true", script[start:])
+
+    def test_a_picker_launched_view_offers_a_way_back(self) -> None:
+        """Opening a study from the browser must not be a one-way door.
+
+        The picker removes itself once a study is chosen, so without this the
+        only way back to the study list is the browser's own back button --
+        which does nothing, because choosing a study never changed the URL.
+        """
+
+        script = self._script()
+        self.assertIn("cameFromPicker=true", script)
+        start = script.index("function init(){")
+        end = (
+            script.index("function buildRuns(", start)
+            if "function buildRuns(" in script[start:]
+            else len(script)
+        )
+        body = script[start:end]
+        self.assertIn("back-to-studies", body)
+        self.assertIn("location.reload()", body)
 
     def test_notice_fold_stays_hidden_when_there_is_nothing_to_say(self) -> None:
         body = self._body()
