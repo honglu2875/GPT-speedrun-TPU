@@ -1,8 +1,9 @@
 # Hyperparameter transfer under Complete(d)P
 
 Whether hyperparameters tuned once at a small size stay optimal as the model
-grows. Two knobs measured on the reference family at 5 TPP: base learning rate
-and global batch size.
+grows. Two knobs measured on the reference family at 5 TPP — base learning rate
+and global batch size — plus a check at 20 TPP that the token horizon does not
+move the answer.
 
 **Both transfer.** Every configuration measured puts the optimum at base LR
 `2^-8` and global batch `128`, across a 4x parameter range (60M → 250M) and a
@@ -17,6 +18,10 @@ costs 0.45 nats at 60M, 0.016 at 250M, and by 500M is no longer resolvable
 against seed noise (t=0.86). Where the optimum sits is stable across scale;
 what it costs to be wrong is not, so the practical recommendation inverts
 before the optimum does.
+
+The horizon does not move it either. At 500M and 20 TPP the optimum is again
+bracketed at or above `2^-8`, four times further out than anything studies 1
+and 2 measured (study 3).
 
 Supersedes the former `LR_TRANSFER.md`.
 
@@ -343,6 +348,42 @@ At 60M, batch 256 buys 14% wall clock for 0.45 nats — never worth it. At 250M
 the same trade costs 0.016 nats. The right answer is already scale-dependent
 and trending toward the larger batch.
 
+## Study 3 — does the optimum survive a 4x longer horizon?
+
+Studies 1 and 2 were run at 5 TPP. Complete(d)P's `m_D` correction is supposed
+to hold the optimum in place as the token horizon grows, so this tests it
+directly: 500M at **20 TPP**, four points, one seed each, on a v6e-8.
+
+| batch | base LR | effective peak LR | steps | val loss | wall | tok/s |
+|---|---|--:|--:|--:|--:|--:|
+| 128 | **2^-8** | 0.0013487 | 76,691 | **2.9759** | 5.68h | 492K |
+| 128 | 2^-7 | 0.0026975 | 76,691 | 2.9766 | 5.68h | 492K |
+| 256 | 2^-8 | 0.0019074 | 38,346 | 2.9788 | 5.59h | 500K |
+| 128 | 2^-9 | 0.0006744 | 76,691 | 2.9961 | 5.68h | 492K |
+
+**What this establishes.** `2^-9` is out by 0.0202 nats, which is 29x the gap
+between the two leaders, so the optimum is bracketed at or above `2^-8`. That
+is the same bracket study 1 produced at 5 TPP, four times shorter — the
+horizon moved 4x and the answer did not.
+
+**What it does not.** `2^-8` leads `2^-7` by **0.0007 nats at one seed each**,
+and one seed resolves nothing at that separation: study 2 measured seed ranges
+of 0.005–0.06 around the optimum, an order of magnitude larger. The supported
+claim is that the 20-TPP optimum lies in `{2^-8, 2^-7}` with `2^-8` nominally
+ahead — which is *verbatim* the claim study 1 reached at 250M. Reading a winner
+out of 0.0007 would repeat exactly the single-seed mistake that produced the
+original v3 250M result.
+
+Batch 256 costs 0.0030 nats against batch 128 at the same base LR, continuing
+the collapse traced in study 2 (0.45 at 60M, 0.016 at 250M) and still well
+inside the noise floor at this scale.
+
+### Settling it
+
+Three seeds at `2^-8` and three at `2^-7`, batch 128. At 5.7h each that is
+~34 TPU-hours to convert "nominally ahead" into a result — the same price
+study 1's reseed paid, and for the same reason.
+
 ## Reproducibility
 
 The 250M/bs128 cells of Study 2 duplicate Study 1's reseed exactly. All six
@@ -396,6 +437,12 @@ Two artifact-format changes make older runs non-comparable in specific ways:
   [FLOPS.md](FLOPS.md).
 - Runs recorded before commit `75f0b22` wrote `training.csv` and
   `diagnostics.csv` in long form. Nothing converts them, so reading one needs a
-  checkout at or before `8936b51`. Every study in this note predates the
-  change; their archived dashboards under `docs/reports/` are the durable
-  record.
+  checkout at or before `8936b51`. Studies 1 and 2 predate the change entirely,
+  as do three of study 3's four points; their archived dashboards under
+  `docs/reports/` are the durable record. Note the consequence for study 3 in
+  particular: no single reader can plot all four of its points, which is why
+  its table is built from `metrics.json` — result-level data is
+  format-independent, only the curves are not.
+
+Study 3's dashboard, covering its three legacy-format points, is
+[500M-20tpp-v6e.html](reports/500M-20tpp-v6e.html).
