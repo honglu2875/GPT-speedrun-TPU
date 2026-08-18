@@ -47,7 +47,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Iterable, Sequence
-import struct
 
 import numpy as np
 
@@ -79,7 +78,19 @@ COLUMN_DTYPE = np.dtype(
         ("element_count", "<i8"),
     ]
 )
-_HEADER_STRUCT = struct.Struct("<ixxxxqd")  # column_count, pad, tokens_per_step, flops
+# The fixed header, as a dtype rather than a struct format so its field
+# offsets are introspectable. A non-Python reader is generated from these
+# offsets rather than repeating them, which is the only thing that keeps such
+# a reader from drifting out of step with this writer. The four padding bytes
+# after ``column_count`` keep the 64-bit fields naturally aligned.
+HEADER_DTYPE = np.dtype(
+    {
+        "names": ["column_count", "tokens_per_step", "flops_per_token"],
+        "formats": ["<i4", "<i8", "<f8"],
+        "offsets": [0, 8, 16],
+        "itemsize": 24,
+    }
+)
 # int32 keeps the record 4-aligned for any column count, where an int64 step
 # would leave odd-column records straddling. The bound is 2^31 optimizer
 # steps; the largest run this family can express is ~1.5e5.
@@ -153,12 +164,44 @@ def column(
     )
 
 
+def layout_descriptor() -> dict:
+    """Describe the byte layout so a reader in another language stays in step.
+
+    Every offset, width, and element type is read back out of the same dtype
+    objects the writer uses, so there is exactly one place any of them is
+    stated. A reader driven by this descriptor cannot disagree with the writer
+    about where a field lives, because neither of them knows independently --
+    which is the whole point, since a disagreement would not raise anything, it
+    would silently render one column's numbers under another column's name.
+
+    ``tests/test_logpack_descriptor.py`` holds a reader honest against it.
+    """
+
+    def fields(dtype):
+        return [
+            {
+                "name": name,
+                "offset": int(dtype.fields[name][1]),
+                "type": dtype.fields[name][0].str,
+            }
+            for name in dtype.names
+        ]
+
+    return {
+        "magic": list(MAGIC),
+        "header": {"itemsize": HEADER_DTYPE.itemsize, "fields": fields(HEADER_DTYPE)},
+        "column": {"itemsize": COLUMN_DTYPE.itemsize, "fields": fields(COLUMN_DTYPE)},
+        "step": {"type": _STEP_DTYPE.str, "itemsize": _STEP_DTYPE.itemsize},
+        "value": {"type": _VALUE_DTYPE.str, "itemsize": _VALUE_DTYPE.itemsize},
+    }
+
+
 def _record_size(column_count: int) -> int:
     return _STEP_DTYPE.itemsize + column_count * _VALUE_DTYPE.itemsize
 
 
 def _header_size(column_count: int) -> int:
-    return len(MAGIC) + _HEADER_STRUCT.size + column_count * COLUMN_DTYPE.itemsize
+    return len(MAGIC) + HEADER_DTYPE.itemsize + column_count * COLUMN_DTYPE.itemsize
 
 
 class LogWriter:
@@ -213,9 +256,10 @@ class LogWriter:
             )
         handle.write(MAGIC)
         handle.write(
-            _HEADER_STRUCT.pack(
-                len(self.columns), self._tokens_per_step, self._flops_per_token
-            )
+            np.array(
+                (len(self.columns), self._tokens_per_step, self._flops_per_token),
+                dtype=HEADER_DTYPE,
+            ).tobytes()
         )
         handle.write(table.tobytes())
         handle.flush()
@@ -309,12 +353,13 @@ def read_log(path: Path) -> Log:
     if len(raw) < len(MAGIC) or not raw.startswith(MAGIC):
         raise LogError(f"{path} is not a rig log (bad magic)")
     offset = len(MAGIC)
-    if len(raw) < offset + _HEADER_STRUCT.size:
+    if len(raw) < offset + HEADER_DTYPE.itemsize:
         raise LogError(f"{path} is truncated inside its header")
-    column_count, tokens_per_step, flops_per_token = _HEADER_STRUCT.unpack_from(
-        raw, offset
-    )
-    offset += _HEADER_STRUCT.size
+    header = np.frombuffer(raw, dtype=HEADER_DTYPE, count=1, offset=offset)[0]
+    column_count = int(header["column_count"])
+    tokens_per_step = int(header["tokens_per_step"])
+    flops_per_token = float(header["flops_per_token"])
+    offset += HEADER_DTYPE.itemsize
     if column_count <= 0:
         raise LogError(f"{path} declares {column_count} columns")
     table_bytes = column_count * COLUMN_DTYPE.itemsize

@@ -10,11 +10,10 @@ training curve into the packed format so those runs are ordinary inputs again,
 and it does so without touching the originals -- the CSV stays exactly where it
 is and the packed file is written somewhere else.
 
-Only the training curve is converted. The diagnostics CSVs are 140-290 MB each
-and carry per-layer parameter and gradient statistics, which are not what a
-learning-rate or batch-size comparison is made of; converting them would grow a
-report by three orders of magnitude for series nobody plots in it. They remain
-readable in place by the same means they always were.
+Both the training curve and the per-layer diagnostics convert. The diagnostics
+are the expensive half -- 5-290 MB of CSV per run -- and the packed form is
+roughly twenty times smaller, which is what makes keeping them affordable at
+all.
 """
 
 from __future__ import annotations
@@ -43,6 +42,18 @@ TRAINING_HEADER = (
     "train_loss",
     "learning_rate",
     "grad_norm",
+)
+
+DIAGNOSTICS_HEADER = (
+    "step",
+    "tokens_processed",
+    "cumulative_estimated_flops",
+    "scope",
+    "layer",
+    "family",
+    "stat",
+    "value",
+    "element_count",
 )
 
 
@@ -97,6 +108,86 @@ def read_training_csv(path: Path) -> tuple[np.ndarray, int, int]:
     return history, tokens_per_step, int(round(float(flops_per_token[0])))
 
 
+def read_diagnostics_csv(
+    path: Path,
+) -> tuple[list[runlog.DiagnosticPoint], list[tuple[str, int | None, int]]]:
+    """Return ``(points, scope_metadata)`` from a long-form diagnostics CSV.
+
+    The long form names every value by ``(scope, layer, family, stat)`` on its
+    own row. The packed form stores a fixed grid instead -- scope x family x
+    stat, in the order ``runlog.diagnostic_log_columns`` lays it out -- so the
+    conversion is a pivot, and its only real risk is putting a value in the
+    wrong cell of that grid.
+
+    Guarded three ways. Scopes keep first-seen order, so the grid matches the
+    order the recipe emitted. Every family and statistic must be one the
+    registry knows, because an unrecognized name means this file records
+    something the packed layout has no cell for. And every step must fill the
+    grid exactly once -- a missing or duplicated cell would otherwise leave a
+    zero that reads as a real measurement.
+    """
+
+    families = {name: index for index, name in enumerate(runlog.DIAGNOSTIC_FAMILIES)}
+    stats = {name: index for index, name in enumerate(runlog.DIAGNOSTIC_STATS)}
+
+    scopes: dict[tuple[str, int | None], int] = {}
+    elements: dict[tuple[str, int | None], int] = {}
+    rows_by_step: dict[int, list[tuple[int, int, int, float]]] = {}
+
+    with Path(path).open(newline="", encoding="utf-8") as handle:
+        reader = csv.reader(handle)
+        try:
+            header = tuple(next(reader))
+        except StopIteration:
+            raise LegacyError(f"{path} is empty") from None
+        if header != DIAGNOSTICS_HEADER:
+            raise LegacyError(
+                f"{path} has header {header}, expected {DIAGNOSTICS_HEADER}"
+            )
+        for row in reader:
+            if not row:
+                continue
+            step = int(row[0])
+            layer = int(row[4]) if row[4] != "" else None
+            key = (row[3], layer)
+            if key not in scopes:
+                scopes[key] = len(scopes)
+                elements[key] = int(row[8])
+            family, stat = row[5], row[6]
+            if family not in families or stat not in stats:
+                raise LegacyError(
+                    f"{path} records {family}.{stat}, which is not in the registry"
+                )
+            rows_by_step.setdefault(step, []).append(
+                (scopes[key], families[family], stats[stat], float(row[7]))
+            )
+
+    if not rows_by_step:
+        raise LegacyError(f"{path} has a header but no samples")
+
+    shape = (len(scopes), len(families), len(stats))
+    expected = shape[0] * shape[1] * shape[2]
+    points = []
+    for step in sorted(rows_by_step):
+        cells = rows_by_step[step]
+        if len(cells) != expected:
+            raise LegacyError(
+                f"{path} step {step} has {len(cells)} values, expected {expected}; "
+                "a partial grid would leave zeros that read as measurements"
+            )
+        values = np.zeros(shape, dtype=np.float32)
+        filled = np.zeros(shape, dtype=bool)
+        for scope_index, family_index, stat_index, value in cells:
+            values[scope_index, family_index, stat_index] = value
+            filled[scope_index, family_index, stat_index] = True
+        if not filled.all():
+            raise LegacyError(f"{path} step {step} repeats a cell and omits another")
+        points.append(runlog.DiagnosticPoint(step=step, values=values))
+
+    metadata = [(name, layer, elements[(name, layer)]) for name, layer in scopes]
+    return points, metadata
+
+
 def convert_run(source: Path, destination: Path) -> dict[str, Any]:
     """Write a packed copy of one legacy run, leaving the original untouched.
 
@@ -134,9 +225,22 @@ def convert_run(source: Path, destination: Path) -> dict[str, Any]:
 
     artifacts = dict(result.get("artifacts") or {})
     artifacts["training_curve"] = runlog.TRAINING_LOG_NAME
-    # The diagnostics stay behind in CSV, so the pointer to them must go too --
-    # a declared artifact that is absent is an error, not a shrug.
-    artifacts.pop("diagnostics", None)
+
+    diagnostics = source / "diagnostics.csv"
+    if diagnostics.is_file():
+        points, metadata = read_diagnostics_csv(diagnostics)
+        runlog.write_diagnostics_log(
+            destination,
+            points,
+            metadata,
+            tokens_per_step=tokens_per_step,
+            final_step=points[-1].step,
+            flops_per_token=flops_per_token,
+        )
+        artifacts["diagnostics"] = runlog.DIAGNOSTICS_LOG_NAME
+    else:
+        # A declared artifact that is absent is an error, not a shrug.
+        artifacts.pop("diagnostics", None)
     result = {**result, "artifacts": artifacts}
     (destination / "result.json").write_text(
         json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
