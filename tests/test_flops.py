@@ -98,7 +98,10 @@ class ForwardCountTests(unittest.TestCase):
             }
             x = _zeros(BATCH, SEQ, model_dim)
             fn = lambda p, t: jnp.sum(  # noqa: E731
-                jnp.einsum("btf,fd->btd", jnp.einsum("btd,df->btf", t, p["w1"]), p["w2"]) ** 2
+                jnp.einsum(
+                    "btf,fd->btd", jnp.einsum("btd,df->btf", t, p["w1"]), p["w2"]
+                )
+                ** 2
             )
             return count_flops(fn, params, x).matmul
 
@@ -375,9 +378,7 @@ class PerTokenTests(unittest.TestCase):
         params = _block_params()
         x = _zeros(BATCH, SEQ, MODEL)
         got = count_flops(lambda p, t: jnp.sum(_block(p, t) ** 2), params, x)
-        self.assertEqual(
-            got.per_token(BATCH * SEQ), got.matmul // (BATCH * SEQ)
-        )
+        self.assertEqual(got.per_token(BATCH * SEQ), got.matmul // (BATCH * SEQ))
         with self.assertRaises(FlopError):
             got.per_token(0)
 

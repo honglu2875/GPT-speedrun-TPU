@@ -103,7 +103,7 @@ class LogPackTests(unittest.TestCase):
             _write(path, [(1, (1.0, 2.0, 3.0, 4.0))])
             raw = bytearray(path.read_bytes())
             # Rewrite the first column's metric id to one no build defines.
-            offset = len(logpack.MAGIC) + logpack._HEADER_STRUCT.size
+            offset = len(logpack.MAGIC) + logpack.HEADER_DTYPE.itemsize
             struct.pack_into("<i", raw, offset, 987_654)
             path.write_bytes(bytes(raw))
 
@@ -185,9 +185,7 @@ class LogPackTests(unittest.TestCase):
                             },
                         )
             with self.assertRaisesRegex(ValueError, "at least one column"):
-                logpack.LogWriter(
-                    path, [], tokens_per_step=1_024, flops_per_token=1.0
-                )
+                logpack.LogWriter(path, [], tokens_per_step=1_024, flops_per_token=1.0)
 
     def test_size_is_the_declared_layout(self) -> None:
         rows, columns = 100, 4

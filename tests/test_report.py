@@ -58,9 +58,7 @@ class ReportTests(unittest.TestCase):
 
         self.assertEqual(summary.included, tuple(sorted(cases)))
         self.assertEqual(summary.skipped, {})
-        classifications = {
-            run["id"]: run["classification"] for run in payload["runs"]
-        }
+        classifications = {run["id"]: run["classification"] for run in payload["runs"]}
         self.assertEqual(classifications["official-good"], "official")
         self.assertEqual(classifications["official-poor"], "official")
         self.assertEqual(classifications["development"], "diagnostic")
@@ -87,7 +85,9 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(summary.included, ())
         self.assertIn("track is invalid", summary.skipped["bad-track"])
 
-    def test_long_form_diagnostics_build_all_family_and_final_scope_charts(self) -> None:
+    def test_long_form_diagnostics_build_all_family_and_final_scope_charts(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runs = root / "runs"
@@ -192,7 +192,9 @@ class ReportTests(unittest.TestCase):
         self.assertTrue(payload["runs"][0]["selected"])
         self.assertEqual(payload["runs"][0]["classification"], "official")
         self.assertEqual(payload["runs"][0]["flopSource"], "traced")
-        train = next(chart for chart in payload["timeCharts"] if chart["key"] == "train_loss")
+        train = next(
+            chart for chart in payload["timeCharts"] if chart["key"] == "train_loss"
+        )
         self.assertEqual(train["series"][0]["points"][-1], [2.0, 2000.0, 4.0])
         # Shell strings stay in the markup; chart titles now live in the
         # compressed payload, so they are asserted through the decoder.
@@ -214,7 +216,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("gradient L2 norm", coverage)
         self.assertIn("update fourth moment", coverage)
         self.assertIn("parameter fourth moment", coverage)
-        self.assertNotRegex(html, r'<script[^>]+src=|<link[^>]+href=')
+        self.assertNotRegex(html, r"<script[^>]+src=|<link[^>]+href=")
         self.assertNotIn(".slice(0,10)", html)
         self.assertNotIn("Math.min(...xs)", html)
         self.assertIn("filter(r=>r.selected)", html)
@@ -314,7 +316,9 @@ class ReportTests(unittest.TestCase):
         self.assertFalse(summary.included)
         self.assertIn("SHA-256", summary.skipped["tampered-run"])
 
-    def test_malformed_unledgered_timing_is_skipped_without_aborting_report(self) -> None:
+    def test_malformed_unledgered_timing_is_skipped_without_aborting_report(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runs = root / "runs"
@@ -438,7 +442,9 @@ class ReportTests(unittest.TestCase):
                     }
                 },
             }
-            (runs / "records.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
+            (runs / "records.jsonl").write_text(
+                json.dumps(record) + "\n", encoding="utf-8"
+            )
             build_report(runs, root / "report.html")
             html = (root / "report.html").read_text(encoding="utf-8")
             payload = _payload(html)
@@ -483,8 +489,11 @@ def _write_result(
 
 
 def _write_training(
-    run: Path, rows: Sequence[Sequence[float]], *, tokens_per_step: int = 10,
-    flops_per_token: float = 100.0
+    run: Path,
+    rows: Sequence[Sequence[float]],
+    *,
+    tokens_per_step: int = 10,
+    flops_per_token: float = 100.0,
 ) -> Path:
     """Write a packed training log; rows are ``(loss, learning_rate, grad_norm)``."""
 
@@ -504,8 +513,9 @@ def _write_training(
     return path
 
 
-def _write_diagnostics(path: Path, *, tokens_per_step: int = 10,
-                       flops_per_token: float = 100.0) -> None:
+def _write_diagnostics(
+    path: Path, *, tokens_per_step: int = 10, flops_per_token: float = 100.0
+) -> None:
     families = ("param", "grad", "update")
     statistics = (
         "l1_norm",
@@ -574,6 +584,54 @@ def _record_for_run(run: Path, *, validation: bool) -> dict[str, object]:
     return record
 
 
+class ChartPointBudgetTests(unittest.TestCase):
+    """How many samples a single-file report carries, and how to get them all.
+
+    These files are a portable overview and thin every series to one budget,
+    so nothing in a file sits at a different fidelity than anything beside it.
+    Thinning cannot be undone by zooming and a downsampled curve looks exactly
+    like a real one, so the lossless originals live in the dataset repository
+    rather than being reconstructed from these.
+    """
+
+    def _report(self, steps: int, **kwargs):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "runs"
+            (runs / "long").mkdir(parents=True)
+            rows = [(10.0 - index * 0.001, 1e-4, 0.5) for index in range(steps)]
+            # One lone spike, the kind a shape-preserving downsample drops.
+            rows[steps // 2] = (99.0, 1e-4, 0.5)
+            # The report cross-checks the final loss against result.json, and
+            # the fixture declares 4.0.
+            rows[-1] = (4.0, 1e-4, 0.5)
+            _write_training(runs / "long", rows)
+            # tokens_per_step is 10 in the fixture; the report cross-checks the
+            # declared token count against the curve, so it has to follow.
+            _write_result(runs / "long", validation_artifact=False, tokens=steps * 10)
+            build_report(runs, root / "report.html", **kwargs)
+            return _payload((root / "report.html").read_text(encoding="utf-8"))
+
+    def test_the_default_thins_to_one_budget(self) -> None:
+        # These single-file reports are a portable overview, so they carry a
+        # bounded number of points. The lossless originals are the dataset.
+        payload = self._report(4000)
+        chart = next(c for c in payload["timeCharts"] if c["key"] == "train_loss")
+        self.assertEqual(len(chart["series"][0]["points"]), 1400)
+
+    def test_zero_embeds_every_sample(self) -> None:
+        steps = 4000
+        payload = self._report(steps, max_chart_points=0)
+        chart = next(c for c in payload["timeCharts"] if c["key"] == "train_loss")
+        self.assertEqual(len(chart["series"][0]["points"]), steps)
+
+    def test_a_spike_survives_at_full_resolution(self) -> None:
+        payload = self._report(4000, max_chart_points=0)
+        chart = next(c for c in payload["timeCharts"] if c["key"] == "train_loss")
+        values = [point[2] for point in chart["series"][0]["points"]]
+        self.assertEqual(max(values), 99.0)
+
+
 def _payload(html: str) -> dict[str, object]:
     """Decode the embedded payload exactly as the page does."""
 
@@ -622,7 +680,9 @@ class LayerSnapshotTests(unittest.TestCase):
             run.mkdir(parents=True)
             _write_training(run, [(4.5, 1e-4, 0.5), (4.0, 9e-5, 0.4)])
             _write_diagnostics(run / DIAGNOSTICS_LOG_NAME)
-            _write_result(run, validation_artifact=False, tokens=20, validation_loss=3.0)
+            _write_result(
+                run, validation_artifact=False, tokens=20, validation_loss=3.0
+            )
             build_report(runs, root / "report.html")
             payload = _payload((root / "report.html").read_text(encoding="utf-8"))
 
@@ -644,10 +704,10 @@ class PayloadPackingTests(unittest.TestCase):
             runs = root / "runs"
             run = runs / "packed"
             run.mkdir(parents=True)
-            _write_training(
-                run, [(4.5 - i / 1000, 1e-4, 0.5) for i in range(1, 400)]
+            _write_training(run, [(4.5 - i / 1000, 1e-4, 0.5) for i in range(1, 400)])
+            _write_result(
+                run, validation_artifact=False, tokens=3990, validation_loss=3.0
             )
-            _write_result(run, validation_artifact=False, tokens=3990, validation_loss=3.0)
             build_report(runs, root / "report.html")
             html = (root / "report.html").read_text(encoding="utf-8")
 
@@ -695,7 +755,9 @@ class ClientSourceGuardTests(unittest.TestCase):
             runs.mkdir()
             build_report(runs, root / "report.html")
             html = (root / "report.html").read_text(encoding="utf-8")
-        scripts = re.findall(r"<script(?![^>]*id=)[^>]*>(.*?)</script>", html, re.DOTALL)
+        scripts = re.findall(
+            r"<script(?![^>]*id=)[^>]*>(.*?)</script>", html, re.DOTALL
+        )
         return max(scripts, key=len)
 
     def test_draw_never_reaches_for_series_points(self) -> None:
@@ -706,7 +768,38 @@ class ClientSourceGuardTests(unittest.TestCase):
         start = script.index("function draw(item){")
         end = script.index("function axisToStep(", start)
         self.assertNotIn("s.points", script[start:end])
-        self.assertIn("base=seriesPoints(item,s)", script[start:end])
+        # Reads go through seriesPoints, whatever the local is called. The
+        # binding was renamed when draw started reducing points for display,
+        # and pinning the old name would have failed for a rename rather than
+        # for the bug this guards.
+        self.assertIn("seriesPoints(item,s)", script[start:end])
+
+    def test_the_draw_reduction_keeps_both_extremes(self) -> None:
+        """Bucketing must keep each bucket's min and max, not one representative.
+
+        The payload now holds every sample, so drawing has to reduce. Which
+        reduction it uses decides whether a lone spike is visible: keeping one
+        point per bucket preserves the curve's shape and can drop the spike
+        entirely, leaving a clean line that is wrong. Keeping both extremes
+        cannot.
+        """
+
+        script = self._script()
+        start = script.index("function envelope(")
+        end = script.index("function reduceForDraw(", start)
+        body = script[start:end]
+        self.assertIn("out.push(points[mn])", body)
+        self.assertIn("out.push(points[mx])", body)
+
+    def test_draw_reduces_against_the_visible_span(self) -> None:
+        # Reducing the whole series and then zooming would show the same
+        # coarse points however far in you went.
+        script = self._script()
+        start = script.index("function reduceForDraw(")
+        self.assertIn("visibleSlice(item,points)", script[start : start + 200])
+        draw_start = script.index("function draw(item){")
+        draw_end = script.index("function axisToStep(", draw_start)
+        self.assertIn("reduceForDraw(item,", script[draw_start:draw_end])
 
     def test_layer_frames_are_cached_for_stable_identity(self) -> None:
         # draw() decides "smoothed" by array identity, so layerFrame must not
@@ -734,14 +827,42 @@ class ClientSourceGuardTests(unittest.TestCase):
             body.index('id="notices-fold"'), body.index('id="layer-charts"')
         )
 
-    def test_summary_fold_is_open_so_a_load_failure_is_visible(self) -> None:
-        # The payload error handler writes into #summary; a collapsed fold
-        # would hide the only report of why the page is empty.
+    def test_summary_starts_collapsed_but_opens_on_a_load_failure(self) -> None:
+        """The charts are what the page is for; the table is reference.
+
+        The fold must still spring open when the payload fails to load, since
+        the error handler writes into #summary and a collapsed fold would hide
+        the only report of why the page is empty. That guarantee comes from the
+        handler forcing it open, not from the markup, which is what lets the
+        default be collapsed at all.
+        """
+
         body = self._body()
-        self.assertIn('id="summary-fold" open', body)
+        self.assertIn('id="summary-fold"', body)
+        self.assertNotIn('id="summary-fold" open', body)
         script = self._script()
         start = script.index("}).catch(error=>{")
         self.assertIn("fold.open=true", script[start:])
+
+    def test_a_picker_launched_view_offers_a_way_back(self) -> None:
+        """Opening a study from the browser must not be a one-way door.
+
+        The picker removes itself once a study is chosen, so without this the
+        only way back to the study list is the browser's own back button --
+        which does nothing, because choosing a study never changed the URL.
+        """
+
+        script = self._script()
+        self.assertIn("cameFromPicker=true", script)
+        start = script.index("function init(){")
+        end = (
+            script.index("function buildRuns(", start)
+            if "function buildRuns(" in script[start:]
+            else len(script)
+        )
+        body = script[start:end]
+        self.assertIn("back-to-studies", body)
+        self.assertIn("location.reload()", body)
 
     def test_notice_fold_stays_hidden_when_there_is_nothing_to_say(self) -> None:
         body = self._body()
@@ -805,3 +926,47 @@ class ClientSourceGuardTests(unittest.TestCase):
         end = script.index("function bounds(item){", start)
         self.assertNotIn("s.values.map(row=>", script[start:end])
         self.assertIn("const pts=seriesPoints(item,s);", script[start:end])
+
+
+class SelectFilterTests(unittest.TestCase):
+    """One line of research per report, without disturbing runs in flight."""
+
+    def _three_runs(self, root: Path) -> Path:
+        runs = root / "runs"
+        for name in ("alpha-lr2e-8", "alpha-lr2e-9", "beta-lr2e-8"):
+            run = runs / name
+            run.mkdir(parents=True)
+            _write_training(run, [(4.5, 1e-4, 0.5), (4.0, 9e-5, 0.4)])
+            _write_result(run, validation_artifact=False)
+        return runs
+
+    def test_a_regex_selects_a_family(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = self._three_runs(root)
+            summary = build_report(runs, root / "r.html", select="^alpha-")
+        self.assertEqual(summary.included, ("alpha-lr2e-8", "alpha-lr2e-9"))
+        # Non-matching runs are omitted, not reported as skipped: they were
+        # never candidates, and listing them would bury real skip reasons.
+        self.assertEqual(summary.skipped, {})
+
+    def test_no_selector_keeps_every_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = self._three_runs(root)
+            summary = build_report(runs, root / "r.html")
+        self.assertEqual(len(summary.included), 3)
+
+    def test_an_invalid_expression_is_refused_by_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = self._three_runs(root)
+            with self.assertRaisesRegex(ReportError, "invalid --select"):
+                build_report(runs, root / "r.html", select="alpha(")
+
+    def test_the_expression_searches_rather_than_anchors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = self._three_runs(root)
+            summary = build_report(runs, root / "r.html", select="lr2e-8")
+        self.assertEqual(summary.included, ("alpha-lr2e-8", "beta-lr2e-8"))

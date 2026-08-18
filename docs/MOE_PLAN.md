@@ -227,7 +227,9 @@ dispatch buffer simply absorbs whatever the router produces.
 
 The experts are ordinary hidden matrices of shape `[d, h]` and `[h, d]` with
 `h = 2d`, so **every existing rule applies unchanged** — that is the main
-reason to sparsify the MLP only.
+reason to sparsify the MLP only. ("Complete(d)P" throughout this plan means the
+parameterization of [arXiv 2512.22382](https://arxiv.org/abs/2512.22382), which
+extends CompleteP to batch and duration; see [COMPLETEP.md](COMPLETEP.md).)
 
 The router `[d, E]` is the one new object, and it is not a hidden layer: `E`
 does not scale with width. It behaves like a readout, so the starting position

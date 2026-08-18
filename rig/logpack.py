@@ -47,7 +47,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Iterable, Sequence
-import struct
 
 import numpy as np
 
@@ -60,19 +59,38 @@ from rig import metrics
 MAGIC = b"RIGLOG\x00\x01"
 SUFFIX = ".riglog"
 
-# metric id, scope id, layer (-1 when the scope is not layered), and the number
-# of scalars the scope covers. Explicit little-endian so a file written on one
-# host reads identically on another.
+# metric id, scope id, layer (-1 when the scope is not layered), a second index
+# whose meaning belongs to the scope, and the number of scalars the scope
+# covers. Explicit little-endian so a file written on one host reads
+# identically on another.
+#
+# ``index`` occupies what earlier writers filled with zero and called reserved.
+# Giving it meaning moves no bytes and rewrites no history: a scope defines
+# whether it uses the slot, and every scope that existed while the field was
+# reserved does not. So a log written before this still decodes exactly as it
+# did, and its zeros are never read as an index.
 COLUMN_DTYPE = np.dtype(
     [
         ("metric_id", "<i4"),
         ("scope_id", "<i4"),
         ("layer", "<i4"),
-        ("reserved", "<i4"),
+        ("index", "<i4"),
         ("element_count", "<i8"),
     ]
 )
-_HEADER_STRUCT = struct.Struct("<ixxxxqd")  # column_count, pad, tokens_per_step, flops
+# The fixed header, as a dtype rather than a struct format so its field
+# offsets are introspectable. A non-Python reader is generated from these
+# offsets rather than repeating them, which is the only thing that keeps such
+# a reader from drifting out of step with this writer. The four padding bytes
+# after ``column_count`` keep the 64-bit fields naturally aligned.
+HEADER_DTYPE = np.dtype(
+    {
+        "names": ["column_count", "tokens_per_step", "flops_per_token"],
+        "formats": ["<i4", "<i8", "<f8"],
+        "offsets": [0, 8, 16],
+        "itemsize": 24,
+    }
+)
 # int32 keeps the record 4-aligned for any column count, where an int64 step
 # would leave odd-column records straddling. The bound is 2^31 optimizer
 # steps; the largest run this family can express is ~1.5e5.
@@ -92,6 +110,10 @@ class Column:
     scope_id: int
     layer: int = -1
     element_count: int = 0
+    # Second index within the scope, -1 when the scope does not use one. For
+    # ``expert`` it is the expert ordinal, so a routed block is addressed as
+    # (layer, expert) rather than needing one metric id per expert.
+    index: int = -1
 
     @property
     def metric(self) -> metrics.Metric | None:
@@ -110,6 +132,8 @@ class Column:
         where = scope.name if scope is not None else f"scope:{self.scope_id}"
         if self.layer >= 0:
             where = f"{where}[{self.layer}]"
+        if self.index >= 0:
+            where = f"{where}#{self.index}"
         return f"{where}/{name}"
 
 
@@ -118,6 +142,7 @@ def column(
     scope_name: str = "overall",
     layer: int | None = None,
     element_count: int = 0,
+    index: int | None = None,
 ) -> Column:
     """Build a column from registry names, failing fast on an unregistered one."""
 
@@ -126,12 +151,49 @@ def column(
         raise ValueError(f"scope {scope_name!r} requires a layer index")
     if not resolved_scope.layered and layer is not None:
         raise ValueError(f"scope {scope_name!r} does not take a layer index")
+    if resolved_scope.indexed and index is None:
+        raise ValueError(f"scope {scope_name!r} requires a second index")
+    if not resolved_scope.indexed and index is not None:
+        raise ValueError(f"scope {scope_name!r} does not take a second index")
     return Column(
         metric_id=metrics.metric(metric_name).id,
         scope_id=resolved_scope.id,
         layer=-1 if layer is None else layer,
         element_count=element_count,
+        index=-1 if index is None else index,
     )
+
+
+def layout_descriptor() -> dict:
+    """Describe the byte layout so a reader in another language stays in step.
+
+    Every offset, width, and element type is read back out of the same dtype
+    objects the writer uses, so there is exactly one place any of them is
+    stated. A reader driven by this descriptor cannot disagree with the writer
+    about where a field lives, because neither of them knows independently --
+    which is the whole point, since a disagreement would not raise anything, it
+    would silently render one column's numbers under another column's name.
+
+    ``tests/test_logpack_descriptor.py`` holds a reader honest against it.
+    """
+
+    def fields(dtype):
+        return [
+            {
+                "name": name,
+                "offset": int(dtype.fields[name][1]),
+                "type": dtype.fields[name][0].str,
+            }
+            for name in dtype.names
+        ]
+
+    return {
+        "magic": list(MAGIC),
+        "header": {"itemsize": HEADER_DTYPE.itemsize, "fields": fields(HEADER_DTYPE)},
+        "column": {"itemsize": COLUMN_DTYPE.itemsize, "fields": fields(COLUMN_DTYPE)},
+        "step": {"type": _STEP_DTYPE.str, "itemsize": _STEP_DTYPE.itemsize},
+        "value": {"type": _VALUE_DTYPE.str, "itemsize": _VALUE_DTYPE.itemsize},
+    }
 
 
 def _record_size(column_count: int) -> int:
@@ -139,7 +201,7 @@ def _record_size(column_count: int) -> int:
 
 
 def _header_size(column_count: int) -> int:
-    return len(MAGIC) + _HEADER_STRUCT.size + column_count * COLUMN_DTYPE.itemsize
+    return len(MAGIC) + HEADER_DTYPE.itemsize + column_count * COLUMN_DTYPE.itemsize
 
 
 class LogWriter:
@@ -189,14 +251,15 @@ class LogWriter:
                 entry.metric_id,
                 entry.scope_id,
                 entry.layer,
-                0,
+                entry.index,
                 entry.element_count,
             )
         handle.write(MAGIC)
         handle.write(
-            _HEADER_STRUCT.pack(
-                len(self.columns), self._tokens_per_step, self._flops_per_token
-            )
+            np.array(
+                (len(self.columns), self._tokens_per_step, self._flops_per_token),
+                dtype=HEADER_DTYPE,
+            ).tobytes()
         )
         handle.write(table.tobytes())
         handle.flush()
@@ -290,12 +353,13 @@ def read_log(path: Path) -> Log:
     if len(raw) < len(MAGIC) or not raw.startswith(MAGIC):
         raise LogError(f"{path} is not a rig log (bad magic)")
     offset = len(MAGIC)
-    if len(raw) < offset + _HEADER_STRUCT.size:
+    if len(raw) < offset + HEADER_DTYPE.itemsize:
         raise LogError(f"{path} is truncated inside its header")
-    column_count, tokens_per_step, flops_per_token = _HEADER_STRUCT.unpack_from(
-        raw, offset
-    )
-    offset += _HEADER_STRUCT.size
+    header = np.frombuffer(raw, dtype=HEADER_DTYPE, count=1, offset=offset)[0]
+    column_count = int(header["column_count"])
+    tokens_per_step = int(header["tokens_per_step"])
+    flops_per_token = float(header["flops_per_token"])
+    offset += HEADER_DTYPE.itemsize
     if column_count <= 0:
         raise LogError(f"{path} declares {column_count} columns")
     table_bytes = column_count * COLUMN_DTYPE.itemsize
@@ -320,6 +384,7 @@ def read_log(path: Path) -> Log:
                 scope_id=int(row["scope_id"]),
                 layer=int(row["layer"]),
                 element_count=int(row["element_count"]),
+                index=int(row["index"]),
             )
             for row in table
         ),

@@ -96,16 +96,35 @@ _RETIRED_FLAGS = {
 _CHECKPOINT_POLICIES = ("always", "qualifying", "none")
 
 
-def _checkpoint_policy(args: argparse.Namespace, fallback: str) -> str:
-    """Resolve the policy from the flag, falling back to saved settings."""
+def _checkpoint_policy(
+    args: argparse.Namespace, fallback: str, *, track: str, profile: str
+) -> str:
+    """Resolve the policy from the flag, falling back to saved settings.
 
-    chosen = getattr(args, "checkpoint_policy", None) or fallback
+    A saved default of ``none`` means "do not keep sweep weights", which is
+    about research runs. It must not silently refuse an official run, whose
+    checkpoint is required, so the fallback yields to ``qualifying`` where
+    ``none`` is not legal. An *explicit* ``--checkpoint-policy none`` there is
+    still an error: that is the caller asking for something disallowed, rather
+    than a default reaching somewhere it was not meant to.
+    """
+
+    explicit = getattr(args, "checkpoint_policy", None)
+    chosen = explicit or fallback
     if chosen not in _CHECKPOINT_POLICIES:
         raise ConfigError(
             f"unknown checkpoint policy {chosen!r}; expected one of "
             + ", ".join(_CHECKPOINT_POLICIES)
         )
+    if explicit is None and chosen == "none" and not _is_research_run(track, profile):
+        return "qualifying"
     return chosen
+
+
+def _is_research_run(track: str, profile: str) -> bool:
+    """Whether weights may be skipped entirely for this run."""
+
+    return track == "open" and profile == "dev"
 
 
 _COLORS = ("auto", "always", "never")
@@ -423,17 +442,32 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument(
         "--layer-snapshots",
         type=_nonnegative_int,
-        default=0,
+        default=1_400,
         help=(
-            "recorded steps kept per layer-snapshot chart; 0 (the default) keeps "
-            "every recorded step, a positive value thins them to shrink the file"
+            "recorded steps kept per layer-snapshot chart; 0 keeps every "
+            "recorded step and 1400 is the default, matching --max-points so "
+            "no series in a file sits at a different fidelity than another"
         ),
     )
     report.add_argument(
         "--max-points",
-        type=_positive_int,
+        type=_nonnegative_int,
         default=1_400,
-        help="maximum embedded points per run and scalar series",
+        help=(
+            "embedded points per run and series; 0 embeds every recorded "
+            "sample. The default keeps these files portable; the lossless "
+            "originals are in the dataset repository, and thinning here "
+            "cannot be undone by zooming"
+        ),
+    )
+    report.add_argument(
+        "--select",
+        help=(
+            "regular expression matched against the run id; plot only those. "
+            "One line of research per report, so a family can be crystallized "
+            "into a page and its logs cleared without disturbing runs still in "
+            "flight"
+        ),
     )
 
     clone = commands.add_parser(
@@ -835,8 +869,10 @@ def command_run(args: argparse.Namespace) -> int:
     timeout = (
         args.timeout or {"smoke": 300.0, "dev": 3600.0, "official": 21600.0}[profile]
     )
-    policy = _checkpoint_policy(args, config.checkpoint_retention)
-    if policy == "none" and (track != "open" or profile != "dev"):
+    policy = _checkpoint_policy(
+        args, config.checkpoint_retention, track=track, profile=profile
+    )
+    if policy == "none" and not _is_research_run(track, profile):
         raise ConfigError(
             "--checkpoint-policy none is restricted to open/dev research runs"
         )
@@ -1396,6 +1432,7 @@ def command_report(args: argparse.Namespace) -> int:
         output,
         max_chart_points=args.max_points,
         layer_snapshots=args.layer_snapshots,
+        select=args.select,
     )
     relative = (
         summary.output_path.relative_to(root)

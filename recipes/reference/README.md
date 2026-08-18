@@ -42,6 +42,52 @@ The stream starts a newly seeded shuffled epoch if a requested horizon exceeds
 the prepared distinct-token capacity. Prepare a corpus large enough for the
 horizon you want when a study needs to stay no-replacement.
 
+## Windows cross document boundaries, deliberately
+
+The corpus is a flat token stream — whole FineWeb documents, each prefixed by
+the GPT-2 EOT token `50256`, concatenated with no offset index. Windows are cut
+live at arbitrary positions (`shard[start : start + seq_len + 1]`), so a window
+can begin mid-document and run through several.
+
+**Attention here is causal only. There is no document masking.** A token can
+attend across an EOT boundary into the preceding document.
+
+Measured on a 100M-token shard (143,857 documents, median length 405 tokens):
+
+| | at `seq_len` 1024 |
+|---|--:|
+| documents a random window spans | ~1.5 |
+| documents that fit whole (< 1024 tokens) | 83.7% |
+| **tokens living in documents ≥ 1024 tokens** | **53.0%** |
+
+So most *documents* are shorter than the window and sit inside it entirely,
+while most *tokens* come from documents long enough that a 1024-token window
+truncates them. Either way the cross-document surface is small: about one
+boundary per window.
+
+Two reasons this stays off:
+
+- **Bit-identical reproducibility.** Every result in
+  [the transfer note](../../docs/HYPERPARAMETER_TRANSFER.md) was measured
+  without masking. Enabling it would silently redefine the baseline and make
+  new 1k runs incomparable with the recorded ones — the 250M cells reproduced
+  bit-identically across a refactor and a package rename, and that property is
+  worth more than a marginal correction.
+- **The baseline should stay basic.** 1024 tokens is a short context; masking
+  buys little at ~1.5 documents per window and adds a data-dependent term to
+  the attention mask.
+
+It is not free of consequence, and the honest statement is that this family
+trains with a small amount of cross-document attention.
+
+The [`reference_8k`](../reference_8k/) variant **does** mask, because at 8192
+tokens a window spans about twelve documents and only 8.5% of tokens live in
+documents that long — unmasked, most of that context would be attention across
+unrelated text. The two families therefore differ in **two** ways, context
+length and masking, which any comparison between them has to account for.
+Implementation is `segment_ids` in
+[`rig/kernels/tpu_flash_attention.py`](../../rig/kernels/tpu_flash_attention.py).
+
 ## Optimizer and kernels
 
 The family uses Complete(d)P with α=1, PyTorch-form AdamW, 10% warmup, cosine

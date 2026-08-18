@@ -68,6 +68,9 @@ class Scope:
     id: int
     name: str
     layered: bool = False
+    # Whether the scope addresses a second axis inside each layer, carried in
+    # the column table's index slot. Only ``expert`` does.
+    indexed: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +84,25 @@ _AXES_AND_SCALARS = (
     Metric(4, "train_loss"),
     Metric(5, "learning_rate"),
     Metric(6, "grad_norm"),
+    # Routing. Recorded by mixture-of-experts recipes and absent otherwise,
+    # which costs a reader nothing: a dense run simply has no column with
+    # these ids. Load is the fraction of assignments an expert received, so
+    # 1/experts is perfectly even and 1.0 is total collapse onto one expert.
+    Metric(7, "router.balance_loss"),
+    Metric(8, "router.max_load"),
+    Metric(9, "router.min_load"),
+    # The exact per-expert distribution rather than a histogram of it: with a
+    # handful of experts the vector *is* the distribution, and it sums to 1.
+    Metric(10, "router.load"),
+    # How spread out the router's choice is, in nats. log(experts) means it
+    # has no preference at all; 0 means it always picks the same expert.
+    Metric(11, "router.entropy"),
+    # Mean weight the gate puts on the expert it ranked first, so 1/top_k is
+    # an even split across the chosen experts and 1.0 is full confidence.
+    Metric(12, "router.top1_gate"),
+    # Root-mean-square router logit. Grows without bound when nothing holds it
+    # down, and a collapsing router shows it here before the loss moves.
+    Metric(13, "router.logit_rms"),
 )
 
 _DIAGNOSTIC_FAMILY_BASES = (("param", 100), ("grad", 200), ("update", 300))
@@ -116,6 +138,10 @@ SCOPES: tuple[Scope, ...] = (
     Scope(3, "unembedding"),
     Scope(4, "block", layered=True),
     Scope(5, "final_norm"),
+    # One routed expert within one block. Layered by transformer layer and
+    # indexed by expert ordinal, so per-expert load is addressable without
+    # inventing a metric id per expert.
+    Scope(6, "expert", layered=True, indexed=True),
 )
 
 

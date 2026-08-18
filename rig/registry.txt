@@ -5,6 +5,13 @@ metric	3	cumulative_flops
 metric	4	train_loss
 metric	5	learning_rate
 metric	6	grad_norm
+metric	7	router.balance_loss
+metric	8	router.max_load
+metric	9	router.min_load
+metric	10	router.load
+metric	11	router.entropy
+metric	12	router.top1_gate
+metric	13	router.logit_rms
 metric	100	param.l1_norm
 metric	101	param.l2_norm
 metric	102	param.mean
@@ -28,3 +35,4 @@ scope	2	embeddings
 scope	3	unembedding
 scope	4	block
 scope	5	final_norm
+scope	6	expert

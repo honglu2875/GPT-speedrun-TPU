@@ -85,10 +85,14 @@ class ResolveRunNameTests(unittest.TestCase):
 
     def test_a_terminal_is_prompted_and_enter_keeps_the_default(self) -> None:
         self.assertEqual(self._resolve(None, tty=True, typed=[""]), "")
-        self.assertEqual(self._resolve(None, tty=True, typed=["Big Batch"]), "big-batch")
+        self.assertEqual(
+            self._resolve(None, tty=True, typed=["Big Batch"]), "big-batch"
+        )
 
     def test_prompt_repeats_until_usable_or_skipped(self) -> None:
-        self.assertEqual(self._resolve(None, tty=True, typed=["!!!", "second"]), "second")
+        self.assertEqual(
+            self._resolve(None, tty=True, typed=["!!!", "second"]), "second"
+        )
         self.assertEqual(self._resolve(None, tty=True, typed=["!!!", ""]), "")
 
     def test_non_interactive_callers_are_never_prompted(self) -> None:

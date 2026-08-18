@@ -1,8 +1,9 @@
 # Hyperparameter transfer under Complete(d)P
 
 Whether hyperparameters tuned once at a small size stay optimal as the model
-grows. Two knobs measured on the reference family at 5 TPP: base learning rate
-and global batch size.
+grows. Two knobs measured on the reference family at 5 TPP — base learning rate
+and global batch size — plus a check at 20 TPP that the token horizon does not
+move the answer.
 
 **Both transfer.** Every configuration measured puts the optimum at base LR
 `2^-8` and global batch `128`, across a 4x parameter range (60M → 250M) and a
@@ -18,6 +19,11 @@ against seed noise (t=0.86). Where the optimum sits is stable across scale;
 what it costs to be wrong is not, so the practical recommendation inverts
 before the optimum does.
 
+The horizon does not move it either. At 500M and 20 TPP the optimum is again
+bracketed at or above `2^-8`, four times further out than anything studies 1
+and 2 measured (study 3). Neither does context length: at 8,192 tokens with
+document masking, `2^-8` wins again and is separated on both sides (study 4).
+
 Supersedes the former `LR_TRANSFER.md`.
 
 ## Terms
@@ -30,8 +36,8 @@ Supersedes the former `LR_TRANSFER.md`.
 | **m_B** | batch multiplier — global batch over the 128 baseline |
 | **TPP** | tokens per parameter — training tokens divided by parameter count. Sets the token horizon |
 | **µP** | Maximal Update Parameterization. Rescales initialization, LR, and multipliers so activation and update magnitudes stay width-invariant |
-| **CompleteP** | µP extended so the rules also hold as *depth* grows |
-| **Complete(d)P** | this repo's corrected CompleteP: input-embedding Adam epsilon is `1/m_N`, and the unembedding's forward multiplier is absorbed into init and LR. Rules in [COMPLETEP.md](COMPLETEP.md) |
+| **CompleteP** | µP extended so the rules also hold as *depth* grows ([Dey et al.](https://arxiv.org/abs/2505.01618)) |
+| **Complete(d)P** | a *separate, later* paper ([Mlodozeniec et al.](https://arxiv.org/abs/2512.22382)) extending CompleteP to **batch** and **duration** — the `(d)` is duration, not depth. It also corrects CompleteP's input-embedding Adam epsilon to `1/m_N` and absorbs the unembedding's forward multiplier into init and LR; both corrections are implemented here, its QK-norm extension is not. Rules in [COMPLETEP.md](COMPLETEP.md) |
 | **m_N / m_L / m_D** | width, depth, and data multipliers relative to the 60M anchor (`D384`, `L12`) |
 | **tier** | a named size rung of the family: 60m, 125m, 250m, 500m, 1b. Measured here: 60m through 500m |
 | **nat** | unit of the loss (natural-log cross-entropy) |
@@ -343,6 +349,117 @@ At 60M, batch 256 buys 14% wall clock for 0.45 nats — never worth it. At 250M
 the same trade costs 0.016 nats. The right answer is already scale-dependent
 and trending toward the larger batch.
 
+## Study 3 — does the optimum survive a 4x longer horizon?
+
+Studies 1 and 2 were run at 5 TPP. Complete(d)P's `m_D` correction is supposed
+to hold the optimum in place as the token horizon grows, so this tests it
+directly: 500M at **20 TPP**, six points on a v6e-8.
+
+*Effective peak LR* is the rate the schedule actually reaches, after the batch
+and duration corrections are applied to the base LR. *Val loss* is
+cross-entropy in nats on held-out FineWeb; lower is better.
+
+| batch | base LR | effective peak LR | steps | seed | val loss | tok/s |
+|---|---|--:|--:|--:|--:|--:|
+| 128 | **2^-8** | 0.0013487 | 76,691 | 1338 | **2.9755** | 492K |
+| 128 | **2^-8** | 0.0013487 | 76,691 | 1337 | **2.9759** | 492K |
+| 128 | 2^-7 | 0.0026975 | 76,691 | 1337 | 2.9766 | 492K |
+| 256 | 2^-8 | 0.0019074 | 38,346 | 1337 | 2.9788 | 500K |
+| 128 | 2^-9 | 0.0006744 | 76,691 | 1337 | 2.9961 | 492K |
+| 64 | 2^-8 | 0.0009537 | 153,382 | 1337 | 3.0204 | 484K |
+
+**The learning-rate optimum survives the longer horizon.** `2^-9` is out by
+0.020 nats and `2^-7` by 0.001, so the optimum is bracketed at `2^-8`. That is
+the same bracket study 1 produced at 5 TPP, four times shorter — the horizon
+moved 4x and the answer did not.
+
+**The batch optimum is now interior rather than an edge.** Adding batch 64
+closed the bracket downward:
+
+| batch | val loss at `2^-8` | cost against batch 128 |
+|---|--:|--:|
+| 64 | 3.0204 | +0.0447 |
+| **128** | **2.9757** (mean of 2 seeds) | — |
+| 256 | 2.9788 | +0.0031 |
+
+Batch 128 wins from both sides, and the penalty is lopsided: halving the batch
+costs 14x what doubling it does. Study 2 found batch 128 best at 5 TPP too, so
+the batch optimum transfers across the 4x horizon change alongside the learning
+rate. Establishing that is what the second seed and the batch-64 point bought.
+
+**What is still not settled.** `2^-8` leads `2^-7` by 0.0009 nats with **two
+seeds against one**. Both `2^-8` seeds land below the single `2^-7` point,
+which is the right ordering, but two seeds is a poor estimate of spread and one
+seed is no estimate at all. The range across the two `2^-8` seeds is 0.0004,
+much tighter than the 0.005–0.06 study 2 saw at smaller scales — encouraging,
+though two points cannot establish that the spread really is that small here.
+The supported claim is that the 20-TPP optimum lies in `{2^-8, 2^-7}` with
+`2^-8` ahead on every seed run so far.
+
+### Settling it
+
+A third seed at `2^-8` and three at `2^-7`, batch 128. At 5.7h each that is
+~23 TPU-hours to convert "ahead on every seed" into a result — the same price
+study 1's reseed paid, and for the same reason.
+
+## Study 4 — the optimum does not move with context length
+
+Studies 1-3 all trained at 1,024 tokens. [`reference_8k`](../recipes/reference_8k/)
+trains at **8,192** with document masking, holding tokens per step (131,072)
+and optimizer steps (2,286) identical to `reference`, so the only differences
+are how tokens are arranged into sequences and whether attention crosses
+document boundaries. 60M, 5 TPP, five learning rates x three seeds, v4-32.
+
+| base LR | effective peak LR | mean | range | seeds 1337 / 1338 / 1339 |
+|---|--:|--:|--:|---|
+| 2^-6 | 0.0156250 | 4.1174 | 0.0390 | 4.1312 4.0921 4.1288 |
+| 2^-7 | 0.0078125 | 4.0935 | 0.0764 | 4.0436 4.1200 4.1169 |
+| **2^-8** | **0.0039062** | **4.0030** | **0.0022** | 4.0020 4.0042 4.0027 |
+| 2^-9 | 0.0019531 | 4.0469 | 0.0176 | 4.0394 4.0445 4.0569 |
+| 2^-10 | 0.0009766 | 4.2458 | 0.0483 | 4.2244 4.2728 4.2401 |
+
+| comparison | difference | t | verdict |
+|---|--:|--:|---|
+| 2^-8 vs 2^-7 | +0.0905 | 3.6 | separated |
+| 2^-8 vs 2^-9 | +0.0439 | 8.4 | separated |
+| 2^-8 vs 2^-6 | +0.1144 | 9.0 | separated |
+| 2^-8 vs 2^-10 | +0.2428 | 17.0 | separated |
+
+**`2^-8` again, bracketed and separated on both sides** — a cleaner result than
+study 1 obtained at 250M, where `2^-8` and `2^-7` never separated. Both
+families run at `m_B = 1` at their own configured batch, so the effective peak
+LR is the base LR in each and the comparison is like-for-like in both.
+
+An eight-fold change in context length does not move the learning-rate
+optimum, at least at 60M with tokens per step held fixed.
+
+### Seed spread inverts, and so do the spikes
+
+Study 2 found seed noise **largest near the optimum** at 1k. At 8k it is
+smallest there — 0.0022 at `2^-8` against 0.0764 at `2^-7` — and the gradient
+spikes are monotone in learning rate rather than peaked:
+
+| base LR | peak/median gradient, per seed |
+|---|---|
+| 2^-6 | 1930x  148x  1803x |
+| 2^-7 | 65x  224x  1069x |
+| **2^-8** | **75x  18x  21x** |
+| 2^-9 | 15x  13x  16x |
+| 2^-10 | 10x  9x  11x |
+
+At 1k the fragile phase sat at the optimum, which is what made single-seed
+comparisons there unreliable. Here the optimum is the calmest point measured.
+
+**Two candidate causes, not separated by this sweep.** Document masking may
+remove an instability that cross-document attention was producing, or the
+eight-fold longer sequence may change the gradient statistics directly. The
+control that would distinguish them is a masked run at 1,024 tokens —
+deliberately not the `reference` default, since that family is kept unmasked
+for bit-reproducibility, but cheap as a one-off arm.
+
+Until that runs, the honest statement is that the 1k noise structure does not
+carry to this configuration, and the reason is unidentified.
+
 ## Reproducibility
 
 The 250M/bs128 cells of Study 2 duplicate Study 1's reseed exactly. All six
@@ -395,7 +512,17 @@ Two artifact-format changes make older runs non-comparable in specific ways:
   hand-maintained formula, not the traced count that replaced it — see
   [FLOPS.md](FLOPS.md).
 - Runs recorded before commit `75f0b22` wrote `training.csv` and
-  `diagnostics.csv` in long form. Nothing converts them, so reading one needs a
-  checkout at or before `8936b51`. Every study in this note predates the
-  change; their archived dashboards under `docs/reports/` are the durable
-  record.
+  `diagnostics.csv` in long form, which the current reader refuses. Studies 1
+  and 2 predate the change entirely, as do four of study 3's six points.
+  [`rig/legacy.py`](../rig/legacy.py) now converts a long-form training curve
+  into the packed format without touching the original, so those runs are
+  ordinary inputs again and a rendered dashboard is a cache rather than the
+  only surviving copy. Their diagnostics stay in CSV: at 140–290 MB each they
+  carry per-layer statistics that no learning-rate or batch-size comparison is
+  made of.
+
+Study 3's dashboard is
+[batch-size-sweep-500M.html](reports/batch-size-sweep-500M.html), which plots
+all twelve 500M runs — both token budgets, both artifact formats, and all three
+archives — in one place. Rebuild it with
+[`docs/reports/build_500m_report.py`](reports/build_500m_report.py).

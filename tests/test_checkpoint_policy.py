@@ -20,7 +20,10 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(_CHECKPOINT_POLICIES, ("always", "qualifying", "none"))
 
     def test_settings_supply_the_default(self) -> None:
-        self.assertEqual(_checkpoint_policy(_args(), "qualifying"), "qualifying")
+        self.assertEqual(
+            _checkpoint_policy(_args(), "qualifying", track="open", profile="dev"),
+            "qualifying",
+        )
 
     def test_legacy_spellings_are_no_longer_accepted(self) -> None:
         # "all"/"none-after-validation" and --omit-checkpoint are gone rather
@@ -29,11 +32,42 @@ class PolicyTests(unittest.TestCase):
         for gone in ("all", "none-after-validation"):
             with self.subTest(value=gone):
                 with self.assertRaisesRegex(ConfigError, "unknown checkpoint policy"):
-                    _checkpoint_policy(_args(), gone)
+                    _checkpoint_policy(_args(), gone, track="open", profile="dev")
 
     def test_an_unknown_policy_is_refused(self) -> None:
         with self.assertRaisesRegex(ConfigError, "unknown checkpoint policy"):
-            _checkpoint_policy(_args(), "keep-forever")
+            _checkpoint_policy(_args(), "keep-forever", track="open", profile="dev")
+
+
+class DefaultYieldsWhereNoneIsIllegalTests(unittest.TestCase):
+    """A saved default of ``none`` must not refuse runs that require weights."""
+
+    @staticmethod
+    def _resolve(explicit, track, profile):
+        return _checkpoint_policy(
+            _args(checkpoint_policy=explicit), "none", track=track, profile=profile
+        )
+
+    def test_the_default_yields_where_none_is_not_legal(self) -> None:
+        # Sweep points keep no weights; that is the point of the default.
+        self.assertEqual(self._resolve(None, "open", "dev"), "none")
+        # Official runs require a checkpoint. Without this, flipping the saved
+        # default to "none" refused every official run outright -- the guard
+        # below rejects the policy the default had just chosen for it.
+        self.assertEqual(
+            self._resolve(None, "sample_efficiency", "official"), "qualifying"
+        )
+        self.assertEqual(self._resolve(None, "open", "official"), "qualifying")
+
+    def test_an_explicit_none_is_still_refused_where_it_is_illegal(self) -> None:
+        # Yielding covers a default reaching somewhere it was not meant to,
+        # never a caller asking for something disallowed.
+        self.assertEqual(self._resolve("none", "sample_efficiency", "official"), "none")
+
+    def test_an_explicit_choice_always_wins(self) -> None:
+        for policy in ("always", "qualifying", "none"):
+            with self.subTest(policy=policy):
+                self.assertEqual(self._resolve(policy, "open", "dev"), policy)
 
 
 class EvaluatorRemovalTests(unittest.TestCase):
@@ -76,9 +110,7 @@ class RetiredFlagTests(unittest.TestCase):
         # `rig run` forwards unknown arguments to the trainer, so a retired
         # flag would otherwise surface as an argparse error from train.py
         # about a flag the user had used correctly the day before.
-        self.assertIn(
-            "--checkpoint-policy", self._run_cli("--checkpoints", "always")
-        )
+        self.assertIn("--checkpoint-policy", self._run_cli("--checkpoints", "always"))
         self.assertIn("--checkpoint-policy none", self._run_cli("--omit-checkpoint"))
 
     def test_genuine_trainer_arguments_still_pass_through(self) -> None:

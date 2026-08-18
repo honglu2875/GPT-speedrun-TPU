@@ -1066,6 +1066,12 @@ def fetch_run_artifacts(
     partial pull leaves whatever already arrived rather than truncating the
     run. The trailing slash copies the directory's contents, not the
     directory itself, so the local run id is preserved.
+
+    In-progress writes are skipped. Every writer here stages through a dotted
+    ``.name.tmp`` and then renames, so a mid-write pull would copy a partial
+    file that the rename immediately orphans -- and because the transfer never
+    deletes, that orphan would outlive the run. A 500M checkpoint left 1.1 GB
+    of one behind before this exclusion.
     """
 
     _require_program("rsync")
@@ -1077,6 +1083,8 @@ def fetch_run_artifacts(
         "rsync",
         "-a",
         "--partial",
+        "--exclude",
+        ".*.tmp",
         "-e",
         shlex.join(ssh_arguments),
         f"{host}:{remote_dir.as_posix()}/",

@@ -29,7 +29,7 @@ from rig.harness import (
 from rig.harness.runner import _validate_payload_identity
 
 
-FAKE_TRAINER = r'''from __future__ import annotations
+FAKE_TRAINER = r"""from __future__ import annotations
 import argparse
 import json
 import sys
@@ -98,7 +98,7 @@ if args.evaluations_json is not None:
     result["evaluations"] = json.loads(args.evaluations_json)
 print("human log output")
 print("RIG_RESULT=" + json.dumps(result, separators=(",", ":")))
-'''
+"""
 
 
 class HarnessRunTests(unittest.TestCase):
@@ -177,14 +177,17 @@ class HarnessRunTests(unittest.TestCase):
     def test_run_captures_validates_records_and_forwards_args(self) -> None:
         outcome = run_recipe(self.config(target_loss=2.6))
 
-        self.assertEqual(json.loads((outcome.run_dir / "seen.json").read_text()), {
-            "config": str(self.root / "recipes" / "tiny" / "config.yaml"),
-            "seed": 1337,
-            "track": "open",
-            "profile": "default",
-            "tag": ["one", "two"],
-            "seeded": False,
-        })
+        self.assertEqual(
+            json.loads((outcome.run_dir / "seen.json").read_text()),
+            {
+                "config": str(self.root / "recipes" / "tiny" / "config.yaml"),
+                "seed": 1337,
+                "track": "open",
+                "profile": "default",
+                "tag": ["one", "two"],
+                "seeded": False,
+            },
+        )
         self.assertTrue((outcome.run_dir / "stdout.log").is_file())
         self.assertTrue((outcome.run_dir / "stderr.log").is_file())
         self.assertTrue((outcome.run_dir / "result.json").is_file())
@@ -217,7 +220,9 @@ class HarnessRunTests(unittest.TestCase):
                 "rig.harness.runner.build_distributed_launch_command",
                 side_effect=localize,
             ) as build,
-            mock.patch("rig.harness.runner.socket.gethostname", return_value="slice-w-0"),
+            mock.patch(
+                "rig.harness.runner.socket.gethostname", return_value="slice-w-0"
+            ),
         ):
             outcome = run_recipe(
                 self.config(
@@ -229,9 +234,7 @@ class HarnessRunTests(unittest.TestCase):
         remote_environment = build.call_args.kwargs["environment"]
         self.assertEqual(remote_environment["RIG_DISTRIBUTED"], "1")
         self.assertEqual(remote_environment["RIG_PROCESS_COUNT"], "4")
-        self.assertEqual(
-            remote_environment["RIG_CONTROLLER_HOSTNAME"], "slice-w-0"
-        )
+        self.assertEqual(remote_environment["RIG_CONTROLLER_HOSTNAME"], "slice-w-0")
         self.assertEqual(
             remote_environment["JAX_COMPILATION_CACHE_DIR"],
             f"/tmp/rig-jax-cache-{outcome.run_id}",
@@ -244,7 +247,9 @@ class HarnessRunTests(unittest.TestCase):
                 "rig.harness.runner.build_distributed_launch_command",
                 return_value=["pdsh", "synthetic"],
             ),
-            mock.patch("rig.harness.runner._run_process", side_effect=KeyboardInterrupt),
+            mock.patch(
+                "rig.harness.runner._run_process", side_effect=KeyboardInterrupt
+            ),
             mock.patch(
                 "rig.harness.runner.terminate_distributed_workers", return_value=True
             ) as terminate,
@@ -265,7 +270,11 @@ class HarnessRunTests(unittest.TestCase):
 
     def test_rejects_reserved_passthrough_flags_but_not_prefixes(self) -> None:
         for flag in ("--config", "--output-dir", "--seed", "--track", "--profile"):
-            for arguments in ((flag, "value"), (f"{flag}=value",), ("--", flag, "value")):
+            for arguments in (
+                (flag, "value"),
+                (f"{flag}=value",),
+                ("--", flag, "value"),
+            ):
                 with self.subTest(arguments=arguments):
                     with self.assertRaisesRegex(ConfigurationError, "reserved flag"):
                         run_recipe(self.config(passthrough_args=arguments))
@@ -278,15 +287,21 @@ class HarnessRunTests(unittest.TestCase):
         trainer = self.root / "recipes" / "tiny" / "train.py"
         original = trainer.read_text(encoding="utf-8")
         variants = {
-            "track": original.replace('"track": args.track,', '"track": "sample_efficiency",'),
-            "profile": original.replace('"profile": args.profile,', '"profile": "wrong",'),
+            "track": original.replace(
+                '"track": args.track,', '"track": "sample_efficiency",'
+            ),
+            "profile": original.replace(
+                '"profile": args.profile,', '"profile": "wrong",'
+            ),
             "seed": original.replace('"seed": args.seed,', '"seed": True,'),
             "missing": original.replace('    "track": args.track,\n', ""),
         }
         for label, source in variants.items():
             with self.subTest(label=label):
                 trainer.write_text(source, encoding="utf-8")
-                with self.assertRaisesRegex(ResultValidationError, "must exactly match"):
+                with self.assertRaisesRegex(
+                    ResultValidationError, "must exactly match"
+                ):
                     run_recipe(self.config())
         trainer.write_text(original, encoding="utf-8")
 
@@ -371,7 +386,9 @@ class HarnessRunTests(unittest.TestCase):
         self.assertTrue(outcome.record["qualified"])
         self.assertEqual(outcome.record["metrics"]["validation_loss"], 2.5)
         self.assertEqual(outcome.record["evaluations"], evaluations)
-        self.assertEqual(load_records(outcome.record_path)[0]["evaluations"], evaluations)
+        self.assertEqual(
+            load_records(outcome.record_path)[0]["evaluations"], evaluations
+        )
 
         evaluations["fresh10"]["macro_loss"] = 99  # type: ignore[index]
         self.assertNotEqual(
@@ -390,7 +407,9 @@ class HarnessRunTests(unittest.TestCase):
             {**{f"domain-{index}": 8_192 for index in range(9)}, "domain-9": 0},
         ):
             with self.subTest(expected=expected):
-                with self.assertRaisesRegex(ConfigurationError, "expected_downstream_tokens"):
+                with self.assertRaisesRegex(
+                    ConfigurationError, "expected_downstream_tokens"
+                ):
                     run_recipe(self.config(expected_downstream_tokens=expected))
 
     def test_provenance_hashes_inputs_and_copies_configured_values(self) -> None:
@@ -404,7 +423,8 @@ class HarnessRunTests(unittest.TestCase):
         self.assertIsNot(provenance["data"], configured["data"])
         self.assertEqual(provenance["train_py"]["bytes"], trainer.stat().st_size)
         self.assertEqual(
-            provenance["train_py"]["sha256"], hashlib.sha256(trainer.read_bytes()).hexdigest()
+            provenance["train_py"]["sha256"],
+            hashlib.sha256(trainer.read_bytes()).hexdigest(),
         )
         self.assertEqual(
             provenance["config_yaml"],
@@ -489,10 +509,14 @@ class HarnessRunTests(unittest.TestCase):
             thread = threading.Thread(target=lambda: result.append(run_recipe(config)))
             thread.start()
             deadline = time.monotonic() + 2.0
-            while "live marker" not in captured.getvalue() and time.monotonic() < deadline:
+            while (
+                "live marker" not in captured.getvalue() and time.monotonic() < deadline
+            ):
                 time.sleep(0.01)
             self.assertIn("live marker", captured.getvalue())
-            self.assertTrue(thread.is_alive(), "stderr was not visible until after process exit")
+            self.assertTrue(
+                thread.is_alive(), "stderr was not visible until after process exit"
+            )
             thread.join(3.0)
 
         self.assertFalse(thread.is_alive())
@@ -521,7 +545,9 @@ class HarnessRunTests(unittest.TestCase):
             with self.assertRaisesRegex(RecipeError, "timed out"):
                 run_recipe(timeout_config)
             self.assertLess(time.monotonic() - started, 2.0)
-        latest_run = max((self.root / "runs").iterdir(), key=lambda path: path.stat().st_mtime_ns)
+        latest_run = max(
+            (self.root / "runs").iterdir(), key=lambda path: path.stat().st_mtime_ns
+        )
         self.assertEqual((latest_run / "stderr.log").read_bytes(), b"before timeout")
 
     def test_discards_per_run_compilation_cache_and_rejects_bad_timeouts(self) -> None:
@@ -573,7 +599,9 @@ class HarnessRunTests(unittest.TestCase):
         self.assertIsNone(outcome.checkpoint_path)
         self.assertFalse(outcome.record["checkpoint"]["retained"])
 
-    def test_research_run_can_explicitly_omit_checkpoint_and_be_reverified(self) -> None:
+    def test_research_run_can_explicitly_omit_checkpoint_and_be_reverified(
+        self,
+    ) -> None:
         outcome = run_recipe(
             self.config(
                 passthrough_args=("--omit-checkpoint",),
@@ -654,18 +682,18 @@ class ProtocolAndScoringTests(unittest.TestCase):
             self.assertEqual(validated.evaluations, evaluations)
 
             mutations = {
-                "fineweb canonical": lambda value: value["evaluations"]["fineweb"].update(
-                    canonical=False
-                ),
+                "fineweb canonical": lambda value: value["evaluations"][
+                    "fineweb"
+                ].update(canonical=False),
                 "fineweb loss": lambda value: value["evaluations"]["fineweb"].update(
                     loss=2.4
                 ),
                 "macro loss": lambda value: value["evaluations"]["fresh10"].update(
                     macro_loss=1.0
                 ),
-                "macro perplexity": lambda value: value["evaluations"]["fresh10"].update(
-                    macro_perplexity=1.0
-                ),
+                "macro perplexity": lambda value: value["evaluations"][
+                    "fresh10"
+                ].update(macro_perplexity=1.0),
                 "total tokens": lambda value: value["evaluations"]["fresh10"].update(
                     scored_tokens=81_919
                 ),
@@ -766,15 +794,25 @@ class ProtocolAndScoringTests(unittest.TestCase):
                 "track": "sample_efficiency",
                 "profile": "tiny",
                 "timing": {"observed_wall_seconds": seconds / 10},
-                "metrics": {"train_seconds": seconds, "tokens_processed": tokens, "validation_loss": 2.0},
+                "metrics": {
+                    "train_seconds": seconds,
+                    "tokens_processed": tokens,
+                    "validation_loss": 2.0,
+                },
             }
 
         ranked = rank_records(
-            [record("fast-many", 1.0, 20), record("slow-few", 9.0, 10), record("fast-few", 2.0, 10)],
+            [
+                record("fast-many", 1.0, 20),
+                record("slow-few", 9.0, 10),
+                record("fast-few", 2.0, 10),
+            ],
             track="sample_efficiency",
             profile="tiny",
         )
-        self.assertEqual([item["recipe"] for item in ranked], ["fast-few", "slow-few", "fast-many"])
+        self.assertEqual(
+            [item["recipe"] for item in ranked], ["fast-few", "slow-few", "fast-many"]
+        )
         rendered = render_leaderboard(ranked, track="sample_efficiency")
         self.assertIn("Sample Efficiency leaderboard", rendered)
         self.assertIn("fast-few", rendered)
@@ -789,7 +827,11 @@ class ProtocolAndScoringTests(unittest.TestCase):
                 "track": "open",
                 "profile": "tiny",
                 "timing": {"observed_wall_seconds": 100.0},
-                "metrics": {"train_seconds": 1.0, "tokens_processed": 8, "validation_loss": 2.0},
+                "metrics": {
+                    "train_seconds": 1.0,
+                    "tokens_processed": 8,
+                    "validation_loss": 2.0,
+                },
             },
             {
                 "run_id": "b-run",
@@ -799,7 +841,11 @@ class ProtocolAndScoringTests(unittest.TestCase):
                 "track": "open",
                 "profile": "tiny",
                 "timing": {"observed_wall_seconds": 1.0},
-                "metrics": {"train_seconds": 2.0, "tokens_processed": 8, "validation_loss": 2.0},
+                "metrics": {
+                    "train_seconds": 2.0,
+                    "tokens_processed": 8,
+                    "validation_loss": 2.0,
+                },
             },
         ]
         ranked = rank_records(records, track="open", profile="tiny")
