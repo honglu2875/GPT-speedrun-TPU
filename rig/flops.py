@@ -152,6 +152,8 @@ _ELEMENTWISE = frozenset(
         "eq",
         "ne",
         "lt",
+        # top_k lowers to a comparison variant on TPU; same class as "lt".
+        "lt_to",
         "le",
         "gt",
         "ge",
@@ -514,6 +516,47 @@ def _flash_attention_rule(site: Site) -> int:
     return 4 * batch * heads * sequence * sequence * head_dim
 
 
+def _grouped_matmul_rule(site: Site) -> int:
+    """Bill a megablox grouped matmul from its shapes.
+
+    All three forms cost the same ``2 m k n``, where ``m`` is the number of
+    routed rows. Verified against the traced operands:
+
+    ===============  ==========================  ==================
+    call             large operands              cost
+    ===============  ==========================  ==================
+    ``gmm``          ``[m, k]``, ``[E, k, n]``   ``2 m k n``
+    ``gmm`` (dX)     ``[m, n]``, ``[E, k, n]``   ``2 m k n``
+    ``tgmm`` (dW)    ``[m, k]``, ``[m, n]``      ``2 m k n``
+    ===============  ==========================  ==================
+
+    Every one of the ``m`` rows is multiplied by exactly one expert's
+    ``[k, n]``, so grouping moves work between experts without creating or
+    removing any. That is what makes a routed model's FLOP count exact and
+    static despite ``group_sizes`` being data: ``m`` is ``tokens * top_k``, so
+    the count bills the ``top_k`` experts each token actually visits. Billing
+    the whole weight tensor would inflate a top-2-of-8 model by 4x and destroy
+    the equi-FLOP comparison a sparse ladder exists to make.
+
+    Smaller rank-0 and rank-1 operands are group metadata and carry no
+    arithmetic.
+    """
+
+    two_d = [shape for shape in site.in_shapes if len(shape) == 2]
+    three_d = [shape for shape in site.in_shapes if len(shape) == 3]
+    if three_d and two_d:
+        rows = two_d[0][0]
+        _, k, n = three_d[0]
+        return 2 * rows * k * n
+    if len(two_d) >= 2 and two_d[0][0] == two_d[1][0]:
+        rows, k = two_d[0]
+        n = two_d[1][1]
+        return 2 * rows * k * n
+    raise FlopError(
+        f"{site.name!r}: not a recognized grouped matmul; shapes {site.in_shapes}"
+    )
+
+
 _FLASH_KERNELS = (
     "tpu_flash_causal_attention_fwd",
     "tpu_flash_causal_attention_bwd_dq",
@@ -527,6 +570,10 @@ def default_rules() -> FlopRules:
     rules = FlopRules()
     for kernel in _FLASH_KERNELS:
         rules = rules.with_kernel(kernel, _flash_attention_rule)
+    # megablox does not name its pallas_call, so it arrives under the bare
+    # primitive name. Nothing else in this repository ships an unnamed one,
+    # and the rule refuses shapes it does not recognize rather than guessing.
+    rules = rules.with_kernel("pallas_call", _grouped_matmul_rule)
     return rules
 
 
