@@ -93,6 +93,115 @@ class TpuFlashAttentionTests(unittest.TestCase):
         for actual_grad, expected_grad in zip(actual, expected, strict=True):
             np.testing.assert_allclose(actual_grad, expected_grad, rtol=3e-5, atol=3e-5)
 
+    @staticmethod
+    def _segments(sequence: int, cuts: tuple[int, ...]) -> jax.Array:
+        """Documents of uneven length, as EOT positions would produce."""
+
+        starts = np.zeros(sequence, np.int32)
+        starts[list(cuts)] = 1
+        return jnp.asarray(np.cumsum(starts)[None, :] - 1, jnp.int32)
+
+    def test_document_masking_makes_a_document_independent_of_its_neighbours(
+        self,
+    ) -> None:
+        """The defining property: block-diagonal means no cross-document leak.
+
+        A document scored inside a packed window must give exactly what it
+        gives alone. Without this, an 8k context mostly trains the model to
+        attend across unrelated documents, since a random FineWeb window of
+        that length spans about twelve of them.
+        """
+
+        q, k, v = self.random_qkv((1, 2, 256, 8))
+        segments = self._segments(256, (0, 61, 130, 131, 200))
+        packed = reference_causal_attention(q, k, v, segment_ids=segments)
+        alone = reference_causal_attention(
+            q[:, :, 61:130], k[:, :, 61:130], v[:, :, 61:130]
+        )
+        np.testing.assert_allclose(packed[:, :, 61:130], alone, rtol=1e-6, atol=1e-6)
+
+        # And it is a real restriction, not a no-op.
+        self.assertFalse(
+            np.allclose(packed, reference_causal_attention(q, k, v), atol=1e-4)
+        )
+        # One segment everywhere must reproduce plain causal attention.
+        single = reference_causal_attention(
+            q, k, v, segment_ids=jnp.zeros((1, 256), jnp.int32)
+        )
+        np.testing.assert_allclose(
+            single, reference_causal_attention(q, k, v), rtol=1e-6, atol=1e-6
+        )
+
+    def test_segmented_kernel_matches_the_reference_forward_and_backward(self) -> None:
+        q, k, v = self.random_qkv((1, 2, 256, 8))
+        segments = self._segments(256, (0, 61, 130, 131, 200))
+        tiles = AttentionTilePlan(
+            block_q=128,
+            block_kv=128,
+            block_kv_compute=128,
+            block_q_dkv=128,
+            block_q_dkv_compute=128,
+            block_kv_dkv=128,
+            block_kv_dkv_compute=128,
+            block_q_dq=128,
+            block_kv_dq=128,
+            block_kv_dq_compute=128,
+        )
+        attention = make_causal_attention(
+            AttentionConfig(backend="tpu_flash", tiles=tiles, interpret=True)
+        )
+        cotangent = jax.random.normal(jax.random.key(7), q.shape, q.dtype) * 0.1
+
+        def kernel_loss(q_value, k_value, v_value):
+            return (attention(q_value, k_value, v_value, segments) * cotangent).sum()
+
+        def oracle_loss(q_value, k_value, v_value):
+            out = reference_causal_attention(
+                q_value, k_value, v_value, segment_ids=segments
+            )
+            return (out * cotangent).sum()
+
+        np.testing.assert_allclose(
+            attention(q, k, v, segments),
+            reference_causal_attention(q, k, v, segment_ids=segments),
+            rtol=2e-5,
+            atol=2e-5,
+        )
+        for name, actual, expected in zip(
+            ("dq", "dk", "dv"),
+            jax.grad(kernel_loss, argnums=(0, 1, 2))(q, k, v),
+            jax.grad(oracle_loss, argnums=(0, 1, 2))(q, k, v),
+        ):
+            with self.subTest(gradient=name):
+                np.testing.assert_allclose(actual, expected, rtol=2e-4, atol=2e-5)
+
+    def test_omitting_segments_leaves_the_kernel_bit_identical(self) -> None:
+        # Document masking must cost nothing when it is not requested: the
+        # segment operands are absent from the pallas_call entirely.
+        q, k, v = self.random_qkv((1, 1, 256, 8))
+        tiles = AttentionTilePlan(
+            block_q=128,
+            block_kv=128,
+            block_kv_compute=128,
+            block_q_dkv=128,
+            block_q_dkv_compute=128,
+            block_kv_dkv=128,
+            block_kv_dkv_compute=128,
+            block_q_dq=128,
+            block_kv_dq=128,
+            block_kv_dq_compute=128,
+        )
+        attention = make_causal_attention(
+            AttentionConfig(backend="tpu_flash", tiles=tiles, interpret=True)
+        )
+        np.testing.assert_array_equal(attention(q, k, v), attention(q, k, v, None))
+        np.testing.assert_allclose(
+            attention(q, k, v),
+            reference_causal_attention(q, k, v),
+            rtol=2e-5,
+            atol=2e-5,
+        )
+
     def test_pallas_interpret_right_padding_matches_reference(self) -> None:
         q, k, v = self.random_qkv((1, 1, 129, 8))
         tiles = AttentionTilePlan(

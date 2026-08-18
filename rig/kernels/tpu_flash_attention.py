@@ -174,8 +174,16 @@ def reference_causal_attention(
     v: jax.Array,
     *,
     softmax_scale: float | None = None,
+    segment_ids: jax.Array | None = None,
 ) -> jax.Array:
-    """Pure-JAX causal attention oracle using an FP32 softmax."""
+    """Pure-JAX causal attention oracle using an FP32 softmax.
+
+    ``segment_ids`` is an optional ``[batch, sequence]`` int32 array giving each
+    position's document index inside its window. Positions may attend only
+    within their own segment, which makes attention block-diagonal over
+    documents on top of the causal mask. This is the oracle the Pallas kernels
+    are checked against, so it defines the semantics.
+    """
 
     _validate_qkv(q, k, v)
     sequence = q.shape[2]
@@ -184,7 +192,12 @@ def reference_causal_attention(
     scores = scores.astype(jnp.float32) * scale
     row = lax.broadcasted_iota(jnp.int32, (sequence, sequence), 0)
     column = lax.broadcasted_iota(jnp.int32, (sequence, sequence), 1)
-    scores = jnp.where(column <= row, scores, _MASK_VALUE)
+    visible = column <= row
+    if segment_ids is not None:
+        # [batch, 1, q, k]: same document only. Broadcasts across heads.
+        same = segment_ids[:, None, :, None] == segment_ids[:, None, None, :]
+        visible = jnp.logical_and(visible[None, None], same)
+    scores = jnp.where(visible, scores, _MASK_VALUE)
     probabilities = jax.nn.softmax(scores, axis=-1).astype(v.dtype)
     return jnp.einsum(
         "bhqk,bhkd->bhqd",
@@ -221,23 +234,47 @@ def _broadcast_row(value: jax.Array, width: int) -> jax.Array:
 
 
 def _tpu_flash_forward_kernel(
-    q_ref: Any,
-    k_ref: Any,
-    v_ref: Any,
-    output_ref: Any,
-    logsumexp_ref: Any,
-    max_scratch_ref: Any,
-    sum_scratch_ref: Any,
-    accumulator_scratch_ref: Any,
-    *,
+    *refs: Any,
     block_q: int,
     block_kv: int,
     block_kv_compute: int,
     sequence: int,
     valid_sequence: int,
     softmax_scale: float,
+    has_segments: bool = False,
 ) -> None:
-    """One online-softmax pass over a query tile and successive KV tiles."""
+    """One online-softmax pass over a query tile and successive KV tiles.
+
+    The segment refs are present only when document masking is requested, so
+    the operand list is unpacked rather than named: passing a dummy array
+    instead would move a block of it through VMEM on every tile for nothing.
+    """
+
+    if has_segments:
+        (
+            q_ref,
+            k_ref,
+            v_ref,
+            q_segment_ref,
+            kv_segment_ref,
+            output_ref,
+            logsumexp_ref,
+            max_scratch_ref,
+            sum_scratch_ref,
+            accumulator_scratch_ref,
+        ) = refs
+    else:
+        (
+            q_ref,
+            k_ref,
+            v_ref,
+            output_ref,
+            logsumexp_ref,
+            max_scratch_ref,
+            sum_scratch_ref,
+            accumulator_scratch_ref,
+        ) = refs
+        q_segment_ref = kv_segment_ref = None
 
     kv_block_index = pl.program_id(3)
 
@@ -272,6 +309,13 @@ def _tpu_flash_forward_kernel(
             column_ids = lax.broadcasted_iota(jnp.int32, (block_q, block_kv_compute), 1)
             column_ids += kv_block_index * block_kv + start_kv
             mask = jnp.logical_and(column_ids <= row_ids, column_ids < valid_sequence)
+            if q_segment_ref is not None:
+                # Block-diagonal over documents: a position may attend only
+                # inside its own segment. Purely additive to the causal mask,
+                # so the tile-skipping above stays valid.
+                rows = q_segment_ref[0, :][:, None]
+                columns = kv_segment_ref[0, start_kv : start_kv + block_kv_compute]
+                mask = jnp.logical_and(mask, rows == columns[None, :])
             scores += jnp.where(mask, 0.0, _MASK_VALUE)
 
             max_current = jnp.max(scores, axis=1)[:, None]
@@ -314,8 +358,14 @@ def _tpu_flash_forward(
     valid_sequence: int,
     interpret: bool,
     debug: bool,
+    segment_ids: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     batch, heads, sequence, head_dim = q.shape
+    if segment_ids is not None and segment_ids.shape != (batch, sequence):
+        raise ValueError(
+            "segment_ids must be [batch, sequence]; got "
+            f"{segment_ids.shape} for q {q.shape}"
+        )
     if sequence % tiles.block_q or sequence % tiles.block_kv:
         raise ValueError(
             "TPU Flash tiles must divide the sequence length; "
@@ -347,8 +397,22 @@ def _tpu_flash_forward(
         )
         return batch_index, head_index, visible_index, 0
 
+    def q_segment_index(batch_index: Any, _head: Any, q_index: Any, _: Any):
+        return batch_index, q_index
+
+    def kv_segment_index(batch_index: Any, _head: Any, q_index: Any, kv_index: Any):
+        visible_index = lax.select(
+            _below_or_on_diagonal(q_index, tiles.block_q, kv_index, tiles.block_kv),
+            kv_index,
+            0,
+        )
+        return batch_index, visible_index
+
     q_spec = pl.BlockSpec((1, 1, tiles.block_q, head_dim), q_index)
     kv_spec = pl.BlockSpec((1, 1, tiles.block_kv, head_dim), kv_index)
+    # Segments are per (batch, position); heads share them.
+    q_segment_spec = pl.BlockSpec((1, tiles.block_q), q_segment_index)
+    kv_segment_spec = pl.BlockSpec((1, tiles.block_kv), kv_segment_index)
     output_spec = pl.BlockSpec((1, 1, tiles.block_q, head_dim), q_index)
     logsumexp_spec = pl.BlockSpec((1, 1, tiles.block_q, TPU_VECTOR_LANES), q_index)
     output_shapes = (
@@ -363,6 +427,7 @@ def _tpu_flash_forward(
         sequence=sequence,
         valid_sequence=valid_sequence,
         softmax_scale=softmax_scale,
+        has_segments=segment_ids is not None,
     )
 
     with jax.named_scope(
@@ -374,7 +439,16 @@ def _tpu_flash_forward(
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=0,
                 grid=grid,
-                in_specs=(q_spec, kv_spec, kv_spec),
+                in_specs=(
+                    q_spec,
+                    kv_spec,
+                    kv_spec,
+                    *(
+                        (q_segment_spec, kv_segment_spec)
+                        if segment_ids is not None
+                        else ()
+                    ),
+                ),
                 out_specs=(output_spec, logsumexp_spec),
                 scratch_shapes=(
                     pltpu.VMEM((1, 1, tiles.block_q, TPU_VECTOR_LANES), jnp.float32),
@@ -389,28 +463,47 @@ def _tpu_flash_forward(
                 dimension_semantics=("parallel", "parallel", "parallel", "arbitrary")
             ),
             name="tpu_flash_causal_attention_fwd",
-        )(q, k, v)
+        )(q, k, v, *((segment_ids, segment_ids) if segment_ids is not None else ()))
     return output, logsumexp_replicated[..., 0]
 
 
 def _tpu_flash_dq_kernel(
-    q_ref: Any,
-    k_ref: Any,
-    v_ref: Any,
-    output_ref: Any,
-    output_cotangent_ref: Any,
-    logsumexp_ref: Any,
-    dq_ref: Any,
-    dq_scratch_ref: Any,
-    *,
+    *refs: Any,
     block_q: int,
     block_kv: int,
     block_kv_compute: int,
     sequence: int,
     valid_sequence: int,
     softmax_scale: float,
+    has_segments: bool = False,
 ) -> None:
     """Query-owned backward pass; recomputes P and accumulates dQ."""
+
+    if has_segments:
+        (
+            q_ref,
+            k_ref,
+            v_ref,
+            output_ref,
+            output_cotangent_ref,
+            logsumexp_ref,
+            q_segment_ref,
+            kv_segment_ref,
+            dq_ref,
+            dq_scratch_ref,
+        ) = refs
+    else:
+        (
+            q_ref,
+            k_ref,
+            v_ref,
+            output_ref,
+            output_cotangent_ref,
+            logsumexp_ref,
+            dq_ref,
+            dq_scratch_ref,
+        ) = refs
+        q_segment_ref = kv_segment_ref = None
 
     kv_block_index = pl.program_id(3)
 
@@ -446,6 +539,10 @@ def _tpu_flash_dq_kernel(
             column_ids = lax.broadcasted_iota(jnp.int32, (block_q, block_kv_compute), 1)
             column_ids += kv_block_index * block_kv + start_kv
             mask = jnp.logical_and(column_ids <= row_ids, column_ids < valid_sequence)
+            if q_segment_ref is not None:
+                rows = q_segment_ref[0, :][:, None]
+                columns = kv_segment_ref[0, start_kv : start_kv + block_kv_compute]
+                mask = jnp.logical_and(mask, rows == columns[None, :])
             probabilities = jnp.exp(
                 scores - _broadcast_row(logsumexp, block_kv_compute)
             )
@@ -470,17 +567,7 @@ def _tpu_flash_dq_kernel(
 
 
 def _tpu_flash_dkv_kernel(
-    q_ref: Any,
-    k_ref: Any,
-    v_ref: Any,
-    output_ref: Any,
-    output_cotangent_ref: Any,
-    logsumexp_ref: Any,
-    dk_ref: Any,
-    dv_ref: Any,
-    dk_scratch_ref: Any,
-    dv_scratch_ref: Any,
-    *,
+    *refs: Any,
     block_q: int,
     block_kv: int,
     block_q_compute: int,
@@ -488,8 +575,39 @@ def _tpu_flash_dkv_kernel(
     sequence: int,
     valid_sequence: int,
     softmax_scale: float,
+    has_segments: bool = False,
 ) -> None:
     """KV-owned backward pass; recomputes P and accumulates dK and dV."""
+
+    if has_segments:
+        (
+            q_ref,
+            k_ref,
+            v_ref,
+            output_ref,
+            output_cotangent_ref,
+            logsumexp_ref,
+            q_segment_ref,
+            kv_segment_ref,
+            dk_ref,
+            dv_ref,
+            dk_scratch_ref,
+            dv_scratch_ref,
+        ) = refs
+    else:
+        (
+            q_ref,
+            k_ref,
+            v_ref,
+            output_ref,
+            output_cotangent_ref,
+            logsumexp_ref,
+            dk_ref,
+            dv_ref,
+            dk_scratch_ref,
+            dv_scratch_ref,
+        ) = refs
+        q_segment_ref = kv_segment_ref = None
 
     q_block_index = pl.program_id(3)
 
@@ -535,6 +653,12 @@ def _tpu_flash_dkv_kernel(
                 mask = jnp.logical_and(
                     column_ids <= row_ids, column_ids < valid_sequence
                 )
+                if q_segment_ref is not None:
+                    rows = q_segment_ref[0, start_q : start_q + block_q_compute][
+                        :, None
+                    ]
+                    columns = kv_segment_ref[0, start_kv : start_kv + block_kv_compute]
+                    mask = jnp.logical_and(mask, rows == columns[None, :])
                 probabilities = jnp.exp(
                     scores - _broadcast_row(logsumexp, block_kv_compute)
                 )
@@ -581,6 +705,7 @@ def _tpu_flash_backward(
     valid_sequence: int,
     interpret: bool,
     debug: bool,
+    segment_ids: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Launch separate query-owned dQ and key-owned dK/dV kernels."""
 
@@ -612,9 +737,25 @@ def _tpu_flash_backward(
         )
         return batch_index, head_index, visible, 0
 
+    def dq_q_segment_index(batch_index: Any, _head: Any, q_index: Any, _: Any):
+        return batch_index, q_index
+
+    def dq_kv_segment_index(batch_index: Any, _head: Any, q_index: Any, kv_index: Any):
+        visible = lax.select(
+            _below_or_on_diagonal(
+                q_index, tiles.block_q_dq, kv_index, tiles.block_kv_dq
+            ),
+            kv_index,
+            0,
+        )
+        return batch_index, visible
+
     dq_q_spec = pl.BlockSpec((1, 1, tiles.block_q_dq, head_dim), q_index)
     dq_kv_spec = pl.BlockSpec((1, 1, tiles.block_kv_dq, head_dim), dq_kv_index)
     dq_lse_spec = pl.BlockSpec((1, 1, tiles.block_q_dq, TPU_VECTOR_LANES), q_index)
+    dq_q_segment_spec = pl.BlockSpec((1, tiles.block_q_dq), dq_q_segment_index)
+    dq_kv_segment_spec = pl.BlockSpec((1, tiles.block_kv_dq), dq_kv_segment_index)
+    segment_operands = (segment_ids, segment_ids) if segment_ids is not None else ()
     dq_kernel = functools.partial(
         _tpu_flash_dq_kernel,
         block_q=tiles.block_q_dq,
@@ -623,6 +764,7 @@ def _tpu_flash_backward(
         sequence=sequence,
         valid_sequence=valid_sequence,
         softmax_scale=softmax_scale,
+        has_segments=segment_ids is not None,
     )
     dq = pl.pallas_call(
         dq_kernel,
@@ -641,6 +783,11 @@ def _tpu_flash_backward(
                 dq_q_spec,
                 dq_q_spec,
                 dq_lse_spec,
+                *(
+                    (dq_q_segment_spec, dq_kv_segment_spec)
+                    if segment_ids is not None
+                    else ()
+                ),
             ),
             out_specs=dq_q_spec,
             scratch_shapes=(
@@ -654,7 +801,7 @@ def _tpu_flash_backward(
             dimension_semantics=("parallel", "parallel", "parallel", "arbitrary")
         ),
         name="tpu_flash_causal_attention_bwd_dq",
-    )(q, k, v, output, output_cotangent, logsumexp_replicated)
+    )(q, k, v, output, output_cotangent, logsumexp_replicated, *segment_operands)
 
     def dkv_kv_index(batch_index: Any, head_index: Any, kv_index: Any, _: Any):
         return batch_index, head_index, kv_index, 0
@@ -674,6 +821,22 @@ def _tpu_flash_backward(
         (1, 1, tiles.block_q_dkv, TPU_VECTOR_LANES), dkv_q_index
     )
     dkv_kv_spec = pl.BlockSpec((1, 1, tiles.block_kv_dkv, head_dim), dkv_kv_index)
+
+    def dkv_kv_segment_index(batch_index: Any, _head: Any, kv_index: Any, _: Any):
+        return batch_index, kv_index
+
+    def dkv_q_segment_index(batch_index: Any, _head: Any, kv_index: Any, q_index: Any):
+        visible = lax.select(
+            _below_or_on_diagonal(
+                q_index, tiles.block_q_dkv, kv_index, tiles.block_kv_dkv
+            ),
+            q_index,
+            0,
+        )
+        return batch_index, visible
+
+    dkv_q_segment_spec = pl.BlockSpec((1, tiles.block_q_dkv), dkv_q_segment_index)
+    dkv_kv_segment_spec = pl.BlockSpec((1, tiles.block_kv_dkv), dkv_kv_segment_index)
     dkv_kernel = functools.partial(
         _tpu_flash_dkv_kernel,
         block_q=tiles.block_q_dkv,
@@ -683,6 +846,7 @@ def _tpu_flash_backward(
         sequence=sequence,
         valid_sequence=valid_sequence,
         softmax_scale=softmax_scale,
+        has_segments=segment_ids is not None,
     )
     dk, dv = pl.pallas_call(
         dkv_kernel,
@@ -701,6 +865,11 @@ def _tpu_flash_backward(
                 dkv_q_spec,
                 dkv_q_spec,
                 dkv_lse_spec,
+                *(
+                    (dkv_q_segment_spec, dkv_kv_segment_spec)
+                    if segment_ids is not None
+                    else ()
+                ),
             ),
             out_specs=(dkv_kv_spec, dkv_kv_spec),
             scratch_shapes=(
@@ -718,7 +887,7 @@ def _tpu_flash_backward(
             dimension_semantics=("parallel", "parallel", "parallel", "arbitrary")
         ),
         name="tpu_flash_causal_attention_bwd_dkv",
-    )(q, k, v, output, output_cotangent, logsumexp_replicated)
+    )(q, k, v, output, output_cotangent, logsumexp_replicated, *segment_operands)
     return dq, dk, dv
 
 
@@ -787,7 +956,19 @@ def make_causal_attention(config: AttentionConfig = AttentionConfig()) -> Callab
 
     backend = _resolve_backend(config)
 
-    def attention(q: jax.Array, k: jax.Array, v: jax.Array) -> jax.Array:
+    def attention(
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        segment_ids: jax.Array | None = None,
+    ) -> jax.Array:
+        """Causal attention, optionally block-diagonal over documents.
+
+        ``segment_ids`` is ``[batch, sequence]`` int32: positions sharing an id
+        may attend to each other, subject to causality. Padding introduced to
+        reach a legal tile length is given a distinct id so it matches nothing.
+        """
+
         _validate_qkv(q, k, v)
         if backend == "tpu_flash" and not config.interpret and q.dtype != jnp.bfloat16:
             raise TypeError(
@@ -801,7 +982,9 @@ def make_causal_attention(config: AttentionConfig = AttentionConfig()) -> Callab
             else config.softmax_scale
         )
         if backend == "reference":
-            return reference_causal_attention(q, k, v, softmax_scale=scale)
+            return reference_causal_attention(
+                q, k, v, softmax_scale=scale, segment_ids=segment_ids
+            )
         tiles = config.tiles or select_attention_tiles(
             sequence=q.shape[2], head_dim=q.shape[3], training=True
         )
@@ -833,8 +1016,19 @@ def make_causal_attention(config: AttentionConfig = AttentionConfig()) -> Callab
             q_padded = jnp.pad(q, padding)
             k_padded = jnp.pad(k, padding)
             v_padded = jnp.pad(v, padding)
+            if segment_ids is not None:
+                # -1 matches no real document, so padding stays invisible even
+                # before the valid_sequence bound is applied.
+                segments_padded = jnp.pad(
+                    segment_ids,
+                    ((0, 0), (0, padded_sequence - original_sequence)),
+                    constant_values=-1,
+                )
+            else:
+                segments_padded = None
         else:
             q_padded, k_padded, v_padded = q, k, v
+            segments_padded = segment_ids
         if backend == "jax_flash":
             if padded_sequence != original_sequence:
                 # Segment zero contains real tokens and segment one contains
@@ -846,9 +1040,16 @@ def make_causal_attention(config: AttentionConfig = AttentionConfig()) -> Callab
                 segment = jnp.broadcast_to(
                     segment[None, :], (q.shape[0], padded_sequence)
                 )
-                segment_ids = jax_flash_attention.SegmentIds(q=segment, kv=segment)
+                if segments_padded is not None:
+                    # Distinct ids per (document, padding) pair.
+                    segment = segments_padded * 2 + segment
+                flash_segments = jax_flash_attention.SegmentIds(q=segment, kv=segment)
+            elif segments_padded is not None:
+                flash_segments = jax_flash_attention.SegmentIds(
+                    q=segments_padded, kv=segments_padded
+                )
             else:
-                segment_ids = None
+                flash_segments = None
             output = _jax_flash(
                 q_padded,
                 k_padded,
@@ -856,7 +1057,7 @@ def make_causal_attention(config: AttentionConfig = AttentionConfig()) -> Callab
                 tiles=tiles,
                 softmax_scale=scale,
                 debug=config.debug,
-                segment_ids=segment_ids,
+                segment_ids=flash_segments,
             )
             return output[:, :, :original_sequence, :]
 
@@ -873,6 +1074,7 @@ def make_causal_attention(config: AttentionConfig = AttentionConfig()) -> Callab
                 valid_sequence=original_sequence,
                 interpret=config.interpret,
                 debug=config.debug,
+                segment_ids=segments_padded,
             )
             return output[:, :, :original_sequence, :]
 
@@ -886,6 +1088,7 @@ def make_causal_attention(config: AttentionConfig = AttentionConfig()) -> Callab
                 valid_sequence=original_sequence,
                 interpret=config.interpret,
                 debug=config.debug,
+                segment_ids=segments_padded,
             )
             logical_output = output[:, :, :original_sequence, :]
             return logical_output, (q_value, k_value, v_value, output, logsumexp)
@@ -916,6 +1119,7 @@ def make_causal_attention(config: AttentionConfig = AttentionConfig()) -> Callab
                 valid_sequence=original_sequence,
                 interpret=config.interpret,
                 debug=config.debug,
+                segment_ids=segments_padded,
             )
             return dq, dk, dv
 
