@@ -584,6 +584,54 @@ def _record_for_run(run: Path, *, validation: bool) -> dict[str, object]:
     return record
 
 
+class ChartPointBudgetTests(unittest.TestCase):
+    """How many samples a single-file report carries, and how to get them all.
+
+    These files are a portable overview and thin every series to one budget,
+    so nothing in a file sits at a different fidelity than anything beside it.
+    Thinning cannot be undone by zooming and a downsampled curve looks exactly
+    like a real one, so the lossless originals live in the dataset repository
+    rather than being reconstructed from these.
+    """
+
+    def _report(self, steps: int, **kwargs):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "runs"
+            (runs / "long").mkdir(parents=True)
+            rows = [(10.0 - index * 0.001, 1e-4, 0.5) for index in range(steps)]
+            # One lone spike, the kind a shape-preserving downsample drops.
+            rows[steps // 2] = (99.0, 1e-4, 0.5)
+            # The report cross-checks the final loss against result.json, and
+            # the fixture declares 4.0.
+            rows[-1] = (4.0, 1e-4, 0.5)
+            _write_training(runs / "long", rows)
+            # tokens_per_step is 10 in the fixture; the report cross-checks the
+            # declared token count against the curve, so it has to follow.
+            _write_result(runs / "long", validation_artifact=False, tokens=steps * 10)
+            build_report(runs, root / "report.html", **kwargs)
+            return _payload((root / "report.html").read_text(encoding="utf-8"))
+
+    def test_the_default_thins_to_one_budget(self) -> None:
+        # These single-file reports are a portable overview, so they carry a
+        # bounded number of points. The lossless originals are the dataset.
+        payload = self._report(4000)
+        chart = next(c for c in payload["timeCharts"] if c["key"] == "train_loss")
+        self.assertEqual(len(chart["series"][0]["points"]), 1400)
+
+    def test_zero_embeds_every_sample(self) -> None:
+        steps = 4000
+        payload = self._report(steps, max_chart_points=0)
+        chart = next(c for c in payload["timeCharts"] if c["key"] == "train_loss")
+        self.assertEqual(len(chart["series"][0]["points"]), steps)
+
+    def test_a_spike_survives_at_full_resolution(self) -> None:
+        payload = self._report(4000, max_chart_points=0)
+        chart = next(c for c in payload["timeCharts"] if c["key"] == "train_loss")
+        values = [point[2] for point in chart["series"][0]["points"]]
+        self.assertEqual(max(values), 99.0)
+
+
 def _payload(html: str) -> dict[str, object]:
     """Decode the embedded payload exactly as the page does."""
 
@@ -720,7 +768,38 @@ class ClientSourceGuardTests(unittest.TestCase):
         start = script.index("function draw(item){")
         end = script.index("function axisToStep(", start)
         self.assertNotIn("s.points", script[start:end])
-        self.assertIn("base=seriesPoints(item,s)", script[start:end])
+        # Reads go through seriesPoints, whatever the local is called. The
+        # binding was renamed when draw started reducing points for display,
+        # and pinning the old name would have failed for a rename rather than
+        # for the bug this guards.
+        self.assertIn("seriesPoints(item,s)", script[start:end])
+
+    def test_the_draw_reduction_keeps_both_extremes(self) -> None:
+        """Bucketing must keep each bucket's min and max, not one representative.
+
+        The payload now holds every sample, so drawing has to reduce. Which
+        reduction it uses decides whether a lone spike is visible: keeping one
+        point per bucket preserves the curve's shape and can drop the spike
+        entirely, leaving a clean line that is wrong. Keeping both extremes
+        cannot.
+        """
+
+        script = self._script()
+        start = script.index("function envelope(")
+        end = script.index("function reduceForDraw(", start)
+        body = script[start:end]
+        self.assertIn("out.push(points[mn])", body)
+        self.assertIn("out.push(points[mx])", body)
+
+    def test_draw_reduces_against_the_visible_span(self) -> None:
+        # Reducing the whole series and then zooming would show the same
+        # coarse points however far in you went.
+        script = self._script()
+        start = script.index("function reduceForDraw(")
+        self.assertIn("visibleSlice(item,points)", script[start : start + 200])
+        draw_start = script.index("function draw(item){")
+        draw_end = script.index("function axisToStep(", draw_start)
+        self.assertIn("reduceForDraw(item,", script[draw_start:draw_end])
 
     def test_layer_frames_are_cached_for_stable_identity(self) -> None:
         # draw() decides "smoothed" by array identity, so layerFrame must not

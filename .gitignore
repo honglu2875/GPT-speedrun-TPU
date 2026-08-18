@@ -18,3 +18,7 @@ __pycache__/
 
 # Local config backups.
 /.rig.toml.*
+
+# Converted logs and the HuggingFace upload tree; the dataset is the record.
+/logs/
+/hf-dataset/

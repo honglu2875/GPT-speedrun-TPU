@@ -442,17 +442,23 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument(
         "--layer-snapshots",
         type=_nonnegative_int,
-        default=0,
+        default=1_400,
         help=(
-            "recorded steps kept per layer-snapshot chart; 0 (the default) keeps "
-            "every recorded step, a positive value thins them to shrink the file"
+            "recorded steps kept per layer-snapshot chart; 0 keeps every "
+            "recorded step and 1400 is the default, matching --max-points so "
+            "no series in a file sits at a different fidelity than another"
         ),
     )
     report.add_argument(
         "--max-points",
-        type=_positive_int,
+        type=_nonnegative_int,
         default=1_400,
-        help="maximum embedded points per run and scalar series",
+        help=(
+            "embedded points per run and series; 0 embeds every recorded "
+            "sample. The default keeps these files portable; the lossless "
+            "originals are in the dataset repository, and thinning here "
+            "cannot be undone by zooming"
+        ),
     )
     report.add_argument(
         "--select",

@@ -1,52 +1,83 @@
-# Reports — what each one shows and how to reproduce it
+# Reports — what each one shows and how to rebuild it
 
-Every dashboard in this directory, where its runs came from, and the command
-that produces that set of runs. The commands are **demonstrative**: they use the
-current CLI and reproduce the *design*, not the exact invocation that ran at the
-time (several predate flags that now exist, and one predates the artifact format
-entirely). Seeds, tiers, and grids are exact.
+Every dashboard here, the runs behind it, and the command that reproduces it.
+Commands are **demonstrative**: they use the current CLI and reproduce the
+*design*, not the exact invocation from the time. Seeds, tiers, and grids are
+exact.
 
-Two things are worth knowing before reading any of these.
+## The logs live on HuggingFace
 
-**The run archives are not in this repository.** They live outside it, under
-`~/rig-run-archive/`, and are not pushed anywhere. That is why these HTML files
-are committed: for most of these studies the rendered dashboard is the only copy
-of the curves that travels with the repo. Treat them as records, not as build
-output.
+**[huggingface.co/datasets/quintic/rig-logs](https://huggingface.co/datasets/quintic/rig-logs)**
+— 177 runs across six studies, laid out as `<study>/<run-name>/`, at full
+recorded resolution. That is the archive of record; its
+[dataset card](https://huggingface.co/datasets/quintic/rig-logs/blob/main/README.md)
+is a copy of this file.
 
-**Two artifact formats.** Runs recorded before commit `75f0b22` wrote
-`training.csv` and `diagnostics.csv` in long form; everything after writes the
-packed `.riglog` format. [`rig/legacy.py`](../../rig/legacy.py) converts a
-long-form *training curve* into the packed format, so those runs can be replotted
-today. It does **not** convert diagnostics, so a report rebuilt from a legacy
-archive today has loss curves but no per-layer statistics — see
-[Rebuilding](#rebuilding) below.
+The dashboards committed here are **summaries** of those logs, thinned so they
+stay portable. Nothing in them is a substitute for the logs: they are one
+rendering at one fidelity, and a thinned curve is indistinguishable on screen
+from a complete one. When a number matters, read it from the `.riglog`.
+
+```python
+from huggingface_hub import hf_hub_download
+from rig import logpack
+
+path = hf_hub_download(
+    "quintic/rig-logs",
+    "batch-sweep-60M/60m-5tpp-bs128-lr2e-8-s1337/training.riglog",
+    repo_type="dataset",
+)
+log = logpack.read_log(path)
+log.series("train_loss")          # every optimizer step
+```
+
+## What "summary" means here
+
+Every series is thinned to at most **1,440 points**. Per-layer diagnostic
+charts additionally keep a bounded number of step frames — 8 for most studies,
+and more for the two where the per-layer behaviour is the subject rather than a
+by-product:
+
+| report | curve points | layer frames | size |
+|---|--:|--:|--:|
+| batch-size-sweep-60M | 1,440 | 400 | 44.3 MB |
+| batch-size-sweep-500M | 1,440 | 1,440 | 44.3 MB |
+| batch-size-sweep-250M | 1,440 | 8 | 15.4 MB |
+| lr-batch-sweep-125M | 1,440 | 8 | 8.2 MB |
+| 3-seed-gradient-spike | 1,440 | 8 | 6.6 MB |
+| 8k-lr-sweep-60M | 1,440 | 8 | 2.4 MB |
+
+The two large ones carry layer detail because gradient spikes are visible in
+it, and studying them is the point. This is deliberate discretion, not a
+default: keep it to a couple of files so the repository stays clonable.
+
+Charts resample against the visible span as you zoom, keeping each pixel
+bucket's minimum and maximum rather than one representative point — so a spike
+inside the embedded data stays visible at every zoom level. It cannot recover a
+sample that thinning already dropped.
 
 ## Contents
 
-| report | runs | tier(s) | what varies |
-|---|--:|---|---|
-| [batch-size-sweep-60M](batch-size-sweep-60M.html) | 75 | 60M | batch x LR x seed |
-| [batch-size-sweep-125M](batch-size-sweep-125M.html) | 27 | 125M | batch x LR x seed |
-| [lr-sweep-125M](lr-sweep-125M.html) | 27 | 125M | same runs, LR view |
-| [batch-size-sweep-250M](batch-size-sweep-250M.html) | 36 | 250M | batch x LR x seed |
-| [batch-size-sweep-125M-250M-500M](batch-size-sweep-125M-250M-500M.html) | 69 | 125M/250M/500M | all three at once |
-| [batch-size-sweep-500M](batch-size-sweep-500M.html) | 12 | 500M | batch x LR x seed, 5 and 20 TPP |
-| [500M-20tpp-v6e](500M-20tpp-v6e.html) | 3 | 500M | LR, 20 TPP |
-| [500M-20tpp-diagnostics](500M-20tpp-diagnostics.html) | 3 | 500M | per-layer diagnostics |
-| [3-seed-gradient-spike](3-seed-gradient-spike.html) | 12 | 250M | LR x seed |
-| [8k-lr-sweep-60M](8k-lr-sweep-60M.html) | 15 | 60M | LR x seed at 8k context |
-| [transfer-charts](transfer-charts.html) | — | — | derived figures, not a run dashboard |
+| report | runs | tier(s) | what varies | logs |
+|---|--:|---|---|---|
+| [batch-size-sweep-60M](batch-size-sweep-60M.html) | 75 | 60M | batch × LR × seed | [`batch-sweep-60M`](https://huggingface.co/datasets/quintic/rig-logs/tree/main/batch-sweep-60M) |
+| [lr-batch-sweep-125M](lr-batch-sweep-125M.html) | 27 | 125M | batch × LR × seed | [`lr-batch-sweep-125M`](https://huggingface.co/datasets/quintic/rig-logs/tree/main/lr-batch-sweep-125M) |
+| [batch-size-sweep-250M](batch-size-sweep-250M.html) | 36 | 250M | batch × LR × seed | [`batch-sweep-250M`](https://huggingface.co/datasets/quintic/rig-logs/tree/main/batch-sweep-250M) |
+| [batch-size-sweep-500M](batch-size-sweep-500M.html) | 12 | 500M | batch × LR × seed, 5 and 20 TPP | [`batch-sweep-500M`](https://huggingface.co/datasets/quintic/rig-logs/tree/main/batch-sweep-500M) |
+| [3-seed-gradient-spike](3-seed-gradient-spike.html) | 12 | 250M | LR × seed | [`lr-transfer-250M`](https://huggingface.co/datasets/quintic/rig-logs/tree/main/lr-transfer-250M) |
+| [8k-lr-sweep-60M](8k-lr-sweep-60M.html) | 15 | 60M | LR × seed at 8k context | [`lr-sweep-8k-60M`](https://huggingface.co/datasets/quintic/rig-logs/tree/main/lr-sweep-8k-60M) |
+| [transfer-charts](transfer-charts.html) | — | — | derived figures, not a run dashboard | — |
+
+Each study also carries a `snapshot.json.gz` (loss curves only, 0.05–0.30 MB)
+and, for the two above, a `snapshot-diagnostics.json.gz` (1.0–3.5 MB). These
+are what the study browser loads before you ask it for anything larger.
 
 ---
 
 ## batch-size-sweep-60M.html
 
-75 runs: **5 batches x 5 learning rates x 3 seeds** at the 60M tier, 5 tokens
-per parameter, 1,024 context. The widest grid in the collection, and the one
-study 2 leans on hardest.
-
-Source archive: `2026-08-15-batch-sweep-60M` (runs dated 2026-08-15).
+75 runs: **5 batches × 5 learning rates × 3 seeds** at 60M, 5 tokens per
+parameter, 1,024 context. The widest grid here, and what study 2 leans on.
 
 ```bash
 for bs in 32 64 128 256 512; do
@@ -59,16 +90,18 @@ for bs in 32 64 128 256 512; do
     done
   done
 done
+rig report --runs <batch-sweep-60M> --max-points 1440 --layer-snapshots 400 \
+  --output docs/reports/batch-size-sweep-60M.html
 ```
 
-## batch-size-sweep-125M.html
+## lr-batch-sweep-125M.html
 
-27 runs: **3 batches (64/128/256) x 3 learning rates (2^-7/2^-8/2^-9) x 3
+27 runs: **3 batches (64/128/256) × 3 learning rates (2^-7/2^-8/2^-9) × 3
 seeds** at 125M, 5 TPP, 1,024 context.
 
-Source archive: `2026-08-17-batch-sweep-125M-250M-500M`, the 125M subset (runs
-dated 2026-08-15 — the archive is named for when it was *archived*, not when the
-runs happened).
+The grid is a batch × LR product, so either axis can be read as the subject.
+This replaces the former `batch-size-sweep-125M.html` and `lr-sweep-125M.html`,
+which were two renderings of these same 27 runs.
 
 ```bash
 for bs in 64 128 256; do
@@ -83,23 +116,17 @@ for bs in 64 128 256; do
 done
 ```
 
-## lr-sweep-125M.html
-
-**The same 27 runs as `batch-size-sweep-125M.html`**, rendered earlier and read
-as a learning-rate comparison rather than a batch one. It is a second view, not
-a second experiment — the grid is a batch x LR product, so either axis can be
-the subject. Reproduce it with the loop above.
-
-Kept because it is the artifact study 1 was written against. If you want one
-file for the 125M tier, prefer `batch-size-sweep-125M.html`.
-
 ## batch-size-sweep-250M.html
 
-36 runs: **4 batches (64/128/256/512) x 3 learning rates x 3 seeds** at 250M,
+36 runs: **4 batches (64/128/256/512) × 3 learning rates × 3 seeds** at 250M,
 5 TPP, 1,024 context.
 
-Source archive: `2026-08-17-batch-sweep-125M-250M-500M`, the 250M subset (runs
-dated 2026-08-15 through 2026-08-17).
+Three runs — `250m-5tpp-bs512-lr2e-7`, all three seeds — recorded diagnostics
+only from step 1920 onward. A report refuses a diagnostics log that does not
+start at step 1, because its axes would not line up with the training curve, so
+those three carry their partial series as `diagnostics-partial.riglog`: kept
+beside the run, not declared, read by nothing automatically. The runs still
+plot from their training curves rather than being dropped over it.
 
 ```bash
 for bs in 64 128 256 512; do
@@ -114,33 +141,16 @@ for bs in 64 128 256 512; do
 done
 ```
 
-## batch-size-sweep-125M-250M-500M.html
-
-All 69 runs of the `2026-08-17-batch-sweep-125M-250M-500M` archive in one
-dashboard: the 27 above at 125M, the 36 above at 250M, and 6 at 500M
-(2 batches x 3 seeds at `2^-8`, 5 TPP).
-
-**Largely superseded.** Its 125M and 250M halves are the same runs as the two
-per-tier reports, and its 500M half is now inside
-`batch-size-sweep-500M.html` alongside six further runs. It is still the only
-file that shows all three tiers on shared axes.
-
 ## batch-size-sweep-500M.html
 
-12 runs, and the only report assembled from more than one source: six at 5 TPP
-from `2026-08-17-batch-sweep-125M-250M-500M`, three at 20 TPP from
-`2026-08-18-500m-20tpp-v6e`, and three at 20 TPP from `runs/`. The first nine
-are long-form CSV converted by `rig/legacy.py`; the last three were recorded
-packed.
+12 runs at two token budgets. Run names carry the budget
+(`500m-5tpp-…` against `500m-20tpp-…`) because the two are different
+experiments whose losses are not comparable to each other.
 
-Run names carry the token budget (`500m-5tpp-...` against `500m-20tpp-...`)
-because the two budgets are different experiments whose losses are not
-comparable to each other.
-
-This is study 3's dashboard. Per-layer diagnostics are deliberately excluded:
-only three of the twelve runs have them in a readable format, and a report where
-a quarter of the runs carry extra series invites reading a gap in coverage as a
-gap in behaviour. They are in `500M-20tpp-diagnostics.html` instead.
+This is study 3's dashboard. It replaces both the former `500M-20tpp-v6e.html`
+(three of these twelve) and `500M-20tpp-diagnostics.html`, which existed only
+because those three were once the only 500M runs whose diagnostics could be
+read. All twelve can now.
 
 ```bash
 # 5 TPP arm, batch bracket at the optimal LR
@@ -168,40 +178,15 @@ for lr in 0.0078125 0.001953125; do
 done
 ```
 
-## 500M-20tpp-v6e.html
-
-The three 20-TPP runs of `2026-08-18-500m-20tpp-v6e` on their own, rendered
-before the packed-format series began.
-
-**Superseded** by `batch-size-sweep-500M.html`, which contains these three plus
-nine more. Kept only as the record that existed when study 3 was first written.
-
-## 500M-20tpp-diagnostics.html
-
-The three 500M runs recorded in the packed format, **with** their per-layer
-parameter, gradient, and update statistics — batch 128 at `2^-8` (seeds 1337 and
-1338) and batch 64 at `2^-8` (seed 1337).
-
-These are the only 500M runs whose diagnostics are readable by the current
-tooling, which is the whole reason this file is separate from the sweep report.
-At 68 MB it is by far the largest file here; the diagnostics are ~99% of that.
-
-```bash
-for bs in 64 128; do
-  rig run reference --cluster v6e-8 --profile dev --track open \
-    --tier 500m --tokens-per-parameter 20 --checkpoint-policy none \
-    --study-batch-size "$bs" --base-learning-rate 0.00390625 --seed 1337 \
-    --name "500m-20tpp-bs${bs}-s1337"
-done
-```
-
 ## 3-seed-gradient-spike.html
 
-12 runs: **4 learning rates x 3 seeds** at 250M, batch 128, 5 TPP. Built to
-settle the 250M reseed described in study 1, and the evidence base for
+12 runs: **4 learning rates × 3 seeds** at 250M, batch 128, 5 TPP. Built to
+settle the 250M reseed in study 1, and the evidence base for
 [GRADIENT_SPIKES.md](../GRADIENT_SPIKES.md).
 
-Source archive: `2026-08-15-lr-transfer-5tpp` (runs dated 2026-08-14/15).
+Its diagnostics were unreadable long-form CSV until they were converted, so
+for a while the dashboard about gradient spikes contained no gradient
+statistics at all.
 
 ```bash
 for lr in 0.015625 0.0078125 0.00390625 0.001953125; do
@@ -216,11 +201,10 @@ done
 
 ## 8k-lr-sweep-60M.html
 
-15 runs: **5 learning rates x 3 seeds** of [`reference_8k`](../../recipes/reference_8k/)
-— 60M at 8,192 context with document masking, batch 16 so that tokens per step
-and step count match the 1,024-context ladder exactly. This is study 4.
-
-These runs are still live in `runs/`, not archived, and were recorded packed.
+15 runs: **5 learning rates × 3 seeds** of
+[`reference_8k`](../../recipes/reference_8k/) — 60M at 8,192 context with
+document masking, batch 16 so tokens per step and step count match the
+1,024-context ladder exactly. This is study 4.
 
 ```bash
 for lr in 0.015625 0.0078125 0.00390625 0.001953125 0.0009765625; do
@@ -231,14 +215,12 @@ for lr in 0.015625 0.0078125 0.00390625 0.001953125 0.0009765625; do
       --name "60m-bs16-lr${lr}-s${seed}"
   done
 done
-rig report --runs runs --select reference_8k --output docs/reports/8k-lr-sweep-60M.html
 ```
 
 ## transfer-charts.html
 
 Not a run dashboard. Derived figures built from recorded results by
-[`make_transfer_charts.py`](make_transfer_charts.py), which is committed beside
-it. Regenerate with:
+[`make_transfer_charts.py`](make_transfer_charts.py), committed beside it.
 
 ```bash
 uv run --frozen --no-sync python docs/reports/make_transfer_charts.py
@@ -248,21 +230,23 @@ uv run --frozen --no-sync python docs/reports/make_transfer_charts.py
 
 ## Rebuilding
 
-`rig report --runs <dir> --output <file>` renders any directory of runs, and
-`--select <regex>` narrows it to one family. A legacy archive needs its training
-curves converted first — `rig/legacy.py` does that without touching the
-originals.
+Download a study from the dataset and point `rig report` at it:
 
-Two limits are worth stating plainly, because both are easy to trip over:
+```bash
+huggingface-cli download quintic/rig-logs --repo-type dataset \
+  --include 'batch-sweep-60M/*' --local-dir /tmp/rig-logs
+rig report --runs /tmp/rig-logs/batch-sweep-60M \
+  --max-points 1440 --layer-snapshots 400 \
+  --output docs/reports/batch-size-sweep-60M.html
+```
 
-- **Diagnostics do not convert.** Only training curves do. A report rebuilt
-  today from a pre-`75f0b22` archive will have loss and validation curves but no
-  per-layer series, so it is **not** byte- or content-equivalent to the file
-  committed here. The committed HTML remains the only complete rendering of
-  those diagnostics. Do not overwrite one with a rebuild expecting a smaller
-  file to be the same file.
-- **The archives are not in this repository.** Anything rebuilt from
-  `~/rig-run-archive/` cannot be rebuilt by someone who only has the repo. This
-  README, the committed HTML, and the tables in
-  [HYPERPARAMETER_TRANSFER.md](../HYPERPARAMETER_TRANSFER.md) are what survive
-  without it.
+`--max-points 0 --layer-snapshots 0` embeds every recorded sample. That is what
+the dataset holds; it makes a much larger file than anything committed here.
+
+## Two runs that are not in the dataset
+
+- `20260816T213609.122328Z-…-37299d66` — a 500M run whose `stdout.log` was
+  deleted while the process still held the descriptor, so no `result.json` was
+  ever written. Its curves survive in the original archive but nothing records
+  what it measured, so it cannot be placed on a chart.
+- A `studies` directory inside the 60M archive, which is not a run.

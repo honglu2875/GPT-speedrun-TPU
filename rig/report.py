@@ -34,11 +34,15 @@ _MAX_JSON_BYTES = 4 * 1024 * 1024
 _MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
 TRAINING_LOG_NAME = f"training{logpack.SUFFIX}"
 DIAGNOSTICS_LOG_NAME = f"diagnostics{logpack.SUFFIX}"
+# One budget for every series, so nothing in a file sits at a different
+# fidelity than anything beside it. These single-file reports are a portable
+# overview; the lossless originals live in the dataset repository, and the
+# study page fetches them on request. 0 embeds every recorded sample.
 _MAX_CHART_POINTS = 1_400
 # 0 keeps every recorded diagnostic step, so the step dragger moves at the
 # granularity the run actually recorded. A positive value thins the step axis,
 # trading dragger resolution for file size; first and last are always kept.
-_MAX_LAYER_SNAPSHOTS = 0
+_MAX_LAYER_SNAPSHOTS = 1_400
 _LAYER_KEY = re.compile(r"(?:^|/)(?:blocks?|layers?|h)(?:/|_)(\d+)(?:/|$)")
 _COLORS = (
     "#7dd3fc",
@@ -212,8 +216,10 @@ def build_report(
 
     runs_dir = Path(runs_dir).expanduser().resolve()
     output_path = Path(output_path).expanduser().resolve()
-    if isinstance(max_chart_points, bool) or max_chart_points < 32:
-        raise ReportError("max_chart_points must be an integer of at least 32")
+    if isinstance(max_chart_points, bool) or max_chart_points < 0:
+        raise ReportError("max_chart_points must be 0 (every sample) or positive")
+    if 0 < max_chart_points < 32:
+        raise ReportError("max_chart_points must be 0 (every sample) or at least 32")
     if isinstance(layer_snapshots, bool) or layer_snapshots < 0:
         raise ReportError("layer_snapshots must be 0 (every step) or a positive count")
     if 0 < layer_snapshots < 2:
@@ -1712,6 +1718,42 @@ function dataBounds(item){let x0=Infinity,x1=-Infinity,y0=Infinity,y1=-Infinity,
 function bounds(item){const base=dataBounds(item);return base?(item.view||base):null}
 function smoothingApplies(item){return smoothing!=='raw'&&effectiveSpan()>1&&item.type==='time'&&item.data.key!=='learning_rate'}
 function displayPoints(item,series){const source=seriesPoints(item,series);if(!smoothingApplies(item)||source.length<2)return source;const span=effectiveSpan(),key=smoothing+':'+span;let cache=smoothCache.get(series);if(!cache){cache=new Map();smoothCache.set(series,cache)}if(cache.has(key))return cache.get(key);let result;if(smoothing==='ema'){const alpha=2/(span+1);let value=source[0][2];result=source.map((point,index)=>{if(index)value=alpha*point[2]+(1-alpha)*value;return[point[0],point[1],value]})}else{const half=(span-1)>>1;if(smoothing==='mean'){const prefix=[0];for(const point of source)prefix.push(prefix[prefix.length-1]+point[2]);result=source.map((point,index)=>{const lo=Math.max(0,index-half),hi=Math.min(source.length-1,index+half);return[point[0],point[1],(prefix[hi+1]-prefix[lo])/(hi-lo+1)]})}else result=source.map((point,index)=>{const lo=Math.max(0,index-half),hi=Math.min(source.length-1,index+half),values=[];for(let i=lo;i<=hi;i++)values.push(source[i][2]);values.sort((a,b)=>a-b);const middle=values.length>>1,value=values.length%2?values[middle]:(values[middle-1]+values[middle])/2;return[point[0],point[1],value]})}cache.set(key,result);return result}
+function drawBudget(width){return Math.max(128,Math.round(width*2))}
+// The payload carries every recorded sample, so one series can hold tens of
+// thousands of points -- far more than a canvas has columns for. Drawing them
+// all is slow and, worse, unreadable: the line becomes a solid band. Each
+// series is therefore reduced to the visible span at roughly two points per
+// CSS pixel, and the reduction is redone whenever the zoom changes, so detail
+// appears as you go in rather than being decided once when the file was built.
+function visibleSlice(item,points){
+ const v=item.view;if(!v||points.length<3)return points;
+ const at=i=>xOf(item,points[i]);
+ let lo=0,hi=points.length;
+ while(lo<hi){const mid=(lo+hi)>>1;if(at(mid)<v.x0)lo=mid+1;else hi=mid}
+ const start=Math.max(0,lo-1);
+ lo=0;hi=points.length;
+ while(lo<hi){const mid=(lo+hi)>>1;if(at(mid)<=v.x1)lo=mid+1;else hi=mid}
+ const end=Math.min(points.length,lo+1);
+ return end-start>=2?points.slice(start,end):points}
+// Each bucket keeps its lowest and highest sample rather than one
+// representative, emitted in the order they occur so x stays increasing. A
+// lone spike therefore survives at every zoom level. Picking one point per
+// bucket -- which is what downsampling for shape does -- would drop it, and
+// the curve would look clean and be wrong, which is the failure worth ruling
+// out here: gradient spikes are usually the thing being looked for.
+function envelope(item,points,budget){
+ if(points.length<=budget)return points;
+ const buckets=Math.max(1,budget>>1),out=[];
+ for(let i=0;i<buckets;i++){
+  const lo=Math.floor(i*points.length/buckets),hi=Math.floor((i+1)*points.length/buckets);
+  if(hi<=lo)continue;
+  let mn=lo,mx=lo,vmn=yOf(item,points[lo]),vmx=vmn;
+  for(let j=lo+1;j<hi;j++){const v=yOf(item,points[j]);if(v<vmn){vmn=v;mn=j}else if(v>vmx){vmx=v;mx=j}}
+  if(mn===mx)out.push(points[mn]);
+  else if(mn<mx){out.push(points[mn]);out.push(points[mx])}
+  else{out.push(points[mx]);out.push(points[mn])}}
+ return out}
+function reduceForDraw(item,points,budget){return envelope(item,visibleSlice(item,points),budget)}
 function draw(item){
  const c=item.canvas,rect=c.getBoundingClientRect(),dpr=Math.min(devicePixelRatio||1,2),w=Math.max(1,rect.width),h=Math.max(1,rect.height);
  if(c.width!==Math.round(w*dpr)||c.height!==Math.round(h*dpr)){c.width=Math.round(w*dpr);c.height=Math.round(h*dpr)}
@@ -1722,7 +1764,8 @@ function draw(item){
  for(let i=0;i<=4;i++){const y=m.t+(h-m.t-m.b)*i/4,v=b.y1-(b.y1-b.y0)*i/4;g.beginPath();g.moveTo(m.l,y);g.lineTo(w-m.r,y);g.stroke();g.textAlign='right';g.fillText(fmt(v,3),m.l-7,y+3)}
  for(let i=0;i<=4;i++){const x=m.l+(w-m.l-m.r)*i/4,v=untransformX(item,tx0+(tx1-tx0)*i/4);g.textAlign=i===0?'left':i===4?'right':'center';g.fillText(fmt(v,item.type==='layer'?0:2),x,h-9)}
  g.save();g.beginPath();g.rect(m.l,m.t,w-m.l-m.r,h-m.t-m.b);g.clip();
- for(const s of item.data.series){if(!visible.has(s.run))continue;const r=runMap.get(s.run),base=seriesPoints(item,s),shown=displayPoints(item,s),smoothed=shown!==base;const stroke=(points,alpha,width)=>{g.strokeStyle=r.color;g.lineWidth=width;g.globalAlpha=alpha;g.beginPath();let count=0;for(const point of points){const x=xOf(item,point),y=yOf(item,point);if(!validX(item,x)||!Number.isFinite(y))continue;count?g.lineTo(X(x),Y(y)):g.moveTo(X(x),Y(y));count++}g.stroke();return count};if(smoothed)stroke(base,.22,1);const count=stroke(shown,.92,smoothed?2.2:1.7);if(count<=20){g.fillStyle=r.color;for(const point of shown){const x=xOf(item,point),y=yOf(item,point);if(!validX(item,x)||!Number.isFinite(y))continue;g.beginPath();g.arc(X(x),Y(y),2.3,0,Math.PI*2);g.fill()}}}
+ const budget=drawBudget(w-m.l-m.r);
+ for(const s of item.data.series){if(!visible.has(s.run))continue;const r=runMap.get(s.run),fullBase=seriesPoints(item,s),fullShown=displayPoints(item,s),smoothed=fullShown!==fullBase,base=smoothed?reduceForDraw(item,fullBase,budget):null,shown=reduceForDraw(item,fullShown,budget);const stroke=(points,alpha,width)=>{g.strokeStyle=r.color;g.lineWidth=width;g.globalAlpha=alpha;g.beginPath();let count=0;for(const point of points){const x=xOf(item,point),y=yOf(item,point);if(!validX(item,x)||!Number.isFinite(y))continue;count?g.lineTo(X(x),Y(y)):g.moveTo(X(x),Y(y));count++}g.stroke();return count};if(smoothed)stroke(base,.22,1);const count=stroke(shown,.92,smoothed?2.2:1.7);if(count<=20){g.fillStyle=r.color;for(const point of shown){const x=xOf(item,point),y=yOf(item,point);if(!validX(item,x)||!Number.isFinite(y))continue;g.beginPath();g.arc(X(x),Y(y),2.3,0,Math.PI*2);g.fill()}}}
  g.restore();g.globalAlpha=1;item._plot={b,m,w,h,X,Y,IX,IY};
  drawMarkers(item,g);
  if(item.drag){const d=item.drag,left=Math.min(d.x0,d.x1),top=Math.min(d.y0,d.y1),width=Math.abs(d.x1-d.x0),height=Math.abs(d.y1-d.y0);g.save();g.fillStyle='rgba(125,211,252,.13)';g.strokeStyle='#7dd3fc';g.lineWidth=1.25;g.setLineDash([5,3]);g.fillRect(left,top,width,height);g.strokeRect(left+.5,top+.5,Math.max(0,width-1),Math.max(0,height-1));g.restore()}
