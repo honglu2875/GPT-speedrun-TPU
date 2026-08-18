@@ -77,7 +77,8 @@ from .doctor import (
     render_doctor,
     run_doctor,
 )
-from .report import build_report
+from .console import Console
+from .report import build_report, export_study
 
 
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -459,6 +460,21 @@ def build_parser() -> argparse.ArgumentParser:
             "originals are in the dataset repository, and thinning here "
             "cannot be undone by zooming"
         ),
+    )
+    report.add_argument("--color", choices=_COLORS, help="terminal color preference")
+    report.add_argument(
+        "--study-export-target",
+        type=Path,
+        default=None,
+        help=(
+            "instead of rendering HTML, lay the runs out as a study folder "
+            "under this path, in the layout the dataset repository uses"
+        ),
+    )
+    report.add_argument(
+        "--study-name",
+        default=None,
+        help="folder name for --study-export-target; required with it",
     )
     report.add_argument(
         "--select",
@@ -1427,6 +1443,34 @@ def command_report(args: argparse.Namespace) -> int:
     root = repo_root()
     runs = args.runs if args.runs.is_absolute() else root / args.runs
     output = args.output if args.output.is_absolute() else root / args.output
+
+    if args.study_export_target is not None:
+        if not args.study_name:
+            raise ConfigError("--study-export-target needs --study-name")
+        target = (
+            args.study_export_target
+            if args.study_export_target.is_absolute()
+            else root / args.study_export_target
+        )
+        summary = export_study(runs, target, args.study_name, select=args.select)
+        print(
+            f"study {summary['path']}: {summary['runs']} run(s), "
+            f"{summary['ledgered']} ledgered, {summary['bytes'] / 1e6:.1f} MB "
+            f"(snapshot {summary['snapshot_bytes'] / 1e6:.2f} MB)"
+        )
+        if not summary["runs"]:
+            return 1
+        # Yellow, and loud: an empty README that nobody notices becomes a study
+        # nobody can reproduce, and this is the one moment the person who ran
+        # the sweep is still holding the reason it was run.
+        console = Console(getattr(args, "color", "auto") or "auto")
+        console.warn(f"{summary['readme']} is empty -- fill it in before publishing.")
+        console.warn(
+            "It is the study's landing page: the setup as bullet points, the "
+            "command that reproduces the sweep, and what it showed."
+        )
+        return 0
+
     summary = build_report(
         runs,
         output,

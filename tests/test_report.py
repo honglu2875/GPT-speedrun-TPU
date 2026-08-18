@@ -15,6 +15,7 @@ from rig.report import (
     DIAGNOSTICS_LOG_NAME,
     TRAINING_LOG_NAME,
     ReportError,
+    export_study,
     _checkpoint_layer_stats,
     _default_run_selection,
     _diagnostic_metric,
@@ -630,6 +631,90 @@ class ChartPointBudgetTests(unittest.TestCase):
         chart = next(c for c in payload["timeCharts"] if c["key"] == "train_loss")
         values = [point[2] for point in chart["series"][0]["points"]]
         self.assertEqual(max(values), 99.0)
+
+
+class StudyExportTests(unittest.TestCase):
+    """Laying runs out the way the dataset repository expects them."""
+
+    def _runs(self, root: Path, *, rich: bool = True) -> Path:
+        runs = root / "runs"
+        for index, seed in enumerate((1337, 1338)):
+            run = runs / f"20260818T00000{index}.000000Z-reference-x-{seed:08x}"
+            run.mkdir(parents=True)
+            _write_training(run, [(4.5, 1e-4, 0.5), (4.0, 9e-5, 0.4)])
+            _write_result(run, validation_artifact=False)
+            payload = json.loads((run / "result.json").read_text(encoding="utf-8"))
+            payload["seed"] = seed
+            if rich:
+                # _write_training writes 2 steps at 10 tokens each; the report
+                # cross-checks the declared token count against the curve, so
+                # these have to agree or the runs are skipped and the snapshot
+                # comes back empty.
+                payload["contract"] = {"sequence_length": 10}
+                payload["metrics"].update(
+                    {
+                        "model_tier": "60m",
+                        "base_learning_rate": 0.00390625,
+                        "training_steps": 2,
+                        "tokens_per_parameter": 5.0,
+                    }
+                )
+            (run / "result.json").write_text(json.dumps(payload), encoding="utf-8")
+        return runs
+
+    def test_it_names_folders_by_what_varies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            summary = export_study(self._runs(root), root / "out", "demo")
+            folders = sorted(p.name for p in summary["path"].iterdir() if p.is_dir())
+        self.assertEqual(summary["runs"], 2)
+        # A timestamp says when a run happened; this says what it was.
+        self.assertEqual(
+            folders, ["60m-5tpp-bs1-lr2e-8-s1337", "60m-5tpp-bs1-lr2e-8-s1338"]
+        )
+
+    def test_it_falls_back_to_the_run_id_when_it_cannot_name_a_run(self) -> None:
+        """A run missing its tier or learning rate is still worth exporting.
+
+        Under a name that is at least unique -- dropping it would lose data
+        over a cosmetic problem.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            summary = export_study(self._runs(root, rich=False), root / "out", "demo")
+            folders = sorted(p.name for p in summary["path"].iterdir() if p.is_dir())
+        self.assertEqual(summary["runs"], 2)
+        for name in folders:
+            self.assertTrue(name.startswith("20260818T"))
+
+    def test_the_readme_is_written_empty(self) -> None:
+        """Nothing here knows why a sweep was run, so nothing should guess.
+
+        A generated description would read as though someone had checked it,
+        which is worse than a blank one that visibly needs filling in.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            summary = export_study(self._runs(root), root / "out", "demo")
+            self.assertEqual(summary["readme"].name, "README.md")
+            self.assertEqual(summary["readme"].read_text(encoding="utf-8"), "")
+
+    def test_it_carries_the_ledger_and_a_curves_only_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            summary = export_study(self._runs(root), root / "out", "demo")
+            path = summary["path"]
+            self.assertTrue((path / "records.jsonl").is_file())
+            snapshot = json.loads(
+                gzip.decompress((path / "snapshot.json.gz").read_bytes())
+            )
+        # The snapshot is the overview the browser loads first, before anything
+        # larger is fetched, so it carries curves and nothing else.
+        self.assertEqual(snapshot["diagnosticCharts"], [])
+        self.assertEqual(snapshot["layerCharts"], [])
+        self.assertTrue(snapshot["timeCharts"])
 
 
 def _payload(html: str) -> dict[str, object]:

@@ -128,3 +128,12 @@ profile: validate-target preflight
 
 report:
 	$(UV_RUN) rig report --runs "$(RUNS_PATH)" --output "$(REPORT)" --layer-snapshots $(LAYER_SNAPSHOTS)
+
+# Lay a study out the way the dataset repository expects it, ready to upload.
+# STUDY names the folder; TARGET is where it lands; SELECT narrows the runs.
+#   make study-export STUDY=lr-sweep-8k-60M TARGET=hf-dataset SELECT=reference_8k
+study-export:
+	@test -n "$(STUDY)" || { echo "set STUDY=<folder name>"; exit 2; }
+	$(UV_RUN) rig report --runs "$(RUNS_PATH)" \
+	  --study-export-target "$(or $(TARGET),hf-dataset)" --study-name "$(STUDY)" \
+	  $(if $(SELECT),--select "$(SELECT)",)

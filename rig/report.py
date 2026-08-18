@@ -19,6 +19,8 @@ import json
 import math
 from pathlib import Path
 import re
+import tempfile
+import shutil
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -1462,6 +1464,120 @@ def _recipe_from_run_id(run_id: str) -> str:
     # authoritative whenever it exists.
     match = re.match(r"^\d{8}T\d{6}\.\d+Z-(.+)-[0-9a-f]{8}$", run_id)
     return match.group(1) if match else run_id
+
+
+def _study_run_name(result: Mapping[str, Any]) -> str:
+    """Name a run by what varies, so a folder listing reads as a grid.
+
+    Falls back to the run id when a field is missing: a directory that cannot
+    be named descriptively should still be exported, under a name that is at
+    least unique.
+    """
+
+    metrics = result.get("metrics") or {}
+    steps = metrics.get("training_steps") or 0
+    tokens = metrics.get("tokens_processed") or 0
+    sequence = (result.get("contract") or {}).get("sequence_length") or 1024
+    rate = metrics.get("base_learning_rate") or 0.0
+    tier = metrics.get("model_tier")
+    if not (steps and tokens and rate and tier):
+        return ""
+    batch = tokens // steps // sequence
+    exponent = round(math.log2(rate))
+    tpp = round(metrics.get("tokens_per_parameter") or 0)
+    return f"{tier}-{tpp}tpp-bs{batch}-lr2e{exponent}-s{result.get('seed')}"
+
+
+def export_study(
+    runs_dir: Path, target: Path, study: str, *, select: str | None = None
+) -> dict[str, Any]:
+    """Lay a study out the way the dataset repository expects it.
+
+    One folder per run under ``<target>/<study>/``, named for what varies
+    rather than for a timestamp, plus the ledger and a curves-only snapshot the
+    study browser can load before fetching anything larger.
+
+    The README is written empty on purpose. Nothing here can infer why a sweep
+    was run or what it showed, and a plausible-looking generated description
+    would be worse than a blank one: it would be read as though someone had
+    checked it.
+    """
+
+    pattern = re.compile(select) if select else None
+    destination = target / study
+    destination.mkdir(parents=True, exist_ok=True)
+
+    ledger: list[str] = []
+    records = {}
+    ledger_path = runs_dir / "records.jsonl"
+    if ledger_path.is_file():
+        for line in ledger_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                entry = json.loads(line)
+                records[entry.get("run_id")] = entry
+
+    exported = 0
+    for run in sorted(p for p in runs_dir.iterdir() if p.is_dir()):
+        result_path = run / "result.json"
+        if not result_path.is_file():
+            continue
+        if pattern and not pattern.search(run.name):
+            continue
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        if result.get("status") != "ok":
+            continue
+        name = _study_run_name(result) or run.name
+        folder = destination / name
+        folder.mkdir(parents=True, exist_ok=True)
+        for artifact in (
+            TRAINING_LOG_NAME,
+            DIAGNOSTICS_LOG_NAME,
+            "validation.csv",
+            "result.json",
+            "metrics.json",
+        ):
+            source = run / artifact
+            if source.is_file():
+                shutil.copy2(source, folder / artifact)
+        entry = records.get(run.name)
+        if entry is not None:
+            ledger.append(json.dumps({**entry, "name": name, "folder": name}))
+        exported += 1
+
+    (destination / "records.jsonl").write_text(
+        "".join(f"{line}\n" for line in ledger), encoding="utf-8"
+    )
+    (destination / "README.md").write_text("", encoding="utf-8")
+
+    snapshot_bytes = 0
+    if exported:
+        with tempfile.TemporaryDirectory() as scratch:
+            page = Path(scratch) / "snapshot.html"
+            build_report(destination, page, max_chart_points=200, layer_snapshots=4)
+            match = re.search(
+                r'<script type="application/gzip-base64" id="report-data">(.*?)</script>',
+                page.read_text(encoding="utf-8"),
+                re.S,
+            )
+            if match:
+                payload = json.loads(
+                    gzip.decompress(base64.b64decode(match.group(1).strip()))
+                )
+                payload["diagnosticCharts"] = []
+                payload["layerCharts"] = []
+                blob = gzip.compress(json.dumps(payload).encode("utf-8"), 9)
+                (destination / "snapshot.json.gz").write_bytes(blob)
+                snapshot_bytes = len(blob)
+
+    total = sum(f.stat().st_size for f in destination.rglob("*") if f.is_file())
+    return {
+        "path": destination,
+        "runs": exported,
+        "ledgered": len(ledger),
+        "bytes": total,
+        "snapshot_bytes": snapshot_bytes,
+        "readme": destination / "README.md",
+    }
 
 
 def build_study_browser(
