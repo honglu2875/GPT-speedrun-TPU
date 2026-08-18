@@ -1766,9 +1766,18 @@ def document_segments(tokens: jax.Array, boundary_token: int) -> jax.Array:
     return jnp.cumsum(tokens == boundary_token, axis=1).astype(jnp.int32)
 
 
+@jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class RouterStats:
-    """What the routed blocks report back for logging and the auxiliary loss."""
+    """What the routed blocks report back for logging and the auxiliary loss.
+
+    Registered as a pytree because it is returned as the aux output of
+    ``jax.value_and_grad(..., has_aux=True)``: an unregistered dataclass is an
+    opaque leaf to JAX, so the tracers inside its fields would not be
+    recognized as part of the traced computation and would dangle once the
+    transformation exits -- an ``UnexpectedTracerError`` at first use, not at
+    construction.
+    """
 
     balance_loss: jax.Array
     # [layers, experts]: the fraction of assignments each expert received.
@@ -2207,11 +2216,20 @@ def learning_rate(step: jax.Array, config: Config) -> jax.Array:
     )
 
 
-def init_optimizer(params: Any, steps: int) -> dict[str, Any]:
+def init_optimizer(params: Any, config: Config) -> dict[str, Any]:
     zeros = jax.tree_util.tree_map(lambda value: np.zeros_like(value), params)
     # Keeping the small scalar history on-device avoids a host synchronization
     # on every step. It is copied once, after the synchronized timing boundary.
-    history = np.zeros((steps, 3), dtype=np.float32)
+    # A routed run widens it by the routing columns so those are recorded every
+    # step too -- the end-of-run rewrite supersedes the sampled rows, so
+    # anything absent here is discarded no matter how often it was appended.
+    #
+    # The width is derived from config rather than taken as a parameter so
+    # there is exactly one place that can get it wrong: a caller that forgot
+    # to pass router_row_width(config) here once shipped a run whose history
+    # buffer was too narrow for the row train_step tried to write into it,
+    # and the run never reached the first optimizer step.
+    history = np.zeros((config.steps, 3 + router_row_width(config)), dtype=np.float32)
     return {
         "step": np.asarray(0, dtype=np.int32),
         "m": zeros,
@@ -2771,7 +2789,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         )
 
     host_params = init_params(config, args.seed)
-    host_optimizer = init_optimizer(host_params, config.steps)
+    host_optimizer = init_optimizer(host_params, config)
     decay_mask = weight_decay_mask(host_params)
     diagnostic_metadata = diagnostic_scope_metadata(host_params)
     params_total = parameter_count(host_params)

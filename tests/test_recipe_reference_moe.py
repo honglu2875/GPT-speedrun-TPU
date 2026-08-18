@@ -314,6 +314,41 @@ class RoutedModelTests(unittest.TestCase):
                 )
         self.assertGreater(float(jnp.abs(grads["token_embedding"]).max()), 0.0)
 
+    def test_a_real_training_step_does_not_crash_on_the_history_write(self) -> None:
+        """Reached a TPU: init_optimizer once took an explicit width argument.
+
+        A caller could construct a routed config and forget to pass
+        router_row_width(config) alongside it, which built a 3-wide history
+        while train_step tried to write a much wider row into it -- and no
+        prior test called init_optimizer the way the recipe actually does, so
+        a pure check of router_row_width in isolation had not caught it.
+        init_optimizer now takes the config directly and derives the width
+        itself, which removes the duplicated call rather than just detecting
+        it -- so this test calls it exactly as command_run does, with nothing
+        this test could get right that the recipe could get wrong beside it.
+        """
+
+        config = self._config()
+        params = trainer.init_params(config, 1337)
+        optimizer = trainer.init_optimizer(params, config)
+        # The real loop moves the optimizer state onto the mesh with
+        # put_replicated_tree before the first step; a single-device jnp.asarray
+        # is the part of that conversion this test actually needs -- ``history``
+        # must be a jax.Array so ``.at[].set(...)`` is defined on it.
+        optimizer = jax.tree_util.tree_map(jnp.asarray, optimizer)
+        tokens = jnp.asarray(
+            np.random.default_rng(5).integers(
+                0, config.semantic_vocab_size, size=(2, config.seq_len + 1)
+            )
+        )
+        _, optimizer, step_metrics = trainer.train_step(
+            params, optimizer, tokens[:, :-1], tokens[:, 1:], config, None
+        )
+        self.assertTrue(np.isfinite(float(step_metrics["loss"])))
+        self.assertEqual(
+            optimizer["history"].shape[1], 3 + trainer.router_row_width(config)
+        )
+
 
 class RouterLoggingTests(unittest.TestCase):
     """The columns and the values are declared in two places; they must agree.
@@ -397,6 +432,13 @@ class RouterLoggingTests(unittest.TestCase):
 
         self.assertEqual(len(training_log_columns()), 3)
         self.assertEqual(int(trainer.router_row(None).shape[0]), 0)
+
+    def test_a_dense_history_stays_three_columns_wide(self) -> None:
+        config = trainer.Config.__new__(trainer.Config)
+        object.__setattr__(config, "experts", 0)
+        object.__setattr__(config, "steps", 10)
+        optimizer = trainer.init_optimizer({"w": jnp.zeros((4,))}, config)
+        self.assertEqual(optimizer["history"].shape, (10, 3))
 
     def test_the_end_of_run_rewrite_keeps_the_routing_columns(self) -> None:
         """The bug this whole path exists for: the rewrite superseded them.
