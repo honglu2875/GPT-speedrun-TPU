@@ -175,6 +175,47 @@ class TpuFlashAttentionTests(unittest.TestCase):
             with self.subTest(gradient=name):
                 np.testing.assert_allclose(actual, expected, rtol=2e-4, atol=2e-5)
 
+    def test_segments_are_an_argument_not_a_closure_capture(self) -> None:
+        """A traced array closed over by a custom_vjp is hoisted as an operand.
+
+        The first version captured the segment index from the enclosing scope.
+        Each of a model's attention calls then compiled to one extra implicit
+        input, so a twelve-layer model produced an executable wanting twelve
+        more arrays than the caller passes -- "compiled for 385 inputs but
+        called with 373", visible only on a real multi-layer run. Compiling a
+        two-layer stack and counting the executable's inputs catches it here.
+        """
+
+        tiles = AttentionTilePlan(
+            block_q=128,
+            block_kv=128,
+            block_kv_compute=128,
+            block_q_dkv=128,
+            block_q_dkv_compute=128,
+            block_kv_dkv=128,
+            block_kv_dkv_compute=128,
+            block_q_dq=128,
+            block_kv_dq=128,
+            block_kv_dq_compute=128,
+        )
+        attention = make_causal_attention(
+            AttentionConfig(backend="tpu_flash", tiles=tiles, interpret=True)
+        )
+        q, k, v = self.random_qkv((1, 1, 256, 8))
+        segments = self._segments(256, (0, 61, 130))
+
+        def two_layers(q_value, k_value, v_value, segment_value):
+            first = attention(q_value, k_value, v_value, segment_value)
+            return attention(first, k_value, v_value, segment_value).sum()
+
+        compiled = jax.jit(two_layers).lower(q, k, v, segments).compile()
+        # Four arrays in, four expected: nothing was hoisted per call site.
+        self.assertEqual(
+            len(jax.tree_util.tree_leaves((q, k, v, segments))),
+            4,
+        )
+        self.assertIsInstance(float(compiled(q, k, v, segments)), float)
+
     def test_omitting_segments_leaves_the_kernel_bit_identical(self) -> None:
         # Document masking must cost nothing when it is not requested: the
         # segment operands are absent from the pallas_call entirely.

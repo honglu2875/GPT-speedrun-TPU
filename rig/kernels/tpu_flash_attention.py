@@ -1061,9 +1061,18 @@ def make_causal_attention(config: AttentionConfig = AttentionConfig()) -> Callab
             )
             return output[:, :, :original_sequence, :]
 
+        # ``segments`` is an explicit argument, never a closure capture. A
+        # traced array closed over by a custom_vjp is hoisted into the
+        # computation as an implicit operand -- one per call site, so a
+        # 12-layer model compiled for 12 more inputs than the caller passes
+        # ("compiled for 385 inputs but called with 373"). Passing it through
+        # and returning a ``None`` cotangent keeps the arity honest.
         @jax.custom_vjp
         def tpu_flash_attention(
-            q_value: jax.Array, k_value: jax.Array, v_value: jax.Array
+            q_value: jax.Array,
+            k_value: jax.Array,
+            v_value: jax.Array,
+            segments: jax.Array | None,
         ) -> jax.Array:
             output, _ = _tpu_flash_forward(
                 q_value,
@@ -1074,11 +1083,16 @@ def make_causal_attention(config: AttentionConfig = AttentionConfig()) -> Callab
                 valid_sequence=original_sequence,
                 interpret=config.interpret,
                 debug=config.debug,
-                segment_ids=segments_padded,
+                segment_ids=segments,
             )
             return output[:, :, :original_sequence, :]
 
-        def forward_rule(q_value: jax.Array, k_value: jax.Array, v_value: jax.Array):
+        def forward_rule(
+            q_value: jax.Array,
+            k_value: jax.Array,
+            v_value: jax.Array,
+            segments: jax.Array | None,
+        ):
             output, logsumexp = _tpu_flash_forward(
                 q_value,
                 k_value,
@@ -1088,15 +1102,22 @@ def make_causal_attention(config: AttentionConfig = AttentionConfig()) -> Callab
                 valid_sequence=original_sequence,
                 interpret=config.interpret,
                 debug=config.debug,
-                segment_ids=segments_padded,
+                segment_ids=segments,
             )
             logical_output = output[:, :, :original_sequence, :]
-            return logical_output, (q_value, k_value, v_value, output, logsumexp)
+            return logical_output, (
+                q_value,
+                k_value,
+                v_value,
+                output,
+                logsumexp,
+                segments,
+            )
 
         def backward_rule(
             residuals: tuple[jax.Array, ...], output_cotangent: jax.Array
         ):
-            q_value, k_value, v_value, output, logsumexp = residuals
+            q_value, k_value, v_value, output, logsumexp, segments = residuals
             if padded_sequence != original_sequence:
                 output_cotangent = jnp.pad(
                     output_cotangent,
@@ -1119,12 +1140,13 @@ def make_causal_attention(config: AttentionConfig = AttentionConfig()) -> Callab
                 valid_sequence=original_sequence,
                 interpret=config.interpret,
                 debug=config.debug,
-                segment_ids=segments_padded,
+                segment_ids=segments,
             )
-            return dq, dk, dv
+            # No cotangent for the segment index: it is data, not a parameter.
+            return dq, dk, dv, None
 
         tpu_flash_attention.defvjp(forward_rule, backward_rule)
-        return tpu_flash_attention(q_padded, k_padded, v_padded)
+        return tpu_flash_attention(q_padded, k_padded, v_padded, segments_padded)
 
     return attention
 

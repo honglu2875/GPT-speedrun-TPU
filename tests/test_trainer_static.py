@@ -1501,8 +1501,8 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertEqual(source.count("compiled_eval = "), 1)
         self.assertIn('"validation_curve": VALIDATION_CSV_NAME', source)
         # Whitespace-insensitive: a formatter may reflow the call chain across
-        # lines, and what matters is that the eval executable is lowered from
-        # the sample shapes and compiled once, not how it is laid out.
+        # lines, and what matters is that the eval executable is lowered once
+        # and compiled, not how it is laid out.
         compact = re.sub(r"\s+", "", source)
         self.assertIn(
             ").lower(params,sample_x,sample_y,sample_mask).compile()", compact
