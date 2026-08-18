@@ -56,6 +56,17 @@ bucket's minimum and maximum rather than one representative point — so a spike
 inside the embedded data stays visible at every zoom level. It cannot recover a
 sample that thinning already dropped.
 
+## The study browser
+
+[`study-browser.html`](study-browser.html) carries no data at all — 53 KB. It
+lists the studies, renders each one's card from the dataset, and fetches only
+that study's overview (0.05–0.30 MB) when you pick one. The full logs are a
+second, separately labelled click that states the size before it starts:
+6.4 MB for the 8k sweep, 138 MB for the 500M one. Nothing downloads on load.
+
+Everything it fetches is an ordinary report payload, so the page never needs to
+understand the packed log format — the two only have to agree about JSON.
+
 ## Contents
 
 | report | runs | tier(s) | what varies | logs |

@@ -1464,6 +1464,49 @@ def _recipe_from_run_id(run_id: str) -> str:
     return match.group(1) if match else run_id
 
 
+def build_study_browser(
+    output_path: Path, *, repo: str, studies: Sequence[Mapping[str, Any]]
+) -> Path:
+    """Write a dashboard that carries no data and fetches it on request.
+
+    The committed reports are summaries; this page is the way to the logs
+    behind them. It ships the same charting code with an empty payload, lists
+    the studies, and fetches nothing until one is chosen -- then only that
+    study's overview, a fraction of a megabyte. The full logs are a second,
+    separately labelled click that says how many megabytes it is about to pull,
+    because on a metered connection a page that helpfully preloaded a hundred
+    megabytes would be a hostile page.
+
+    Every tier it fetches is an ordinary report payload, so nothing here needs
+    to understand the packed log format. That keeps the browser and the writer
+    from having to agree about anything but JSON.
+    """
+
+    payload = {
+        "meta": {
+            "generatedAt": datetime.now(timezone.utc).isoformat(),
+            "included": 0,
+            "skipped": 0,
+            "defaultXAxis": "flops",
+            "defaultXScale": "log",
+            "flopsLabel": "Estimated cumulative FLOPs",
+            "maxChartPoints": _MAX_CHART_POINTS or 1_400,
+            "profile": "official",
+        },
+        "remote": {"repo": repo, "studies": [dict(entry) for entry in studies]},
+        "runs": [],
+        "timeCharts": [],
+        "diagnosticCharts": [],
+        "layerCharts": [],
+        "notices": [],
+        "skipped": [],
+    }
+    html = _render_html(payload)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(html, encoding="utf-8")
+    return output_path
+
+
 def _render_html(payload: Mapping[str, Any]) -> str:
     """Embed the payload as gzip, base64-encoded into a script text node.
 
@@ -1552,6 +1595,32 @@ _HTML = r"""<!doctype html>
 :root{--bg:#080b12;--panel:#101521;--panel2:#151b29;--line:#273247;--text:#edf4ff;--muted:#91a0b8;--accent:#7dd3fc;--good:#86efac;--warn:#fde047;--bad:#fca5a5;--radius:14px;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--text);background:var(--bg);font-synthesis:none}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 75% -10%,#17233a 0,transparent 35rem),var(--bg);min-height:100vh}button,input{font:inherit}.shell{display:grid;grid-template-columns:280px minmax(0,1fr);min-height:100vh}.sidebar{position:sticky;top:0;height:100vh;overflow:auto;border-right:1px solid var(--line);background:rgba(10,14,23,.94);backdrop-filter:blur(16px);padding:20px}.brand{font-weight:800;letter-spacing:.02em;font-size:17px}.brand b{color:var(--accent)}.subtle{color:var(--muted);font-size:12px;line-height:1.5}.side-actions{display:flex;gap:7px;margin:18px 0 10px}.ghost{border:1px solid var(--line);color:var(--muted);background:var(--panel);border-radius:8px;padding:6px 9px;cursor:pointer}.ghost:hover{color:var(--text);border-color:#41516d}.search{width:100%;border:1px solid var(--line);background:#090d16;color:var(--text);padding:9px 10px;border-radius:9px;outline:none}.search:focus{border-color:var(--accent)}.run-list{display:grid;gap:7px;margin-top:12px}.run-toggle{display:grid;grid-template-columns:auto 10px 1fr;gap:9px;align-items:start;padding:9px;border:1px solid transparent;border-radius:10px;cursor:pointer}.run-toggle:hover{background:var(--panel);border-color:var(--line)}.run-toggle input{margin-top:3px;accent-color:var(--accent)}.dot{width:9px;height:9px;border-radius:50%;margin-top:4px;box-shadow:0 0 14px currentColor}.run-name{font-size:12px;font-weight:650;overflow-wrap:anywhere}.run-meta{display:block;color:var(--muted);font-size:10px;margin-top:3px}.main{min-width:0;padding:26px 28px 60px}.top{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:20px}.eyebrow{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent);font-weight:750}.top h1{font-size:clamp(25px,3vw,42px);letter-spacing:-.04em;margin:5px 0 7px}.stats{display:flex;gap:8px;flex-wrap:wrap}.pill{border:1px solid var(--line);background:rgba(16,21,33,.8);border-radius:999px;padding:7px 10px;color:var(--muted);font-size:12px}.pill strong{color:var(--text)}.axis-control{flex:none;border:1px solid var(--line);border-radius:11px;padding:4px;background:#090d16;display:flex}.axis-control label{cursor:pointer}.axis-control input{position:absolute;opacity:0;pointer-events:none}.axis-control span{display:block;padding:8px 11px;border-radius:7px;color:var(--muted);font-size:12px;font-weight:700}.axis-control input:checked+span{background:var(--panel2);color:var(--text);box-shadow:0 1px 5px #0008}.axis-hint{text-align:right;color:var(--muted);font-size:10px;margin-top:6px}.export-row{display:flex;justify-content:flex-end;align-items:center;gap:8px;margin-top:9px}.export-status{font-size:10px;color:var(--muted);text-align:right;max-width:250px;overflow-wrap:anywhere}.export-status.bad{color:var(--bad)}.ghost[disabled]{opacity:.55;cursor:progress}.notice-wrap{display:grid;gap:7px;margin:0 0 16px}.fold>summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px}.fold>summary::-webkit-details-marker{display:none}.fold>summary::before{content:'\25B8';font-size:9px;color:var(--accent)}.fold[open]>summary::before{content:'\25BE'}.fold>summary:hover{color:var(--text)}.fold-count{color:var(--muted);font-weight:400}.notice{padding:10px 12px;border:1px solid #3d3940;background:#18161c;color:#c6b9c6;border-radius:10px;font-size:12px}.section-title{margin:30px 0 12px;font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,410px),1fr));gap:12px}.chart{background:linear-gradient(145deg,rgba(20,27,42,.92),rgba(12,17,27,.92));border:1px solid var(--line);border-radius:var(--radius);padding:15px;min-width:0}.chart-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:7px}.chart h2{font-size:14px;margin:0;letter-spacing:-.01em}.chart-unit{color:var(--muted);font-size:10px}.canvas-wrap{height:270px;position:relative}.chart canvas{display:block;width:100%;height:100%;touch-action:none}.tooltip{position:fixed;z-index:20;pointer-events:none;background:#070a11ec;border:1px solid #36435b;border-radius:8px;padding:7px 9px;box-shadow:0 12px 30px #000a;font-size:11px;line-height:1.45;display:none;max-width:270px}.empty{border:1px dashed var(--line);border-radius:var(--radius);padding:30px;color:var(--muted);text-align:center}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:var(--radius);background:var(--panel)}table{border-collapse:collapse;width:100%;font-size:12px;white-space:nowrap}th,td{text-align:right;padding:10px 12px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em}th:first-child,td:first-child{text-align:left}tbody tr:last-child td{border-bottom:0}.status{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:7px}.footer{color:var(--muted);font-size:11px;margin-top:26px}.mobile-runs{display:none}.skip details{color:var(--muted);font-size:12px}.skip summary{cursor:pointer}.skip code{color:var(--bad);white-space:normal;overflow-wrap:anywhere}@media(max-width:850px){.shell{grid-template-columns:1fr}.sidebar{display:none;position:fixed;z-index:30;width:min(88vw,320px);box-shadow:20px 0 70px #000;height:100vh}.sidebar.open{display:block}.main{padding:20px 14px 50px}.mobile-runs{display:inline-flex}.top{align-items:stretch;flex-direction:column}.axis-control{align-self:flex-start}.axis-hint{text-align:left}.export-row{justify-content:flex-start}.export-status{text-align:left}.canvas-wrap{height:240px}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
 .analysis-controls{display:flex;align-items:center;gap:10px 14px;flex-wrap:wrap;border:1px solid var(--line);background:rgba(9,13,22,.82);border-radius:12px;padding:10px 12px;margin:0 0 18px}.control-title{font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}.smoothing-control{border:1px solid var(--line);border-radius:9px;padding:3px;background:#070b13;display:flex;flex-wrap:wrap}.smoothing-control label{cursor:pointer}.smoothing-control input{position:absolute;opacity:0;pointer-events:none}.smoothing-control span{display:block;padding:6px 9px;border-radius:6px;color:var(--muted);font-size:11px;font-weight:700}.smoothing-control input:checked+span{background:var(--panel2);color:var(--text);box-shadow:0 1px 4px #0008}.smooth-level{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:11px;font-weight:700}.smooth-level input{width:76px;border:1px solid var(--line);border-radius:7px;background:#070b13;color:var(--text);padding:6px 7px;outline:none}.smooth-level input:focus{border-color:var(--accent)}.smooth-level input:disabled{opacity:.45}.smoothing-hint{flex:1 1 100%;color:var(--muted);font-size:10px;line-height:1.45}.chart-head{align-items:center}.chart-tools{display:flex;align-items:center;gap:5px}.icon-button{border:1px solid transparent;background:transparent;color:var(--muted);border-radius:7px;padding:4px 7px;cursor:pointer;line-height:1}.icon-button:hover,.icon-button:focus-visible{border-color:var(--line);color:var(--text);outline:none}.chart canvas{cursor:crosshair}.chart canvas.dragging{cursor:crosshair}.chart.family-hidden{display:none}.family-control{display:flex;gap:5px;margin:12px 0;flex-wrap:wrap}.family-control button{border:1px solid var(--line);background:#090d16;color:var(--muted);border-radius:8px;padding:7px 11px;cursor:pointer;font-weight:700;font-size:12px}.family-control button.active{background:var(--panel2);color:var(--text);border-color:#49617f}.tooltip{z-index:60}.focus-dialog{width:min(96vw,1500px);height:min(94vh,980px);padding:0;border:1px solid #43516a;border-radius:16px;background:var(--panel);color:var(--text);box-shadow:0 30px 100px #000d}.focus-dialog::backdrop{background:#03050ae8;backdrop-filter:blur(4px)}.focus-shell{height:100%;display:flex;flex-direction:column;padding:16px}.focus-head{display:flex;justify-content:space-between;align-items:center;gap:12px}.focus-head h2{font-size:17px;margin:0}.focus-canvas{flex:1;min-height:0;margin-top:8px}.focus-canvas canvas{display:block;width:100%;height:100%;touch-action:none;cursor:crosshair}.interaction-hint{color:var(--muted);font-size:10px;margin-top:7px}.layer-step{display:flex;align-items:center;gap:11px;border:1px solid var(--line);background:rgba(9,13,22,.82);border-radius:11px;padding:9px 12px;margin:0 0 12px}.layer-step label{font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}.layer-step input[type=range]{flex:1;min-width:140px;accent-color:var(--accent)}.layer-step output{font:11px ui-monospace,monospace;color:var(--text);min-width:9ch;text-align:right}@media(max-width:850px){.focus-dialog{width:100vw;height:100vh;max-width:none;max-height:none;border-radius:0}.analysis-controls{align-items:flex-start}.smoothing-control{width:100%}.smoothing-control label{flex:1;text-align:center}}
+.study-picker{position:fixed;inset:0;background:var(--bg);overflow:auto;z-index:50;padding:38px 22px}
+.study-inner{max-width:1000px;margin:0 auto}
+.study-title{font-size:26px;margin:0 0 6px}
+.study-sub{color:#91a0b8;margin:0 0 26px;font-size:14px}
+.study-grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(232px,1fr));margin-bottom:26px}
+.study-card{display:flex;flex-direction:column;gap:5px;text-align:left;padding:14px 15px;border-radius:10px;
+ border:1px solid var(--line);background:var(--panel);color:var(--text);cursor:pointer;font:inherit}
+.study-card:hover{border-color:#3d76d6}
+.study-card.on{border-color:#4d8dfd;background:var(--panel2)}
+.study-name{font-weight:600;font-size:14px}
+.study-meta,.study-load{color:#91a0b8;font-size:12px}
+.study-detail{border-top:1px solid var(--line);padding-top:18px}
+.study-doc{max-width:760px}
+.study-actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:20px 0 8px}
+.study-go,.study-full{padding:9px 15px;border-radius:8px;border:1px solid var(--line);
+ background:var(--panel2);color:var(--text);cursor:pointer;font:inherit;font-size:13px}
+.study-go{border-color:#4d8dfd}
+.study-full:disabled{opacity:.5;cursor:default}
+.study-warn{color:#d7a44a;font-size:12px;flex:1 1 260px}
+.study-status{color:#91a0b8;font-size:13px;min-height:18px}
+.study-status.bad{color:#e0736b}
+.md-h{font-size:15px;margin:18px 0 6px}
+.md-p{margin:6px 0;font-size:13px;line-height:1.55}
+.md-list{margin:6px 0 6px 18px;font-size:13px;line-height:1.6}
+.md-code{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:11px 13px;
+ overflow-x:auto;font-size:12px;line-height:1.5;white-space:pre}
 </style>
 </head>
 <body>
@@ -1621,6 +1690,87 @@ _HTML = r"""<!doctype html>
 (()=>{'use strict';
 let D, runMap, visible;
 const families=['grad','update','param'];
+const HF='https://huggingface.co/datasets/';
+function mdToHtml(src){
+ // Enough markdown for a study card: headings, bullets, fences, code, links,
+ // bold. Deliberately small -- these files are written by us, not by the web.
+ const lines=String(src).split(/\r?\n/),out=[];let list=false,fence=false,buf=[];
+ const inline=t=>esc(t).replace(/`([^`]+)`/g,'<code>$1</code>')
+   .replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>')
+   .replace(/\[([^\]]+)\]\(([^)]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
+ const closeList=()=>{if(list){out.push('</ul>');list=false}};
+ for(const line of lines){
+  if(/^```/.test(line)){
+   if(fence){out.push('<pre class="md-code">'+esc(buf.join('\n'))+'</pre>');buf=[];fence=false}
+   else{closeList();fence=true}
+   continue}
+  if(fence){buf.push(line);continue}
+  const h=/^(#{1,4})\s+(.*)$/.exec(line);
+  if(h){closeList();const n=h[1].length;out.push(`<h${n+2} class="md-h">${inline(h[2])}</h${n+2}>`);continue}
+  const li=/^\s*[-*]\s+(.*)$/.exec(line);
+  if(li){if(!list){out.push('<ul class="md-list">');list=true}out.push('<li>'+inline(li[1])+'</li>');continue}
+  if(!line.trim()){closeList();continue}
+  closeList();out.push('<p class="md-p">'+inline(line)+'</p>')}
+ closeList();
+ if(fence&&buf.length)out.push('<pre class="md-code">'+esc(buf.join('\n'))+'</pre>');
+ return out.join('')}
+async function fetchGzipJson(url,onProgress){
+ const response=await fetch(url);
+ if(!response.ok)throw new Error(url.split('/').pop()+' → HTTP '+response.status);
+ const total=Number(response.headers.get('content-length')||0),reader=response.body.getReader(),chunks=[];
+ let got=0;
+ for(;;){const {done,value}=await reader.read();if(done)break;chunks.push(value);got+=value.length;if(onProgress)onProgress(got,total)}
+ if(typeof DecompressionStream!=='function')
+  throw new Error('this browser cannot inflate the payload (needs DecompressionStream)');
+ const stream=new Blob(chunks).stream().pipeThrough(new DecompressionStream('gzip'));
+ return JSON.parse(await new Response(stream).text())}
+function mb(n){return (n/1048576).toFixed(n<10485760?1:0)+' MB'}
+function chooseStudy(remote){
+ // Nothing is fetched until a study is picked, and the only thing a pick
+ // fetches is the small overview. Anything larger is a separate, labelled act.
+ return new Promise(resolve=>{
+  const root=document.createElement('div');root.className='study-picker';
+  root.innerHTML='<div class="study-inner"><h1 class="study-title">rig training logs</h1>'
+   +'<p class="study-sub">'+esc(remote.studies.length)+' studies · '
+   +esc(remote.studies.reduce((a,s)=>a+s.runs,0))+' runs · full logs at '
+   +'<a href="'+HF+esc(remote.repo)+'" target="_blank" rel="noopener">'+esc(remote.repo)+'</a></p>'
+   +'<div class="study-grid">'+remote.studies.map((s,i)=>
+     '<button class="study-card" data-index="'+i+'">'
+     +'<span class="study-name">'+esc(s.title||s.name)+'</span>'
+     +'<span class="study-meta">'+esc(s.runs)+' runs · '+esc(s.tier||'')+'</span>'
+     +'<span class="study-load">overview '+mb(s.snapshot||0)+'</span></button>').join('')
+   +'</div><div class="study-detail" id="study-detail"></div></div>';
+  document.body.appendChild(root);
+  root.querySelectorAll('.study-card').forEach(button=>{
+   button.onclick=async()=>{
+    const study=remote.studies[Number(button.dataset.index)],
+     detail=root.querySelector('#study-detail');
+    root.querySelectorAll('.study-card').forEach(b=>b.classList.toggle('on',b===button));
+    detail.innerHTML='<div class="study-status">Loading overview…</div>';
+    try{
+     const base=HF+remote.repo+'/resolve/main/'+study.name+'/';
+     let card='';
+     try{const r=await fetch(base+'README.md');if(r.ok)card=mdToHtml(await r.text())}catch(e){}
+     const payload=await fetchGzipJson(base+'snapshot.json.gz');
+     detail.innerHTML='<div class="study-doc">'+card+'</div>'
+      +'<div class="study-actions"><button class="study-go" id="study-go">Open overview</button>'
+      +(study.full?'<button class="study-full" id="study-full">Download full logs ('
+        +mb(study.full)+')</button><span class="study-warn">Downloads '+mb(study.full)
+        +' from HuggingFace. Nothing is fetched until you click.</span>':'')
+      +'</div><div class="study-status" id="study-progress"></div>';
+     detail.querySelector('#study-go').onclick=()=>{root.remove();resolve(payload)};
+     const fullButton=detail.querySelector('#study-full');
+     if(fullButton)fullButton.onclick=async()=>{
+      fullButton.disabled=true;
+      const status=detail.querySelector('#study-progress');
+      try{
+       const full=await fetchGzipJson(base+'full.json.gz',(got,total)=>{
+        status.textContent='Downloading '+mb(got)+(total?' of '+mb(total):'')+'…'});
+       status.textContent='Rendering…';root.remove();resolve(full)}
+      catch(error){status.textContent='Download failed: '+String(error&&error.message||error);
+       fullButton.disabled=false}}}
+    catch(error){detail.innerHTML='<div class="study-status bad">Could not load: '
+     +esc(String(error&&error.message||error))+'</div>'}}})})}
 async function loadPayload(){
  // The payload is gzip, base64-encoded: it is ~99% of the file and numeric
  // JSON, which compresses about 2x even after base64's 33% overhead.
@@ -1631,7 +1781,8 @@ async function loadPayload(){
  if(typeof DecompressionStream!=='function')
   throw new Error('this browser cannot inflate the report payload (needs DecompressionStream)');
  const stream=new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
- return JSON.parse(await new Response(stream).text())}
+ const payload=JSON.parse(await new Response(stream).text());
+ return payload.remote?chooseStudy(payload.remote):payload}
 const smoothCache=new WeakMap();
 let axis='flops', xScale='log', family='grad', smoothing='raw', charts=[], frame=0, focusItem=null;
 // hoverX follows the pointer, pinnedX survives until clicked again, layerStep
