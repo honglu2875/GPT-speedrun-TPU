@@ -450,38 +450,63 @@ def ticks(lo: float, hi: float, n: int = 5) -> list[float]:
 # --------------------------------------------------------------------------
 
 
-def fig_batch_normalized(c) -> str:
-    """Loss above each tier's own best, vs batch. The headline figure."""
+def regime_cells(runs: list[Run]) -> dict[tuple[str, int, int], list[float]]:
+    """Losses keyed by (regime, batch, learning rate) rather than by tier.
+
+    The tier-keyed view cannot hold two token budgets at once, and 500M was
+    measured at both.
+    """
+
+    out: dict[tuple[str, int, int], list[float]] = defaultdict(list)
+    for run in runs:
+        out[(run.condition, run.batch, run.lg_lr)].append(run.loss)
+    return out
+
+
+def fig_batch_normalized(
+    c, extra: dict[str, list[tuple[float, float]]] | None = None
+) -> str:
+    """Loss above each regime's own best, vs batch. The headline batch figure."""
     series = {}
     for tier in TIERS:
         pts = []
         for batch in sorted({k[1] for k in c if k[0] == tier}):
-            best = min(
+            candidates = [
                 st.mean(v)
                 for k, v in c.items()
                 if k[0] == tier and k[1] == batch and len(v) >= 3
-            )
-            pts.append((math.log2(batch), best))
-        if pts:
+            ]
+            if candidates:
+                pts.append((math.log2(batch), min(candidates)))
+        if len(pts) >= 2:
             floor = min(y for _, y in pts)
-            series[tier] = [(x, y - floor) for x, y in pts]
+            series[f"{tier} · 5 TPP"] = [(x, y - floor) for x, y in pts]
+    for label, pts in (extra or {}).items():
+        if len(pts) >= 2:
+            floor = min(y for _, y in pts)
+            series[label] = [(x, y - floor) for x, y in pts]
+
     top = max(y for s in series.values() for _, y in s)
+    xs = sorted({x for s in series.values() for x, _ in s})
     p = Plot(
-        "Loss above each tier's own optimum",
+        "Loss above each regime's own optimum",
         "global batch size",
-        "loss above that tier's best (nats)",
-        (4.6, 9.4),
+        "loss above that regime's best (nats)",
+        (min(xs) - 0.4, max(xs) + 0.4),
         (-0.05, top * 1.08),
     )
     p.frame(
-        [5, 6, 7, 8, 9],
+        xs,
         ticks(0, top, 4),
         xfmt=lambda v: str(int(2**v)),
         yfmt=lambda v: f"{v:.2f}",
     )
-    for tier, pts in series.items():
-        p.line(pts, TIER_COLOR[tier], 2.4)
-        p.dots(pts, TIER_COLOR[tier])
+    for label, pts in sorted(series.items()):
+        colour = CONDITION_COLOR.get(
+            label, TIER_COLOR.get(label.split(" ")[0], "#94a3b8")
+        )
+        p.line(pts, colour, 2.4)
+        p.dots(pts, colour)
     p.line(
         [(math.log2(128), -0.05), (math.log2(128), top * 1.08)],
         "#94a3b8",
@@ -490,12 +515,18 @@ def fig_batch_normalized(c) -> str:
         opacity=0.5,
     )
     p.text(p.X(7), PAD["t"] - 4, "batch 128", MUTED, 9)
-    p.legend([(t, TIER_COLOR[t]) for t in series])
+    p.legend(
+        [
+            (k, CONDITION_COLOR.get(k, TIER_COLOR.get(k.split(" ")[0], "#94a3b8")))
+            for k in sorted(series)
+        ]
+    )
     return p.render()
 
 
 CONDITION_COLOR = {
     "60m · 5 TPP": "#7dd3fc",
+    "500m · 20 TPP (1-2 seeds)": "#22d3ee",
     "125m · 5 TPP": "#f0abfc",
     "250m · 5 TPP": "#fbbf24",
     "500m · 5 TPP": "#4ade80",
@@ -567,10 +598,20 @@ def fig_optimum_transfers(runs: list[Run]) -> str:
     return p.render()
 
 
-def fig_heatmaps(c) -> list[str]:
-    """LR x batch grid per tier; colour is loss above that tier's best."""
+def fig_heatmaps(c, order: list[str] | None = None) -> list[str]:
+    """LR x batch grid per regime; colour is loss above that regime's best.
+
+    Regimes that swept a single batch come out as one column. That is what was
+    run, and a strip still shows where the learning rate bottoms out, which is
+    the thing being compared across regimes.
+
+    Colour is always relative to the panel's own best, never across panels: an
+    8k model is scored on windows eight times longer than a 1k model's, so its
+    absolute loss is lower for reasons that have nothing to do with which
+    configuration won.
+    """
     out = []
-    for tier in TIERS:
+    for tier in order or list(TIERS):
         batches = sorted({k[1] for k in c if k[0] == tier})
         lrs = sorted({k[2] for k in c if k[0] == tier}, reverse=True)
         vals = {
@@ -579,7 +620,7 @@ def fig_heatmaps(c) -> list[str]:
             for l in lrs
             if (tier, b, l) in c
         }
-        if not vals:
+        if len(vals) < 2:
             continue
         floor = min(vals.values())
         worst = max(vals.values())
@@ -915,6 +956,24 @@ def main() -> None:
     # experiments that are not comparable to begin with.
     ladder = [r for r in runs if r.tpp == 5 and r.context == 1024 and not r.routed]
     c = cells(ladder)
+    # 500M was measured at two token budgets, and only the longer one swept
+    # batch on both sides of 128. Carried as its own series rather than merged
+    # into the 5-TPP tier: the budgets are different experiments.
+    rc = regime_cells(runs)
+    long_500m = [
+        (math.log2(batch), st.mean(rc[("500m · 20 TPP", batch, -8)]))
+        for batch in (64, 128, 256)
+        if ("500m · 20 TPP", batch, -8) in rc
+    ]
+    extra = {"500m · 20 TPP (1-2 seeds)": long_500m} if len(long_500m) >= 2 else {}
+    # Panels for every regime, base ladder first, so the later ones read as
+    # variations on it rather than as separate collections.
+    regime_order = [f"{tier} · 5 TPP" for tier in TIERS] + [
+        "500m · 20 TPP",
+        "60m · 8k",
+        "60m MoE · 8k",
+        "125m MoE · 8k",
+    ]
     spikes = load_spikes(roots)
 
     body = []
@@ -939,15 +998,31 @@ def main() -> None:
     )
     body.append(
         card(
-            "Batch 128 is optimal at all three tiers. The penalty for exceeding "
-            "it falls steeply with scale: 0.45 nats at 60M, 0.016 at 250M.",
-            fig_batch_normalized(c),
+            "Batch 128 is optimal in every regime measured. At 5 tokens per "
+            "parameter the ladder only bracketed it from above, so 128 was the "
+            "smallest batch tried and could have been an edge rather than an "
+            "optimum. The 500M run at 20 TPP closes it from below: batch 64 "
+            "costs 0.045 nats and batch 256 only 0.003, so halving the batch "
+            "costs about fourteen times what doubling it does. That curve is "
+            "one seed per batch (two at 128), against three everywhere else. "
+            "The penalty for exceeding 128 falls steeply with scale: 0.45 nats "
+            "at 60M, 0.016 at 250M.",
+            fig_batch_normalized(c, extra),
         )
     )
     body.append("<h2>Full grids</h2>")
     body.append(
+        '<p class="note">One panel per regime, coloured against that panel\'s own '
+        "best. Colour is never comparable between panels: an 8k model is scored "
+        "on windows eight times longer than a 1k model's, so its absolute loss "
+        "is lower for reasons unrelated to which configuration won. Regimes that "
+        "swept a single batch appear as one column, which is what was run.</p>"
+    )
+    body.append(
         '<div class="row">'
-        + "".join(f'<div class="card">{s}</div>' for s in fig_heatmaps(c))
+        + "".join(
+            f'<div class="card">{s}</div>' for s in fig_heatmaps(rc, order=regime_order)
+        )
         + "</div>"
     )
     body.append("<h2>What batch size buys</h2>")
