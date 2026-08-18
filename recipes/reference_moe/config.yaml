@@ -111,6 +111,14 @@ profiles:
       heads: 2
       d_model: 64
       mlp_mult: 4
+      # Routing stays on in the smoke profile: a profile block replaces the
+      # tier's model wholesale, so omitting these silently made the fast
+      # self-check run a dense model and never touch the routed path at all.
+      # 4 x 32 x top_k = 256 rows, a multiple of the grouped matmul's 128 tile.
+      experts: 8
+      expert_top_k: 2
+      expert_mult: 2
+      router_aux_coefficient: 0.01
       normalization: rms_norm
       position_encoding: rope_base_10000
       mlp_activation: gelu

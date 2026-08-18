@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 from contextlib import nullcontext
 import csv
+import functools
 import hashlib
 from importlib import metadata as importlib_metadata
 import json
@@ -1772,32 +1773,76 @@ class RouterStats:
     load: jax.Array
 
 
-def routed_mlp(
-    x: jax.Array,
-    block: Mapping[str, Any],
-    config: Config,
-    dtype: Any,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Top-k routed experts via a grouped matmul.
+def active_parameter_count(params: Any, config: Config) -> int:
+    """Parameters a single token actually visits.
 
-    Returns the block output, the router probabilities, and the fraction of
-    assignments each expert received -- the two statistics the load-balance
-    loss is built from.
+    A routed model stores ``experts`` copies of the MLP and visits
+    ``expert_top_k`` of them, so its total is not what the tier declares. The
+    ladder is defined by *active* parameters -- that is what makes a sparse
+    tier comparable with the dense tier of the same name, and what makes the
+    two equi-FLOP.
+    """
+
+    total = parameter_count(params)
+    if not config.experts:
+        return total
+    width, hidden = config.d_model, config.expert_mult * config.d_model
+    per_expert = width * hidden + hidden + hidden * width + width
+    unvisited = config.experts - config.expert_top_k
+    return total - config.layers * unvisited * per_expert
+
+
+def expected_active_parameters(config: Config) -> int:
+    """What the declared tier size becomes once the MLP is routed.
+
+    Routing preserves the dense MLP's active *width* exactly, because
+    ``expert_top_k * expert_mult == mlp_mult``. It adds two things and only
+    two: the router projection, and one extra set of expert biases per
+    additional expert a token visits. Both are named here rather than absorbed
+    into a tolerance, so the check stays a check.
+    """
+
+    declared = config.declared_parameters
+    if declared is None or not config.experts:
+        return declared
+    router = config.d_model * config.experts
+    extra_biases = (config.expert_top_k - 1) * config.d_model
+    return declared + config.layers * (router + extra_biases)
+
+
+def routed_mlp_local(
+    x: jax.Array,
+    router_w: jax.Array,
+    up_w: jax.Array,
+    up_b: jax.Array,
+    down_w: jax.Array,
+    down_b: jax.Array,
+    *,
+    experts: int,
+    top_k: int,
+    dtype: Any,
+    axis_name: str | None,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Top-k routed experts via a grouped matmul, on one device's tokens.
+
+    Returns the block output, the mean router probability per expert, and the
+    fraction of assignments each expert received -- the two statistics the
+    balance loss is built from. Both are averaged across the data axis when one
+    is given, so the loss sees global load rather than one shard's view.
 
     Dropless by construction: ``group_sizes`` is data while the total
     ``tokens * top_k`` is static, so every assignment is served and no capacity
-    factor exists. Nothing here couples one token's routing to another's, which
-    is what keeps the model causal.
+    factor exists. Nothing couples one token's routing to another's, which is
+    what keeps the model causal.
     """
 
     batch, length, width = x.shape
-    experts, top_k = config.experts, config.expert_top_k
     flat = x.reshape(batch * length, width)
 
     logits = jnp.einsum(
         "md,de->me",
         flat,
-        block["router_w"].astype(jnp.float32),
+        router_w.astype(jnp.float32),
         preferred_element_type=jnp.float32,
     )
     probabilities = jax.nn.softmax(logits, axis=-1)
@@ -1806,6 +1851,7 @@ def routed_mlp(
 
     assignments = chosen.reshape(-1)
     order = jnp.argsort(assignments, stable=True)
+    sorted_assignments = assignments[order]
     counts = jax.nn.one_hot(assignments, experts, dtype=jnp.int32).sum(0)
     rows = jnp.repeat(jnp.arange(batch * length), top_k)[order]
 
@@ -1813,36 +1859,86 @@ def routed_mlp(
     # path stays checkable against a dense reference on CPU.
     interpret = jax.default_backend() != "tpu"
     grouped = flat[rows].astype(dtype)
-    hidden = megablox.gmm(
-        grouped, block["expert_up_w"].astype(dtype), counts, interpret=interpret
-    )
-    hidden = hidden + block["expert_up_b"][assignments[order]].astype(hidden.dtype)
+    hidden = megablox.gmm(grouped, up_w.astype(dtype), counts, interpret=interpret)
+    hidden = hidden + up_b[sorted_assignments].astype(hidden.dtype)
     hidden = jax.nn.gelu(hidden, approximate=True)
     out = megablox.gmm(
-        hidden.astype(dtype),
-        block["expert_down_w"].astype(dtype),
-        counts,
-        interpret=interpret,
+        hidden.astype(dtype), down_w.astype(dtype), counts, interpret=interpret
     )
-    out = out + block["expert_down_b"][assignments[order]].astype(out.dtype)
+    out = out + down_b[sorted_assignments].astype(out.dtype)
 
     weighted = out * gate.reshape(-1)[order][:, None].astype(out.dtype)
     combined = jnp.zeros((batch * length, width), out.dtype).at[rows].add(weighted)
-    load = counts.astype(jnp.float32) / jnp.float32(batch * length * top_k)
-    return combined.reshape(batch, length, width), probabilities, load
-
-
-def load_balance_loss(probabilities: jax.Array, load: jax.Array) -> jax.Array:
-    """Switch-style auxiliary loss: E * sum_i (f_i * P_i).
-
-    ``load`` is the realized fraction of assignments per expert and
-    ``probabilities`` the router's mean probability for it. Minimized when both
-    are uniform. This *encourages* balance; it never enforces it, because any
-    rule that equalized loads would have to couple one token's routing to
-    another's and break causality.
-    """
 
     mean_probability = probabilities.mean(axis=0)
+    load = counts.astype(jnp.float32) / jnp.float32(batch * length * top_k)
+    if axis_name is not None:
+        mean_probability = jax.lax.pmean(mean_probability, axis_name)
+        load = jax.lax.pmean(load, axis_name)
+    return combined.reshape(batch, length, width), mean_probability, load
+
+
+def make_mesh_routed_mlp(config: Config, mesh: Mesh) -> Any:
+    """Wrap the routed MLP in an explicit data-sharded boundary.
+
+    The grouped matmul is a Mosaic kernel, so an outer jit cannot partition it
+    automatically -- the same constraint that forces make_mesh_attention to
+    exist. Experts stay replicated (plan phase 1): each device routes its own
+    tokens among all of them, so there are no expert collectives, only the two
+    tiny mean-reductions that give the balance loss a global view.
+    """
+
+    if not config.experts:
+        return None
+    batch_partition = P("data", None, None)
+    replicated = P()
+    local = functools.partial(
+        routed_mlp_local,
+        experts=config.experts,
+        top_k=config.expert_top_k,
+        dtype=config.compute_dtype,
+        axis_name="data",
+    )
+    return jax.shard_map(
+        local,
+        mesh=mesh,
+        in_specs=(
+            batch_partition,
+            replicated,
+            replicated,
+            replicated,
+            replicated,
+            replicated,
+        ),
+        out_specs=(batch_partition, replicated, replicated),
+        check_vma=False,
+    )
+
+
+def load_balance_loss(mean_probability: jax.Array, load: jax.Array) -> jax.Array:
+    """Switch-style auxiliary loss: E * sum_i (f_i * P_i).
+
+    Both arguments are per-expert vectors of length E: ``load`` is the realized
+    fraction of assignments an expert received and ``mean_probability`` the
+    router's mean probability for it, each already averaged over every token on
+    every device. Minimized at 1.0 when both are uniform, and E when one expert
+    takes everything.
+
+    This *encourages* balance; it never enforces it, because any rule that
+    equalized loads would have to couple one token's routing to another's and
+    break causality.
+
+    Both must arrive already reduced over tokens. Passing the raw ``[tokens, E]``
+    probability matrix here would average it to a scalar, which makes the whole
+    term collapse to the constant 1.0 with no gradient to the router at all --
+    a failure that trains happily and simply never balances.
+    """
+
+    if mean_probability.ndim != 1 or load.ndim != 1:
+        raise ValueError(
+            "load_balance_loss takes per-expert vectors already reduced over "
+            f"tokens, got shapes {mean_probability.shape} and {load.shape}"
+        )
     return jnp.float32(load.shape[0]) * jnp.sum(load * mean_probability)
 
 
@@ -1851,6 +1947,7 @@ def gpt_hidden(
     tokens: jax.Array,
     config: Config,
     attention_fn: AttentionCallable | None = None,
+    routed_fn: Any = None,
 ) -> tuple[jax.Array, "RouterStats | None"]:
     """Return final token representations, and router statistics when routed."""
 
@@ -1921,8 +2018,22 @@ def gpt_hidden(
         residual = x
         x_norm = rms_norm(x, block["ln2_scale"], dtype)
         if config.experts:
-            mlp_out, probabilities, load = routed_mlp(x_norm, block, config, dtype)
-            router_losses.append(load_balance_loss(probabilities, load))
+            routed = routed_fn or functools.partial(
+                routed_mlp_local,
+                experts=config.experts,
+                top_k=config.expert_top_k,
+                dtype=dtype,
+                axis_name=None,
+            )
+            mlp_out, mean_probability, load = routed(
+                x_norm,
+                block["router_w"],
+                block["expert_up_w"],
+                block["expert_up_b"],
+                block["expert_down_w"],
+                block["expert_down_b"],
+            )
+            router_losses.append(load_balance_loss(mean_probability, load))
             router_loads.append(load)
         else:
             hidden = linear(x_norm, block["mlp_up_w"], block["mlp_up_b"], dtype)
@@ -1947,8 +2058,9 @@ def gpt_logits(
     tokens: jax.Array,
     config: Config,
     attention_fn: AttentionCallable | None = None,
+    routed_fn: Any = None,
 ) -> jax.Array:
-    x, _ = gpt_hidden(params, tokens, config, attention_fn)
+    x, _ = gpt_hidden(params, tokens, config, attention_fn, routed_fn)
     output_embedding = params.get("output_embedding", params["token_embedding"])
     return jnp.einsum(
         "btd,vd->btv",
@@ -1963,6 +2075,7 @@ def cross_entropy(
     y: jax.Array,
     config: Config,
     attention_fn: AttentionCallable | None = None,
+    routed_fn: Any = None,
 ) -> jax.Array:
     """Training objective. For routed models this includes the balance loss.
 
@@ -1972,7 +2085,7 @@ def cross_entropy(
     """
 
     if config.loss_backend == "tiled":
-        hidden, router = gpt_hidden(params, x, config, attention_fn)
+        hidden, router = gpt_hidden(params, x, config, attention_fn, routed_fn)
         loss = tiled_tied_cross_entropy(
             hidden,
             params.get("output_embedding", params["token_embedding"]),
@@ -1982,7 +2095,7 @@ def cross_entropy(
             compute_dtype=config.compute_dtype,
         )
     else:
-        logits = gpt_logits(params, x, config, attention_fn)[
+        logits = gpt_logits(params, x, config, attention_fn, routed_fn)[
             ..., : config.semantic_vocab_size
         ]
         log_probabilities = jax.nn.log_softmax(logits, axis=-1)
@@ -2134,6 +2247,7 @@ def _apply_training_update(
     config: Config,
     decay_mask: Any | None = None,
     attention_fn: AttentionCallable | None = None,
+    routed_fn: Any = None,
 ) -> tuple[Any, dict[str, Any], dict[str, jax.Array], Any]:
     """Apply one ordinary update and also return the raw, pre-clip gradient.
 
@@ -2148,7 +2262,9 @@ def _apply_training_update(
     )
     beta1, beta2 = effective_adam_betas(config)
     loss, gradients = jax.value_and_grad(
-        lambda candidate: cross_entropy(candidate, x, y, config, attention_fn)
+        lambda candidate: cross_entropy(
+            candidate, x, y, config, attention_fn, routed_fn
+        )
     )(params)
     gradients = jax.tree_util.tree_map(lambda grad: grad.astype(jnp.float32), gradients)
     raw_gradients = gradients
@@ -2232,9 +2348,10 @@ def train_step(
     config: Config,
     decay_mask: Any | None = None,
     attention_fn: AttentionCallable | None = None,
+    routed_fn: Any = None,
 ) -> tuple[Any, dict[str, Any], dict[str, jax.Array]]:
     params, optimizer, metrics, _ = _apply_training_update(
-        params, optimizer, x, y, config, decay_mask, attention_fn
+        params, optimizer, x, y, config, decay_mask, attention_fn, routed_fn
     )
     return params, optimizer, metrics
 
@@ -2356,12 +2473,13 @@ def diagnostic_train_step(
     config: Config,
     decay_mask: Any | None = None,
     attention_fn: AttentionCallable | None = None,
+    routed_fn: Any = None,
 ) -> tuple[Any, dict[str, Any], dict[str, jax.Array], jax.Array]:
     """Run the same update as :func:`train_step` and emit sparse statistics."""
 
     params_before = params
     params, optimizer, metrics, raw_gradients = _apply_training_update(
-        params, optimizer, x, y, config, decay_mask, attention_fn
+        params, optimizer, x, y, config, decay_mask, attention_fn, routed_fn
     )
     values = diagnostic_values(params_before, raw_gradients, params)
     return params, optimizer, metrics, values
@@ -2374,11 +2492,12 @@ def eval_step(
     mask: jax.Array,
     config: Config,
     attention_fn: AttentionCallable | None = None,
+    routed_fn: Any = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Return a loss sum and exact target count for fixed-shape masked eval."""
 
     if config.loss_backend == "tiled":
-        hidden, _ = gpt_hidden(params, x, config, attention_fn)
+        hidden, _ = gpt_hidden(params, x, config, attention_fn, routed_fn)
         losses = tiled_tied_cross_entropy_losses(
             hidden,
             params.get("output_embedding", params["token_embedding"]),
@@ -2388,7 +2507,7 @@ def eval_step(
             compute_dtype=config.compute_dtype,
         )
     else:
-        logits = gpt_logits(params, x, config, attention_fn)[
+        logits = gpt_logits(params, x, config, attention_fn, routed_fn)[
             ..., : config.semantic_vocab_size
         ]
         log_probabilities = jax.nn.log_softmax(logits, axis=-1)
@@ -2531,13 +2650,13 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     decay_mask = weight_decay_mask(host_params)
     diagnostic_metadata = diagnostic_scope_metadata(host_params)
     params_total = parameter_count(host_params)
-    if (
-        config.declared_parameters is not None
-        and params_total != config.declared_parameters
-    ):
+    params_active = active_parameter_count(host_params, config)
+    expected_active = expected_active_parameters(config)
+    if expected_active is not None and params_active != expected_active:
         raise ValueError(
-            f"tier {config.tier} declares {config.declared_parameters:,} parameters, "
-            f"but initialized {params_total:,}"
+            f"tier {config.tier} should have {expected_active:,} active "
+            f"parameters, but initialized {params_active:,} "
+            f"(total {params_total:,})"
         )
     flop_breakdown = traced_flops(config, host_params)
     flops_per_token = flop_breakdown.per_token(config.seq_len)
@@ -2645,6 +2764,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     replicated = NamedSharding(mesh, P())
     data_sharding = NamedSharding(mesh, P("data", None))
     attention_fn = make_mesh_attention(config, mesh, attention_runtime.tiles)
+    routed_fn = make_mesh_routed_mlp(config, mesh)
     params = put_replicated_tree(host_params, mesh, replicated, process_count)
     optimizer = put_replicated_tree(host_optimizer, mesh, replicated, process_count)
     del host_params, host_optimizer
@@ -2661,7 +2781,9 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     )
 
     compiled_step = jax.jit(
-        lambda p, o, x, y: train_step(p, o, x, y, config, decay_mask, attention_fn),
+        lambda p, o, x, y: train_step(
+            p, o, x, y, config, decay_mask, attention_fn, routed_fn
+        ),
         in_shardings=(replicated, replicated, data_sharding, data_sharding),
         donate_argnums=(0, 1),
     )
@@ -2681,7 +2803,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         diagnostic_executable = (
             jax.jit(
                 lambda p, o, x, y: diagnostic_train_step(
-                    p, o, x, y, config, decay_mask, attention_fn
+                    p, o, x, y, config, decay_mask, attention_fn, routed_fn
                 ),
                 in_shardings=(replicated, replicated, data_sharding, data_sharding),
                 donate_argnums=(0, 1),
@@ -2710,7 +2832,9 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         eval_compile_started = time.perf_counter()
         compiled_eval = (
             jax.jit(
-                lambda p, x, y, mask: eval_step(p, x, y, mask, config, attention_fn),
+                lambda p, x, y, mask: eval_step(
+                    p, x, y, mask, config, attention_fn, routed_fn
+                ),
                 in_shardings=(replicated, data_sharding, data_sharding, data_sharding),
             )
             .lower(params, sample_x, sample_y, sample_mask)
@@ -3252,7 +3376,10 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                 else None
             ),
             "model_tier": config.tier,
-            "parameter_count": int(params_total),
+            "parameter_count": int(params_active),
+            "total_parameter_count": int(params_total),
+            "experts": int(config.experts),
+            "expert_top_k": int(config.expert_top_k),
             "tokens_per_parameter": (
                 float(config.tokens_per_parameter)
                 if config.tokens_per_parameter is not None
