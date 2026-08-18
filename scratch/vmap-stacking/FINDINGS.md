@@ -4,61 +4,74 @@ Verification for the model-stacking feature: run N models on one `model_batch`
 axis so a small model saturates the chip better. The requirement was that slice
 `i` bit-perfectly reproduce a standalone run with seed `i`.
 
-Run these on the v6e-8, which is single-host, so one process can hold the TPU:
+Probes run on the v6e-8, which is single-host, so one process can hold the TPU.
 
-```bash
-scp scratch/vmap-stacking/tpu_stack_probe.py <v6e-host>:/tmp/
-ssh <v6e-host> '/home/cubic27/GPT-speedrun-TPU/.venv/bin/python3 /tmp/tpu_stack_probe.py'
-```
+## Answer: no, not reliably, and not for the reason first assumed
 
-## Answer
+Bit-exactness under `vmap` **depends on tensor shape**, and fails at realistic
+shapes even with dense attention, dense loss, float32, and no custom kernels
+anywhere. `tpu_shape_probe.py`, all float32, params after one step:
 
-| configuration | gradients | params after 1 step | after 8 steps |
-|---|---|---|---|
-| dense attention + dense loss, **TPU** | 22/22 exact | 22/22 exact | 22/22 exact |
-| `tpu_flash` + `tiled`, **TPU** | 0/22, 2.4e-04 | 1/22, 3.3e-04 | 0/22, 3.4e-04 |
-| dense + dense, **CPU** | 22/22 exact | 5/22, 3.7e-09 | 4/22, 6.0e-08 |
+| layers | d_model | seq | batch | default precision | highest precision |
+|--:|--:|--:|--:|--:|--:|
+| 2 | 64 | 32 | 2 | exact | exact |
+| 2 | 64 | 64 | 4 | 8.4e-09 | exact |
+| 2 | 128 | 64 | 4 | 3.3e-04 | exact |
+| 2 | 128 | 256 | 8 | 1.2e-06 | 3.7e-09 |
+| 2 | 256 | 256 | 8 | 4.0e-07 | 2.2e-06 |
+| 4 | 256 | 512 | 8 | 3.3e-04 | 1.6e-06 |
 
-**On TPU with dense backends, stacking is already bit-exact.** Nothing needs to
-change for that path.
+Two contributors, in order of size:
 
-**With the Pallas flash kernel it is not.** The forward pass is exact -- the
-loss matches bitwise -- and the gradients do not, which places it in the flash
-*backward* kernels (`bwd_dq`, `bwd_dkv`). `vmap` over a `shard_map`-wrapped
-`pallas_call` does not preserve the kernel's blocking.
+1. **TPU matmul precision.** TPU runs float32 matmuls as bf16 passes by
+   default, and the pass count can differ between batched and unbatched. This
+   is the 3.3e-04 entries. `jax.default_matmul_precision("highest")` removes
+   them, at a throughput cost that works against the reason for stacking.
+2. **Residual XLA codegen**, ~1e-06 in float32, which survives `highest` and
+   has no knob.
 
-The error is bounded and does not compound: 3.294e-04 after one step, 3.433e-04
-after eight, flat thereafter. bf16 epsilon is 7.8e-03, so for a parameter of
-typical magnitude (init_std 0.02) this is roughly two bf16 ULP.
+## What is *not* the cause
 
-## The CPU result is an artifact, and cost real time
+Ruled out by isolation, each measured rather than argued:
 
-CPU diverges even on dense backends, and chasing that is what most of this
-investigation went into. The cause is XLA:CPU strength reduction: it rewrites
-`a / b` into `a * (1/b)` when it sees the batched shapes and leaves the division
-alone when unbatched. Those differ in the last ULP. Compiled HLO op counts:
+- **The flash attention kernel.** Raw and inside its `shard_map`, forward and
+  all three gradients are bit-exact under `vmap` (`tpu_kernel_probe.py`).
+- **The matmul, gradients, moments, or any scalar** in the optimizer. All exact
+  under `vmap` when tested alone.
+- **bfloat16 as such.** bf16 enlarges the differences, it does not create them;
+  float32 diverges at the same shapes.
 
-```
-op          unbatched  vmapped
-divide            44       24     <- 20 divisions rewritten
-multiply         251      273     <- into multiplies
-maximum/minimum   22/22    0/0    <- clip fused to clamp (harmless)
-clamp              0       22
-```
+One real contributor was found and is worth knowing:
 
-Writing the reciprocal explicitly (`1.0/c1` hoisted, then multiply) makes CPU
-bit-exact, 22/22. **This is not needed on TPU** -- the same probe shows XLA:TPU
-does not perform the rewrite, and both forms are already bit-identical there.
+- **The tiled cross-entropy with a single vocab tile.** A one-trip `fori_loop`
+  is eliminated and the inlined code optimizes differently under batching. With
+  two or more tiles it is bit-exact in isolation (`tpu_ce_probe.py`). The real
+  config is 50,304 vocab / 2,048 tile = 25 tiles, so it is not in the hot path,
+  but a test that sets `vocab_tile_size == semantic_vocab_size` will see it.
 
-Do not generalise CPU numerics to TPU. Every conclusion here that came from the
-CPU run was wrong about the target hardware.
+## The CPU result is an artifact and cost most of the investigation
 
-## What still needs deciding
+CPU diverges on dense backends where TPU does not. XLA:CPU rewrites `a / b`
+into `a * (1/b)` when it sees batched shapes and keeps the division unbatched;
+compiled HLO shows 20 divides becoming multiplies. Hoisting the reciprocal
+makes CPU exact. XLA:TPU performs no such rewrite.
 
-The dev and official profiles use `tpu_flash` + `tiled`, so the real training
-config is the one that is not bit-exact. Options, in rough order of cost:
+Do not generalise CPU numerics to TPU. Every conclusion drawn from the CPU run
+was wrong about the target hardware.
 
-1. Accept ~2 bf16 ULP, bounded and non-compounding, and state it in the recipe.
-2. Thread the model axis through the flash kernel explicitly instead of
-   `vmap`-ing over it, so the kernel sees it as a real batch dimension.
-3. Use dense attention for stacked runs. Cheap at 1k context, expensive at 8k.
+## Recommendation
+
+Drop bit-exactness as an acceptance criterion and keep the feature. The
+differences are ULP-scale for the dtype in use, bounded, and do not compound
+(3.294e-04 at step 1, 3.433e-04 at step 8, flat after). Slices do not
+interfere: two identical models in one `vmap` stay bit-identical to each other,
+and stack size does not matter, N=1 differs from unbatched exactly as much as
+N=4 does.
+
+For a seed-variance study none of this matters. Each slice is a valid draw from
+the seed distribution; it is a different draw than the unstacked run would have
+produced, not a wrong one.
+
+A batched cross-entropy kernel with a correct `custom_vjp` for the model axis
+would fix contributor (3) above, but not (1) or (2), so it does not buy
+bit-exactness on its own.
