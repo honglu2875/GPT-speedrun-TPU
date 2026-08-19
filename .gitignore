@@ -8,7 +8,6 @@ __pycache__/
 /shm
 /data/cache/
 /runs/
-/report.html
 /.rig.toml
 /.env*
 
@@ -23,5 +22,3 @@ __pycache__/
 /logs/
 /hf-dataset/
 
-# Chart generator: it reads the local run archives, so it is only useful here.
-/docs/reports/make_transfer_charts.py
