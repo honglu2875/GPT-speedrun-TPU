@@ -2,7 +2,7 @@
 
 ## Document masking fails when a chip holds more than one sequence
 
-**Status:** open. Blocks the v6e-8 for all 8,192-context work, dense or routed.
+**Status:** fixed. Kept as the record of why it hid for so long.
 
 Every 8k run compiled and trained fine until the seed-variance study was queued
 on the v6e-8, where every run died before the first step:
@@ -44,13 +44,18 @@ dkv_q_segment_spec  = pl.BlockSpec((1, tiles.block_q_dkv),  dkv_q_segment_index)
 dkv_kv_segment_spec = pl.BlockSpec((1, tiles.block_kv_dkv), dkv_kv_segment_index)
 ```
 
-### The likely fix
+### The fix
 
-Give `segment_ids` a singleton axis so the batch is not one of the last two:
-pass `(batch, 1, sequence)` and the block becomes `(1, 1, block)`. The
-second-to-last dimension is then `1` and equals the array's, and the last is the
-sequence block, already 128-aligned. Each kernel body then reads a `[1, block]`
-ref rather than `[block]`.
+`segment_ids` now carries a singleton at the kernel boundary --
+`segment_ids[:, None, :]` -- so the array is three-dimensional and the batch
+axis sits outside the two Pallas constrains. The specs became
+`pl.BlockSpec((None, None, block))`, squeezing batch and the singleton back off
+so the kernel body still reads a one-dimensional `[block]` ref.
+
+Squeezing alone does **not** work: `pl.BlockSpec((None, block))` over a
+two-dimensional array still puts batch in the checked window, and Pallas
+rejects it as `(Squeezed(), Blocked(...))` against array `(2, 1024)`. The array
+itself has to gain the axis.
 
 ### Verifying a fix
 
@@ -59,6 +64,14 @@ coverage — `tests/test_tpu_flash_attention.py` and the gradient-against-oracle
 check document masking landed with — passes today for the same reason the bug
 hid, so a fix verified only there proves nothing.
 
-### Workaround
+### Verified
 
-Run 8k work on the v4-32, where batch 16 over 16 chips is one sequence per chip.
+On the v6e-8 at one, two, and four sequences per chip. Against the module's own
+dense oracle the error is 3.4-3.9e-03, sub-ULP for bfloat16, while against the
+same oracle with the sequences' document layouts rolled between them it is 1.02
+to 1.26 -- about 250x larger. That gap is what shows each sequence is masked by
+its own boundaries rather than by a shared layout, which a compile-only check
+could not distinguish.
+
+`tests/test_tpu_flash_attention.py::SegmentBlockSpecTests` pins both the block
+spec shape and the per-sequence masking semantics.

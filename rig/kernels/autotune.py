@@ -48,7 +48,7 @@ KERNEL_REVISION = "tpu_flash_attention_v1"
 # tpu_flash_attention.py was two docstring references to the package name, so
 # the shipped TPU v4 tile plans below remain valid measurements.
 TPU_FLASH_SOURCE_SHA256 = (
-    "6cc8808e8a2908faaa97cf26b75af823e2ecd9ca8aa6489532a9567e656b5fc5"
+    "f437acc9aff584974ee5c681427193839236e7d1df23b791ea2f5f14f0b500a5"
 )
 JAX_FLASH_REVISION = "jax_flash_jax_0.11.0"
 JAX_FLASH_SOURCE_SHA256 = (

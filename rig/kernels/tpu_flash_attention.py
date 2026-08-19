@@ -313,8 +313,8 @@ def _tpu_flash_forward_kernel(
                 # Block-diagonal over documents: a position may attend only
                 # inside its own segment. Purely additive to the causal mask,
                 # so the tile-skipping above stays valid.
-                rows = q_segment_ref[0, :][:, None]
-                columns = kv_segment_ref[0, start_kv : start_kv + block_kv_compute]
+                rows = q_segment_ref[:][:, None]
+                columns = kv_segment_ref[start_kv : start_kv + block_kv_compute]
                 mask = jnp.logical_and(mask, rows == columns[None, :])
             scores += jnp.where(mask, 0.0, _MASK_VALUE)
 
@@ -398,7 +398,7 @@ def _tpu_flash_forward(
         return batch_index, head_index, visible_index, 0
 
     def q_segment_index(batch_index: Any, _head: Any, q_index: Any, _: Any):
-        return batch_index, q_index
+        return batch_index, 0, q_index
 
     def kv_segment_index(batch_index: Any, _head: Any, q_index: Any, kv_index: Any):
         visible_index = lax.select(
@@ -406,13 +406,13 @@ def _tpu_flash_forward(
             kv_index,
             0,
         )
-        return batch_index, visible_index
+        return batch_index, 0, visible_index
 
     q_spec = pl.BlockSpec((1, 1, tiles.block_q, head_dim), q_index)
     kv_spec = pl.BlockSpec((1, 1, tiles.block_kv, head_dim), kv_index)
     # Segments are per (batch, position); heads share them.
-    q_segment_spec = pl.BlockSpec((1, tiles.block_q), q_segment_index)
-    kv_segment_spec = pl.BlockSpec((1, tiles.block_kv), kv_segment_index)
+    q_segment_spec = pl.BlockSpec((None, None, tiles.block_q), q_segment_index)
+    kv_segment_spec = pl.BlockSpec((None, None, tiles.block_kv), kv_segment_index)
     output_spec = pl.BlockSpec((1, 1, tiles.block_q, head_dim), q_index)
     logsumexp_spec = pl.BlockSpec((1, 1, tiles.block_q, TPU_VECTOR_LANES), q_index)
     output_shapes = (
@@ -463,7 +463,16 @@ def _tpu_flash_forward(
                 dimension_semantics=("parallel", "parallel", "parallel", "arbitrary")
             ),
             name="tpu_flash_causal_attention_fwd",
-        )(q, k, v, *((segment_ids, segment_ids) if segment_ids is not None else ()))
+        )(
+            q,
+            k,
+            v,
+            *(
+                (segment_ids[:, None, :], segment_ids[:, None, :])
+                if segment_ids is not None
+                else ()
+            ),
+        )
     return output, logsumexp_replicated[..., 0]
 
 
@@ -540,8 +549,8 @@ def _tpu_flash_dq_kernel(
             column_ids += kv_block_index * block_kv + start_kv
             mask = jnp.logical_and(column_ids <= row_ids, column_ids < valid_sequence)
             if q_segment_ref is not None:
-                rows = q_segment_ref[0, :][:, None]
-                columns = kv_segment_ref[0, start_kv : start_kv + block_kv_compute]
+                rows = q_segment_ref[:][:, None]
+                columns = kv_segment_ref[start_kv : start_kv + block_kv_compute]
                 mask = jnp.logical_and(mask, rows == columns[None, :])
             probabilities = jnp.exp(
                 scores - _broadcast_row(logsumexp, block_kv_compute)
@@ -654,10 +663,10 @@ def _tpu_flash_dkv_kernel(
                     column_ids <= row_ids, column_ids < valid_sequence
                 )
                 if q_segment_ref is not None:
-                    rows = q_segment_ref[0, start_q : start_q + block_q_compute][
+                    rows = q_segment_ref[start_q : start_q + block_q_compute][
                         :, None
                     ]
-                    columns = kv_segment_ref[0, start_kv : start_kv + block_kv_compute]
+                    columns = kv_segment_ref[start_kv : start_kv + block_kv_compute]
                     mask = jnp.logical_and(mask, rows == columns[None, :])
                 probabilities = jnp.exp(
                     scores - _broadcast_row(logsumexp, block_kv_compute)
@@ -738,7 +747,7 @@ def _tpu_flash_backward(
         return batch_index, head_index, visible, 0
 
     def dq_q_segment_index(batch_index: Any, _head: Any, q_index: Any, _: Any):
-        return batch_index, q_index
+        return batch_index, 0, q_index
 
     def dq_kv_segment_index(batch_index: Any, _head: Any, q_index: Any, kv_index: Any):
         visible = lax.select(
@@ -748,14 +757,18 @@ def _tpu_flash_backward(
             kv_index,
             0,
         )
-        return batch_index, visible
+        return batch_index, 0, visible
 
     dq_q_spec = pl.BlockSpec((1, 1, tiles.block_q_dq, head_dim), q_index)
     dq_kv_spec = pl.BlockSpec((1, 1, tiles.block_kv_dq, head_dim), dq_kv_index)
     dq_lse_spec = pl.BlockSpec((1, 1, tiles.block_q_dq, TPU_VECTOR_LANES), q_index)
-    dq_q_segment_spec = pl.BlockSpec((1, tiles.block_q_dq), dq_q_segment_index)
-    dq_kv_segment_spec = pl.BlockSpec((1, tiles.block_kv_dq), dq_kv_segment_index)
-    segment_operands = (segment_ids, segment_ids) if segment_ids is not None else ()
+    dq_q_segment_spec = pl.BlockSpec((None, None, tiles.block_q_dq), dq_q_segment_index)
+    dq_kv_segment_spec = pl.BlockSpec((None, None, tiles.block_kv_dq), dq_kv_segment_index)
+    segment_operands = (
+        (segment_ids[:, None, :], segment_ids[:, None, :])
+        if segment_ids is not None
+        else ()
+    )
     dq_kernel = functools.partial(
         _tpu_flash_dq_kernel,
         block_q=tiles.block_q_dq,
@@ -823,7 +836,7 @@ def _tpu_flash_backward(
     dkv_kv_spec = pl.BlockSpec((1, 1, tiles.block_kv_dkv, head_dim), dkv_kv_index)
 
     def dkv_kv_segment_index(batch_index: Any, _head: Any, kv_index: Any, _: Any):
-        return batch_index, kv_index
+        return batch_index, 0, kv_index
 
     def dkv_q_segment_index(batch_index: Any, _head: Any, kv_index: Any, q_index: Any):
         visible = lax.select(
@@ -833,10 +846,10 @@ def _tpu_flash_backward(
             q_index,
             0,
         )
-        return batch_index, visible
+        return batch_index, 0, visible
 
-    dkv_q_segment_spec = pl.BlockSpec((1, tiles.block_q_dkv), dkv_q_segment_index)
-    dkv_kv_segment_spec = pl.BlockSpec((1, tiles.block_kv_dkv), dkv_kv_segment_index)
+    dkv_q_segment_spec = pl.BlockSpec((None, None, tiles.block_q_dkv), dkv_q_segment_index)
+    dkv_kv_segment_spec = pl.BlockSpec((None, None, tiles.block_kv_dkv), dkv_kv_segment_index)
     dkv_kernel = functools.partial(
         _tpu_flash_dkv_kernel,
         block_q=tiles.block_q_dkv,

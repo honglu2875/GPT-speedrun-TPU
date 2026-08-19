@@ -5,6 +5,9 @@ import os
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import unittest
+from pathlib import Path
+
+import rig.kernels.tpu_flash_attention as tpu_flash_attention
 
 import jax
 import jax.numpy as jnp
@@ -388,6 +391,70 @@ class TpuFlashAttentionTests(unittest.TestCase):
         q, k, v = self.random_qkv((1, 1, 16, 8))
         with self.assertRaisesRegex(ValueError, "identical q/k/v"):
             reference_causal_attention(q, k[:, :, :-1], v)
+
+
+class SegmentBlockSpecTests(unittest.TestCase):
+    """Document masking must survive more than one sequence per chip.
+
+    The segment array is the kernel's only two-dimensional operand, so its
+    batch axis is one of the two dimensions Pallas constrains, while q/k/v are
+    four-dimensional and theirs is not. Blocking that axis at 1 was legal only
+    while the array's own batch was also 1 -- one sequence per chip -- which is
+    what a 16-chip slice at batch 16 gives, and is every 8k run recorded before
+    this. On eight chips the same batch puts two sequences on each and lowering
+    was refused outright.
+
+    A batch of one therefore proves nothing here, which is why this asks for
+    more than one.
+    """
+
+    def test_the_segment_array_is_not_two_dimensional_at_the_kernel(self) -> None:
+        """The singleton is what keeps batch out of the constrained window."""
+
+        source = Path(tpu_flash_attention.__file__).read_text(encoding="utf-8")
+        # Both call sites add the axis on the way in ...
+        self.assertEqual(source.count("segment_ids[:, None, :]"), 4)
+        # ... and every spec squeezes batch and the singleton back off.
+        for spec in (
+            "q_segment_spec",
+            "kv_segment_spec",
+            "dq_q_segment_spec",
+            "dq_kv_segment_spec",
+            "dkv_q_segment_spec",
+            "dkv_kv_segment_spec",
+        ):
+            with self.subTest(spec=spec):
+                self.assertIn(f"{spec} = pl.BlockSpec((None, None, ", source)
+
+    def test_masking_matches_the_oracle_with_several_sequences(self) -> None:
+        """Each sequence must be masked by its own document layout.
+
+        Runs on CPU through the reference path, so it checks the masking
+        semantics rather than the Pallas lowering; the lowering is what the
+        block spec test above pins. Sequences are given deliberately different
+        layouts, so masking every row by the first sequence's boundaries would
+        be visible rather than plausible.
+        """
+
+        rng = np.random.default_rng(0)
+        batch, heads, sequence, head_dim = 3, 2, 32, 8
+        shape = (batch, heads, sequence, head_dim)
+        q, k, v = (jnp.asarray(rng.normal(size=shape), jnp.float32) for _ in range(3))
+        segments = jnp.asarray(
+            np.stack(
+                [np.cumsum(rng.random(sequence) < rate) for rate in (0.1, 0.3, 0.5)]
+            ),
+            jnp.int32,
+        )
+        out = reference_causal_attention(
+            q, k, v, softmax_scale=1.0, segment_ids=segments
+        )
+        rolled = reference_causal_attention(
+            q, k, v, softmax_scale=1.0, segment_ids=jnp.roll(segments, 1, axis=0)
+        )
+        # Rolling the layouts between sequences must change the answer; if it
+        # does not, the mask is not per-sequence.
+        self.assertGreater(float(jnp.abs(out - rolled).max()), 1e-3)
 
 
 if __name__ == "__main__":
