@@ -999,6 +999,15 @@ def _report_payload(
                 "ledger": run.record is not None,
                 "flopSource": run.flop_source,
                 "finalStep": run.final_step,
+                # Topology, because it changes the number. The data stream is
+                # invariant under it -- the same seed draws the same global
+                # batches on any process count -- but gradients reduce across a
+                # different number of devices and each chip holds a different
+                # share of the batch, and the same run has landed 0.004-0.023
+                # nats apart across two slices for that reason alone.
+                "chip": _hardware(result).get("chip"),
+                "processes": _hardware(result).get("processes"),
+                "devices": _hardware(result).get("devices"),
                 "tokens": int(metrics["tokens_processed"]),
                 "trainSeconds": metrics.get("train_seconds"),
                 "trainLoss": metrics.get("train_loss"),
@@ -1151,6 +1160,21 @@ _ROUTER_CHARTS = (
     SeriesChart("router.top1_gate", "Mean top-1 gate weight", "weight"),
     SeriesChart("router.logit_rms", "Router logit RMS", "RMS"),
 )
+
+
+def _hardware(result: Mapping[str, Any]) -> dict[str, Any]:
+    """Chip kind, process count, and device count, when the run recorded them."""
+
+    system = result.get("system")
+    if not isinstance(system, dict):
+        return {}
+    kinds = system.get("device_kinds")
+    chip = kinds[0] if isinstance(kinds, list) and kinds else None
+    return {
+        "chip": chip if isinstance(chip, str) else None,
+        "processes": system.get("process_count"),
+        "devices": system.get("device_count"),
+    }
 
 
 def _training_chart(
@@ -1989,7 +2013,14 @@ function init(){
  new ResizeObserver(()=>{if(focusItem&&$('focus-dialog').open)redraw(focusItem)}).observe($('focus-dialog'));
  new ResizeObserver(schedule).observe(document.querySelector('.main')); schedule();
 }
-function buildRuns(){$('run-list').innerHTML=D.runs.map(r=>`<label class="run-toggle" data-search="${esc((r.label+' '+r.id+' '+r.classification).toLowerCase())}"><input type="checkbox" data-run="${esc(r.id)}" ${r.selected?'checked':''}><span class="dot" style="color:${r.color};background:${r.color}"></span><span class="run-name">${esc(r.label)}<small class="run-meta">${esc(r.classification)} · step ${fmt(r.finalStep,0)} · val ${fmt(r.validationLoss,4)}${r.ledger?' · ledger ✓':' · unledgered'}</small></span></label>`).join('')||'<p class="subtle">No plot-able runs found.</p>';document.querySelectorAll('[data-run]').forEach(x=>x.onchange=()=>{x.checked?visible.add(x.dataset.run):visible.delete(x.dataset.run);resetViews();buildLayerSteps();schedule()})}
+// Topology belongs next to the number it produced: the same seed on a
+// different chip count has landed 0.004-0.023 nats away, purely through
+// reduction order and per-chip batch, with identical data.
+function hw(r){
+ if(!r.chip&&!r.devices)return '';
+ const bits=[r.chip,r.devices?r.devices+' chips':null,r.processes?r.processes+'p':null].filter(Boolean);
+ return ' · '+esc(bits.join(' '))}
+function buildRuns(){$('run-list').innerHTML=D.runs.map(r=>`<label class="run-toggle" data-search="${esc((r.label+' '+r.id+' '+r.classification+' '+(r.chip||'')).toLowerCase())}"><input type="checkbox" data-run="${esc(r.id)}" ${r.selected?'checked':''}><span class="dot" style="color:${r.color};background:${r.color}"></span><span class="run-name">${esc(r.label)}<small class="run-meta">${esc(r.classification)} · step ${fmt(r.finalStep,0)} · val ${fmt(r.validationLoss,4)}${hw(r)}${r.ledger?' · ledger ✓':' · unledgered'}</small></span></label>`).join('')||'<p class="subtle">No plot-able runs found.</p>';document.querySelectorAll('[data-run]').forEach(x=>x.onchange=()=>{x.checked?visible.add(x.dataset.run):visible.delete(x.dataset.run);resetViews();buildLayerSteps();schedule()})}
 function syncChecks(){document.querySelectorAll('[data-run]').forEach(x=>x.checked=visible.has(x.dataset.run))}
 function buildSummary(){if(!D.runs.length){$('summary').innerHTML='<div class="empty">No eligible run passed the report completeness, profile, and qualification checks.</div>';return}$('summary').innerHTML=`<div class="table-wrap"><table><thead><tr><th>Run</th><th>Class</th><th>Steps</th><th>Tokens</th><th>Train s</th><th>Train loss</th><th>Val loss</th><th>Fresh10</th><th>FLOP x</th><th>Final scopes</th></tr></thead><tbody>${D.runs.map(r=>`<tr><td><span class="status" style="background:${r.color}"></span>${esc(r.label)}</td><td>${esc(r.classification)}</td><td>${fmt(r.finalStep,0)}</td><td>${fmt(r.tokens,0)}</td><td>${fmt(r.trainSeconds,2)}</td><td>${fmt(r.trainLoss,4)}</td><td>${fmt(r.validationLoss,4)}</td><td>${fmt(r.fresh10Loss,4)}</td><td title="${esc(r.flopSource)}">${r.flopSource.startsWith('derived:')?'derived':'logged'}</td><td>${r.hasLayerStats?'yes':'—'}</td></tr>`).join('')}</tbody></table></div>`}
 function buildCharts(){charts=[];makeGroup($('time-charts'),D.timeCharts,'time');makeGroup($('diagnostic-charts'),D.diagnosticCharts,'time');makeGroup($('layer-charts'),D.layerCharts,'layer');buildLayerSteps();buildFamilies();if(!D.diagnosticCharts.length)$('diagnostic-charts').innerHTML='<div class="empty">No included run recorded overall diagnostics.</div>';if(!D.layerCharts.length)$('layer-charts').innerHTML='<div class="empty">No included run recorded final model-scope diagnostics or retained compatible layer arrays.</div>'}

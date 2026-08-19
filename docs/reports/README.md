@@ -81,6 +81,19 @@ second, separately labelled click that states the size before it starts:
 Everything it fetches is an ordinary report payload, so the page never needs to
 understand the packed log format — the two only have to agree about JSON.
 
+## Hardware is part of a result
+
+The same configuration and seed lands 0.004–0.023 nats apart on a 16-chip
+v4 slice versus an 8-chip v6e — the same size as the seed effect. The data is
+identical (the stream is invariant under process count, verified) and so is the
+attention tile plan; what differs is that gradients reduce across a different
+number of devices and each chip holds a different share of the batch.
+
+Every dashboard therefore shows chip kind, chip count, and process count beside
+each run, and the run filter matches on chip. Every study is TPU v4, 4
+processes, 16 chips, except `batch-size-sweep-500M`, which mixes that with 6
+runs on TPU v6 lite at 1 process and 8 chips — its 20-TPP arm.
+
 ## Contents
 
 | report | runs | tier(s) | what varies | logs |

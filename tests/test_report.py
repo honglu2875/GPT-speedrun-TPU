@@ -987,6 +987,42 @@ class ClientSourceGuardTests(unittest.TestCase):
         for spec in _ROUTER_CHARTS:
             self.assertNotIn(spec.metric, keys)
 
+    def test_runs_carry_the_topology_that_produced_them(self) -> None:
+        """Chip kind and device count belong beside the loss they produced.
+
+        The data stream is invariant under process count -- the same seed draws
+        the same global batches on any -- but gradients reduce across a
+        different number of devices and each chip holds a different share of
+        the batch. The same configuration and seed has landed 0.004-0.023 nats
+        apart across two slices for that reason alone, so a number without its
+        topology is not reproducible.
+        """
+
+        script = self._script()
+        self.assertIn("function hw(r){", script)
+        start = script.index("function buildRuns(){")
+        self.assertIn("${hw(r)}", script[start : start + 1200])
+
+    def test_hardware_is_absent_rather_than_invented(self) -> None:
+        # Older artifacts predate the system block; they must render, not throw.
+        from rig.report import _hardware
+
+        self.assertEqual(_hardware({}), {})
+        self.assertEqual(_hardware({"system": "not-an-object"}), {})
+        self.assertEqual(
+            _hardware(
+                {
+                    "system": {
+                        "device_kinds": ["TPU v4"],
+                        "process_count": 4,
+                        "device_count": 16,
+                    }
+                }
+            ),
+            {"chip": "TPU v4", "processes": 4, "devices": 16},
+        )
+        self.assertEqual(_hardware({"system": {}})["chip"], None)
+
     def test_notice_fold_stays_hidden_when_there_is_nothing_to_say(self) -> None:
         body = self._body()
         self.assertIn('<details class="fold" id="notices-fold" hidden>', body)
