@@ -93,26 +93,31 @@ Experts are **replicated**: every device holds all eight and routes only its own
 tokens, so there are no expert collectives. That is what the recorded ladder
 ran, and it is sufficient while the experts fit in memory.
 
-Expert *parallelism* — sharding experts across devices — is designed but not
-implemented. Under `shard_map` over an `expert` axis it would be: all-gather
-the `[E]` counts so every device can derive the full `[P, E]` traffic matrix by
+Expert *parallelism* — sharding experts across devices — is designed but
+deliberately not implemented. It becomes necessary when the experts stop
+fitting, which is a bigger-model problem, not one this ladder has. The design,
+for whoever needs it: under `shard_map` over an `expert` axis, all-gather the
+`[E]` counts so every device can derive the full `[P, E]` traffic matrix by
 prefix sum; `ragged_all_to_all` the expert-major tokens; block-transpose the
 receive buffer, which arrives source-major and expert-minor, into expert-major
 order using indices from the counts rather than a sort; `gmm` with
 `group_offset` set to the first local expert, which is what that argument is
-for; then the inverse `all_to_all` and unsort. It becomes necessary when the
-experts stop fitting, not before.
+for; then the inverse `all_to_all` and unsort.
 
-## Open questions
+## Decisions this recipe has settled
 
-- **Sparsify every layer, or every other?** Interleaving is common and halves
-  the parameter cost, but it breaks the clean "active parameters == dense tier"
-  identity that makes the routed and dense ladders equi-FLOP.
-- **Does `E = 8` stay fixed across the ladder, or scale with width?** Fixed is
-  the simpler experiment and the one the current tiers are sized for.
+**Every layer is routed.** All twelve, not alternating. Interleaving dense and
+routed layers is common and halves the parameter cost, but it breaks the clean
+"active parameters == dense tier" identity, and that identity is what makes the
+routed and dense ladders equi-FLOP and therefore comparable. A cheaper model
+that cannot be compared is not cheaper for this purpose.
 
-**Settled: no shared expert.** An always-on expert alongside the routed ones is
-cheap and usually helps, which is exactly why it does not belong in a baseline.
-It adds active FLOPs, so it breaks the equi-FLOP identity against the dense
-ladder, and it confounds "did sparsity help" with "did extra dense capacity
-help". Worth measuring later as its own arm, not as part of this one.
+**`E = 8` is fixed across the ladder**, not scaled with width. It is the
+simpler experiment and the one the tiers are sized for.
+
+**No shared expert here.** An always-on expert alongside the routed ones is
+cheap and usually helps, which is exactly why it does not belong in the
+baseline: it adds active FLOPs, so it breaks the equi-FLOP identity against the
+dense ladder, and it confounds "did sparsity help" with "did extra dense
+capacity help". It is worth measuring — as an ablation forked from this recipe,
+with its own arm, so the two questions stay separable.
