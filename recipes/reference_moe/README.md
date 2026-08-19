@@ -86,3 +86,33 @@ masked 8k window is largely short documents sitting beside masked-off
 neighbours. Masking makes 8k *correct*; it does not make FineWeb *long*. If
 this family does not beat `reference` at equal FLOPs, the corpus is the first
 place to look, not the recipe.
+
+## What is not built yet
+
+Experts are **replicated**: every device holds all eight and routes only its own
+tokens, so there are no expert collectives. That is what the recorded ladder
+ran, and it is sufficient while the experts fit in memory.
+
+Expert *parallelism* — sharding experts across devices — is designed but not
+implemented. Under `shard_map` over an `expert` axis it would be: all-gather
+the `[E]` counts so every device can derive the full `[P, E]` traffic matrix by
+prefix sum; `ragged_all_to_all` the expert-major tokens; block-transpose the
+receive buffer, which arrives source-major and expert-minor, into expert-major
+order using indices from the counts rather than a sort; `gmm` with
+`group_offset` set to the first local expert, which is what that argument is
+for; then the inverse `all_to_all` and unsort. It becomes necessary when the
+experts stop fitting, not before.
+
+## Open questions
+
+- **Sparsify every layer, or every other?** Interleaving is common and halves
+  the parameter cost, but it breaks the clean "active parameters == dense tier"
+  identity that makes the routed and dense ladders equi-FLOP.
+- **Does `E = 8` stay fixed across the ladder, or scale with width?** Fixed is
+  the simpler experiment and the one the current tiers are sized for.
+
+**Settled: no shared expert.** An always-on expert alongside the routed ones is
+cheap and usually helps, which is exactly why it does not belong in a baseline.
+It adds active FLOPs, so it breaks the equi-FLOP identity against the dense
+ladder, and it confounds "did sparsity help" with "did extra dense capacity
+help". Worth measuring later as its own arm, not as part of this one.
