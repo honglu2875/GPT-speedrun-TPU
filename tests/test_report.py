@@ -673,6 +673,33 @@ class StudyExportTests(unittest.TestCase):
             folders, ["60m-5tpp-bs1-lr2e-8-s1337", "60m-5tpp-bs1-lr2e-8-s1338"]
         )
 
+    def test_a_routed_run_does_not_overwrite_the_dense_run_beside_it(self) -> None:
+        """Routing is not one of the coordinates the name is built from.
+
+        A study holding both families at the same tier, batch, rate, and seed
+        would otherwise name them identically and export one on top of the
+        other, losing half the study with no error.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = self._runs(root)
+            # Make the second run routed and give it the first one's seed, so
+            # every other coordinate in the name matches.
+            second = sorted(p for p in runs.iterdir() if p.is_dir())[1]
+            payload = json.loads((second / "result.json").read_text(encoding="utf-8"))
+            payload["seed"] = 1337
+            payload["metrics"]["experts"] = 8
+            (second / "result.json").write_text(json.dumps(payload), encoding="utf-8")
+
+            summary = export_study(runs, root / "out", "demo")
+            folders = sorted(p.name for p in summary["path"].iterdir() if p.is_dir())
+
+        self.assertEqual(summary["runs"], 2)
+        self.assertEqual(
+            folders, ["60m-5tpp-bs1-lr2e-8-s1337", "60m-moe-5tpp-bs1-lr2e-8-s1337"]
+        )
+
     def test_it_falls_back_to_the_run_id_when_it_cannot_name_a_run(self) -> None:
         """A run missing its tier or learning rate is still worth exporting.
 

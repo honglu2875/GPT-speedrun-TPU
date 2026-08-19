@@ -105,6 +105,7 @@ runs on TPU v6 lite at 1 process and 8 chips — its 20-TPP arm.
 | [3-seed-gradient-spike](3-seed-gradient-spike.html) | 12 | 250M | LR × seed | [`lr-transfer-250M`](https://huggingface.co/datasets/quintic/rig-logs/tree/main/lr-transfer-250M) |
 | [8k-lr-sweep-60M](8k-lr-sweep-60M.html) | 15 | 60M | LR × seed at 8k context | [`lr-sweep-8k-60M`](https://huggingface.co/datasets/quintic/rig-logs/tree/main/lr-sweep-8k-60M) |
 | [moe-lr-sweep-8k](moe-lr-sweep-8k.html) | 18 | 60M/125M | LR × seed, top-2 of 8 experts | [`moe-lr-sweep-8k`](https://huggingface.co/datasets/quintic/rig-logs/tree/main/moe-lr-sweep-8k) |
+| [batch-size-grid-8k](batch-size-grid-8k.html) | 42 | 60M/125M | batch × LR × seed at 8k, dense and routed | [`batch-size-grid-8k`](https://huggingface.co/datasets/quintic/rig-logs/tree/main/batch-size-grid-8k) |
 | [transfer-charts](transfer-charts.html) | — | — | derived figures, not a run dashboard | — |
 
 Each study also carries a `snapshot.json.gz` (loss curves only, 0.05–0.30 MB)
@@ -279,6 +280,45 @@ for lr in 0.015625 0.0078125 0.00390625 0.001953125 0.0009765625; do
       --tier 60m --tokens-per-parameter 5 \
       --base-learning-rate "$lr" --seed "$seed" --checkpoint-policy none \
       --name "60m-moe-lr${lr}-s${seed}"
+  done
+done
+```
+
+## batch-size-grid-8k.html
+
+42 runs extending the two 8k ladders to batch 32 and 64 — `reference_8k` and
+`reference_moe` at 60M with three seeds per cell, `reference_moe` at 125M with
+one. Three learning rates at every batch, so no batch is judged at a rate
+picked for another. The batch-16 arm is not in this study: it is the ladder
+each family already had, in `lr-sweep-8k-60M` and `moe-lr-sweep-8k`.
+
+The token budget is held fixed across batches, so doubling the batch halves the
+optimizer steps — 2,286 down to 571 at 60M. **Batch 16 wins everywhere.** The
+best batch-32 run costs 0.39 nats at 60M dense, 0.27 routed, 0.05 at 125M; the
+best batch-64 run costs 1.30, 1.15, and 0.31. Throughput is flat across the
+grid (1,041 → 1,100 → 1,093 TFLOP/s at 60M dense), so nothing is bought back in
+wall-clock. This reverses the 1,024-context ladder, where batch 128 was optimal
+and larger batches finished sooner on the same budget; at 8k a single sequence
+is eight times longer, so batch 16 already saturates the chips.
+
+The apparent best learning rate moves between cells, but the seed spread grows
+with batch — median 0.011 at batch 16, 0.046 at 32, 0.068 at 64 — until it is
+as large as the gaps between rates. The drift is not resolvable at three seeds,
+and every large-batch cell is far worse than batch 16 at every rate tried, so
+it was not worth more machine time.
+
+```bash
+for recipe in reference_8k reference_moe; do
+  tag=$([ "$recipe" = reference_8k ] && echo 8k || echo moe)
+  for batch in 32 64; do
+    for lr in 0.0078125 0.00390625 0.001953125; do
+      for seed in 1337 1338 1339; do
+        rig run "$recipe" --cluster v4-32 --profile dev --track open \
+          --tier 60m --tokens-per-parameter 5 --study-batch-size "$batch" \
+          --base-learning-rate "$lr" --seed "$seed" --checkpoint-policy none \
+          --name "60m-${tag}-bs${batch}-lr${lr}-s${seed}"
+      done
+    done
   done
 done
 ```
