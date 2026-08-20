@@ -67,6 +67,11 @@ reciprocals. The important local choice is what those symbols mean here:
 These definitions are a project choice. They should not be attributed to the
 Complete(d)P paper without the `fixed-TPP` qualification.
 
+The isolated [`reference_duration`](../recipes/reference_duration/) fork adds
+the omitted `TPP / 5` factor so the two policies can be compared without
+changing this default contract. Its pre-registered 500M/v4-32 matrix is in
+[`studies/500m-duration-scaling`](../studies/500m-duration-scaling/).
+
 Primary sources:
 
 - [Tensor Programs V: Tuning Large Neural Networks via Zero-Shot Hyperparameter Transfer](https://arxiv.org/abs/2203.03466)
