@@ -1,0 +1,239 @@
+"""Explicit argument groups shared by executable training recipes.
+
+These helpers describe the stable invocation protocol between ``rig`` and a
+recipe.  They deliberately do not add scientific controls such as model tier,
+context, token horizon, learning rate, or batch size; those remain visible in
+each recipe's ``build_parser`` function.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+from pathlib import Path
+from typing import Sequence
+
+from rig.arguments import COLORS, positive_int
+
+
+def new_recipe_parser(*, description: str) -> argparse.ArgumentParser:
+    """Create the common strict parser shell without adding any arguments."""
+
+    return argparse.ArgumentParser(
+        description=description,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        allow_abbrev=False,
+    )
+
+
+def add_standard_config_arguments(
+    group: argparse._ArgumentGroup,
+    *,
+    default_output_dir: Path,
+    profiles: Sequence[str],
+) -> None:
+    """Add ``--config``, ``--output-dir``, ``--seed``, ``--profile``,
+    ``--color``, and the hidden ``--print-plan`` harness protocol flag.
+    """
+
+    group.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="experiment definition (must resolve to the config.yaml beside train.py)",
+    )
+    group.add_argument("--output-dir", type=Path, default=default_output_dir)
+    group.add_argument("--seed", type=int, default=1337)
+    environment_profile = os.environ.get("RIG_PROFILE")
+    if environment_profile not in profiles:
+        environment_profile = None
+    group.add_argument("--profile", choices=profiles, default=environment_profile)
+    group.add_argument("--color", choices=COLORS, default="auto")
+    group.add_argument("--print-plan", action="store_true", help=argparse.SUPPRESS)
+
+
+def add_standard_xprof_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add ``--xprof-dir``, ``--xprof-start-step``, ``--xprof-steps``,
+    ``--diagnostic-mode``, and ``--omit-checkpoint`` in a ``profiling`` group.
+    """
+
+    profiling = parser.add_argument_group("profiling")
+    profiling.add_argument(
+        "--xprof-dir",
+        type=Path,
+        default=None,
+        help="write an XProf trace for a bounded training-step window",
+    )
+    profiling.add_argument(
+        "--xprof-start-step",
+        type=positive_int,
+        default=None,
+        help="first 1-based step to capture; required with --xprof-dir",
+    )
+    profiling.add_argument(
+        "--xprof-steps",
+        type=positive_int,
+        default=None,
+        help="number of consecutive steps to capture; required with --xprof-dir",
+    )
+    profiling.add_argument(
+        "--diagnostic-mode",
+        action="store_true",
+        help="XProf-only execution without evaluation, diagnostics, checkpoint, or result",
+    )
+    profiling.add_argument(
+        "--omit-checkpoint",
+        action="store_true",
+        help=(
+            "non-official research only: retain final validation and metrics but omit "
+            "the parameter checkpoint"
+        ),
+    )
+
+
+def add_standard_data_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add ``--data``/``--data-path``, ``--train-data``, ``--val-data``,
+    ``--data-dtype``, ``--val-fraction``, ``--vocab-size``, ``--dataset-id``,
+    ``--tokenizer-id``, ``--data-format``, ``--downstream-manifest``,
+    ``--downstream-root``, and ``--downstream-data`` in a ``data`` group.
+    """
+
+    data = parser.add_argument_group("data")
+    data.add_argument(
+        "--data",
+        "--data-path",
+        dest="data_path",
+        type=Path,
+        default=None,
+        help="train file or directory containing discovered train/val shards",
+    )
+    data.add_argument(
+        "--train-data",
+        type=Path,
+        action="append",
+        default=[],
+        help="explicit training shard; repeat for multiple shards",
+    )
+    data.add_argument(
+        "--val-data",
+        type=Path,
+        action="append",
+        default=[],
+        help="explicit validation shard; repeat for multiple shards",
+    )
+    data.add_argument(
+        "--data-dtype",
+        choices=("uint8", "uint16", "uint32", "int32"),
+        default="uint16",
+        help="dtype for raw .bin token files",
+    )
+    data.add_argument("--val-fraction", type=float, default=0.05)
+    data.add_argument(
+        "--vocab-size", type=positive_int, default=None, help=argparse.SUPPRESS
+    )
+    data.add_argument(
+        "--dataset-id", default=None, help="stable dataset identifier for records"
+    )
+    data.add_argument(
+        "--tokenizer-id", default=None, help="stable tokenizer identifier for records"
+    )
+    data.add_argument(
+        "--data-format",
+        choices=("auto", "raw", "llmc"),
+        default="auto",
+        help="raw binaries or llm.c 256-int-header shards",
+    )
+    data.add_argument(
+        "--downstream-manifest",
+        type=Path,
+        default=None,
+        help="fresh10 manifest containing domain shard paths and document spans",
+    )
+    data.add_argument(
+        "--downstream-root",
+        type=Path,
+        default=None,
+        help="directory containing shards named by --downstream-manifest",
+    )
+    data.add_argument(
+        "--downstream-data",
+        action="append",
+        default=[],
+        metavar="DOMAIN=PATH",
+        help="standalone downstream document; repeat paths and domains as needed",
+    )
+
+
+def add_standard_reporting_arguments(group: argparse._ArgumentGroup) -> None:
+    """Add the hardware-reporting-only ``--peak-tflops`` argument."""
+
+    group.add_argument(
+        "--peak-tflops",
+        type=float,
+        default=None,
+        help="hardware bf16 peak for the whole mesh; enables an MFU estimate",
+    )
+
+
+def validate_standard_data_arguments(args: argparse.Namespace) -> None:
+    """Validate relationships among arguments added by the data helper."""
+
+    if not 0.0 < args.val_fraction < 1.0:
+        raise ValueError("--val-fraction must be between 0 and 1")
+    if args.downstream_root is not None and args.downstream_manifest is None:
+        raise ValueError("--downstream-root requires --downstream-manifest")
+    if args.downstream_manifest is not None and args.downstream_data:
+        raise ValueError(
+            "--downstream-manifest and --downstream-data are mutually exclusive"
+        )
+
+
+def validate_standard_xprof_arguments(
+    args: argparse.Namespace, *, profile: str
+) -> None:
+    """Validate relationships among arguments added by the XProf helper."""
+
+    xprof_window_args = (args.xprof_start_step, args.xprof_steps)
+    if args.xprof_dir is None:
+        if any(value is not None for value in xprof_window_args):
+            raise ValueError("--xprof-start-step and --xprof-steps require --xprof-dir")
+        if args.diagnostic_mode:
+            raise ValueError("--diagnostic-mode requires --xprof-dir")
+    elif any(value is None for value in xprof_window_args):
+        raise ValueError(
+            "--xprof-dir requires both --xprof-start-step and --xprof-steps"
+        )
+    if args.omit_checkpoint and args.diagnostic_mode:
+        raise ValueError(
+            "--omit-checkpoint and --diagnostic-mode are mutually exclusive"
+        )
+    if args.omit_checkpoint and profile != "dev":
+        raise ValueError("--omit-checkpoint is restricted to development research runs")
+    if args.diagnostic_mode and (
+        args.downstream_manifest is not None or args.downstream_data
+    ):
+        raise ValueError(
+            "--diagnostic-mode cannot be combined with downstream evaluation data"
+        )
+
+
+def validate_standard_reporting_arguments(args: argparse.Namespace) -> None:
+    """Validate arguments added by the reporting helper."""
+
+    if args.peak_tflops is not None and (
+        not math.isfinite(args.peak_tflops) or args.peak_tflops <= 0.0
+    ):
+        raise ValueError("--peak-tflops must be positive")
+
+
+__all__ = (
+    "add_standard_config_arguments",
+    "add_standard_data_arguments",
+    "add_standard_reporting_arguments",
+    "add_standard_xprof_arguments",
+    "new_recipe_parser",
+    "validate_standard_data_arguments",
+    "validate_standard_reporting_arguments",
+    "validate_standard_xprof_arguments",
+)
