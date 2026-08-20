@@ -454,10 +454,10 @@ def _recipe_entry(root: Path, recipe: str) -> tuple[Path, Path, Path]:
     return recipe_dir, trainer, experiment_config
 
 
-def _scientific_trainer_args(args: argparse.Namespace, profile: str) -> list[str]:
+def _scientific_trainer_args(args: argparse.Namespace) -> list[str]:
     """Translate the deliberately small public research surface to a recipe."""
 
-    result = ["--profile", profile]
+    result: list[str] = []
     optional = (
         ("--tier", getattr(args, "tier", None)),
         ("--context", getattr(args, "context", None)),
@@ -486,13 +486,19 @@ def command_run(args: argparse.Namespace) -> int:
         profile, requested=None, development_default=config.target_loss
     )
     recipe_dir, trainer, experiment_config = _recipe_entry(root, args.recipe)
-    scientific_args = _scientific_trainer_args(args, profile)
+    scientific_args = _scientific_trainer_args(args)
     python_executable = root / ".venv" / "bin" / "python"
     style.heading("Resolving recipe plan")
     plan = resolve_recipe_plan(
         python_executable=python_executable,
         trainer=trainer,
-        arguments=("--config", str(experiment_config), *scientific_args),
+        arguments=(
+            "--config",
+            str(experiment_config),
+            "--profile",
+            profile,
+            *scientific_args,
+        ),
         cwd=recipe_dir,
     )
     style.ok(
@@ -725,7 +731,7 @@ def command_profile(args: argparse.Namespace) -> int:
     color = args.color or config.color
     style = Style(color)
     recipe_dir, trainer, experiment_config = _recipe_entry(root, args.recipe)
-    scientific_args = _scientific_trainer_args(args, profile)
+    scientific_args = _scientific_trainer_args(args)
     python_executable = root / ".venv" / "bin" / "python"
     plan = resolve_recipe_plan(
         python_executable=python_executable,
@@ -733,6 +739,8 @@ def command_profile(args: argparse.Namespace) -> int:
         arguments=(
             "--config",
             str(experiment_config),
+            "--profile",
+            profile,
             *scientific_args,
             "--diagnostic-mode",
         ),
@@ -773,6 +781,8 @@ def command_profile(args: argparse.Namespace) -> int:
         str(output_dir),
         "--seed",
         str(args.seed),
+        "--profile",
+        profile,
         *scientific_args,
         "--data-format",
         "llmc",

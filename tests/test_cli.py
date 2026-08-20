@@ -4,6 +4,7 @@ from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -51,6 +52,91 @@ class CliTests(unittest.TestCase):
         for removed in ("--steps", "--train-tokens", "--track", "--layers"):
             with self.subTest(removed=removed), self.assertRaises(SystemExit):
                 parser.parse_args(["run", "reference", removed, "1"])
+
+    def test_run_passes_profile_as_harness_state_not_trainer_passthrough(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recipe = root / "recipes" / "variant"
+            recipe.mkdir(parents=True)
+            (recipe / "train.py").write_text("pass\n", encoding="utf-8")
+            (recipe / "config.yaml").write_text("schema_version: 1\n", encoding="utf-8")
+            manifest = root / "manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            prepared = PreparedDataset(
+                name="tiny",
+                root=root / "data",
+                manifest_path=manifest,
+                manifest_sha256="a" * 64,
+                train_files=(root / "data" / "train.bin",),
+                validation_files=(root / "data" / "val.bin",),
+                train_tokens=1_000,
+                validation_tokens=20,
+                validation_prefix_tokens=20,
+            )
+            plan = RecipePlan(
+                payload={
+                    "tier": "500m",
+                    "schedule_steps": 10,
+                    "expected_tokens": 1_000,
+                    "run_kind": "full",
+                },
+                sha256="b" * 64,
+            )
+            config = LocalConfig(
+                data_path="data",
+                artifacts_path="runs",
+                default_profile="dev",
+                checkpoint_retention="none",
+                color="never",
+            )
+            args = cli.build_parser().parse_args(
+                [
+                    "run",
+                    "variant",
+                    "--profile",
+                    "dev",
+                    "--tier",
+                    "500m",
+                    "--batch-size",
+                    "128",
+                    "--name",
+                    "profile-boundary",
+                    "--skip-data-check",
+                ]
+            )
+            outcome = SimpleNamespace(
+                run_id="variant-profile-boundary-test",
+                record={
+                    "qualified": False,
+                    "metrics": {
+                        "validation_loss": 4.0,
+                        "train_seconds": 1.0,
+                        "tokens_processed": 1_000,
+                    },
+                },
+            )
+            with (
+                patch("rig.cli.repo_root", return_value=root),
+                patch("rig.cli.load_config", return_value=config),
+                patch("rig.cli.resolve_recipe_plan", return_value=plan) as resolve,
+                patch("rig.cli._require_prepared_dataset"),
+                patch("rig.cli.resolve_preparation_manifest", return_value=manifest),
+                patch("rig.cli.verify_dataset", return_value=prepared),
+                patch("rig.cli.build_cohort", return_value=None),
+                patch("rig.cli.run_recipe", return_value=outcome) as run,
+            ):
+                self.assertEqual(cli.command_run(args), 0)
+
+            plan_arguments = resolve.call_args.kwargs["arguments"]
+            self.assertEqual(plan_arguments.count("--profile"), 1)
+            self.assertEqual(
+                plan_arguments[plan_arguments.index("--profile") + 1], "dev"
+            )
+            run_config = run.call_args.args[0]
+            self.assertEqual(run_config.profile, "dev")
+            self.assertNotIn("--profile", run_config.trainer_args)
+            self.assertIn("--tier", run_config.trainer_args)
+            self.assertIn("--batch-size", run_config.trainer_args)
 
     def test_clone_copies_recipe_config_byte_exactly(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
