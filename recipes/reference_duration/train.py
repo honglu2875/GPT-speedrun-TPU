@@ -41,6 +41,7 @@ import yaml
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from rig import logpack
+from rig.arguments import positive_int
 from rig.attention import (
     AttentionCallable,
     AttentionRuntime,
@@ -50,6 +51,16 @@ from rig.attention import (
     document_segments,
     make_mesh_attention,
     resolve_attention_runtime,
+)
+from rig.recipe_args import (
+    add_standard_config_arguments,
+    add_standard_data_arguments,
+    add_standard_reporting_arguments,
+    add_standard_xprof_arguments,
+    new_recipe_parser,
+    validate_standard_data_arguments,
+    validate_standard_reporting_arguments,
+    validate_standard_xprof_arguments,
 )
 from rig.metrics import DIAGNOSTIC_FAMILIES, DIAGNOSTIC_STATS
 from rig.configfile import (
@@ -281,20 +292,6 @@ class ExperimentProfile:
 
 
 _UINT64_MASK = (1 << 64) - 1
-
-
-def positive_int(text: str) -> int:
-    value = int(text)
-    if value <= 0:
-        raise argparse.ArgumentTypeError("must be a positive integer")
-    return value
-
-
-def nonnegative_int(text: str) -> int:
-    value = int(text)
-    if value < 0:
-        raise argparse.ArgumentTypeError("must be a nonnegative integer")
-    return value
 
 
 def _parse_model(value: Any, label: str) -> dict[str, Any]:
@@ -818,23 +815,18 @@ def load_experiment_profile(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = new_recipe_parser(
         description=(
             "Train a decoder-only GPT with JAX. Static experiment settings come "
             "from config.yaml beside this entry script."
-        ),
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        allow_abbrev=False,
+        )
     )
     run = parser.add_argument_group("run")
-    run.add_argument(
-        "--config",
-        type=Path,
-        default=None,
-        help="experiment definition (must resolve to the config.yaml beside train.py)",
+    add_standard_config_arguments(
+        run,
+        default_output_dir=Path("runs/reference"),
+        profiles=_VALID_PROFILES,
     )
-    run.add_argument("--output-dir", type=Path, default=Path("runs/reference"))
-    run.add_argument("--seed", type=int, default=1337)
     environment_tier = os.environ.get("RIG_TIER")
     run.add_argument(
         "--tier",
@@ -861,110 +853,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="research budget rounded to the nearest complete global step",
     )
-    environment_profile = os.environ.get("RIG_PROFILE")
-    if environment_profile not in _VALID_PROFILES:
-        environment_profile = None
-    run.add_argument("--profile", choices=_VALID_PROFILES, default=environment_profile)
-    run.add_argument("--color", choices=("auto", "always", "never"), default="auto")
-    run.add_argument("--print-plan", action="store_true", help=argparse.SUPPRESS)
+    add_standard_xprof_arguments(parser)
 
-    profiling = parser.add_argument_group("profiling")
-    profiling.add_argument(
-        "--xprof-dir",
-        type=Path,
-        default=None,
-        help="write an XProf trace for a bounded training-step window",
-    )
-    profiling.add_argument(
-        "--xprof-start-step",
-        type=positive_int,
-        default=None,
-        help="first 1-based step to capture; required with --xprof-dir",
-    )
-    profiling.add_argument(
-        "--xprof-steps",
-        type=positive_int,
-        default=None,
-        help="number of consecutive steps to capture; required with --xprof-dir",
-    )
-    profiling.add_argument(
-        "--diagnostic-mode",
-        action="store_true",
-        help="XProf-only execution without evaluation, diagnostics, checkpoint, or result",
-    )
-    profiling.add_argument(
-        "--omit-checkpoint",
-        action="store_true",
-        help=(
-            "non-official research only: retain final validation and metrics but omit "
-            "the parameter checkpoint"
-        ),
-    )
-
-    data = parser.add_argument_group("data")
-    data.add_argument(
-        "--data",
-        "--data-path",
-        dest="data_path",
-        type=Path,
-        default=None,
-        help="train file or directory containing discovered train/val shards",
-    )
-    data.add_argument(
-        "--train-data",
-        type=Path,
-        action="append",
-        default=[],
-        help="explicit training shard; repeat for multiple shards",
-    )
-    data.add_argument(
-        "--val-data",
-        type=Path,
-        action="append",
-        default=[],
-        help="explicit validation shard; repeat for multiple shards",
-    )
-    data.add_argument(
-        "--data-dtype",
-        choices=("uint8", "uint16", "uint32", "int32"),
-        default="uint16",
-        help="dtype for raw .bin token files",
-    )
-    data.add_argument("--val-fraction", type=float, default=0.05)
-    data.add_argument(
-        "--vocab-size", type=positive_int, default=None, help=argparse.SUPPRESS
-    )
-    data.add_argument(
-        "--dataset-id", default=None, help="stable dataset identifier for records"
-    )
-    data.add_argument(
-        "--tokenizer-id", default=None, help="stable tokenizer identifier for records"
-    )
-    data.add_argument(
-        "--data-format",
-        choices=("auto", "raw", "llmc"),
-        default="auto",
-        help="raw binaries or llm.c 256-int-header shards",
-    )
-    data.add_argument(
-        "--downstream-manifest",
-        type=Path,
-        default=None,
-        help="fresh10 manifest containing domain shard paths and document spans",
-    )
-    data.add_argument(
-        "--downstream-root",
-        type=Path,
-        default=None,
-        help="directory containing shards named by --downstream-manifest",
-    )
-    data.add_argument(
-        "--downstream-data",
-        action="append",
-        default=[],
-        metavar="DOMAIN=PATH",
-        help="standalone downstream document; repeat paths and domains as needed",
-    )
+    add_standard_data_arguments(parser)
 
     optim = parser.add_argument_group("optimization")
     optim.add_argument(
@@ -979,12 +870,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="research override for the global sequence batch",
     )
-    optim.add_argument(
-        "--peak-tflops",
-        type=float,
-        default=None,
-        help="hardware bf16 peak for the whole mesh; enables an MFU estimate",
-    )
+    add_standard_reporting_arguments(optim)
     return parser
 
 
@@ -1002,40 +888,9 @@ def validate_args(args: argparse.Namespace) -> ExperimentProfile:
         not math.isfinite(args.base_learning_rate) or args.base_learning_rate <= 0.0
     ):
         raise ValueError("--base-learning-rate must be finite and positive")
-    if not 0.0 < args.val_fraction < 1.0:
-        raise ValueError("--val-fraction must be between 0 and 1")
-    if args.peak_tflops is not None and (
-        not math.isfinite(args.peak_tflops) or args.peak_tflops <= 0.0
-    ):
-        raise ValueError("--peak-tflops must be positive")
-    if args.downstream_root is not None and args.downstream_manifest is None:
-        raise ValueError("--downstream-root requires --downstream-manifest")
-    if args.downstream_manifest is not None and args.downstream_data:
-        raise ValueError(
-            "--downstream-manifest and --downstream-data are mutually exclusive"
-        )
-    xprof_window_args = (args.xprof_start_step, args.xprof_steps)
-    if args.xprof_dir is None:
-        if any(value is not None for value in xprof_window_args):
-            raise ValueError("--xprof-start-step and --xprof-steps require --xprof-dir")
-        if args.diagnostic_mode:
-            raise ValueError("--diagnostic-mode requires --xprof-dir")
-    elif any(value is None for value in xprof_window_args):
-        raise ValueError(
-            "--xprof-dir requires both --xprof-start-step and --xprof-steps"
-        )
-    if args.omit_checkpoint and args.diagnostic_mode:
-        raise ValueError(
-            "--omit-checkpoint and --diagnostic-mode are mutually exclusive"
-        )
-    if args.omit_checkpoint and selected_profile(args) != "dev":
-        raise ValueError("--omit-checkpoint is restricted to development research runs")
-    if args.diagnostic_mode and (
-        args.downstream_manifest is not None or args.downstream_data
-    ):
-        raise ValueError(
-            "--diagnostic-mode cannot be combined with downstream evaluation data"
-        )
+    validate_standard_data_arguments(args)
+    validate_standard_reporting_arguments(args)
+    validate_standard_xprof_arguments(args, profile=selected_profile(args))
     return experiment
 
 
