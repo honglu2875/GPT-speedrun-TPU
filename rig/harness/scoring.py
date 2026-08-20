@@ -5,54 +5,53 @@ from __future__ import annotations
 import math
 from typing import Any, Iterable, Mapping, Sequence
 
+from ..cohort import CohortError, validate_cohort
+
 
 def rank_records(
     records: Iterable[Mapping[str, Any]],
     *,
-    track: str,
+    cohort_id: str | None = None,
     profile: str | None = None,
-    target_loss: float | None = None,
     best_per_recipe: bool = True,
 ) -> list[dict[str, Any]]:
-    """Rank qualifying, comparable records using the track's canonical score."""
-
-    if target_loss is not None and not _finite_nonnegative(target_loss):
-        raise ValueError("target_loss must be finite and non-negative")
+    """Rank full, qualifying records from exactly one explicit cohort."""
 
     candidates: list[dict[str, Any]] = []
+    observed_cohorts: set[str] = set()
     for source in records:
         record = dict(source)
-        if record.get("status") != "ok" or record.get("track") != track:
+        if record.get("status") != "ok" or record.get("run_kind") != "full":
             continue
         if profile is not None and record.get("profile") != profile:
             continue
+        cohort = record.get("cohort")
+        if not isinstance(cohort, Mapping):
+            continue
+        try:
+            checked_cohort = validate_cohort(cohort)
+        except CohortError:
+            continue
+        current_cohort = checked_cohort["cohort_id"]
+        if record.get("cohort_id") != current_cohort:
+            continue
+        observed_cohorts.add(current_cohort)
+        if cohort_id is not None and current_cohort != cohort_id:
+            continue
         train_seconds = record.get("metrics", {}).get("train_seconds")
-        tokens = record.get("metrics", {}).get("tokens_processed")
-        validation_loss = record.get("metrics", {}).get("validation_loss")
-        if target_loss is None:
-            if not bool(record.get("qualified")):
-                continue
-        elif (
-            not _finite_nonnegative(validation_loss)
-            or float(validation_loss) > target_loss
-        ):
+        if not bool(record.get("qualified")):
             continue
         if not _finite_nonnegative(train_seconds):
             continue
-        if track == "sample_efficiency" and not _positive_int(tokens):
-            continue
-        if track not in ("open", "sample_efficiency"):
-            raise ValueError(f"unknown track: {track!r}")
         candidates.append(record)
+
+    if cohort_id is None and len(observed_cohorts) > 1:
+        raise ValueError(
+            "records span multiple cohorts; select one cohort_id before ranking"
+        )
 
     def key(record: Mapping[str, Any]) -> tuple[Any, ...]:
         seconds = float(record["metrics"]["train_seconds"])
-        if track == "sample_efficiency":
-            return (
-                int(record["metrics"]["tokens_processed"]),
-                seconds,
-                record["run_id"],
-            )
         return (seconds, record["run_id"])
 
     candidates.sort(key=key)
@@ -72,7 +71,10 @@ def rank_records(
 
 
 def render_leaderboard(
-    records: Sequence[Mapping[str, Any]], *, track: str, color: bool = False
+    records: Sequence[Mapping[str, Any]],
+    *,
+    cohort_id: str | None = None,
+    color: bool = False,
 ) -> str:
     """Return a compact terminal table; callers decide whether ANSI is suitable."""
 
@@ -101,7 +103,8 @@ def render_leaderboard(
             for i, value in enumerate(row)
         )
 
-    title = f"{track.replace('_', ' ').title()} leaderboard"
+    cohort_label = cohort_id[:12] if cohort_id else "unselected"
+    title = f"Cohort {cohort_label} leaderboard"
     if color:
         title = f"\x1b[1;36m{title}\x1b[0m"
     divider = "  ".join("─" * width for width in widths)

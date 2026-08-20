@@ -97,6 +97,12 @@ def config_float(value: Any, label: str) -> float:
     return result
 
 
+def config_bool(value: Any, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"config.yaml {label} must be true or false; got {value!r}")
+    return value
+
+
 def config_choice(value: Any, label: str, choices: Sequence[str]) -> str:
     if not isinstance(value, str) or value not in choices:
         raise ValueError(

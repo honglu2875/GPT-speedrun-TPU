@@ -14,10 +14,15 @@ import subprocess
 import sys
 from typing import Any, Callable, Iterable, Sequence
 
+from .arguments import (
+    CHECKPOINT_POLICIES as _CHECKPOINT_POLICIES,
+    COLORS as _COLORS,
+    PROFILES as _PROFILES,
+    build_parser,
+)
 from .harness import (
     HarnessError,
     normalize_run_name,
-    ReferenceContract,
     RunConfig,
     load_records,
     rank_records,
@@ -25,6 +30,8 @@ from .harness import (
     run_recipe,
     verify_run,
 )
+from .cohort import CohortError, build_cohort, validate_cohort
+from .plan import resolve_recipe_plan
 from .harness.cluster import (
     ClusterError,
     ClusterInventory,
@@ -67,11 +74,10 @@ from .data_routing import (
     SCALED_CACHE_SUBDIRECTORY,
     dataset_names,
     named_preparation_route,
-    preparation_route,
     resolve_preparation_manifest,
+    smoke_preparation_route,
 )
 from .doctor import (
-    data_selection,
     doctor_ok,
     environment_checks,
     render_doctor,
@@ -82,24 +88,12 @@ from .report import build_report, export_study
 
 
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-_TRACKS = ("open", "sample_efficiency")
-_PROFILES = ("smoke", "dev", "official")
-_TIERS = ("60m", "125m", "250m", "500m", "1b")
 # What happens to model weights. Deliberately named for the decision rather
 # than the outcome, so future options (a checkpointing frequency, keeping the
 # last N) extend this axis instead of adding another flag beside it.
-# Flags removed from the surface. Kept only so their removal is explained at
-# the point of use rather than by a confusing error from the trainer.
-_RETIRED_FLAGS = {
-    "--checkpoints": "--checkpoint-policy {always,qualifying,none}",
-    "--omit-checkpoint": "--checkpoint-policy none",
-}
-_CHECKPOINT_POLICIES = ("always", "qualifying", "none")
 
 
-def _checkpoint_policy(
-    args: argparse.Namespace, fallback: str, *, track: str, profile: str
-) -> str:
+def _checkpoint_policy(args: argparse.Namespace, fallback: str, *, profile: str) -> str:
     """Resolve the policy from the flag, falling back to saved settings.
 
     A saved default of ``none`` means "do not keep sweep weights", which is
@@ -117,22 +111,18 @@ def _checkpoint_policy(
             f"unknown checkpoint policy {chosen!r}; expected one of "
             + ", ".join(_CHECKPOINT_POLICIES)
         )
-    if explicit is None and chosen == "none" and not _is_research_run(track, profile):
+    if explicit is None and chosen == "none" and not _is_research_run(profile):
         return "qualifying"
     return chosen
 
 
-def _is_research_run(track: str, profile: str) -> bool:
+def _is_research_run(profile: str) -> bool:
     """Whether weights may be skipped entirely for this run."""
 
-    return track == "open" and profile == "dev"
+    return profile == "dev"
 
 
-_COLORS = ("auto", "always", "never")
 OFFICIAL_TARGET_LOSS = 3.28
-# Legacy v1 calibration fallback used only when re-verifying an old record that
-# did not capture its token constraint. New family runs record their own horizon.
-OFFICIAL_OPEN_TRAINING_TOKENS = 624_984_064
 _CLUSTER_WORKER_ENV = "RIG_CLUSTER_WORKER"
 _CONTROLLER_HOST_ENV = "RIG_CONTROLLER_HOSTNAME"
 _DISTRIBUTED_ENV = "RIG_DISTRIBUTED"
@@ -181,338 +171,10 @@ class Style:
         print(f"  {self.text('→', 'cyan')} {value}", flush=True)
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="rig",
-        description="Prepare, run, and score single-entry JAX trainers on TPU v4 slices.",
-    )
-    parser.add_argument("--version", action="version", version="%(prog)s 0.1.0")
-    commands = parser.add_subparsers(dest="command", required=True)
-
-    prepare = commands.add_parser(
-        "prepare",
-        help="interactive machine, cache, and personal-default setup",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    prepare.add_argument(
-        "--path", type=Path, help="exact dataset cache root (for example shm/)"
-    )
-    prepare.add_argument(
-        "--profile", choices=_PROFILES, help="dataset profile to prepare"
-    )
-    prepare.add_argument(
-        "--artifacts", type=Path, help="persistent run artifact directory"
-    )
-    prepare.add_argument(
-        "--tpu-vm-count",
-        type=_positive_int,
-        help="number of TPU VM hosts participating in one JAX job",
-    )
-    prepare.add_argument(
-        "--tpu-vm-hosts",
-        help="pdsh expression containing every TPU VM host",
-    )
-    prepare.add_argument("--track", choices=_TRACKS, help="default competition track")
-    prepare.add_argument("--run-profile", choices=_PROFILES, help="default run profile")
-    prepare.add_argument(
-        "--checkpoint-policy",
-        choices=_CHECKPOINT_POLICIES,
-        help="default checkpoint policy for runs",
-    )
-    prepare.add_argument("--cluster", help="named cluster profile from .rig.toml")
-    prepare.add_argument("--color", choices=_COLORS, help="terminal color preference")
-    prepare.add_argument(
-        "--target-loss",
-        type=_nonnegative_float,
-        help="default qualification target for smoke/development runs only",
-    )
-    prepare.add_argument(
-        "--training-tokens",
-        type=_positive_int,
-        help=(
-            "corpus capacity to prepare and use for non-smoke runs: official "
-            "routes through 900M to classic, through 1.9B/3.9B/7.9B/74.9B "
-            "to 2B/4B/8B/hero"
-        ),
-    )
-    prepare.add_argument(
-        "--train-shards", type=_positive_int, help="override train shard count"
-    )
-    prepare.add_argument("--offline", action="store_true", help="forbid network access")
-    prepare.add_argument(
-        "--check-only", action="store_true", help="verify without mutation"
-    )
-    prepare.add_argument(
-        "--force", action="store_true", help="replace invalid cached shards"
-    )
-    prepare.add_argument(
-        "--timeout",
-        type=_positive_float,
-        default=60.0,
-        help="per-request network timeout",
-    )
-    prepare.add_argument(
-        "--non-interactive", action="store_true", help="use flags/current defaults"
-    )
-    prepare.add_argument(
-        "--yes", action="store_true", help="accept defaults and run non-interactively"
-    )
-    prepare.add_argument(
-        "--no-doctor", action="store_true", help="skip environment diagnostics"
-    )
-    prepare.add_argument(
-        "--no-download", action="store_true", help="save settings without data work"
-    )
-    prepare.add_argument(
-        "--ship-data",
-        action="store_true",
-        help="copy this host's prepared corpus to the peers instead of "
-        "having each download it (required when peers have no internet)",
-    )
-    prepare.add_argument(
-        "--no-save", action="store_true", help="do not write .rig.toml"
-    )
-
-    doctor = commands.add_parser(
-        "doctor",
-        help="validate Python, JAX, TPU topology, storage, and cached data",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    doctor.add_argument("--path", type=Path, help="dataset cache root")
-    doctor.add_argument("--profile", choices=_PROFILES, help="data/run profile")
-    doctor.add_argument(
-        "--require-tpu",
-        action="store_true",
-        help="require the configured TPU v4 topology",
-    )
-    doctor.add_argument(
-        "--quick", action="store_true", help="skip compile/collective probe"
-    )
-    doctor.add_argument(
-        "--skip-data", action="store_true", help="skip dataset integrity scan"
-    )
-    doctor.add_argument(
-        "--training-tokens",
-        type=_positive_int,
-        help=argparse.SUPPRESS,
-    )
-    doctor.add_argument("--cluster", help="named cluster profile from .rig.toml")
-    doctor.add_argument("--color", choices=_COLORS)
-
-    run = commands.add_parser(
-        "run",
-        help="execute, validate, and record one recipe",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    run.add_argument("recipe", help="folder name beneath recipes/")
-    run.add_argument("--track", choices=_TRACKS)
-    run.add_argument("--profile", choices=_PROFILES)
-    run.add_argument("--tier", choices=_TIERS, default="125m")
-    run.add_argument(
-        "--tokens-per-parameter",
-        type=_positive_float,
-        help="research budget, rounded by the trainer to a complete global step",
-    )
-    run.add_argument(
-        "--base-learning-rate",
-        type=_positive_float,
-        help="research override for the family's transferable base learning rate",
-    )
-    run.add_argument(
-        "--study-batch-size",
-        type=_positive_int,
-        help="research-only global batch override",
-    )
-    run.add_argument(
-        "--early-stopping-step",
-        type=_positive_int,
-        help=(
-            "stop after this optimizer step while keeping the full schedule; "
-            "requires --tokens-per-parameter"
-        ),
-    )
-    run.add_argument(
-        "--name",
-        help=(
-            "short label folded into the run directory name; prompted for when "
-            "omitted on a terminal"
-        ),
-    )
-    run.add_argument("--data-path", type=Path)
-    run.add_argument("--seed", type=_nonnegative_int, default=1337)
-    run.add_argument("--target-loss", type=_nonnegative_float)
-    run.add_argument(
-        "--timeout", type=_positive_float, help="whole-process timeout in seconds"
-    )
-    run.add_argument(
-        "--checkpoint-policy",
-        choices=_CHECKPOINT_POLICIES,
-        help="always keep weights, keep only when qualifying, or never write them",
-    )
-    run.add_argument("--cluster", help="named cluster profile from .rig.toml")
-    run.add_argument("--color", choices=_COLORS)
-    run.add_argument("--skip-data-check", action="store_true")
-    run.add_argument("--study-id", help=argparse.SUPPRESS)
-    run.add_argument("--study-point", help=argparse.SUPPRESS)
-    run.add_argument("--study-suite-sha256", help=argparse.SUPPRESS)
-
-    profile = commands.add_parser(
-        "profile",
-        help="capture a bounded XProf trace from a distributed recipe",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    profile.add_argument(
-        "recipe", nargs="?", default="reference", help="folder name beneath recipes/"
-    )
-    profile.add_argument("--profile", choices=_PROFILES, help="saved profile override")
-    profile.add_argument("--tier", choices=_TIERS, default="125m")
-    profile.add_argument("--data-path", type=Path, help="dataset cache root override")
-    profile.add_argument("--output-dir", type=Path, required=True)
-    profile.add_argument("--steps", type=_positive_int, default=100)
-    profile.add_argument("--xprof-start-step", type=_positive_int, default=11)
-    profile.add_argument("--xprof-steps", type=_positive_int, default=10)
-    profile.add_argument("--seed", type=_nonnegative_int, default=1337)
-    profile.add_argument("--timeout", type=_positive_float, default=7200.0)
-    profile.add_argument("--cluster", help="named cluster profile from .rig.toml")
-    profile.add_argument("--color", choices=_COLORS)
-
-    verify = commands.add_parser(
-        "verify", help="re-validate a captured run and checkpoint"
-    )
-    verify.add_argument("run", help="run ID or path")
-    verify.add_argument("--track", choices=_TRACKS)
-    verify.add_argument("--profile", choices=_PROFILES)
-
-    dataset = commands.add_parser(
-        "dataset",
-        help="prepare and distribute named corpora, independently of settings",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    dataset_actions = dataset.add_subparsers(dest="dataset_command", required=True)
-    dataset_actions.add_parser("list", help="show every corpus and whether it is here")
-    dataset_prepare = dataset_actions.add_parser(
-        "prepare", help="download and verify one corpus by name"
-    )
-    dataset_prepare.add_argument("name", help="corpus name, for example hero")
-    dataset_prepare.add_argument(
-        "--shards",
-        type=_positive_int,
-        help="train shards to fetch; omit for the whole corpus",
-    )
-    dataset_prepare.add_argument("--path", type=Path, help="cache root override")
-    dataset_prepare.add_argument("--offline", action="store_true")
-    dataset_prepare.add_argument("--force", action="store_true")
-    dataset_prepare.add_argument("--check-only", action="store_true")
-    dataset_prepare.add_argument("--timeout", type=_positive_float, default=60.0)
-    dataset_prepare.add_argument("--color", choices=_COLORS)
-    dataset_ship = dataset_actions.add_parser(
-        "ship", help="copy a prepared corpus to a cluster that cannot download it"
-    )
-    dataset_ship.add_argument("name", help="corpus name, for example hero")
-    dataset_ship.add_argument("--cluster", help="target cluster profile")
-    dataset_ship.add_argument("--color", choices=_COLORS)
-    dataset_status = dataset_actions.add_parser(
-        "status", help="report which corpora are present here and on a cluster"
-    )
-    dataset_status.add_argument("--cluster", help="also check this cluster's hosts")
-    dataset_status.add_argument("--color", choices=_COLORS)
-
-    leaderboard = commands.add_parser(
-        "leaderboard", help="render recorded qualifying scores"
-    )
-    leaderboard.add_argument("--track", choices=_TRACKS)
-    leaderboard.add_argument("--profile", choices=_PROFILES, default="official")
-    leaderboard.add_argument("--target-loss", type=_nonnegative_float)
-    leaderboard.add_argument("--all-recipes", action="store_true")
-    leaderboard.add_argument("--color", choices=_COLORS)
-
-    report = commands.add_parser(
-        "report",
-        help="build a self-contained HTML comparison of completed run logs",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    report.add_argument(
-        "--runs", type=Path, default=Path("runs"), help="run log directory"
-    )
-    report.add_argument(
-        "--output",
-        type=Path,
-        default=Path("report.html"),
-        help="standalone HTML destination",
-    )
-    report.add_argument(
-        "--layer-snapshots",
-        type=_nonnegative_int,
-        default=1_400,
-        help=(
-            "recorded steps kept per layer-snapshot chart; 0 keeps every "
-            "recorded step and 1400 is the default, matching --max-points so "
-            "no series in a file sits at a different fidelity than another"
-        ),
-    )
-    report.add_argument(
-        "--max-points",
-        type=_nonnegative_int,
-        default=1_400,
-        help=(
-            "embedded points per run and series; 0 embeds every recorded "
-            "sample. The default keeps these files portable; the lossless "
-            "originals are in the dataset repository, and thinning here "
-            "cannot be undone by zooming"
-        ),
-    )
-    report.add_argument("--color", choices=_COLORS, help="terminal color preference")
-    report.add_argument(
-        "--study-export-target",
-        type=Path,
-        default=None,
-        help=(
-            "instead of rendering HTML, lay the runs out as a study folder "
-            "under this path, in the layout the dataset repository uses"
-        ),
-    )
-    report.add_argument(
-        "--study-name",
-        default=None,
-        help="folder name for --study-export-target; required with it",
-    )
-    report.add_argument(
-        "--select",
-        help=(
-            "regular expression matched against the run id; plot only those. "
-            "One line of research per report, so a family can be crystallized "
-            "into a page and its logs cleared without disturbing runs still in "
-            "flight"
-        ),
-    )
-
-    clone = commands.add_parser(
-        "clone", help="clone one recipe into a new algorithm folder"
-    )
-    clone.add_argument("source", nargs="?", default="reference")
-    clone.add_argument("name")
-
-    settings = commands.add_parser("settings", help="show resolved local preferences")
-    settings.add_argument("--json", action="store_true")
-    return parser
-
-
 def main(argv: Iterable[str] | None = None) -> int:
     parser = build_parser()
     arguments = list(argv) if argv is not None else sys.argv[1:]
-    args, unknown = parser.parse_known_args(arguments)
-    if unknown and args.command != "run":
-        parser.error("unrecognized arguments: " + " ".join(unknown))
-    # Unknown arguments are legal only for `run`; conventionally they follow
-    # `--`, but parse_known_args also makes common direct flags ergonomic.
-    # That forwarding hides retired flags: they stop being rig's problem and
-    # resurface as an unrelated argparse error from the trainer, naming a flag
-    # the user typed correctly a day earlier. Name them here instead.
-    for flag in unknown:
-        replacement = _RETIRED_FLAGS.get(flag.split("=", 1)[0])
-        if replacement:
-            parser.error(f"{flag.split('=', 1)[0]} was replaced by {replacement}")
-    args.trainer_args = unknown if args.command == "run" else []
+    args = parser.parse_args(arguments)
     try:
         if args.command == "prepare":
             return command_prepare(args)
@@ -565,6 +227,16 @@ def _work_runs_elsewhere(config: LocalConfig) -> bool:
 def command_prepare(args: argparse.Namespace) -> int:
     root = repo_root()
     current = load_config(root, cluster=getattr(args, "cluster", None))
+    train_shards_override = args.train_shards
+    if (
+        args.dataset is not None
+        and args.dataset != current.dataset
+        and train_shards_override is None
+    ):
+        # A prefix count belongs to one manifest. Selecting another corpus
+        # without an explicit count means that corpus's full published prefix,
+        # not the previous corpus's coincidentally numbered prefix.
+        train_shards_override = 0
     proposed = with_overrides(
         current,
         {
@@ -577,11 +249,11 @@ def command_prepare(args: argparse.Namespace) -> int:
             "tpu_vm_hosts": args.tpu_vm_hosts,
             "data_profile": args.profile,
             "default_profile": args.run_profile,
-            "default_track": args.track,
             "checkpoint_retention": args.checkpoint_policy,
             "color": args.color,
             "target_loss": args.target_loss,
-            "training_tokens": args.training_tokens,
+            "dataset": args.dataset,
+            "train_shards": train_shards_override,
         },
     )
     interactive = not (args.non_interactive or args.yes)
@@ -607,17 +279,12 @@ def command_prepare(args: argparse.Namespace) -> int:
     data_path = resolve_path(proposed.data_path, root)
     artifacts_path = resolve_path(proposed.artifacts_path, root)
     _ensure_artifacts_inside_repo(artifacts_path, root)
-    route = preparation_route(proposed.data_profile, proposed.training_tokens)
-    if route.is_scaled and args.train_shards is not None:
-        raise ConfigError(
-            "--train-shards cannot truncate a budget-selected scaled dataset; "
-            "choose a smaller --training-tokens budget instead"
-        )
+    route = _route_for_config(proposed, proposed.data_profile)
     route_root = route.data_root(data_path)
     route_manifest = (
         resolve_preparation_manifest(route) if data_work else route.manifest
     )
-    style.note(route.summary(proposed.training_tokens))
+    style.note(route.summary())
     if route.is_scaled:
         style.note(f"scaled shards use the dedicated cache {route_root}")
     if args.check_only and save:
@@ -650,7 +317,7 @@ def command_prepare(args: argparse.Namespace) -> int:
                 expected_process_count=_expected_process_count(proposed),
                 accelerator=proposed.accelerator,
                 chips_per_host=proposed.chips_per_host,
-                training_tokens=proposed.training_tokens,
+                route=route,
                 check_data=args.check_only and not route.is_scaled,
                 compile_probe=True,
             )
@@ -670,7 +337,7 @@ def command_prepare(args: argparse.Namespace) -> int:
         _run_cluster_prepare(proposed, args, inventory, root=root)
     else:
         style.heading("Dataset cache")
-        shards = args.train_shards or route.train_shards
+        shards = route.train_shards
         if args.check_only:
             prepared = verify_dataset(route_manifest, route_root, train_shards=shards)
         else:
@@ -722,7 +389,6 @@ def command_prepare(args: argparse.Namespace) -> int:
 def command_doctor(args: argparse.Namespace) -> int:
     config = load_config(cluster=getattr(args, "cluster", None))
     profile = args.profile or config.default_profile
-    training_tokens = args.training_tokens or config.training_tokens
     path = resolve_path(args.path or config.data_path)
     color = args.color or config.color
     if _work_runs_elsewhere(config) and not _is_cluster_worker():
@@ -753,7 +419,7 @@ def command_doctor(args: argparse.Namespace) -> int:
             expected_process_count=_expected_process_count(config),
             accelerator=config.accelerator,
             chips_per_host=config.chips_per_host,
-            training_tokens=training_tokens,
+            route=_route_for_config(config, _runtime_data_profile(profile)),
             check_data=not args.skip_data,
             compile_probe=not args.quick,
         )
@@ -766,10 +432,49 @@ def command_doctor(args: argparse.Namespace) -> int:
     return 0 if healthy else 1
 
 
+def _recipe_entry(root: Path, recipe: str) -> tuple[Path, Path, Path]:
+    """Resolve one recipe's two required files without permitting path traversal."""
+
+    if not _NAME.fullmatch(recipe):
+        raise ConfigError(
+            "recipe names may contain only letters, digits, '.', '_' and '-'"
+        )
+    recipes_root = (root / "recipes").resolve()
+    recipe_dir = (recipes_root / recipe).resolve()
+    try:
+        recipe_dir.relative_to(recipes_root)
+    except ValueError as exc:
+        raise ConfigError("recipe path escapes recipes directory") from exc
+    trainer = recipe_dir / "train.py"
+    experiment_config = recipe_dir / "config.yaml"
+    if not trainer.is_file() or trainer.is_symlink():
+        raise ConfigError(f"recipe entry script not found: {trainer}")
+    if not experiment_config.is_file() or experiment_config.is_symlink():
+        raise ConfigError(f"recipe configuration file not found: {experiment_config}")
+    return recipe_dir, trainer, experiment_config
+
+
+def _scientific_trainer_args(args: argparse.Namespace, profile: str) -> list[str]:
+    """Translate the deliberately small public research surface to a recipe."""
+
+    result = ["--profile", profile]
+    optional = (
+        ("--tier", getattr(args, "tier", None)),
+        ("--context", getattr(args, "context", None)),
+        ("--tokens-per-parameter", getattr(args, "tokens_per_parameter", None)),
+        ("--base-learning-rate", getattr(args, "base_learning_rate", None)),
+        ("--batch-size", getattr(args, "batch_size", None)),
+        ("--stop-after-step", getattr(args, "stop_after_step", None)),
+    )
+    for flag, value in optional:
+        if value is not None:
+            result.extend((flag, str(value)))
+    return result
+
+
 def command_run(args: argparse.Namespace) -> int:
     config = load_config(cluster=getattr(args, "cluster", None))
     root = repo_root()
-    track = args.track or config.default_track
     profile = args.profile or config.default_profile
     color = args.color or config.color
     style = Style(color)
@@ -778,7 +483,21 @@ def command_run(args: argparse.Namespace) -> int:
     run_name = _resolve_run_name(args, style)
     trainer_color = "always" if style.enabled else "never"
     target_loss = _effective_target_loss(
-        profile, requested=args.target_loss, development_default=config.target_loss
+        profile, requested=None, development_default=config.target_loss
+    )
+    recipe_dir, trainer, experiment_config = _recipe_entry(root, args.recipe)
+    scientific_args = _scientific_trainer_args(args, profile)
+    python_executable = root / ".venv" / "bin" / "python"
+    style.heading("Resolving recipe plan")
+    plan = resolve_recipe_plan(
+        python_executable=python_executable,
+        trainer=trainer,
+        arguments=("--config", str(experiment_config), *scientific_args),
+        cwd=recipe_dir,
+    )
+    style.ok(
+        f"{plan.payload['tier']}: {plan.payload['schedule_steps']:,} schedule steps, "
+        f"{plan.expected_tokens:,} executed tokens ({plan.run_kind})"
     )
     configured_data_path = str(args.data_path or config.data_path)
     if _work_runs_elsewhere(config):
@@ -788,11 +507,11 @@ def command_run(args: argparse.Namespace) -> int:
     _ensure_artifacts_inside_repo(artifacts, root)
     if profile == "official" and args.skip_data_check:
         raise ConfigError("official runs require full dataset SHA-256 verification")
-    # A profile controls runtime/evaluation policy.  The saved preparation
-    # budget controls which immutable FineWeb prefix backs non-smoke runs.
+    # A profile controls runtime/evaluation policy. The saved dataset name and
+    # shard prefix control which immutable FineWeb corpus backs non-smoke runs.
     # Keeping those axes separate lets a short dev study consume the same
     # rank-disjoint corpus as the eventual official family run.
-    run_data_profile = "smoke" if profile == "smoke" else config.data_profile
+    run_data_profile = _runtime_data_profile(profile)
     route = _route_for_config(config, run_data_profile)
     _require_prepared_dataset(
         config, route, data_path, cluster=getattr(args, "cluster", None)
@@ -850,9 +569,8 @@ def command_run(args: argparse.Namespace) -> int:
     dataset_id, tokenizer_id = _data_identity(
         run_data_profile, prepared_name=prepared.name
     )
-    passthrough = [
-        "--tier",
-        args.tier,
+    trainer_args = [
+        *scientific_args,
         "--data-format",
         "llmc",
         "--dataset-id",
@@ -862,40 +580,25 @@ def command_run(args: argparse.Namespace) -> int:
         "--color",
         trainer_color,
     ]
-    if args.tokens_per_parameter is not None:
-        passthrough.extend(("--tokens-per-parameter", str(args.tokens_per_parameter)))
-    if args.base_learning_rate is not None:
-        passthrough.extend(("--base-learning-rate", str(args.base_learning_rate)))
-    if args.study_batch_size is not None:
-        passthrough.extend(("--study-batch-size", str(args.study_batch_size)))
-    if args.early_stopping_step is not None:
-        passthrough.extend(("--early-stopping-step", str(args.early_stopping_step)))
     for train_file in prepared.train_files:
-        passthrough.extend(("--train-data", str(train_file)))
+        trainer_args.extend(("--train-data", str(train_file)))
     for validation_file in prepared.validation_files:
-        passthrough.extend(("--val-data", str(validation_file)))
+        trainer_args.extend(("--val-data", str(validation_file)))
     if fresh10 is not None:
-        passthrough.extend(("--downstream-manifest", str(fresh10.manifest_path)))
-        passthrough.extend(("--downstream-root", str(fresh10.root)))
-    forwarded = list(args.trainer_args)
-    if forwarded and forwarded[0] == "--":
-        forwarded.pop(0)
-    _reject_reserved_trainer_args(forwarded)
-    passthrough.extend(forwarded)
+        trainer_args.extend(("--downstream-manifest", str(fresh10.manifest_path)))
+        trainer_args.extend(("--downstream-root", str(fresh10.root)))
     timeout = (
         args.timeout or {"smoke": 300.0, "dev": 3600.0, "official": 21600.0}[profile]
     )
-    policy = _checkpoint_policy(
-        args, config.checkpoint_retention, track=track, profile=profile
-    )
-    if policy == "none" and not _is_research_run(track, profile):
+    policy = _checkpoint_policy(args, config.checkpoint_retention, profile=profile)
+    if policy == "none" and not _is_research_run(profile):
         raise ConfigError(
-            "--checkpoint-policy none is restricted to open/dev research runs"
+            "--checkpoint-policy none is restricted to development research runs"
         )
     if policy == "none":
         # Skip writing rather than write-then-delete. Nothing reads the weights
         # between those two points, so a 500M run would spend ~2 GB for nothing.
-        passthrough.append("--omit-checkpoint")
+        trainer_args.append("--omit-checkpoint")
     retention = policy
     study_values = (args.study_id, args.study_point, args.study_suite_sha256)
     if any(value is not None for value in study_values) and not all(
@@ -912,17 +615,24 @@ def command_run(args: argparse.Namespace) -> int:
         r"[0-9a-f]{64}", args.study_suite_sha256
     ):
         raise ConfigError("study suite SHA-256 must be 64 lowercase hexadecimal digits")
-    reference = (
-        _reference_contract(
-            profile,
-            tier=args.tier,
-            dataset_id=dataset_id,
-            tokenizer_id=tokenizer_id,
-        )
-        if track == "sample_efficiency"
-        else None
+    provenance = _data_provenance(
+        prepared,
+        profile=run_data_profile,
+        integrity="headers+size" if args.skip_data_check else "sha256",
+        repo=root,
+        fresh10=fresh10,
     )
-    style.banner(f"run / {track} / {profile}")
+    cohort = build_cohort(
+        plan=plan,
+        dataset_id=dataset_id,
+        tokenizer_id=tokenizer_id,
+        dataset_provenance=provenance,
+        accelerator=config.accelerator,
+        tpu_vm_count=config.tpu_vm_count,
+        chips_per_host=config.chips_per_host,
+        target_loss=target_loss,
+    )
+    style.banner(f"run / {profile} / {plan.run_kind}")
     outcome = run_recipe(
         RunConfig(
             repo_root=root,
@@ -930,12 +640,12 @@ def command_run(args: argparse.Namespace) -> int:
             name=run_name,
             runs_dir=artifacts,
             records_path=artifacts / "records.jsonl",
-            track=track,
+            plan=plan.as_dict(),
+            cohort=cohort,
             profile=profile,
             seed=args.seed,
             timeout_seconds=timeout,
             target_loss=target_loss,
-            expected_training_tokens=None,
             expected_validation_tokens=(
                 prepared.validation_prefix_tokens if profile == "official" else None
             ),
@@ -944,21 +654,15 @@ def command_run(args: argparse.Namespace) -> int:
                 if fresh10 is not None
                 else None
             ),
-            passthrough_args=tuple(passthrough),
-            reference_contract=reference,
+            trainer_args=tuple(trainer_args),
             checkpoint_retention=retention,
+            python_executable=str(python_executable),
             remote_controller=config.remote_controller,
             artifact_host=artifact_target,
             artifact_hostname=artifact_hostname,
             environment={},
             provenance={
-                **_data_provenance(
-                    prepared,
-                    profile=run_data_profile,
-                    integrity="headers+size" if args.skip_data_check else "sha256",
-                    repo=root,
-                    fresh10=fresh10,
-                ),
+                **provenance,
                 "cluster": {
                     "tpu_vm_count": config.tpu_vm_count,
                     "tpu_vm_hosts": config.tpu_vm_hosts,
@@ -1003,6 +707,8 @@ def command_run(args: argparse.Namespace) -> int:
                 f"ppl {float(fresh['macro_perplexity']):.2f}"
             )
     print(f"  run {outcome.run_id}\n")
+    if cohort is not None:
+        print(f"  cohort {cohort['cohort_id']}\n")
     return 0
 
 
@@ -1014,33 +720,33 @@ def command_profile(args: argparse.Namespace) -> int:
         raise ConfigError("no saved default profile found; run `make prepare` first")
     config = load_config(root, cluster=getattr(args, "cluster", None))
     profile = args.profile or config.default_profile
+    if profile == "smoke":
+        raise ConfigError("XProf capture requires a fixed-TPP dev or official profile")
     color = args.color or config.color
     style = Style(color)
-    if args.xprof_start_step + args.xprof_steps - 1 > args.steps:
-        raise ConfigError("the XProf capture window must fit inside --steps")
-
-    if not _NAME.fullmatch(args.recipe):
-        raise ConfigError(
-            "recipe names may contain only letters, digits, '.', '_' and '-'"
-        )
-    recipes_root = (root / "recipes").resolve()
-    recipe_dir = (recipes_root / args.recipe).resolve()
-    try:
-        recipe_dir.relative_to(recipes_root)
-    except ValueError as exc:
-        raise ConfigError("recipe path escapes recipes directory") from exc
-    trainer = recipe_dir / "train.py"
-    experiment_config = recipe_dir / "config.yaml"
-    if not trainer.is_file() or trainer.is_symlink():
-        raise ConfigError(f"recipe entry script not found: {trainer}")
-    if not experiment_config.is_file() or experiment_config.is_symlink():
-        raise ConfigError(f"recipe configuration file not found: {experiment_config}")
+    recipe_dir, trainer, experiment_config = _recipe_entry(root, args.recipe)
+    scientific_args = _scientific_trainer_args(args, profile)
+    python_executable = root / ".venv" / "bin" / "python"
+    plan = resolve_recipe_plan(
+        python_executable=python_executable,
+        trainer=trainer,
+        arguments=(
+            "--config",
+            str(experiment_config),
+            *scientific_args,
+            "--diagnostic-mode",
+        ),
+        cwd=recipe_dir,
+    )
+    final_step = int(plan.payload["stop_after_step"] or plan.payload["schedule_steps"])
+    if args.xprof_start_step + args.xprof_steps - 1 > final_step:
+        raise ConfigError("the XProf capture window must fit inside --stop-after-step")
 
     configured_data_path = str(args.data_path or config.data_path)
     if _work_runs_elsewhere(config):
         configured_data_path = _cluster_data_argument(configured_data_path, root)
     data_path = resolve_path(configured_data_path, root)
-    run_data_profile = "smoke" if profile == "smoke" else config.data_profile
+    run_data_profile = _runtime_data_profile(profile)
     route = _route_for_config(config, run_data_profile)
     manifest = resolve_preparation_manifest(route)
     route_root = route.data_root(data_path)
@@ -1059,7 +765,7 @@ def command_profile(args: argparse.Namespace) -> int:
     )
     trainer_color = "always" if style.enabled else "never"
     trainer_command = [
-        str(root / ".venv" / "bin" / "python"),
+        str(python_executable),
         str(trainer),
         "--config",
         str(experiment_config),
@@ -1067,20 +773,7 @@ def command_profile(args: argparse.Namespace) -> int:
         str(output_dir),
         "--seed",
         str(args.seed),
-        "--track",
-        config.default_track,
-        "--profile",
-        profile,
-        "--tier",
-        args.tier,
-        "--steps",
-        str(args.steps),
-        "--val-every",
-        "0",
-        "--diagnostics-every",
-        "0",
-        "--log-every",
-        str(args.steps),
+        *scientific_args,
         "--data-format",
         "llmc",
         "--dataset-id",
@@ -1100,8 +793,7 @@ def command_profile(args: argparse.Namespace) -> int:
             str(args.xprof_start_step),
             "--xprof-steps",
             str(args.xprof_steps),
-            "--no-final-validation",
-            "--no-checkpoint",
+            "--diagnostic-mode",
             "--color",
             trainer_color,
         )
@@ -1175,42 +867,8 @@ def command_verify(args: argparse.Namespace) -> int:
     record = next(
         (item for item in reversed(records) if item.get("run_id") == run_dir.name), None
     )
-    track = args.track or (
-        str(record["track"]) if record is not None else config.default_track
-    )
     profile = args.profile or (
         str(record["profile"]) if record is not None else config.default_profile
-    )
-    recorded_contract = record.get("contract") if isinstance(record, dict) else None
-    recorded_model = (
-        recorded_contract.get("model") if isinstance(recorded_contract, dict) else None
-    )
-    recorded_tier = (
-        recorded_model.get("tier") if isinstance(recorded_model, dict) else "125m"
-    )
-    recorded_dataset = (
-        recorded_contract.get("dataset_id")
-        if isinstance(recorded_contract, dict)
-        else None
-    )
-    recorded_tokenizer = (
-        recorded_contract.get("tokenizer_id")
-        if isinstance(recorded_contract, dict)
-        else None
-    )
-    reference = (
-        _reference_contract(
-            profile,
-            tier=str(recorded_tier),
-            dataset_id=(
-                str(recorded_dataset) if recorded_dataset is not None else None
-            ),
-            tokenizer_id=(
-                str(recorded_tokenizer) if recorded_tokenizer is not None else None
-            ),
-        )
-        if track == "sample_efficiency"
-        else None
     )
     expected_downstream = (
         _recorded_downstream_tokens(record)
@@ -1219,16 +877,8 @@ def command_verify(args: argparse.Namespace) -> int:
     )
     result = verify_run(
         run_dir,
-        track=track,
-        reference_contract=reference,
         expected_training_tokens=(
-            _recorded_training_tokens(record)
-            if record is not None
-            else (
-                OFFICIAL_OPEN_TRAINING_TOKENS
-                if profile == "official" and track == "open"
-                else None
-            )
+            _recorded_training_tokens(record) if record is not None else None
         ),
         expected_validation_tokens=10_485_760 if profile == "official" else None,
         expected_downstream_tokens=expected_downstream,
@@ -1266,7 +916,7 @@ def command_verify(args: argparse.Namespace) -> int:
         else "omitted"
     )
     print(
-        f"verified {run_dir.name} ({track}/{profile}): loss={result.validation_loss:.4f}, "
+        f"verified {run_dir.name} ({profile}): loss={result.validation_loss:.4f}, "
         f"tokens={result.tokens_processed:,}, checkpoint={checkpoint_label}"
     )
     return 0
@@ -1281,7 +931,8 @@ def _dataset_presence(root: Path) -> dict[str, tuple[int, int]]:
 
     found: dict[str, tuple[int, int]] = {}
     for name in dataset_names():
-        directory = root / SCALED_CACHE_SUBDIRECTORY / name
+        route = named_preparation_route(name)
+        directory = route.data_root(root)
         if not directory.is_dir():
             continue
         files = [entry for entry in directory.iterdir() if entry.suffix == ".bin"]
@@ -1290,17 +941,20 @@ def _dataset_presence(root: Path) -> dict[str, tuple[int, int]]:
 
 
 def _route_for_config(config: LocalConfig, data_profile: str):
-    """Resolve the corpus a run should use, by name when one is configured.
+    """Resolve the explicit corpus, with smoke as the sole inline exception."""
 
-    A named dataset is authoritative: if it is absent, the run stops with the
-    command that prepares it rather than silently falling back to whichever
-    corpus the training_tokens capacity happens to select. That fallback is the
-    dangerous case -- it trains successfully on the wrong data.
-    """
+    if data_profile == "smoke":
+        return smoke_preparation_route()
+    return named_preparation_route(
+        config.dataset,
+        train_shards=config.train_shards or None,
+    )
 
-    if config.dataset and data_profile == "official":
-        return named_preparation_route(config.dataset)
-    return preparation_route(data_profile, config.training_tokens)
+
+def _runtime_data_profile(profile: str) -> str:
+    """Map an execution profile to synthetic or named immutable data."""
+
+    return "smoke" if profile == "smoke" else "official"
 
 
 def _require_prepared_dataset(
@@ -1308,11 +962,15 @@ def _require_prepared_dataset(
 ) -> None:
     """Fail with the fixing command when a named corpus is not present."""
 
-    if not config.dataset or not route.is_scaled:
-        return
-    directory = root / route.cache_subdirectory
+    directory = route.data_root(root)
     if directory.is_dir() and any(directory.glob("*.bin")):
         return
+    if route.profile == "smoke":
+        cluster_flag = f" --cluster {cluster}" if cluster else ""
+        raise ConfigError(
+            f"smoke data is not prepared at {directory}"
+            f"\n  prepare it here:  rig prepare --profile smoke{cluster_flag}"
+        )
     ship = (
         f"\n  then ship it:     rig dataset ship {config.dataset} --cluster {cluster}"
         if cluster
@@ -1327,11 +985,10 @@ def _require_prepared_dataset(
 def command_dataset(args: argparse.Namespace) -> int:
     """Prepare and distribute corpora by name, decoupled from saved settings.
 
-    Selecting a corpus through the ``training_tokens`` capacity request meant a
-    caller who wanted "hero" had to know which budget happened to select it,
-    and could not prepare data without also touching profile settings. Naming
-    the corpus removes both, and lets `rig run` report a missing dataset with
-    the command that fixes it instead of silently choosing another one.
+    Naming a corpus independently of its training horizon lets callers prepare
+    data without changing run settings, and lets `rig run` report a missing
+    dataset with the command that fixes it instead of silently choosing another
+    one.
     """
 
     config = load_config(cluster=getattr(args, "cluster", None))
@@ -1420,22 +1077,52 @@ def command_dataset(args: argparse.Namespace) -> int:
 
 def command_leaderboard(args: argparse.Namespace) -> int:
     config = load_config(cluster=getattr(args, "cluster", None))
-    track = args.track or config.default_track
     artifacts = resolve_path(config.artifacts_path)
     records = load_records(artifacts / "records.jsonl")
-    target_loss = _effective_target_loss(
-        args.profile, requested=args.target_loss, development_default=config.target_loss
-    )
-    ranked = rank_records(
-        records,
-        track=track,
-        profile=args.profile,
-        target_loss=target_loss,
-        best_per_recipe=not args.all_recipes,
-    )
     style = Style(args.color or config.color)
-    print(f"target validation loss ≤ {target_loss:.4f}\n")
-    print(render_leaderboard(ranked, track=track, color=style.enabled))
+    cohorts: dict[str, dict[str, Any]] = {}
+    for record in records:
+        if (
+            record.get("status") != "ok"
+            or record.get("run_kind") != "full"
+            or record.get("profile") != args.profile
+            or not isinstance(record.get("cohort"), dict)
+        ):
+            continue
+        try:
+            cohort = validate_cohort(record["cohort"])
+        except CohortError:
+            continue
+        cohort_id = cohort["cohort_id"]
+        if record.get("cohort_id") != cohort_id:
+            continue
+        cohorts.setdefault(cohort_id, cohort)
+    cohort_ids = sorted(cohorts)
+    if args.cohort is not None:
+        if args.cohort not in cohort_ids:
+            raise ConfigError(
+                f"no full {args.profile} records belong to cohort {args.cohort}"
+            )
+        cohort_ids = [args.cohort]
+    if not cohort_ids:
+        print(f"No cohort-tagged full {args.profile} runs.")
+        return 0
+    rendered: list[str] = []
+    for cohort_id in cohort_ids:
+        ranked = rank_records(
+            records,
+            cohort_id=cohort_id,
+            profile=args.profile,
+            best_per_recipe=not args.all_recipes,
+        )
+        cohort = cohorts[cohort_id]
+        target_loss = cohort["qualification"]["target_loss"]
+        tpp = cohort["horizon"]["target_tokens_per_parameter"]
+        rendered.append(
+            f"tier {cohort['tier']} · {tpp} TPP · target loss ≤ {target_loss}\n"
+            + render_leaderboard(ranked, cohort_id=cohort_id, color=style.enabled)
+        )
+    print("\n\n".join(rendered))
     return 0
 
 
@@ -1641,18 +1328,14 @@ def _run_cluster_prepare(
         str(config.tpu_vm_count),
         "--tpu-vm-hosts",
         config.tpu_vm_hosts,
-        "--track",
-        config.default_track,
         "--run-profile",
         config.default_profile,
         "--checkpoint-policy",
         config.checkpoint_retention,
         "--color",
         "never",
-        "--target-loss",
-        str(config.target_loss),
-        "--training-tokens",
-        str(config.training_tokens),
+        "--dataset",
+        config.dataset,
         "--timeout",
         str(args.timeout),
     ]
@@ -1661,8 +1344,8 @@ def _run_cluster_prepare(
     # the file has no active cluster, refuse to resolve one at all.
     if getattr(args, "cluster", None):
         command.extend(("--cluster", args.cluster))
-    if args.train_shards is not None:
-        command.extend(("--train-shards", str(args.train_shards)))
+    if config.train_shards:
+        command.extend(("--train-shards", str(config.train_shards)))
     if args.offline:
         command.append("--offline")
     if args.check_only:
@@ -1684,7 +1367,7 @@ def _run_cluster_prepare(
 def _remote_prepare_timeout(config: LocalConfig, args: argparse.Namespace) -> float:
     """Return a whole-peer cap distinct from the per-request HTTP timeout.
 
-    Budget routing determines the nominal shard bytes each peer must install.
+    The explicit dataset selection determines the nominal bytes each peer installs.
     Estimate transfer plus verification at 10 MiB/s, add 50% for contention and
     retries, then add 30 minutes for fixed setup.  This gives hero roughly 6.5
     hours while retaining a 15-minute absolute floor.  Offline and check-only
@@ -1692,7 +1375,7 @@ def _remote_prepare_timeout(config: LocalConfig, args: argparse.Namespace) -> fl
     duration.
     """
 
-    route = preparation_route(config.data_profile, config.training_tokens)
+    route = _route_for_config(config, config.data_profile)
     token_bytes = 2 * (
         (route.train_capacity or route.train_shards * 100_000_000)
         + (100_000_000 if config.data_profile != "smoke" else 0)
@@ -1757,8 +1440,6 @@ def _run_cluster_doctor(
         data_path,
         "--profile",
         profile,
-        "--training-tokens",
-        str(config.training_tokens),
         "--color",
         color,
     ]
@@ -1847,18 +1528,29 @@ def _prepare_wizard(
     )
     data_path = _ask("Data cache root", config.data_path, style)
     data_profile = _choose(
-        "Dataset to prepare",
+        "Preparation profile",
         _PROFILES,
         config.data_profile,
         style,
         descriptions={
             "smoke": "tiny generated CI data",
-            "dev": "one 100M-token FineWeb train shard",
-            "official": (
-                "classic 900M train corpus, or the smallest published scaled "
-                "prefix selected by the preparation budget"
-            ),
+            "dev": "the explicitly selected corpus without Fresh10",
+            "official": "the explicitly selected immutable corpus plus Fresh10",
         },
+    )
+    dataset = _choose(
+        "Non-smoke dataset",
+        dataset_names(),
+        config.dataset,
+        style,
+    )
+    route = named_preparation_route(dataset)
+    saved_shards = config.train_shards if dataset == config.dataset else 0
+    train_shards = _ask_int(
+        f"Train shards (1-{route.train_shards})",
+        saved_shards or route.train_shards,
+        style,
+        maximum=route.train_shards,
     )
     artifacts = _ask("Persistent run/artifact directory", config.artifacts_path, style)
     tpu_vm_count = _ask_int("TPU VM hosts in this JAX job", config.tpu_vm_count, style)
@@ -1870,7 +1562,6 @@ def _prepare_wizard(
         tpu_vm_hosts = _ask("pdsh host expression", default_hosts, style)
     else:
         tpu_vm_hosts = ""
-    track = _choose("Default track", _TRACKS, config.default_track, style)
     run_profile = _choose("Default run profile", _PROFILES, data_profile, style)
     retention = _choose(
         "Checkpoint policy",
@@ -1886,11 +1577,6 @@ def _prepare_wizard(
     color = _choose("Terminal colors", _COLORS, config.color, style)
     target = _ask_float(
         "Smoke/development qualification target", config.target_loss, style
-    )
-    training_tokens = _ask_int(
-        "Non-smoke corpus capacity (≤900M classic; max 74.9B)",
-        config.training_tokens,
-        style,
     )
     run_diagnostics = _confirm(
         "Run environment diagnostics now", run_diagnostics, style
@@ -1908,12 +1594,12 @@ def _prepare_wizard(
         tpu_vm_count=tpu_vm_count,
         tpu_vm_hosts=tpu_vm_hosts,
         data_profile=data_profile,
+        dataset=dataset,
+        train_shards=train_shards,
         default_profile=run_profile,
-        default_track=track,
         checkpoint_retention=retention,
         color=color,
         target_loss=target,
-        training_tokens=training_tokens,
     ).validate()
     return resolved, run_diagnostics, require_tpu, download, save
 
@@ -1973,17 +1659,29 @@ def _ask_float(prompt: str, default: float, style: Style) -> float:
         print("  Enter a finite non-negative number.")
 
 
-def _ask_int(prompt: str, default: int, style: Style) -> int:
+def _ask_int(
+    prompt: str, default: int, style: Style, *, maximum: int | None = None
+) -> int:
     while True:
         raw = _ask(prompt, str(default), style)
         try:
             value = int(raw)
         except ValueError:
-            print("  Enter a positive integer.")
+            message = (
+                f"  Enter an integer from 1 to {maximum}."
+                if maximum is not None
+                else "  Enter a positive integer."
+            )
+            print(message)
             continue
-        if value > 0:
+        if value > 0 and (maximum is None or value <= maximum):
             return value
-        print("  Enter a positive integer.")
+        message = (
+            f"  Enter an integer from 1 to {maximum}."
+            if maximum is not None
+            else "  Enter a positive integer."
+        )
+        print(message)
 
 
 def _choose(
@@ -2076,65 +1774,6 @@ def _print_fresh10(prepared: PreparedFresh10, style: Style) -> None:
     print(f"  manifest       sha256:{prepared.manifest_sha256[:12]}")
     print(f"  domains        {len(prepared.domains)} ({', '.join(FRESH10_DOMAINS)})")
     print(f"  scored tokens  {prepared.scored_tokens:,} total")
-
-
-def _reference_contract(
-    profile: str,
-    *,
-    tier: str = "125m",
-    dataset_id: str | None = None,
-    tokenizer_id: str | None = None,
-) -> ReferenceContract:
-    default_dataset_id, default_tokenizer_id = _data_identity(profile)
-    shapes = {
-        "60m": (12, 6, 384),
-        "125m": (12, 10, 640),
-        "250m": (16, 14, 896),
-        "500m": (19, 20, 1280),
-        "1b": (21, 28, 1792),
-    }
-    if tier not in shapes:
-        raise ConfigError(f"unknown model tier in reference contract: {tier!r}")
-    if profile == "smoke":
-        model = {
-            "layers": 2,
-            "heads": 2,
-            "d_model": 64,
-            "mlp_mult": 4,
-            "normalization": "rms_norm",
-            "position_encoding": "rope_base_10000",
-            "mlp_activation": "gelu",
-            "vocab_size": 256,
-            "semantic_vocab_size": 256,
-            "tied_embeddings": True,
-            "tier": "smoke",
-            "parameterization": "standard",
-        }
-        sequence = 32
-    else:
-        layers, heads, width = shapes[tier]
-        model = {
-            "layers": layers,
-            "heads": heads,
-            "d_model": width,
-            "mlp_mult": 4,
-            "normalization": "rms_norm",
-            "position_encoding": "rope_base_10000",
-            "mlp_activation": "gelu",
-            "vocab_size": 50_304,
-            "semantic_vocab_size": 50_304,
-            "tied_embeddings": False,
-            "tier": tier,
-            "parameterization": "complete_d_p",
-        }
-        sequence = 1024
-    return ReferenceContract(
-        model_id="reference-gpt-v3-family",
-        dataset_id=dataset_id or default_dataset_id,
-        tokenizer_id=tokenizer_id or default_tokenizer_id,
-        sequence_length=sequence,
-        extra={"model": model},
-    )
 
 
 def _data_identity(
@@ -2275,82 +1914,8 @@ def _ensure_artifacts_inside_repo(path: Path, root: Path) -> None:
         ) from exc
 
 
-def _reject_reserved_trainer_args(arguments: Sequence[str]) -> None:
-    reserved = {
-        "--config",
-        "--output-dir",
-        "--seed",
-        "--track",
-        "--profile",
-        "--smoke",
-        "--data",
-        "--data-path",
-        "--train-data",
-        "--val-data",
-        "--data-format",
-        "--dataset-id",
-        "--tokenizer-id",
-        "--downstream-manifest",
-        "--downstream-root",
-        "--downstream-data",
-        "--train-tokens",
-        "--tier",
-        "--tokens-per-parameter",
-        "--base-learning-rate",
-        "--study-batch-size",
-        "--early-stopping-step",
-        "--omit-checkpoint",
-        "--study-id",
-        "--study-point",
-        "--study-suite-sha256",
-        "--color",
-    }
-    for argument in arguments:
-        option = argument.split("=", 1)[0]
-        if option in reserved:
-            raise ConfigError(
-                f"{option} is controlled by the harness; set it before `--` "
-                "or choose a trainer-specific option"
-            )
-        if option.startswith("--"):
-            matches = sorted(flag for flag in reserved if flag.startswith(option))
-            if matches:
-                raise ConfigError(
-                    f"abbreviated option {option} could override harness-controlled "
-                    f"{matches[0]}; use the trainer option's complete name"
-                )
-
-
 def _indent(value: str) -> str:
     return "\n".join("  " + line for line in value.splitlines())
-
-
-def _positive_int(value: str) -> int:
-    parsed = int(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be positive")
-    return parsed
-
-
-def _nonnegative_int(value: str) -> int:
-    parsed = int(value)
-    if parsed < 0:
-        raise argparse.ArgumentTypeError("must be non-negative")
-    return parsed
-
-
-def _positive_float(value: str) -> float:
-    parsed = float(value)
-    if not 0.0 < parsed < float("inf"):
-        raise argparse.ArgumentTypeError("must be finite and positive")
-    return parsed
-
-
-def _nonnegative_float(value: str) -> float:
-    parsed = float(value)
-    if not 0.0 <= parsed < float("inf"):
-        raise argparse.ArgumentTypeError("must be finite and non-negative")
-    return parsed
 
 
 if __name__ == "__main__":

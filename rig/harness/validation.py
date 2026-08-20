@@ -11,7 +11,7 @@ import re
 from typing import Any, Mapping
 
 from .errors import ResultValidationError
-from .models import ReferenceContract, ValidationResult
+from .models import ValidationResult
 
 
 RESULT_PREFIX = "RIG_RESULT="
@@ -70,30 +70,6 @@ def _positive_integer(value: Any, name: str) -> int:
 def _plain_object(value: Any, name: str) -> Mapping[str, Any]:
     if not isinstance(value, dict):
         raise ResultValidationError(f"{name} must be a JSON object")
-    return value
-
-
-def reference_contract_dict(
-    contract: ReferenceContract | Mapping[str, Any] | None,
-) -> dict[str, Any] | None:
-    if contract is None:
-        return None
-    value = (
-        contract.as_dict()
-        if isinstance(contract, ReferenceContract)
-        else dict(contract)
-    )
-    required = ("model_id", "dataset_id", "tokenizer_id", "sequence_length")
-    missing = [key for key in required if key not in value]
-    if missing:
-        raise ResultValidationError(
-            "reference contract is missing: " + ", ".join(sorted(missing))
-        )
-    for key in required[:3]:
-        if not isinstance(value[key], str) or not value[key].strip():
-            raise ResultValidationError(f"reference contract {key} must be non-empty")
-    _positive_integer(value["sequence_length"], "reference contract sequence_length")
-    _ensure_json(value, "reference contract")
     return value
 
 
@@ -326,8 +302,6 @@ def validate_result(
     payload: Mapping[str, Any],
     *,
     run_dir: Path,
-    track: str,
-    reference_contract: ReferenceContract | Mapping[str, Any] | None = None,
     expected_training_tokens: int | None = None,
     expected_validation_tokens: int | None = None,
     expected_downstream_tokens: Mapping[str, int] | None = None,
@@ -400,22 +374,6 @@ def validate_result(
             raise ResultValidationError(f"invalid artifact name: {name!r}")
         artifact_paths[name] = contained_file(run_dir, relative)
 
-    expected = reference_contract_dict(reference_contract)
-    if track == "sample_efficiency":
-        if expected is None:
-            raise ResultValidationError(
-                "sample_efficiency requires a configured reference contract"
-            )
-        submitted = _plain_object(payload.get("contract"), "contract")
-        for key, expected_value in expected.items():
-            if submitted.get(key) != expected_value:
-                raise ResultValidationError(
-                    f"contract mismatch for {key}: expected {expected_value!r}, "
-                    f"got {submitted.get(key)!r}"
-                )
-    elif track != "open":
-        raise ResultValidationError(f"unknown track: {track!r}")
-
     checkpoint_size = checkpoint.stat().st_size if checkpoint is not None else None
     return ValidationResult(
         payload=dict(payload),
@@ -443,8 +401,6 @@ def _ensure_json(value: Any, name: str) -> None:
 def verify_run(
     run_dir: Path,
     *,
-    track: str = "open",
-    reference_contract: ReferenceContract | Mapping[str, Any] | None = None,
     expected_training_tokens: int | None = None,
     expected_validation_tokens: int | None = None,
     expected_downstream_tokens: Mapping[str, int] | None = None,
@@ -461,8 +417,6 @@ def verify_run(
     return validate_result(
         payload,
         run_dir=run_dir,
-        track=track,
-        reference_contract=reference_contract,
         expected_training_tokens=expected_training_tokens,
         expected_validation_tokens=expected_validation_tokens,
         expected_downstream_tokens=expected_downstream_tokens,

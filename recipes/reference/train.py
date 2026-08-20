@@ -43,6 +43,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from rig import logpack
 from rig.metrics import DIAGNOSTIC_FAMILIES, DIAGNOSTIC_STATS
 from rig.configfile import (
+    config_bool,
     config_choice,
     config_float,
     config_int,
@@ -134,13 +135,13 @@ from rig.kernels.autotune import (
 
 
 SCHEMA_VERSION = 1
-CONFIG_SCHEMA_VERSION = 2
+CONFIG_SCHEMA_VERSION = 4
 CONFIG_FILENAME = "config.yaml"
 CONFIG_PATH = Path(__file__).resolve().with_name(CONFIG_FILENAME)
-_VALID_TRACKS = ("open", "sample_efficiency")
 _VALID_PROFILES = ("smoke", "dev", "official")
-_VALID_TIERS = ("60m", "125m", "250m", "500m", "1b")
 _DOMAIN_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_TIER_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+_CONTEXT_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 
 
 # A deliberately small, original corpus for offline and smoke-test use.  The
@@ -175,6 +176,7 @@ class Config:
     depth_multiplier: float
     data_multiplier: float
     batch_multiplier: float
+    target_tokens_per_parameter: float | None
     tokens_per_parameter: float | None
     learning_rate: float
     min_lr_ratio: float
@@ -199,13 +201,14 @@ class Config:
     config_schema_version: int
     config_sha256: str
     config_profile: str
-    config_overrides: tuple[tuple[str, int], ...]
+    context_preset: str
+    config_overrides: tuple[tuple[str, int | str], ...]
     # Optimizer step after which to stop. steps, warmup, and m_D still resolve
     # from the full horizon, so the trajectory matches the untruncated run up
     # to this point. None runs to completion.
-    early_stopping_step: int | None = None
-    # Block-diagonal attention over documents. Off in the reference family so
-    # its recorded results stay bit-reproducible; see recipes/reference/README.
+    stop_after_step: int | None = None
+    # Block-diagonal attention over documents. The selected context preset owns
+    # this policy together with sequence length and the recipe-local batch anchor.
     document_masking: bool = False
     document_boundary_token: int = 50256
 
@@ -213,7 +216,7 @@ class Config:
     def final_step(self) -> int:
         """Last optimizer step this run takes; steps stays the schedule horizon."""
 
-        return self.early_stopping_step or self.steps
+        return self.stop_after_step or self.steps
 
 
 @dataclass(frozen=True)
@@ -223,8 +226,8 @@ class ExperimentProfile:
     schema_version: int
     source_sha256: str
     name: str
+    context_preset: str
     steps: int | None
-    train_tokens: int | None
     tokens_per_parameter: float | None
     batch_size: int
     seq_len: int
@@ -266,31 +269,6 @@ class ExperimentProfile:
     diagnostics_every: int
     log_every: int
     document_masking: bool = False
-
-
-_STATIC_CLI_FIELDS = {
-    "eval_batches": "--eval-batches",
-    "val_probe_batches": "--val-probe-batches",
-    "vocab_size": "--vocab-size",
-    "batch_size": "--batch-size",
-    "seq_len": "--seq-len",
-    "layers": "--layers",
-    "heads": "--heads",
-    "d_model": "--d-model",
-    "mlp_mult": "--mlp-mult",
-    "dtype": "--dtype",
-    "attention_backend": "--attention-backend",
-    "loss_backend": "--loss-backend",
-    "semantic_vocab_size": "--semantic-vocab-size",
-    "vocab_tile_size": "--vocab-tile-size",
-    "learning_rate": "--learning-rate",
-    "min_lr_ratio": "--min-lr-ratio",
-    "warmup_steps": "--warmup-steps",
-    "weight_decay": "--weight-decay",
-    "beta1": "--beta1",
-    "beta2": "--beta2",
-    "grad_clip": "--grad-clip",
-}
 
 
 @dataclass(frozen=True)
@@ -401,7 +379,11 @@ def _declared_family_parameter_count(model: Mapping[str, Any]) -> int:
 
 
 def _parse_experiment_profile(
-    payload: Mapping[str, Any], profile: str, source_sha256: str, tier: str
+    payload: Mapping[str, Any],
+    profile: str,
+    source_sha256: str,
+    tier: str | None,
+    context: str | None,
 ) -> ExperimentProfile:
     top = config_keys(payload, "document", {"schema_version", "family", "profiles"})
     schema_version = config_int(top["schema_version"], "schema_version", minimum=1)
@@ -413,20 +395,20 @@ def _parse_experiment_profile(
     family = config_keys(
         top["family"],
         "family",
-        {"default_tier", "parameterization", "tiers"},
+        {
+            "default_tier",
+            "default_context",
+            "contexts",
+            "parameterization",
+            "tiers",
+        },
     )
-    default_tier = config_choice(
-        family["default_tier"], "family.default_tier", _VALID_TIERS
-    )
-    if tier not in _VALID_TIERS:
-        raise ValueError(
-            f"unknown model tier {tier!r}; expected {', '.join(_VALID_TIERS)}"
-        )
     parameterization = config_keys(
         family["parameterization"],
         "family.parameterization",
         {
             "name",
+            "base_tier",
             "base_width",
             "base_depth",
             "depth_alpha",
@@ -438,8 +420,11 @@ def _parse_experiment_profile(
     parameterization_name = config_choice(
         parameterization["name"],
         "family.parameterization.name",
-        ("complete_d_p",),
+        ("completep_fixed_tpp_v1",),
     )
+    base_tier = parameterization["base_tier"]
+    if not isinstance(base_tier, str) or not _TIER_NAME.fullmatch(base_tier):
+        raise ValueError("config.yaml family.parameterization.base_tier is invalid")
     base_width = config_int(
         parameterization["base_width"],
         "family.parameterization.base_width",
@@ -474,9 +459,75 @@ def _parse_experiment_profile(
         "family.parameterization.embeddings",
         ("untied",),
     )
-    raw_tiers = config_keys(family["tiers"], "family.tiers", set(_VALID_TIERS))
+    raw_contexts = config_mapping(family["contexts"], "family.contexts")
+    if not raw_contexts:
+        raise ValueError("config.yaml family.contexts must define at least one preset")
+    invalid_contexts = sorted(
+        name for name in raw_contexts if not _CONTEXT_NAME.fullmatch(name)
+    )
+    if invalid_contexts:
+        raise ValueError(
+            "config.yaml family.contexts contains invalid name(s): "
+            + ", ".join(invalid_contexts)
+        )
+    default_context = family["default_context"]
+    if not isinstance(default_context, str) or default_context not in raw_contexts:
+        raise ValueError(
+            "config.yaml family.default_context must name a defined context preset"
+        )
+    selected_context = context or default_context
+    if selected_context not in raw_contexts:
+        raise ValueError(
+            f"unknown context preset {selected_context!r}; expected "
+            + ", ".join(sorted(raw_contexts))
+        )
+    parsed_contexts: dict[str, tuple[int, int, bool]] = {}
+    for context_name in sorted(raw_contexts):
+        context_value = config_keys(
+            raw_contexts[context_name],
+            f"family.contexts.{context_name}",
+            {"seq_len", "reference_batch_size", "document_masking"},
+        )
+        parsed_contexts[context_name] = (
+            config_int(
+                context_value["seq_len"],
+                f"family.contexts.{context_name}.seq_len",
+                minimum=1,
+            ),
+            config_int(
+                context_value["reference_batch_size"],
+                f"family.contexts.{context_name}.reference_batch_size",
+                minimum=1,
+            ),
+            config_bool(
+                context_value["document_masking"],
+                f"family.contexts.{context_name}.document_masking",
+            ),
+        )
+    raw_tiers = config_mapping(family["tiers"], "family.tiers")
+    if not raw_tiers:
+        raise ValueError("config.yaml family.tiers must define at least one tier")
+    invalid_tiers = sorted(name for name in raw_tiers if not _TIER_NAME.fullmatch(name))
+    if invalid_tiers:
+        raise ValueError(
+            "config.yaml family.tiers contains invalid name(s): "
+            + ", ".join(invalid_tiers)
+        )
+    default_tier = family["default_tier"]
+    if not isinstance(default_tier, str) or default_tier not in raw_tiers:
+        raise ValueError("config.yaml family.default_tier must name a defined tier")
+    if base_tier not in raw_tiers:
+        raise ValueError(
+            "config.yaml family.parameterization.base_tier must name a defined tier"
+        )
+    selected_family_tier = tier or default_tier
+    if selected_family_tier not in raw_tiers:
+        raise ValueError(
+            f"unknown model tier {selected_family_tier!r}; expected "
+            + ", ".join(sorted(raw_tiers))
+        )
     parsed_tiers: dict[str, tuple[int, dict[str, Any]]] = {}
-    for tier_name in _VALID_TIERS:
+    for tier_name in sorted(raw_tiers):
         tier_value = config_keys(
             raw_tiers[tier_name],
             f"family.tiers.{tier_name}",
@@ -515,19 +566,12 @@ def _parse_experiment_profile(
     training = config_keys(
         selected["training"],
         f"profiles.{profile}.training",
-        {"batch_size", "seq_len", "sampling", "dtype"},
-        optional={"steps", "train_tokens", "tokens_per_parameter"},
+        (
+            {"batch_size", "seq_len", "sampling", "dtype", "steps"}
+            if profile == "smoke"
+            else {"tokens_per_parameter", "sampling", "dtype"}
+        ),
     )
-    duration_fields = tuple(
-        name
-        for name in ("steps", "train_tokens", "tokens_per_parameter")
-        if name in training
-    )
-    if len(duration_fields) != 1:
-        raise ValueError(
-            f"config.yaml profiles.{profile}.training must define exactly one of "
-            "steps, train_tokens, or tokens_per_parameter"
-        )
     if profile == "smoke":
         model = _parse_model(selected["model"], f"profiles.{profile}.model")
         selected_tier = "smoke"
@@ -539,13 +583,23 @@ def _parse_experiment_profile(
         selected_init_std = 0.02
         selected_attention_scale = "inverse_sqrt_head_dim"
         selected_embeddings = "tied"
+        selected_context_name = "smoke"
+        selected_seq_len = config_int(
+            training["seq_len"], f"profiles.{profile}.training.seq_len", minimum=1
+        )
+        selected_batch_size = config_int(
+            training["batch_size"],
+            f"profiles.{profile}.training.batch_size",
+            minimum=1,
+        )
+        selected_document_masking = False
     else:
         if selected["model"] != "family_tier":
             raise ValueError(
                 f"config.yaml profiles.{profile}.model must be 'family_tier'"
             )
-        declared_parameters, model = parsed_tiers[tier]
-        selected_tier = tier
+        declared_parameters, model = parsed_tiers[selected_family_tier]
+        selected_tier = selected_family_tier
         selected_parameterization = parameterization_name
         selected_base_width = base_width
         selected_base_depth = base_depth
@@ -553,11 +607,16 @@ def _parse_experiment_profile(
         selected_init_std = init_std
         selected_attention_scale = attention_scale
         selected_embeddings = embeddings
+        selected_context_name = selected_context
+        (
+            selected_seq_len,
+            selected_batch_size,
+            selected_document_masking,
+        ) = parsed_contexts[selected_context]
     kernels = config_keys(
         selected["kernels"],
         f"profiles.{profile}.kernels",
         {"attention_backend", "loss_backend", "vocab_tile_size"},
-        optional={"document_masking"},
     )
     optimizer = config_keys(
         selected["optimizer"],
@@ -634,16 +693,10 @@ def _parse_experiment_profile(
         schema_version=schema_version,
         source_sha256=source_sha256,
         name=profile,
+        context_preset=selected_context_name,
         steps=(
             config_int(training["steps"], f"{prefix}.training.steps", minimum=1)
-            if "steps" in training
-            else None
-        ),
-        train_tokens=(
-            config_int(
-                training["train_tokens"], f"{prefix}.training.train_tokens", minimum=1
-            )
-            if "train_tokens" in training
+            if profile == "smoke"
             else None
         ),
         tokens_per_parameter=(
@@ -651,15 +704,11 @@ def _parse_experiment_profile(
                 training["tokens_per_parameter"],
                 f"{prefix}.training.tokens_per_parameter",
             )
-            if "tokens_per_parameter" in training
+            if profile != "smoke"
             else None
         ),
-        batch_size=config_int(
-            training["batch_size"], f"{prefix}.training.batch_size", minimum=1
-        ),
-        seq_len=config_int(
-            training["seq_len"], f"{prefix}.training.seq_len", minimum=1
-        ),
+        batch_size=selected_batch_size,
+        seq_len=selected_seq_len,
         sampling=config_choice(
             training["sampling"],
             f"{prefix}.training.sampling",
@@ -677,7 +726,7 @@ def _parse_experiment_profile(
         mlp_activation=str(model["mlp_activation"]),
         tier=selected_tier,
         declared_parameters=declared_parameters,
-        base_parameters=parsed_tiers["60m"][0],
+        base_parameters=parsed_tiers[base_tier][0],
         parameterization=selected_parameterization,
         base_width=selected_base_width,
         base_depth=selected_base_depth,
@@ -700,7 +749,7 @@ def _parse_experiment_profile(
         vocab_tile_size=config_int(
             kernels["vocab_tile_size"], f"{prefix}.kernels.vocab_tile_size", minimum=1
         ),
-        document_masking=bool(kernels.get("document_masking", False)),
+        document_masking=selected_document_masking,
         learning_rate=learning_rate,
         min_lr_ratio=min_lr_ratio,
         warmup_ratio=warmup_ratio,
@@ -739,11 +788,6 @@ def _parse_experiment_profile(
             f"{result.attention_backend} requires training.dtype bfloat16"
         )
     tokens_per_step = result.batch_size * result.seq_len
-    if result.train_tokens is not None and result.train_tokens % tokens_per_step:
-        raise ValueError(
-            f"config.yaml {prefix}.training.train_tokens must be divisible by "
-            f"batch_size * seq_len ({tokens_per_step:,})"
-        )
     if profile == "official":
         validation_tokens = 10_485_760
         if validation_tokens % tokens_per_step:
@@ -765,26 +809,21 @@ def _parse_experiment_profile(
 
 
 def load_experiment_profile(
-    profile: str, requested_path: Path | None = None, *, tier: str = "125m"
+    profile: str,
+    requested_path: Path | None = None,
+    *,
+    tier: str | None = None,
+    context: str | None = None,
 ) -> ExperimentProfile:
     if profile not in _VALID_PROFILES:
         raise ValueError(f"unknown experiment profile: {profile!r}")
     path = resolve_sibling_config_path(requested_path, CONFIG_PATH)
     mapping, source_sha256 = read_config_document(path)
     parsed = {
-        name: _parse_experiment_profile(mapping, name, source_sha256, tier)
+        name: _parse_experiment_profile(mapping, name, source_sha256, tier, context)
         for name in _VALID_PROFILES
     }
     return parsed[profile]
-
-
-def reject_static_cli_overrides(args: argparse.Namespace) -> None:
-    for destination, option in _STATIC_CLI_FIELDS.items():
-        if getattr(args, destination) is not None:
-            raise ValueError(
-                f"{option} is defined by sibling config.yaml; edit the selected "
-                "profile or clone a new recipe variant"
-            )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -805,17 +844,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--output-dir", type=Path, default=Path("runs/reference"))
     run.add_argument("--seed", type=int, default=1337)
-    environment_tier = os.environ.get("RIG_TIER", "125m")
-    if environment_tier not in _VALID_TIERS:
-        environment_tier = "125m"
+    environment_tier = os.environ.get("RIG_TIER")
     run.add_argument(
         "--tier",
-        choices=_VALID_TIERS,
         default=environment_tier,
-        help="model-family size tier (smoke keeps its tiny inline model)",
+        help="model-family size tier; defaults to family.default_tier",
     )
     run.add_argument(
-        "--early-stopping-step",
+        "--context",
+        default=None,
+        help="named context preset; defaults to family.default_context",
+    )
+    run.add_argument(
+        "--stop-after-step",
         type=positive_int,
         default=None,
         help=(
@@ -823,55 +864,18 @@ def build_parser() -> argparse.ArgumentParser:
             "requires --tokens-per-parameter so the horizon is unchanged"
         ),
     )
-    duration = run.add_mutually_exclusive_group()
-    duration.add_argument("--steps", type=positive_int, default=None)
-    duration.add_argument(
-        "--train-tokens",
-        type=positive_int,
-        default=None,
-        help="derive an exact step count from the global batch and sequence length",
-    )
-    duration.add_argument(
+    run.add_argument(
         "--tokens-per-parameter",
         type=float,
         default=None,
         help="research budget rounded to the nearest complete global step",
     )
-    environment_track = os.environ.get("RIG_TRACK", "open")
-    if environment_track not in _VALID_TRACKS:
-        environment_track = "open"
     environment_profile = os.environ.get("RIG_PROFILE")
     if environment_profile not in _VALID_PROFILES:
         environment_profile = None
-    run.add_argument("--track", choices=_VALID_TRACKS, default=environment_track)
     run.add_argument("--profile", choices=_VALID_PROFILES, default=environment_profile)
-    run.add_argument("--smoke", action="store_true", help="alias for --profile smoke")
-    run.add_argument(
-        "--eval-batches", type=positive_int, default=None, help=argparse.SUPPRESS
-    )
-    run.add_argument(
-        "--val-every",
-        type=nonnegative_int,
-        default=None,
-        help="run a deterministic validation probe every N optimizer steps; 0 disables probes",
-    )
-    run.add_argument(
-        "--val-probe-batches",
-        type=positive_int,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    run.add_argument(
-        "--diagnostics-every",
-        type=nonnegative_int,
-        default=None,
-        help=(
-            "capture sparse parameter, pre-clipping gradient, and actual update "
-            "statistics every N steps; 0 disables diagnostics"
-        ),
-    )
-    run.add_argument("--log-every", type=positive_int, default=None)
     run.add_argument("--color", choices=("auto", "always", "never"), default="auto")
+    run.add_argument("--print-plan", action="store_true", help=argparse.SUPPRESS)
 
     profiling = parser.add_argument_group("profiling")
     profiling.add_argument(
@@ -893,20 +897,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="number of consecutive steps to capture; required with --xprof-dir",
     )
     profiling.add_argument(
-        "--no-final-validation",
+        "--diagnostic-mode",
         action="store_true",
-        help="diagnostic-only: omit evaluation compilation and final validation",
-    )
-    profiling.add_argument(
-        "--no-checkpoint",
-        action="store_true",
-        help="diagnostic-only: omit the checkpoint and competition result",
+        help="XProf-only execution without evaluation, diagnostics, checkpoint, or result",
     )
     profiling.add_argument(
         "--omit-checkpoint",
         action="store_true",
         help=(
-            "open/dev research only: retain final validation and metrics but omit "
+            "non-official research only: retain final validation and metrics but omit "
             "the parameter checkpoint"
         ),
     )
@@ -976,72 +975,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="standalone downstream document; repeat paths and domains as needed",
     )
 
-    model = parser.add_argument_group("model")
-    model.add_argument(
-        "--batch-size", type=positive_int, default=None, help=argparse.SUPPRESS
-    )
-    model.add_argument(
-        "--seq-len", type=positive_int, default=None, help=argparse.SUPPRESS
-    )
-    model.add_argument(
-        "--layers", type=positive_int, default=None, help=argparse.SUPPRESS
-    )
-    model.add_argument(
-        "--heads", type=positive_int, default=None, help=argparse.SUPPRESS
-    )
-    model.add_argument(
-        "--d-model", type=positive_int, default=None, help=argparse.SUPPRESS
-    )
-    model.add_argument(
-        "--mlp-mult", type=positive_int, default=None, help=argparse.SUPPRESS
-    )
-    model.add_argument(
-        "--dtype",
-        choices=("bfloat16", "float32"),
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    model.add_argument(
-        "--attention-backend",
-        choices=("dense", "jax_flash", "tpu_flash"),
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    model.add_argument(
-        "--loss-backend",
-        choices=("dense", "tiled"),
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    model.add_argument(
-        "--semantic-vocab-size",
-        type=positive_int,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    model.add_argument(
-        "--vocab-tile-size",
-        type=positive_int,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-
     optim = parser.add_argument_group("optimization")
-    optim.add_argument(
-        "--learning-rate", type=float, default=None, help=argparse.SUPPRESS
-    )
-    optim.add_argument(
-        "--min-lr-ratio", type=float, default=None, help=argparse.SUPPRESS
-    )
-    optim.add_argument(
-        "--warmup-steps", type=nonnegative_int, default=None, help=argparse.SUPPRESS
-    )
-    optim.add_argument(
-        "--weight-decay", type=float, default=None, help=argparse.SUPPRESS
-    )
-    optim.add_argument("--beta1", type=float, default=None, help=argparse.SUPPRESS)
-    optim.add_argument("--beta2", type=float, default=None, help=argparse.SUPPRESS)
-    optim.add_argument("--grad-clip", type=float, default=None, help=argparse.SUPPRESS)
     optim.add_argument(
         "--base-learning-rate",
         type=float,
@@ -1049,10 +983,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="research override for the transferable base learning rate",
     )
     optim.add_argument(
-        "--study-batch-size",
+        "--batch-size",
         type=positive_int,
         default=None,
-        help="research-only global batch override for a staged batch study",
+        help="research override for the global sequence batch",
     )
     optim.add_argument(
         "--peak-tflops",
@@ -1064,12 +998,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_args(args: argparse.Namespace) -> ExperimentProfile:
-    if args.smoke and args.profile not in (None, "smoke"):
-        raise ValueError("--smoke cannot be combined with a non-smoke --profile")
-    reject_static_cli_overrides(args)
     experiment = load_experiment_profile(
-        selected_profile(args), args.config, tier=args.tier
+        selected_profile(args), args.config, tier=args.tier, context=args.context
     )
+    if selected_profile(args) == "smoke" and args.context is not None:
+        raise ValueError("--context is not applicable to the smoke profile")
     if args.tokens_per_parameter is not None and (
         not math.isfinite(args.tokens_per_parameter) or args.tokens_per_parameter <= 0.0
     ):
@@ -1094,37 +1027,23 @@ def validate_args(args: argparse.Namespace) -> ExperimentProfile:
     if args.xprof_dir is None:
         if any(value is not None for value in xprof_window_args):
             raise ValueError("--xprof-start-step and --xprof-steps require --xprof-dir")
-        if args.no_final_validation or args.no_checkpoint:
-            raise ValueError(
-                "--no-final-validation and --no-checkpoint require --xprof-dir"
-            )
+        if args.diagnostic_mode:
+            raise ValueError("--diagnostic-mode requires --xprof-dir")
     elif any(value is None for value in xprof_window_args):
         raise ValueError(
             "--xprof-dir requires both --xprof-start-step and --xprof-steps"
         )
-    if args.no_final_validation != args.no_checkpoint:
+    if args.omit_checkpoint and args.diagnostic_mode:
         raise ValueError(
-            "--no-final-validation and --no-checkpoint must be used together"
+            "--omit-checkpoint and --diagnostic-mode are mutually exclusive"
         )
-    if args.omit_checkpoint and args.no_checkpoint:
-        raise ValueError("--omit-checkpoint and --no-checkpoint are mutually exclusive")
-    if args.omit_checkpoint and (
-        args.track != "open" or selected_profile(args) != "dev"
-    ):
-        raise ValueError("--omit-checkpoint is restricted to open/dev research runs")
-    if args.no_final_validation and (
+    if args.omit_checkpoint and selected_profile(args) != "dev":
+        raise ValueError("--omit-checkpoint is restricted to development research runs")
+    if args.diagnostic_mode and (
         args.downstream_manifest is not None or args.downstream_data
     ):
         raise ValueError(
-            "--no-final-validation cannot be combined with downstream evaluation data"
-        )
-    effective_val_every = (
-        args.val_every if args.val_every is not None else experiment.val_every
-    )
-    if args.no_final_validation and effective_val_every:
-        raise ValueError(
-            "--no-final-validation requires --val-every 0 (the official profile "
-            "otherwise enables periodic validation by default)"
+            "--diagnostic-mode cannot be combined with downstream evaluation data"
         )
     return experiment
 
@@ -1136,13 +1055,11 @@ def should_compile_evaluation(
 ) -> bool:
     """Return whether this invocation can execute any validation workload."""
 
-    return (
-        not args.no_final_validation or config.val_every > 0 or bool(downstream_domains)
-    )
+    return not args.diagnostic_mode or config.val_every > 0 or bool(downstream_domains)
 
 
 def selected_profile(args: argparse.Namespace) -> str:
-    return "smoke" if args.smoke else (args.profile or "dev")
+    return args.profile or "dev"
 
 
 def resolve_config(
@@ -1152,9 +1069,8 @@ def resolve_config(
     experiment: ExperimentProfile | None = None,
 ) -> Config:
     profile = selected_profile(args)
-    reject_static_cli_overrides(args)
     experiment = experiment or load_experiment_profile(
-        profile, args.config, tier=args.tier
+        profile, args.config, tier=args.tier, context=args.context
     )
     if experiment.name != profile:
         raise ValueError(
@@ -1165,57 +1081,31 @@ def resolve_config(
             "loaded dataset vocabulary does not match config.yaml: "
             f"dataset={vocab_size}, configured={experiment.vocab_size}"
         )
-    batch_size = args.study_batch_size or experiment.batch_size
+    batch_size = args.batch_size or experiment.batch_size
     seq_len = experiment.seq_len
     tokens_per_step = batch_size * seq_len
-    requested_train_tokens = (
-        args.train_tokens
-        if args.train_tokens is not None
-        else (
-            None
-            if args.steps is not None or args.tokens_per_parameter is not None
-            else experiment.train_tokens
-        )
-    )
-    requested_tpp = (
-        args.tokens_per_parameter
-        if args.tokens_per_parameter is not None
-        else (
-            None
-            if args.steps is not None or args.train_tokens is not None
-            else experiment.tokens_per_parameter
-        )
-    )
-    early_stop = getattr(args, "early_stopping_step", None)
-    if early_stop is not None and requested_tpp is None:
-        # --steps and --train-tokens rebuild the schedule around the length you
-        # ask for: m_D falls to 1 and warmup shrinks with it, so a truncated run
-        # would not reproduce the trajectory it is meant to sample.
-        raise ValueError(
-            "--early-stopping-step requires a tokens-per-parameter horizon; "
-            "it cannot be combined with --steps or --train-tokens"
-        )
-    if requested_train_tokens is not None:
-        if requested_train_tokens % tokens_per_step:
-            raise ValueError(
-                "training token budget must be divisible by batch_size * seq_len "
-                f"({tokens_per_step:,}); got {requested_train_tokens:,}"
-            )
-        steps = requested_train_tokens // tokens_per_step
-    elif requested_tpp is not None:
+    requested_tpp = args.tokens_per_parameter or experiment.tokens_per_parameter
+    early_stop = getattr(args, "stop_after_step", None)
+    if profile == "smoke":
+        if args.tokens_per_parameter is not None:
+            raise ValueError("--tokens-per-parameter cannot override the smoke profile")
+        if early_stop is not None:
+            raise ValueError("--stop-after-step requires a fixed-TPP profile")
+        if experiment.steps is None:
+            raise AssertionError("smoke profile did not resolve a step count")
+        steps = experiment.steps
+    else:
+        if requested_tpp is None:
+            raise AssertionError("non-smoke profile did not resolve a TPP horizon")
         if experiment.declared_parameters is None:
-            raise ValueError("tokens-per-parameter requires a non-smoke family tier")
+            raise AssertionError("fixed-TPP profile has no declared parameter count")
         ideal_tokens = float(experiment.declared_parameters) * requested_tpp
         steps = max(1, int(math.floor(ideal_tokens / tokens_per_step + 0.5)))
-    else:
-        steps = args.steps if args.steps is not None else experiment.steps
-        if (
-            steps is None
-        ):  # schema validation establishes a duration, defensively retain type.
-            raise AssertionError("experiment duration did not resolve")
+    if early_stop is not None and requested_tpp is None:
+        raise ValueError("--stop-after-step requires a fixed-TPP profile")
     if early_stop is not None and early_stop > steps:
         raise ValueError(
-            f"--early-stopping-step {early_stop:,} is past the {steps:,}-step "
+            f"--stop-after-step {early_stop:,} is past the {steps:,}-step "
             "horizon this configuration resolves to"
         )
     if profile == "official":
@@ -1235,19 +1125,15 @@ def resolve_config(
         eval_batches = required_eval_batches
     else:
         eval_batches = experiment.eval_batches
-    val_every = args.val_every if args.val_every is not None else experiment.val_every
+    val_every = 0 if args.diagnostic_mode else experiment.val_every
     val_probe_batches = experiment.val_probe_batches
     if val_every > 0 and val_probe_batches > eval_batches:
         raise ValueError(
             "config.yaml val_probe_batches must not exceed the canonical evaluation batch "
             f"count ({eval_batches}); got {val_probe_batches}"
         )
-    log_every = args.log_every if args.log_every is not None else experiment.log_every
-    diagnostics_every = (
-        args.diagnostics_every
-        if args.diagnostics_every is not None
-        else experiment.diagnostics_every
-    )
+    log_every = steps if args.diagnostic_mode else experiment.log_every
+    diagnostics_every = 0 if args.diagnostic_mode else experiment.diagnostics_every
     dtype_name = experiment.dtype_name
     compute_dtype = jnp.bfloat16 if dtype_name == "bfloat16" else jnp.float32
     attention_backend = experiment.attention_backend
@@ -1260,26 +1146,24 @@ def resolve_config(
             f"config.yaml attention_backend {attention_backend} currently requires "
             "dtype bfloat16"
         )
-    overrides = tuple(
-        (name, int(value))
-        for name, value in (
-            ("steps", args.steps),
-            ("train_tokens", args.train_tokens),
+    override_values: list[tuple[str, int | str]] = []
+    for name, value in (
+        (
+            "tokens_per_parameter_micros",
             (
-                "tokens_per_parameter_micros",
-                (
-                    round(args.tokens_per_parameter * 1_000_000)
-                    if args.tokens_per_parameter is not None
-                    else None
-                ),
+                round(args.tokens_per_parameter * 1_000_000)
+                if args.tokens_per_parameter is not None
+                else None
             ),
-            ("study_batch_size", args.study_batch_size),
-            ("val_every", args.val_every),
-            ("diagnostics_every", args.diagnostics_every),
-            ("log_every", args.log_every),
-        )
-        if value is not None
-    )
+        ),
+        ("batch_size", args.batch_size),
+        ("diagnostic_mode", 1 if args.diagnostic_mode else None),
+    ):
+        if value is not None:
+            override_values.append((name, int(value)))
+    if args.context is not None:
+        override_values.append(("context", args.context))
+    overrides = tuple(override_values)
     width_multiplier = experiment.d_model / float(experiment.base_width)
     depth_multiplier = experiment.layers / float(experiment.base_depth)
     batch_multiplier = batch_size / float(experiment.batch_size)
@@ -1288,13 +1172,12 @@ def resolve_config(
         if experiment.declared_parameters is not None
         else None
     )
-    # In a fixed-TPP ladder, the data horizon grows in proportion to model
-    # parameters. This is the Complete(d)P m_D axis, normalized to the 60m base.
-    # A step- or token-bounded diagnostic instead holds its data horizon fixed
-    # across tiers, so it must not accidentally inherit the ladder correction.
+    # This project reanchors every TPP ladder. The multiplier captures only the
+    # model-size-induced data growth within one fixed-TPP ladder; it deliberately
+    # omits any cross-horizon TPP / TPP_0 factor.
     data_multiplier = (
         experiment.declared_parameters / float(experiment.base_parameters)
-        if experiment.declared_parameters is not None and requested_tpp is not None
+        if experiment.declared_parameters is not None
         else 1.0
     )
     base_learning_rate = (
@@ -1309,7 +1192,7 @@ def resolve_config(
         warmup_steps = 0
     return Config(
         steps=steps,
-        early_stopping_step=early_stop,
+        stop_after_step=early_stop,
         document_masking=experiment.document_masking,
         batch_size=batch_size,
         seq_len=seq_len,
@@ -1335,6 +1218,7 @@ def resolve_config(
         depth_multiplier=depth_multiplier,
         data_multiplier=data_multiplier,
         batch_multiplier=batch_multiplier,
+        target_tokens_per_parameter=requested_tpp,
         tokens_per_parameter=achieved_tpp,
         learning_rate=base_learning_rate,
         min_lr_ratio=experiment.min_lr_ratio,
@@ -1359,6 +1243,7 @@ def resolve_config(
         config_schema_version=experiment.schema_version,
         config_sha256=experiment.source_sha256,
         config_profile=experiment.name,
+        context_preset=experiment.context_preset,
         config_overrides=overrides,
     )
 
@@ -1369,7 +1254,7 @@ def init_params(config: Config, seed: int) -> dict[str, Any]:
     hidden = config.mlp_mult * d_model
     hidden_scale = (
         config.init_std / math.sqrt(config.width_multiplier)
-        if config.parameterization == "complete_d_p"
+        if config.parameterization == "completep_fixed_tpp_v1"
         else 0.02
     )
     blocks: list[dict[str, np.ndarray]] = []
@@ -1466,7 +1351,7 @@ def attention_console_rows(
 
 
 def contract_model_metadata(config: Config) -> dict[str, Any]:
-    """Return the fixed sample-efficiency architecture contract only."""
+    """Return the resolved model architecture metadata."""
 
     return {
         "layers": config.layers,
@@ -1492,6 +1377,7 @@ def experiment_config_metadata(config: Config) -> dict[str, Any]:
         "path": CONFIG_FILENAME,
         "sha256": config.config_sha256,
         "profile": config.config_profile,
+        "context_preset": config.context_preset,
         "overrides": dict(config.config_overrides),
         "resolved": {
             "training": {
@@ -1502,12 +1388,14 @@ def experiment_config_metadata(config: Config) -> dict[str, Any]:
                 "sampling": config.sampling,
                 "dtype": config.dtype_name,
                 "tokens_per_parameter": config.tokens_per_parameter,
+                "target_tokens_per_parameter": config.target_tokens_per_parameter,
             },
             "model": contract_model_metadata(config),
             "kernels": {
                 "attention_backend": config.attention_backend,
                 "loss_backend": config.loss_backend,
                 "vocab_tile_size": config.vocab_tile_size,
+                "document_masking": config.document_masking,
             },
             "optimizer": {
                 "learning_rate": config.learning_rate,
@@ -1526,8 +1414,8 @@ def experiment_config_metadata(config: Config) -> dict[str, Any]:
                 "base_depth": config.base_depth,
                 "width_multiplier": config.width_multiplier,
                 "depth_multiplier": config.depth_multiplier,
-                "data_multiplier": config.data_multiplier,
-                "batch_multiplier": config.batch_multiplier,
+                "ladder_data_multiplier": config.data_multiplier,
+                "batch_ratio": config.batch_multiplier,
                 "depth_alpha": config.depth_alpha,
                 "init_std": config.init_std,
                 "attention_scale": config.attention_scale,
@@ -1543,6 +1431,41 @@ def experiment_config_metadata(config: Config) -> dict[str, Any]:
                 "log_every": config.log_every,
             },
         },
+    }
+
+
+def resolved_plan_metadata(config: Config) -> dict[str, Any]:
+    """Return the deterministic, data-independent execution contract."""
+
+    tokens_per_step = config.batch_size * config.seq_len
+    return {
+        "schema_version": 2,
+        "config_schema_version": config.config_schema_version,
+        "config_sha256": config.config_sha256,
+        "profile": config.config_profile,
+        "context_preset": config.context_preset,
+        "document_masking": config.document_masking,
+        "tier": config.tier,
+        "run_kind": (
+            "smoke"
+            if config.config_profile == "smoke"
+            else ("diagnostic" if config.stop_after_step is not None else "full")
+        ),
+        "parameterization": config.parameterization,
+        "weight_decay_policy": "weights_and_embeddings_only_v2",
+        "declared_parameters": config.declared_parameters,
+        "batch_size": config.batch_size,
+        "sequence_length": config.seq_len,
+        "tokens_per_step": tokens_per_step,
+        "target_tokens_per_parameter": config.target_tokens_per_parameter,
+        "achieved_tokens_per_parameter": config.tokens_per_parameter,
+        "schedule_steps": config.steps,
+        "stop_after_step": config.stop_after_step,
+        "planned_tokens": config.steps * tokens_per_step,
+        "expected_tokens": config.final_step * tokens_per_step,
+        "base_learning_rate": config.learning_rate,
+        "batch_ratio": config.batch_multiplier,
+        "ladder_data_multiplier": config.data_multiplier,
     }
 
 
@@ -1593,6 +1516,9 @@ def implementation_metadata(
         "attention_tuning": attention_runtime_metadata(runtime),
         "loss_backend": config.loss_backend,
         "vocab_tile_size": config.vocab_tile_size,
+        "weight_decay_policy": "weights_and_embeddings_only_v2",
+        "context_preset": config.context_preset,
+        "document_masking": config.document_masking,
         "configuration": experiment_config_metadata(config),
     }
 
@@ -1851,20 +1777,31 @@ def init_optimizer(params: Any, steps: int) -> dict[str, Any]:
 
 
 def weight_decay_mask(params: Any) -> Any:
-    """Match the parameter tree, selecting only matrices for AdamW decay.
+    """Select AdamW decay from parameter roles, never from array rank.
 
-    Every learned projection and embedding in this model is rank two. Biases
-    and normalization scales are rank one, so they intentionally remain
-    outside the decoupled weight-decay update.
+    Expert-stacked biases are rank two, so shape is not a reliable indication
+    that a leaf is a weight.  Parameter names are part of this recipe's
+    optimizer contract; failing closed also makes a newly introduced role ask
+    for an explicit decay decision.
     """
 
-    return jax.tree_util.tree_map(lambda value: bool(value.ndim >= 2), params)
+    def decay_for_path(path: tuple[Any, ...], _value: Any) -> bool:
+        name = getattr(path[-1], "key", None) if path else None
+        if not isinstance(name, str):
+            raise ValueError(f"cannot classify unnamed parameter leaf at {path!r}")
+        if name in {"token_embedding", "output_embedding"} or name.endswith("_w"):
+            return True
+        if name.endswith(("_b", "_bias", "_scale")):
+            return False
+        raise ValueError(f"weight-decay policy has no rule for parameter {name!r}")
+
+    return jax.tree_util.tree_map_with_path(decay_for_path, params)
 
 
 def optimizer_hyperparameter_trees(
     params: Mapping[str, Any], config: Config
 ) -> tuple[Any, Any, Any]:
-    """Return Complete(d)P LR, epsilon, and decay multipliers per tensor.
+    """Return Complete(d)P-inspired LR, epsilon, and decay multipliers per tensor.
 
     Input/output layers and the residual backbone are intentionally distinct.
     Complete(d)P corrects CompleteP's input-embedding epsilon to ``1 / m_N``;
@@ -1872,7 +1809,7 @@ def optimizer_hyperparameter_trees(
     absorbed into initialization and learning rate.
     """
 
-    if config.parameterization != "complete_d_p":
+    if config.parameterization != "completep_fixed_tpp_v1":
         ones = jax.tree_util.tree_map(lambda _: 1.0, params)
         return ones, ones, ones
 
@@ -1929,14 +1866,14 @@ def effective_adam_betas(config: Config) -> tuple[float, float]:
     beta2 = 1.0 - (1.0 - config.beta2) * ratio
     if not 0.0 <= beta1 < 1.0 or not 0.0 <= beta2 < 1.0:
         raise ValueError(
-            "Complete(d)P batch/data scaling produced invalid Adam momenta; "
+            "fixed-TPP batch/data scaling produced invalid Adam momenta; "
             "use a closer transfer base"
         )
     return beta1, beta2
 
 
 def effective_optimizer_metadata(config: Config) -> dict[str, float]:
-    """Return the global Complete(d)P horizon/batch scalars used at runtime."""
+    """Return the fixed-TPP hybrid's global horizon/batch scalars."""
 
     beta1, beta2 = effective_adam_betas(config)
     ratio = config.batch_multiplier / config.data_multiplier
@@ -2312,7 +2249,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         documents=args.downstream_data,
         vocab_size=config.semantic_vocab_size,
     )
-    diagnostic_mode = args.no_final_validation and args.no_checkpoint
+    diagnostic_mode = args.diagnostic_mode
     needs_evaluation = should_compile_evaluation(args, config, downstream_domains)
     if config.batch_size % len(devices):
         raise ValueError(
@@ -2439,7 +2376,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                 (
                     f"{config.final_step:,} of {config.steps:,} scheduled steps "
                     "(early stop)"
-                    if config.early_stopping_step is not None
+                    if config.stop_after_step is not None
                     else f"{config.steps:,} steps"
                 ),
             ),
@@ -2598,7 +2535,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             flops_per_token=flops_per_token,
         )
     try:
-        # final_step is the horizon unless --early-stopping-step truncates it.
+        # final_step is the horizon unless --stop-after-step truncates it.
         # The schedule below still spans config.steps, so a truncated run walks
         # exactly the prefix of the trajectory it samples.
         for step_index in range(1, config.final_step + 1):
@@ -3036,7 +2973,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     result: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "status": "ok",
-        "track": args.track,
+        "track": "open",
         "profile": profile,
         "seed": int(args.seed),
         "checkpoint": None if args.omit_checkpoint else CHECKPOINT_NAME,
@@ -3054,11 +2991,11 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             "dataset_id": dataset_id,
             "tokenizer_id": tokenizer_id,
             "sequence_length": config.seq_len,
+            "context_preset": config.context_preset,
             "model": contract_model_metadata(config),
         },
-        # Kernel choices are implementation provenance, not part of the fixed
-        # sample-efficiency model contract. Keeping this sibling object separate
-        # preserves exact compatibility with the harness reference contract.
+        # Keep kernel choices in implementation provenance so the architecture
+        # metadata remains easy to compare across otherwise different recipes.
         "implementation": implementation_metadata(config, attention_runtime),
         "evaluations": evaluations,
         "metrics": {
@@ -3069,9 +3006,9 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             "training_token_budget": int(tokens_processed),
             "training_steps": int(config.final_step),
             "schedule_steps": int(config.steps),
-            "early_stopping_step": (
-                int(config.early_stopping_step)
-                if config.early_stopping_step is not None
+            "stop_after_step": (
+                int(config.stop_after_step)
+                if config.stop_after_step is not None
                 else None
             ),
             "model_tier": config.tier,
@@ -3079,6 +3016,11 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             "tokens_per_parameter": (
                 float(config.tokens_per_parameter)
                 if config.tokens_per_parameter is not None
+                else None
+            ),
+            "target_tokens_per_parameter": (
+                float(config.target_tokens_per_parameter)
+                if config.target_tokens_per_parameter is not None
                 else None
             ),
             "base_learning_rate": float(config.learning_rate),
@@ -3165,6 +3107,24 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
 def main(argv: Iterable[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.print_plan:
+        try:
+            experiment = validate_args(args)
+            planned = resolve_config(
+                args,
+                "cpu" if selected_profile(args) == "smoke" else "tpu",
+                experiment.vocab_size,
+                experiment,
+            )
+        except Exception as error:
+            print(f"\nerror: {error}", file=sys.stderr)
+            return 1
+        print(
+            json.dumps(
+                resolved_plan_metadata(planned), sort_keys=True, separators=(",", ":")
+            )
+        )
+        return 0
     try:
         result = run(args)
     except Exception as error:

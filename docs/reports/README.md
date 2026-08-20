@@ -123,9 +123,9 @@ parameter, 1,024 context. The widest grid here, and what study 2 leans on.
 for bs in 32 64 128 256 512; do
   for lr in 0.015625 0.0078125 0.00390625 0.001953125 0.0009765625; do
     for seed in 1337 1338 1339; do
-      rig run reference --cluster v4-32 --profile dev --track open \
+      rig run reference --context 1k --cluster v4-32 --profile dev \
         --tier 60m --tokens-per-parameter 5 \
-        --study-batch-size "$bs" --base-learning-rate "$lr" --seed "$seed" \
+        --batch-size "$bs" --base-learning-rate "$lr" --seed "$seed" \
         --name "60m-bs${bs}-lr${lr}-s${seed}"
     done
   done
@@ -147,9 +147,9 @@ which were two renderings of these same 27 runs.
 for bs in 64 128 256; do
   for lr in 0.0078125 0.00390625 0.001953125; do
     for seed in 1337 1338 1339; do
-      rig run reference --cluster v4-32 --profile dev --track open \
+      rig run reference --context 1k --cluster v4-32 --profile dev \
         --tier 125m --tokens-per-parameter 5 \
-        --study-batch-size "$bs" --base-learning-rate "$lr" --seed "$seed" \
+        --batch-size "$bs" --base-learning-rate "$lr" --seed "$seed" \
         --name "125m-bs${bs}-lr${lr}-s${seed}"
     done
   done
@@ -172,9 +172,9 @@ plot from their training curves rather than being dropped over it.
 for bs in 64 128 256 512; do
   for lr in 0.0078125 0.00390625 0.001953125; do
     for seed in 1337 1338 1339; do
-      rig run reference --cluster v4-32 --profile dev --track open \
+      rig run reference --context 1k --cluster v4-32 --profile dev \
         --tier 250m --tokens-per-parameter 5 \
-        --study-batch-size "$bs" --base-learning-rate "$lr" --seed "$seed" \
+        --batch-size "$bs" --base-learning-rate "$lr" --seed "$seed" \
         --name "250m-bs${bs}-lr${lr}-s${seed}"
     done
   done
@@ -196,24 +196,24 @@ read. All twelve can now.
 # 5 TPP arm, batch bracket at the optimal LR
 for bs in 128 256; do
   for seed in 1337 1338 1339; do
-    rig run reference --cluster v4-32 --profile dev --track open \
+    rig run reference --context 1k --cluster v4-32 --profile dev \
       --tier 500m --tokens-per-parameter 5 \
-      --study-batch-size "$bs" --base-learning-rate 0.00390625 --seed "$seed" \
+      --batch-size "$bs" --base-learning-rate 0.00390625 --seed "$seed" \
       --name "500m-5tpp-bs${bs}-s${seed}"
   done
 done
 
 # 20 TPP arm on the v6e-8: batch bracket, then the LR bracket at batch 128
 for bs in 64 128 256; do
-  rig run reference --cluster v6e-8 --profile dev --track open \
+  rig run reference --context 1k --cluster v6e-8 --profile dev \
     --tier 500m --tokens-per-parameter 20 --checkpoint-policy none \
-    --study-batch-size "$bs" --base-learning-rate 0.00390625 --seed 1337 \
+    --batch-size "$bs" --base-learning-rate 0.00390625 --seed 1337 \
     --name "500m-20tpp-bs${bs}-s1337"
 done
 for lr in 0.0078125 0.001953125; do
-  rig run reference --cluster v6e-8 --profile dev --track open \
+  rig run reference --context 1k --cluster v6e-8 --profile dev \
     --tier 500m --tokens-per-parameter 20 --checkpoint-policy none \
-    --study-batch-size 128 --base-learning-rate "$lr" --seed 1337 \
+    --batch-size 128 --base-learning-rate "$lr" --seed 1337 \
     --name "500m-20tpp-bs128-lr${lr}-s1337"
 done
 ```
@@ -231,9 +231,9 @@ statistics at all.
 ```bash
 for lr in 0.015625 0.0078125 0.00390625 0.001953125; do
   for seed in 1337 1338 1339; do
-    rig run reference --cluster v4-32 --profile dev --track open \
+    rig run reference --context 1k --cluster v4-32 --profile dev \
       --tier 250m --tokens-per-parameter 5 \
-      --study-batch-size 128 --base-learning-rate "$lr" --seed "$seed" \
+      --batch-size 128 --base-learning-rate "$lr" --seed "$seed" \
       --name "250m-lr${lr}-s${seed}"
   done
 done
@@ -242,14 +242,14 @@ done
 ## 8k-lr-sweep-60M.html
 
 15 runs: **5 learning rates × 3 seeds** of
-[`reference_8k`](../../recipes/reference_8k/) — 60M at 8,192 context with
+[`reference --context 8k`](../../recipes/reference/) — 60M at 8,192 context with
 document masking, batch 16 so tokens per step and step count match the
 1,024-context ladder exactly. This is study 4.
 
 ```bash
 for lr in 0.015625 0.0078125 0.00390625 0.001953125 0.0009765625; do
   for seed in 1337 1338 1339; do
-    rig run reference_8k --cluster v4-32 --profile dev --track open \
+    rig run reference --context 8k --cluster v4-32 --profile dev \
       --tier 60m --tokens-per-parameter 5 \
       --base-learning-rate "$lr" --seed "$seed" --checkpoint-policy none \
       --name "60m-bs16-lr${lr}-s${seed}"
@@ -276,7 +276,7 @@ load for all 8 experts in all 12 layers, at every step.
 ```bash
 for lr in 0.015625 0.0078125 0.00390625 0.001953125 0.0009765625; do
   for seed in 1337 1338 1339; do
-    rig run reference_moe --cluster v4-32 --profile dev --track open \
+    rig run reference_moe --context 8k --cluster v4-32 --profile dev \
       --tier 60m --tokens-per-parameter 5 \
       --base-learning-rate "$lr" --seed "$seed" --checkpoint-policy none \
       --name "60m-moe-lr${lr}-s${seed}"
@@ -286,7 +286,7 @@ done
 
 ## batch-size-grid-8k.html
 
-42 runs extending the two 8k ladders to batch 32 and 64 — `reference_8k` and
+42 runs extending the two 8k ladders to batch 32 and 64 — `reference --context 8k` and
 `reference_moe` at 60M with three seeds per cell, `reference_moe` at 125M with
 one. Three learning rates at every batch, so no batch is judged at a rate
 picked for another. The batch-16 arm is not in this study: it is the ladder
@@ -308,13 +308,13 @@ and every large-batch cell is far worse than batch 16 at every rate tried, so
 it was not worth more machine time.
 
 ```bash
-for recipe in reference_8k reference_moe; do
-  tag=$([ "$recipe" = reference_8k ] && echo 8k || echo moe)
+for recipe in reference reference_moe; do
+  tag=$([ "$recipe" = reference ] && echo 8k || echo moe)
   for batch in 32 64; do
     for lr in 0.0078125 0.00390625 0.001953125; do
       for seed in 1337 1338 1339; do
-        rig run "$recipe" --cluster v4-32 --profile dev --track open \
-          --tier 60m --tokens-per-parameter 5 --study-batch-size "$batch" \
+        rig run "$recipe" --context 8k --cluster v4-32 --profile dev \
+          --tier 60m --tokens-per-parameter 5 --batch-size "$batch" \
           --base-learning-rate "$lr" --seed "$seed" --checkpoint-policy none \
           --name "60m-${tag}-bs${batch}-lr${lr}-s${seed}"
       done

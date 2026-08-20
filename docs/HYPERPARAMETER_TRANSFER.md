@@ -1,4 +1,4 @@
-# Hyperparameter transfer under Complete(d)P
+# Hyperparameter transfer under the fixed-TPP CompleteP hybrid
 
 Whether hyperparameters tuned once at a small size stay optimal as the model
 grows. Two knobs measured on the reference family at 5 TPP — base learning rate
@@ -9,9 +9,9 @@ move the answer.
 `2^-8` and global batch `128`, across a 4x parameter range (60M → 250M) and a
 16x batch range. The one apparent break was a seed artifact with an identified
 cause. Note that a fixed *base* LR is a `sqrt(batch)` schedule on the
-*effective* LR, since the runtime applies `sqrt(m_B / m_D)` — so the
-batch-invariant base LR confirms that correction rather than showing LR is
-independent of batch.
+*effective* LR, since the runtime applies `sqrt(m_B / m_D_ladder)` using a
+recipe-local batch anchor — so the batch-invariant base LR supports this
+recipe's correction rather than showing LR is independent of batch.
 
 The penalty for missing it does *not* transfer: exceeding the optimal batch
 costs 0.45 nats at 60M, 0.016 at 250M, and by 500M is no longer resolvable
@@ -32,13 +32,13 @@ Supersedes the former `LR_TRANSFER.md`.
 |---|---|
 | **LR** | learning rate |
 | **base LR** | the normalized, scale-free LR knob that is swept. `config.yaml`'s `learning_rate` and the trainer's `--base-learning-rate` are the same field |
-| **effective peak LR** | what the optimizer actually applies at the top of the schedule: `base LR * sqrt(m_B / m_D)`. Both factors matter here — sweeping batch moves the effective LR even at a fixed base LR |
-| **m_B** | batch multiplier — global batch over the 128 baseline |
+| **effective peak LR** | what the optimizer actually applies at the top of the schedule: `base LR * sqrt(m_B / m_D_ladder)`. Both factors matter here — sweeping batch moves the effective LR even at a fixed base LR |
+| **m_B** | recipe-local batch multiplier — global batch over the selected context preset's anchor (128 at `1k`, 16 at `8k`, in both `reference` and `reference_moe`) |
 | **TPP** | tokens per parameter — training tokens divided by parameter count. Sets the token horizon |
 | **µP** | Maximal Update Parameterization. Rescales initialization, LR, and multipliers so activation and update magnitudes stay width-invariant |
 | **CompleteP** | µP extended so the rules also hold as *depth* grows ([Dey et al.](https://arxiv.org/abs/2505.01618)) |
-| **Complete(d)P** | a *separate, later* paper ([Mlodozeniec et al.](https://arxiv.org/abs/2512.22382)) extending CompleteP to **batch** and **duration** — the `(d)` is duration, not depth. It also corrects CompleteP's input-embedding Adam epsilon to `1/m_N` and absorbs the unembedding's forward multiplier into init and LR; both corrections are implemented here, its QK-norm extension is not. Rules in [COMPLETEP.md](COMPLETEP.md) |
-| **m_N / m_L / m_D** | width, depth, and data multipliers relative to the 60M anchor (`D384`, `L12`) |
+| **Complete(d)P** | a *separate, later* paper ([Mlodozeniec et al.](https://arxiv.org/abs/2512.22382)) extending CompleteP to **batch** and **duration** — the `(d)` is duration, not depth. This repository borrows selected corrections but does not implement its cross-horizon duration transfer. Rules in [COMPLETEP.md](COMPLETEP.md) |
+| **m_N / m_L / m_D_ladder** | width, depth, and fixed-TPP model-ladder multipliers relative to the 60M anchor (`D384`, `L12`). `m_D_ladder = P/P₀`; it deliberately omits `TPP/TPP₀` |
 | **tier** | a named size rung of the family: 60m, 125m, 250m, 500m, 1b. Measured here: 60m through 500m |
 | **nat** | unit of the loss (natural-log cross-entropy) |
 | **separated** | Welch's t between two 3-seed means exceeds 2.5 in magnitude. Anything below that is reported as unresolved, not as a ranking |
@@ -199,8 +199,8 @@ spread does not, and is not done anywhere in this note.
 Full grid, three seeds per cell, 144 runs across four tiers.
 
 **What "the LR optimum does not move" means here.** The runtime already applies
-`sqrt(m_B / m_D)`, so holding the base LR fixed *is* a `sqrt(batch)` schedule on
-the effective LR. At 60M:
+`sqrt(m_B / m_D_ladder)`, so holding the base LR fixed *is* a `sqrt(batch)`
+schedule on the effective LR relative to the recipe's batch anchor. At 60M:
 
 | batch | base LR | effective peak LR |
 |---|--:|--:|
@@ -210,7 +210,7 @@ the effective LR. At 60M:
 
 A 4x effective swing across the 16x batch range. So the finding below —
 `2^-8` optimal at every batch — is not evidence that LR is independent of
-batch. It is evidence that **Complete(d)P's `sqrt(m_B)` rule is the right
+batch. It is evidence that **the recipe's local `sqrt(m_B)` rule is a useful
 correction**, because applying it makes the remaining knob batch-invariant.
 Sweeping base LR at each batch is what tests the rule rather than assuming it.
 
@@ -351,9 +351,10 @@ and trending toward the larger batch.
 
 ## Study 3 — does the optimum survive a 4x longer horizon?
 
-Studies 1 and 2 were run at 5 TPP. Complete(d)P's `m_D` correction is supposed
-to hold the optimum in place as the token horizon grows, so this tests it
-directly: 500M at **20 TPP**, six points on a v6e-8.
+Studies 1 and 2 were run at 5 TPP. This study asks whether the empirical optimum
+also survives at 20 TPP under the repository's reanchored rule: 500M at
+**20 TPP**, six points on a v6e-8. It does not test Complete(d)P's additional
+cross-horizon `TPP / TPP₀` factor, because that factor is absent here.
 
 *Effective peak LR* is the rate the schedule actually reaches, after the batch
 and duration corrections are applied to the base LR. *Val loss* is
@@ -368,7 +369,7 @@ cross-entropy in nats on held-out FineWeb; lower is better.
 | 128 | 2^-9 | 0.0006744 | 76,691 | 1337 | 2.9961 | 492K |
 | 64 | 2^-8 | 0.0009537 | 153,382 | 1337 | 3.0204 | 484K |
 
-**The learning-rate optimum survives the longer horizon.** `2^-9` is out by
+**The learning-rate optimum survives the longer horizon under reanchoring.** `2^-9` is out by
 0.020 nats and `2^-7` by 0.001, so the optimum is bracketed at `2^-8`. That is
 the same bracket study 1 produced at 5 TPP, four times shorter — the horizon
 moved 4x and the answer did not.
@@ -404,11 +405,12 @@ study 1's reseed paid, and for the same reason.
 
 ## Study 4 — the optimum does not move with context length
 
-Studies 1-3 all trained at 1,024 tokens. [`reference_8k`](../recipes/reference_8k/)
-trains at **8,192** with document masking, holding tokens per step (131,072)
-and optimizer steps (2,286) identical to `reference`, so the only differences
-are how tokens are arranged into sequences and whether attention crosses
-document boundaries. 60M, 5 TPP, five learning rates x three seeds, v4-32.
+Studies 1-3 all trained with `reference`'s default `1k` preset. Study 4 selects
+`reference --context 8k`, training at **8,192** with document masking while
+holding tokens per step (131,072) and optimizer steps (2,286) identical to the
+default preset. The only differences are how tokens are arranged into sequences
+and whether attention crosses document boundaries. 60M, 5 TPP, five learning
+rates x three seeds, v4-32.
 
 | base LR | effective peak LR | mean | range | seeds 1337 / 1338 / 1339 |
 |---|--:|--:|--:|---|
@@ -473,10 +475,10 @@ initialization and data order, not run-to-run nondeterminism.
 - **Not qualifying numbers.** Every run used the dev profile, so each loss is 8
   probe batches, not canonical validation. Rankings at fixed everything-else
   are valid; the absolute losses are not official results.
-- **One horizon.** 5 TPP only. Complete(d)P's `sqrt(m_D)` correction is meant
-  to carry the base LR to other horizons; that was not measured. The batch
-  result is especially horizon-bound — at 20 TPP every batch gets 4x the steps,
-  and the large-batch collapse should move.
+- **No cross-horizon scaling ablation.** Study 3 measures 20 TPP and finds the
+  same LR/batch optimum, but the implementation reanchors `m_D_ladder` at each
+  TPP. It does not compare that behavior against a true `TPP/TPP₀` multiplier.
+  The Complete(d)P duration rule therefore remains untested here.
 - **250M's `2^-6` shoulder is untested in Study 2.** The optimum is bracketed
   by `2^-7` and `2^-9` at every batch, but the far upper shoulder rests on
   Study 1's batch-128 measurement alone.
@@ -490,8 +492,9 @@ initialization and data order, not run-to-run nondeterminism.
   at 250M, the 4B-to-8B difference was −0.0005/+0.0022/+0.0001 at `2^-9`,
   `2^-8`, `2^-7` — an order of magnitude below seed noise — but +0.044 at
   `2^-6`, so the effects are not cleanly separable at high LR.
-- **500M's LR is assumed, not measured.** Only `2^-8` ran there, and only at
-  batches 128 and 256. Its batch optimum is bracketed on neither side.
+- **500M at 5 TPP is still unbracketed.** Only `2^-8` exists at that horizon.
+  Study 3 brackets the 20-TPP neighborhood, but cannot substitute for the
+  missing 5-TPP shoulders needed by the next scaling comparison.
 - **1B is untouched.** Only Study 1's single `2^-8` centre exists.
 - **The 500M batch comparison is noise-limited.** A 0.018 difference against a
   seed spread that one 1011x gradient spike widened to ±0.020 cannot be

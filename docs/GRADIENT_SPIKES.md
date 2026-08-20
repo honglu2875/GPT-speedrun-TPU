@@ -61,7 +61,7 @@ spike on exactly the listed step.
 ```bash
 uv --cache-dir /tmp/uv-cache run --frozen --no-sync rig run reference \
   --cluster v4-32 --profile dev --tier 250m \
-  --tokens-per-parameter 5 --study-batch-size 128 \
+  --tokens-per-parameter 5 --batch-size 128 \
   --base-learning-rate 0.0078125 --seed 1339 \
   --name "spike-250m-bs128-lr2e-7-s1339" \
   --checkpoint-policy none --timeout 14400
@@ -74,24 +74,17 @@ LR values: `2^-6` = `0.015625`, `2^-7` = `0.0078125`, `2^-8` = `0.00390625`,
 
 ### Stopping at the spike
 
-Do not reach for `--steps`. It is mutually exclusive with
-`--tokens-per-parameter` and sets `m_D = 1.0`; for the 250M example that
-doubles the effective peak LR from `0.00193397` to `0.00390625` and shortens
-warmup from 932 steps to 9. That truncated run is a different experiment and
-will not reproduce the spike.
-
-Use `--early-stopping-step N` instead. It leaves `steps`, `warmup_steps`, and
-`m_D` resolved from the full horizon and simply exits the loop after step `N`,
-so the trajectory is the untruncated run's prefix, step for step. It refuses to
-run unless the horizon came from a tokens-per-parameter budget, which is what
-makes that guarantee hold.
+Raw `--steps` and `--train-tokens` horizons are intentionally not available.
+Use `--stop-after-step N`. It leaves `steps`, `warmup_steps`, and `m_D` resolved
+from the full fixed-TPP horizon and simply exits after step `N`, so the
+trajectory is the untruncated run's prefix, step for step.
 
 ```bash
 uv --cache-dir /tmp/uv-cache run --frozen --no-sync rig run reference \
   --cluster v4-32 --profile dev --tier 250m \
-  --tokens-per-parameter 5 --study-batch-size 128 \
+  --tokens-per-parameter 5 --batch-size 128 \
   --base-learning-rate 0.0078125 --seed 1339 \
-  --early-stopping-step 61 \
+  --stop-after-step 61 \
   --name "spike-250m-bs128-lr2e-7-s1339-at-spike" \
   --checkpoint-policy none --timeout 3600
 ```

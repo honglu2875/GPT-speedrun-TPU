@@ -14,7 +14,6 @@ from .errors import (
     ResultValidationError,
 )
 from .models import (
-    ReferenceContract,
     RunConfig,
     RunOutcome,
     ValidationResult,
@@ -37,7 +36,6 @@ __all__ = [
     "RESULT_PREFIX",
     "RecipeError",
     "RecordError",
-    "ReferenceContract",
     "ResultValidationError",
     "RunConfig",
     "RunOutcome",

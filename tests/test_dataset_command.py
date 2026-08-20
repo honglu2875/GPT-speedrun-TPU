@@ -6,16 +6,21 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from rig.cli import _require_prepared_dataset, _route_for_config
+from rig.cli import (
+    _require_prepared_dataset,
+    _route_for_config,
+    _runtime_data_profile,
+)
 from rig.config import ConfigError, LocalConfig
 from rig.data_routing import DataError, dataset_names, named_preparation_route
 
 
 class NamedRoutingTests(unittest.TestCase):
     def test_every_corpus_is_addressable_by_name(self) -> None:
-        self.assertEqual(dataset_names(), ("2B", "4B", "8B", "hero"))
-        for name in dataset_names():
+        self.assertEqual(dataset_names(), ("classic", "2B", "4B", "8B", "hero"))
+        for name in ("2B", "4B", "8B", "hero"):
             self.assertEqual(named_preparation_route(name).variant.name, name)
+        self.assertIsNone(named_preparation_route("classic").variant)
 
     def test_a_partial_download_is_requested_honestly(self) -> None:
         # 500M at 20 TPP needs 10.05B tokens: 101 of hero's 749 shards, not all
@@ -35,22 +40,32 @@ class NamedRoutingTests(unittest.TestCase):
 
 class ResolutionTests(unittest.TestCase):
     def _config(self, **kwargs) -> LocalConfig:
-        base = dict(data_profile="official", training_tokens=5_000_000_000)
+        base = dict(data_profile="official", dataset="8B", train_shards=79)
         base.update(kwargs)
         return LocalConfig(**base)
 
-    def test_a_named_dataset_wins_over_capacity_routing(self) -> None:
-        # training_tokens would select 8B; the name must decide instead.
+    def test_the_named_dataset_decides_the_route(self) -> None:
         route = _route_for_config(self._config(dataset="hero"), "official")
         self.assertEqual(route.variant.name, "hero")
 
-    def test_capacity_routing_still_works_when_unnamed(self) -> None:
+    def test_saved_shard_prefix_is_preserved(self) -> None:
         route = _route_for_config(self._config(), "official")
         self.assertEqual(route.variant.name, "8B")
+        self.assertEqual(route.train_shards, 79)
 
-    def test_non_official_profiles_ignore_the_name(self) -> None:
-        # dev and smoke have their own fixed corpora.
+    def test_development_uses_the_same_named_corpus(self) -> None:
         route = _route_for_config(self._config(dataset="hero"), "dev")
+        self.assertEqual(route.variant.name, "hero")
+
+    def test_runtime_profile_cannot_route_development_to_smoke_data(self) -> None:
+        config = self._config(data_profile="smoke", dataset="hero")
+        route = _route_for_config(config, _runtime_data_profile("dev"))
+        self.assertEqual(route.variant.name, "hero")
+
+    def test_smoke_runtime_uses_only_the_generated_route(self) -> None:
+        config = self._config(dataset="hero")
+        route = _route_for_config(config, _runtime_data_profile("smoke"))
+        self.assertEqual(route.profile, "smoke")
         self.assertIsNone(route.variant)
 
 
@@ -77,12 +92,23 @@ class PresenceGuardTests(unittest.TestCase):
             (target / "fineweb_train_000001.bin").write_bytes(b"x")
             _require_prepared_dataset(config, route, root, cluster=None)
 
-    def test_unnamed_configurations_are_not_guarded(self) -> None:
-        # Existing clusters keep capacity routing and must not start failing.
-        config = LocalConfig(data_profile="official", training_tokens=5_000_000_000)
+    def test_classic_is_guarded_like_every_other_named_corpus(self) -> None:
+        config = LocalConfig(data_profile="official", dataset="classic")
         route = _route_for_config(config, "official")
         with tempfile.TemporaryDirectory() as directory:
-            _require_prepared_dataset(config, route, Path(directory), cluster=None)
+            with self.assertRaisesRegex(ConfigError, "dataset 'classic'"):
+                _require_prepared_dataset(config, route, Path(directory), cluster=None)
+
+    def test_missing_smoke_data_names_the_smoke_preparation_command(self) -> None:
+        config = LocalConfig(dataset="hero", data_profile="smoke")
+        route = _route_for_config(config, "smoke")
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                ConfigError, "rig prepare --profile smoke --cluster v4-8"
+            ):
+                _require_prepared_dataset(
+                    config, route, Path(directory), cluster="v4-8"
+                )
 
 
 if __name__ == "__main__":

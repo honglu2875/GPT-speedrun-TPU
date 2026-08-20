@@ -7,8 +7,6 @@ import unittest
 
 from rig.data import DataError, HEADER_BYTES
 from rig.data_routing import (
-    CLASSIC_TRAIN_CAPACITY,
-    MAX_SCALED_TRAIN_CAPACITY,
     SCALED_BUILDER_SHA256,
     SCALED_CORE_SHA256,
     SCALED_ENTRYPOINT_SHA256,
@@ -16,9 +14,10 @@ from rig.data_routing import (
     SCALED_SOURCE_INVENTORY_SHA256,
     SCALED_SOURCE_REPOSITORY,
     SCALED_SOURCE_REVISION,
-    preparation_route,
+    dataset_names,
+    named_preparation_route,
     resolve_preparation_manifest,
-    scaled_variant_for_tokens,
+    smoke_preparation_route,
 )
 
 
@@ -97,8 +96,8 @@ def publication_manifest(variant: str = "2B") -> dict[str, object]:
 
 
 class DataRoutingTests(unittest.TestCase):
-    def test_current_default_budget_preserves_classic_route(self) -> None:
-        route = preparation_route("official", 624_984_064)
+    def test_classic_route_is_selected_by_name(self) -> None:
+        route = named_preparation_route("classic")
         self.assertFalse(route.is_scaled)
         self.assertEqual(route.manifest, "fineweb10b-gpt2")
         self.assertEqual(route.train_shards, 9)
@@ -107,51 +106,33 @@ class DataRoutingTests(unittest.TestCase):
             route.data_root(Path("/tmp/example-data")), Path("/tmp/example-data")
         )
 
-    def test_exact_capacity_boundaries_choose_minimal_corpus(self) -> None:
-        cases = (
-            (1, None),
-            (CLASSIC_TRAIN_CAPACITY, None),
-            (CLASSIC_TRAIN_CAPACITY + 1, "2B"),
-            (1_900_000_000, "2B"),
-            (1_900_000_001, "4B"),
-            (3_900_000_000, "4B"),
-            (3_900_000_001, "8B"),
-            (7_900_000_000, "8B"),
-            (7_900_000_001, "hero"),
-            (MAX_SCALED_TRAIN_CAPACITY, "hero"),
-        )
-        for budget, expected in cases:
-            with self.subTest(budget=budget):
-                selected = scaled_variant_for_tokens(budget)
-                self.assertEqual(None if selected is None else selected.name, expected)
+    def test_named_routes_are_exact_and_allow_explicit_prefixes(self) -> None:
+        self.assertEqual(dataset_names(), ("classic", "2B", "4B", "8B", "hero"))
+        capacities = {"2B": 19, "4B": 39, "8B": 79, "hero": 749}
+        for name, shards in capacities.items():
+            with self.subTest(name=name):
+                route = named_preparation_route(name)
+                self.assertEqual(route.variant.name, name)  # type: ignore[union-attr]
+                self.assertEqual(route.train_shards, shards)
+                self.assertEqual(
+                    named_preparation_route(name, train_shards=1).train_capacity,
+                    100_000_000,
+                )
+        with self.assertRaises(DataError):
+            named_preparation_route("unknown")
+        with self.assertRaises(DataError):
+            named_preparation_route("2B", train_shards=20)
 
-        for invalid in (0, -1, True, MAX_SCALED_TRAIN_CAPACITY + 1):
-            with self.subTest(invalid=invalid), self.assertRaises(DataError):
-                scaled_variant_for_tokens(invalid)  # type: ignore[arg-type]
-
-    def test_smoke_and_dev_do_not_route_but_budget_bounds_are_global(
-        self,
-    ) -> None:
-        self.assertFalse(
-            preparation_route("smoke", MAX_SCALED_TRAIN_CAPACITY).is_scaled
-        )
-        development = preparation_route("dev", MAX_SCALED_TRAIN_CAPACITY)
-        self.assertFalse(development.is_scaled)
-        self.assertEqual(development.train_shards, 1)
-        for profile in ("smoke", "dev", "official"):
-            for budget in (0, MAX_SCALED_TRAIN_CAPACITY + 1):
-                with (
-                    self.subTest(profile=profile, budget=budget),
-                    self.assertRaises(DataError),
-                ):
-                    preparation_route(profile, budget)
+    def test_smoke_is_the_only_non_named_route(self) -> None:
+        route = smoke_preparation_route()
+        self.assertEqual(route.profile, "smoke")
+        self.assertEqual(route.manifest, "smoke")
+        self.assertFalse(route.is_scaled)
 
     def test_scaled_route_uses_dedicated_nested_root_and_manifest_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repository = Path(directory) / "repo-manifests"
-            route = preparation_route(
-                "official", 1_900_000_000, manifest_root=repository
-            )
+            route = named_preparation_route("2B", manifest_root=repository)
             self.assertEqual(route.variant.name, "2B")  # type: ignore[union-attr]
             self.assertEqual(route.train_shards, 19)
             self.assertEqual(
@@ -171,7 +152,7 @@ class DataRoutingTests(unittest.TestCase):
             physical.mkdir()
             selected = root / "shm"
             selected.symlink_to(physical, target_is_directory=True)
-            route = preparation_route("official", 1_000_000_000)
+            route = named_preparation_route("2B")
             self.assertEqual(
                 route.data_root(selected), physical / "fineweb-scaled" / "2B"
             )
@@ -185,7 +166,7 @@ class DataRoutingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "fineweb-scaled").write_text("not a directory", encoding="utf-8")
-            route = preparation_route("official", 1_000_000_000)
+            route = named_preparation_route("2B")
             with self.assertRaisesRegex(DataError, "not a directory"):
                 route.data_root(root)
 
@@ -193,9 +174,7 @@ class DataRoutingTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            route = preparation_route(
-                "official", 1_000_000_000, manifest_root=Path(directory)
-            )
+            route = named_preparation_route("2B", manifest_root=Path(directory))
             with self.assertRaisesRegex(
                 DataError, "trusted immutable publication manifest is not checked in"
             ):
@@ -208,9 +187,7 @@ class DataRoutingTests(unittest.TestCase):
             destination.parent.mkdir()
             payload = publication_manifest()
             destination.write_text(json.dumps(payload), encoding="utf-8")
-            route = preparation_route(
-                "official", 1_900_000_000, manifest_root=manifest_root
-            )
+            route = named_preparation_route("2B", manifest_root=manifest_root)
             self.assertEqual(resolve_preparation_manifest(route), destination)
 
             for entry in payload["files"]:  # type: ignore[index]
@@ -230,9 +207,7 @@ class DataRoutingTests(unittest.TestCase):
             manifest_root = Path(directory)
             destination = manifest_root / "fineweb-scaled-gpt2" / "2B.json"
             destination.parent.mkdir()
-            route = preparation_route(
-                "official", 1_000_000_000, manifest_root=manifest_root
-            )
+            route = named_preparation_route("2B", manifest_root=manifest_root)
             cases = (
                 ("source", lambda row: row["source"].update(revision="b" * 40)),
                 (
@@ -259,7 +234,7 @@ class DataRoutingTests(unittest.TestCase):
             manifest = root / "fineweb-scaled-gpt2" / "2B.json"
             manifest.parent.mkdir()
             manifest.symlink_to(target)
-            route = preparation_route("official", 1_000_000_000, manifest_root=root)
+            route = named_preparation_route("2B", manifest_root=root)
             with self.assertRaisesRegex(DataError, "symlink manifest"):
                 resolve_preparation_manifest(route)
 
@@ -270,7 +245,7 @@ class DataRoutingTests(unittest.TestCase):
             target.mkdir()
             (target / "2B.json").write_text("{}", encoding="utf-8")
             (root / "fineweb-scaled-gpt2").symlink_to(target, target_is_directory=True)
-            route = preparation_route("official", 1_000_000_000, manifest_root=root)
+            route = named_preparation_route("2B", manifest_root=root)
             with self.assertRaisesRegex(DataError, "symlink manifest directory"):
                 resolve_preparation_manifest(route)
 

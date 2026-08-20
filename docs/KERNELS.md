@@ -99,10 +99,10 @@ the model may store 50,304 embedding rows while only token IDs `[0, 50_257)`
 receive probability mass or output-head gradients. This changes the modeled
 probability distribution, so it is an explicit algorithm choice rather than a
 kernel-only optimization. The trainer therefore defaults the semantic size to
-the full storage vocabulary for both dense and tiled loss; sample-efficiency
-runs pin that 50,304-class value in their model contract. A 50,257-class run is
-therefore an open-track algorithm experiment. `vocab_tile_size=2_048` is the
-measured v4 seed.
+the full storage vocabulary for both dense and tiled loss. Recipes may
+deliberately choose the 50,257-class alternative, but that changes the modeled
+distribution and must remain visible in recipe configuration and run
+provenance. `vocab_tile_size=2_048` is the measured v4 seed.
 
 A hand-written Pallas version of this loss was tried and removed. It was
 correctness-checked but its value-plus-backward microbenchmark ran slower than

@@ -45,9 +45,9 @@ def _fake_config(**fields) -> SimpleNamespace:
     fixtures cannot drift into declaring a stopping step the horizon contradicts.
     """
 
-    fields.setdefault("early_stopping_step", None)
+    fields.setdefault("stop_after_step", None)
     return SimpleNamespace(
-        final_step=fields["early_stopping_step"] or fields.get("steps"), **fields
+        final_step=fields["stop_after_step"] or fields.get("steps"), **fields
     )
 
 
@@ -128,7 +128,7 @@ class TrainerStaticTests(unittest.TestCase):
                     round(parameters * config.tokens_per_parameter),
                 )
 
-    def test_complete_d_p_tensor_and_horizon_multipliers(self) -> None:
+    def test_fixed_tpp_completep_hybrid_tensor_and_ladder_multipliers(self) -> None:
         parser = trainer.build_parser()
         args = parser.parse_args(
             ["--profile", "dev", "--tier", "250m", "--tokens-per-parameter", "5"]
@@ -165,18 +165,33 @@ class TrainerStaticTests(unittest.TestCase):
             config.learning_rate / math.sqrt(config.data_multiplier),
         )
 
-        diagnostic = trainer.resolve_config(
-            parser.parse_args(["--profile", "dev", "--tier", "250m", "--steps", "2"]),
+        twenty_tpp = trainer.resolve_config(
+            parser.parse_args(
+                [
+                    "--profile",
+                    "dev",
+                    "--tier",
+                    "250m",
+                    "--tokens-per-parameter",
+                    "20",
+                ]
+            ),
             "tpu",
             50_304,
         )
-        self.assertEqual(diagnostic.data_multiplier, 1.0)
+        # Each TPP ladder is reanchored. m_D captures model-size growth within
+        # the ladder and therefore does not gain a 20/5 horizon factor.
+        self.assertEqual(twenty_tpp.data_multiplier, config.data_multiplier)
 
     def test_yaml_config_is_authoritative_strict_and_versioned(self) -> None:
         source = trainer.CONFIG_PATH.read_text(encoding="utf-8")
         official = trainer.load_experiment_profile("official")
-        self.assertEqual(official.schema_version, 2)
+        self.assertEqual(official.schema_version, 4)
         self.assertEqual(official.tokens_per_parameter, 20.0)
+        self.assertEqual(official.context_preset, "1k")
+        self.assertEqual(official.batch_size, 128)
+        self.assertEqual(official.seq_len, 1024)
+        self.assertFalse(official.document_masking)
         self.assertEqual(official.attention_backend, "tpu_flash")
         self.assertEqual(official.sampling, "shuffled_epochs")
         self.assertEqual(official.dtype_name, "bfloat16")
@@ -187,14 +202,14 @@ class TrainerStaticTests(unittest.TestCase):
 
         invalid = {
             "duplicate": source.replace(
-                "schema_version: 2", "schema_version: 2\nschema_version: 2", 1
+                "schema_version: 4", "schema_version: 4\nschema_version: 4", 1
             ),
             "unknown": source + "\nunknown: true\n",
-            "anchor": source.replace("schema_version: 2", "schema_version: &v 2", 1),
+            "anchor": source.replace("schema_version: 4", "schema_version: &v 4", 1),
             "alias": source.replace(
-                "schema_version: 2", "schema_version: &v 2\nextra: *v", 1
+                "schema_version: 4", "schema_version: &v 4\nextra: *v", 1
             ),
-            "tag": source.replace("schema_version: 2", "schema_version: !!int 2", 1),
+            "tag": source.replace("schema_version: 4", "schema_version: !!int 4", 1),
             "directive": "%YAML 1.2\n---\n" + source,
             "multiple documents": source + "\n---\n{}\n",
             "nonfinite": source.replace(
@@ -242,8 +257,8 @@ class TrainerStaticTests(unittest.TestCase):
                 trainer.load_experiment_profile("smoke", alternate)
 
             shuffled_source = source.replace(
-                "      seq_len: 1024\n      sampling: shuffled_epochs\n      dtype: bfloat16",
-                "      seq_len: 1024\n      sampling: random_windows\n      dtype: bfloat16",
+                "      sampling: shuffled_epochs\n      dtype: bfloat16",
+                "      sampling: random_windows\n      dtype: bfloat16",
                 1,
             )
             path.write_text(shuffled_source, encoding="utf-8")
@@ -252,6 +267,14 @@ class TrainerStaticTests(unittest.TestCase):
                     trainer.load_experiment_profile("dev").sampling,
                     "random_windows",
                 )
+
+        long_context = trainer.load_experiment_profile("dev", context="8k")
+        self.assertEqual(long_context.context_preset, "8k")
+        self.assertEqual(long_context.batch_size, 16)
+        self.assertEqual(long_context.seq_len, 8192)
+        self.assertTrue(long_context.document_masking)
+        with self.assertRaisesRegex(ValueError, "unknown context preset"):
+            trainer.load_experiment_profile("dev", context="not-defined")
 
     def test_static_cli_values_are_rejected_but_diagnostic_overrides_resolve(
         self,
@@ -263,86 +286,77 @@ class TrainerStaticTests(unittest.TestCase):
             ("--learning-rate", "0.001"),
             ("--eval-batches", "1"),
         ):
-            with (
-                self.subTest(option=option),
-                self.assertRaisesRegex(ValueError, "defined by sibling config.yaml"),
-            ):
-                trainer.resolve_config(
-                    parser.parse_args(["--profile", "official", *option]),
-                    "tpu",
-                    50_304,
-                )
+            with self.subTest(option=option), redirect_stderr(StringIO()):
+                with self.assertRaises(SystemExit):
+                    parser.parse_args(["--profile", "official", *option])
         config = trainer.resolve_config(
             parser.parse_args(
                 [
                     "--profile",
                     "official",
-                    "--steps",
+                    "--stop-after-step",
                     "100",
-                    "--val-every",
-                    "0",
-                    "--diagnostics-every",
-                    "0",
-                    "--log-every",
-                    "100",
+                    "--diagnostic-mode",
                 ]
             ),
             "tpu",
             50_304,
         )
-        self.assertEqual(config.steps, 100)
+        self.assertEqual(config.steps, 18_838)
+        self.assertEqual(config.final_step, 100)
         self.assertEqual(config.val_every, 0)
+        self.assertEqual(config.diagnostics_every, 0)
+        self.assertEqual(config.log_every, config.steps)
         self.assertEqual(
             dict(config.config_overrides),
-            {"steps": 100, "val_every": 0, "diagnostics_every": 0, "log_every": 100},
+            {"diagnostic_mode": 1},
         )
+        context_config = trainer.resolve_config(
+            parser.parse_args(["--profile", "dev", "--context", "8k"]),
+            "tpu",
+            50_304,
+        )
+        self.assertEqual(context_config.context_preset, "8k")
+        self.assertEqual(dict(context_config.config_overrides), {"context": "8k"})
 
-    def test_train_tokens_derives_exact_steps_and_is_exclusive(self) -> None:
+    def test_fixed_tpp_derives_complete_steps_and_rejects_custom_horizons(self) -> None:
         parser = trainer.build_parser()
         config = trainer.resolve_config(
             parser.parse_args(
                 [
                     "--profile",
-                    "official",
-                    "--train-tokens",
-                    "655360",
+                    "dev",
+                    "--tokens-per-parameter",
+                    "5",
                 ]
             ),
             "tpu",
             50_304,
         )
-        self.assertEqual(config.steps, 5)
-        with self.assertRaisesRegex(ValueError, "must be divisible"):
-            trainer.resolve_config(
-                parser.parse_args(
-                    [
-                        "--profile",
-                        "official",
-                        "--train-tokens",
-                        "655361",
-                    ]
-                ),
-                "tpu",
-                50_304,
-            )
-        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
-            parser.parse_args(["--steps", "20", "--train-tokens", "655360"])
+        expected = round(
+            config.declared_parameters * 5 / (config.batch_size * config.seq_len)
+        )
+        self.assertEqual(config.steps, expected)
+        self.assertAlmostEqual(config.target_tokens_per_parameter, 5.0)
+        for removed in ("--steps", "--train-tokens"):
+            with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                parser.parse_args(["--profile", "dev", removed, "20"])
 
     def test_short_diagnostic_run_resolves_fractional_warmup(self) -> None:
         parser = trainer.build_parser()
+        full = trainer.resolve_config(
+            parser.parse_args(["--profile", "official"]), "tpu", 50_304
+        )
         config = trainer.resolve_config(
-            parser.parse_args(["--profile", "official", "--steps", "100"]),
+            parser.parse_args(["--profile", "official", "--stop-after-step", "100"]),
             "tpu",
             50_304,
         )
-        self.assertEqual(config.steps, 100)
-        self.assertEqual(config.warmup_steps, 10)
-        with self.assertRaisesRegex(ValueError, "defined by sibling config.yaml"):
-            trainer.resolve_config(
-                parser.parse_args(["--profile", "official", "--warmup-steps", "100"]),
-                "tpu",
-                50_304,
-            )
+        self.assertEqual(config.steps, full.steps)
+        self.assertEqual(config.warmup_steps, full.warmup_steps)
+        self.assertEqual(config.final_step, 100)
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(["--profile", "official", "--warmup-steps", "100"])
 
     def test_xprof_diagnostic_contract_and_capture_window(self) -> None:
         parser = trainer.build_parser()
@@ -355,8 +369,7 @@ class TrainerStaticTests(unittest.TestCase):
                 "11",
                 "--xprof-steps",
                 "20",
-                "--no-final-validation",
-                "--no-checkpoint",
+                "--diagnostic-mode",
             ]
         )
         trainer.validate_args(valid)
@@ -392,6 +405,7 @@ class TrainerStaticTests(unittest.TestCase):
         invalid_commands = (
             ["--xprof-start-step", "1"],
             ["--xprof-dir", "trace", "--xprof-start-step", "1"],
+            ["--diagnostic-mode"],
             [
                 "--xprof-dir",
                 "trace",
@@ -399,20 +413,19 @@ class TrainerStaticTests(unittest.TestCase):
                 "1",
                 "--xprof-steps",
                 "1",
-                "--no-checkpoint",
+                "--diagnostic-mode",
+                "--omit-checkpoint",
             ],
-            ["--no-final-validation", "--no-checkpoint"],
             [
-                "--profile",
-                "official",
                 "--xprof-dir",
                 "trace",
                 "--xprof-start-step",
                 "1",
                 "--xprof-steps",
                 "1",
-                "--no-final-validation",
-                "--no-checkpoint",
+                "--diagnostic-mode",
+                "--downstream-data",
+                "science=data.bin",
             ],
         )
         for command in invalid_commands:
@@ -432,28 +445,23 @@ class TrainerStaticTests(unittest.TestCase):
             },
         )
 
-    def test_checkpoint_omission_is_restricted_to_open_dev_research(self) -> None:
+    def test_checkpoint_omission_is_restricted_to_development_research(self) -> None:
         parser = trainer.build_parser()
-        valid = parser.parse_args(
-            ["--track", "open", "--profile", "dev", "--omit-checkpoint"]
-        )
+        valid = parser.parse_args(["--profile", "dev", "--omit-checkpoint"])
         trainer.validate_args(valid)
         invalid_commands = (
-            ["--track", "open", "--profile", "official", "--omit-checkpoint"],
+            ["--profile", "official", "--omit-checkpoint"],
             [
-                "--track",
-                "sample_efficiency",
                 "--profile",
                 "dev",
                 "--omit-checkpoint",
-            ],
-            [
-                "--track",
-                "open",
-                "--profile",
-                "dev",
-                "--omit-checkpoint",
-                "--no-checkpoint",
+                "--diagnostic-mode",
+                "--xprof-dir",
+                "trace",
+                "--xprof-start-step",
+                "1",
+                "--xprof-steps",
+                "1",
             ],
         )
         for command in invalid_commands:
@@ -478,7 +486,7 @@ class TrainerStaticTests(unittest.TestCase):
             self.assertEqual(trainer.main([]), 0)
         self.assertEqual(stdout.getvalue(), "")
 
-    def test_periodic_validation_defaults_and_cli_overrides(self) -> None:
+    def test_periodic_validation_defaults_and_diagnostic_mode(self) -> None:
         parser = trainer.build_parser()
 
         official = trainer.resolve_config(
@@ -505,59 +513,34 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertEqual(development.val_every, 0)
         self.assertEqual(development.diagnostics_every, 10)
 
-        overridden = trainer.resolve_config(
-            parser.parse_args(
-                [
-                    "--profile",
-                    "dev",
-                    "--val-every",
-                    "5",
-                ]
-            ),
-            "tpu",
-            50_304,
-        )
-        self.assertEqual(overridden.val_every, 5)
-        self.assertEqual(overridden.val_probe_batches, 8)
-        disabled = trainer.resolve_config(
+        diagnostic = trainer.resolve_config(
             parser.parse_args(
                 [
                     "--profile",
                     "official",
-                    "--steps",
-                    "1",
-                    "--val-every",
-                    "0",
+                    "--stop-after-step",
+                    "100",
+                    "--diagnostic-mode",
                 ]
             ),
             "tpu",
             50_304,
         )
-        self.assertEqual(disabled.val_every, 0)
-        self.assertEqual(disabled.eval_batches, 80)
-        self.assertEqual(disabled.val_probe_batches, 8)
+        self.assertEqual(diagnostic.steps, official.steps)
+        self.assertEqual(diagnostic.final_step, 100)
+        self.assertEqual(diagnostic.val_every, 0)
+        self.assertEqual(diagnostic.diagnostics_every, 0)
+        self.assertEqual(diagnostic.log_every, diagnostic.steps)
+        self.assertEqual(diagnostic.eval_batches, 80)
+        self.assertEqual(diagnostic.val_probe_batches, 8)
         for option in (
-            ("--batch-size", "128"),
             ("--seq-len", "16384"),
             ("--val-probe-batches", "9"),
+            ("--val-every", "5"),
         ):
-            with (
-                self.subTest(option=option),
-                self.assertRaisesRegex(ValueError, "defined by sibling config.yaml"),
-            ):
-                trainer.resolve_config(
-                    parser.parse_args(["--profile", "official", *option]),
-                    "tpu",
-                    50_304,
-                )
-        with self.assertRaisesRegex(ValueError, "must be divisible"):
-            trainer.resolve_config(
-                parser.parse_args(
-                    ["--profile", "official", "--train-tokens", "655361"]
-                ),
-                "tpu",
-                50_304,
-            )
+            with self.subTest(option=option), redirect_stderr(StringIO()):
+                with self.assertRaises(SystemExit):
+                    parser.parse_args(["--profile", "official", *option])
 
     def test_tiled_loss_resolves_semantic_vocab_and_counts_recompute_flops(
         self,
@@ -590,12 +573,8 @@ class TrainerStaticTests(unittest.TestCase):
             _traced_per_token(replace(dense, **_SMALL)),
         )
 
-        with self.assertRaisesRegex(ValueError, "defined by sibling config.yaml"):
-            trainer.resolve_config(
-                parser.parse_args(["--profile", "official", "--loss-backend", "tiled"]),
-                "tpu",
-                50_304,
-            )
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(["--profile", "official", "--loss-backend", "tiled"])
 
     def test_flash_flops_include_right_padding_for_odd_sequences(self) -> None:
         parser = trainer.build_parser()
@@ -705,7 +684,7 @@ class TrainerStaticTests(unittest.TestCase):
         # different tiles for the same program.
         parser = trainer.build_parser()
         defaults = parser.parse_args([])
-        self.assertIsNone(defaults.attention_backend)
+        self.assertFalse(hasattr(defaults, "attention_backend"))
         self.assertFalse(hasattr(defaults, "attention_tuning_cache"))
         self.assertFalse(hasattr(defaults, "autotune_attention"))
         for flag in ("--attention-tuning-cache", "--autotune-attention"):
@@ -881,7 +860,7 @@ class TrainerStaticTests(unittest.TestCase):
                 "semantic_vocab_size": 50_257,
                 "tied_embeddings": False,
                 "tier": "125m",
-                "parameterization": "complete_d_p",
+                "parameterization": "completep_fixed_tpp_v1",
             },
         )
         implementation = trainer.implementation_metadata(config, runtime)
@@ -975,12 +954,12 @@ class TrainerStaticTests(unittest.TestCase):
         np.testing.assert_array_equal(log.axis("tokens_processed"), [32, 64])
         np.testing.assert_array_equal(log.axis("cumulative_flops"), [320.0, 640.0])
 
-    def test_early_stopping_step_truncates_without_moving_the_schedule(self) -> None:
+    def test_stop_after_step_truncates_without_moving_the_schedule(self) -> None:
         parser = trainer.build_parser()
         horizon = ["--profile", "dev", "--tier", "250m", "--tokens-per-parameter", "5"]
         full = trainer.resolve_config(parser.parse_args(horizon), "tpu", 50_304)
         stopped = trainer.resolve_config(
-            parser.parse_args([*horizon, "--early-stopping-step", "60"]),
+            parser.parse_args([*horizon, "--stop-after-step", "60"]),
             "tpu",
             50_304,
         )
@@ -998,39 +977,21 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertEqual(full.final_step, full.steps)
         self.assertLess(60, full.steps)
 
-        # The step-driven forms rebuild the schedule around the length asked
-        # for, so truncation there would not reproduce anything.
-        for duration in (["--steps", "9325"], ["--train-tokens", "5242880"]):
-            with self.subTest(duration=duration[0]):
-                with self.assertRaisesRegex(
-                    ValueError, "requires a tokens-per-parameter horizon"
-                ):
-                    trainer.resolve_config(
-                        parser.parse_args(
-                            [
-                                "--profile",
-                                "dev",
-                                "--tier",
-                                "250m",
-                                *duration,
-                                "--early-stopping-step",
-                                "60",
-                            ]
-                        ),
-                        "tpu",
-                        50_304,
-                    )
+        # Custom step and raw-token horizons are deliberately no longer part
+        # of the public surface.
+        for removed in ("--steps", "--train-tokens"):
+            with self.subTest(removed=removed), redirect_stderr(StringIO()):
+                with self.assertRaises(SystemExit):
+                    parser.parse_args([*horizon, removed, "100"])
         with self.assertRaisesRegex(ValueError, "past the"):
             trainer.resolve_config(
-                parser.parse_args(
-                    [*horizon, "--early-stopping-step", str(full.steps + 1)]
-                ),
+                parser.parse_args([*horizon, "--stop-after-step", str(full.steps + 1)]),
                 "tpu",
                 50_304,
             )
 
     def test_early_stopped_artifacts_cover_only_the_steps_taken(self) -> None:
-        config = _fake_config(steps=5, early_stopping_step=2, batch_size=4, seq_len=8)
+        config = _fake_config(steps=5, stop_after_step=2, batch_size=4, seq_len=8)
         # The device history buffer is sized for the full horizon and only its
         # prefix is written, so the writer must drop the trailing zeros.
         history = np.zeros((5, 3), dtype=np.float32)
@@ -1146,12 +1107,11 @@ class TrainerStaticTests(unittest.TestCase):
         self,
     ) -> None:
         parser = trainer.build_parser()
-        config = trainer.resolve_config(
-            parser.parse_args(
-                ["--profile", "smoke", "--steps", "2", "--diagnostics-every", "1"]
+        config = replace(
+            trainer.resolve_config(
+                parser.parse_args(["--profile", "smoke"]), "cpu", 256
             ),
-            "cpu",
-            256,
+            diagnostics_every=1,
         )
         host_params = trainer.init_params(config, 7)
         decay_mask = trainer.weight_decay_mask(host_params)
@@ -1524,10 +1484,14 @@ class SalvageTests(unittest.TestCase):
 
     def _config(self, steps: int = 200):
         parser = trainer.build_parser()
-        return trainer.resolve_config(
-            parser.parse_args(["--profile", "dev", "--steps", str(steps)]),
-            "tpu",
-            50_304,
+        resolved = trainer.resolve_config(
+            parser.parse_args(["--profile", "dev"]), "tpu", 50_304
+        )
+        return replace(
+            resolved,
+            steps=steps,
+            stop_after_step=None,
+            warmup_steps=min(resolved.warmup_steps, max(0, steps - 1)),
         )
 
     def _meta(self):

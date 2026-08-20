@@ -1,9 +1,14 @@
-# Complete(d)P
+# Fixed-TPP CompleteP hybrid
 
-(note originally drafted by GPT 5.6 but revised by myself)
+This repository uses an opinionated parameterization called
+`completep_fixed_tpp_v1`. It starts from **CompleteP, α = 1**, adopts a small
+set of useful corrections and batch/duration formulas from Complete(d)P, and
+reanchors those formulas independently inside every fixed-TPP ladder.
 
-This repository currently uses **Complete(d)P, α = 1** for the
-baseline family.
+It is deliberately not presented as a complete implementation of
+Complete(d)P. In particular, changing a run from 5 TPP to 20 TPP does not add
+the paper's cross-horizon `TPP / TPP₀` factor. The 5-TPP and 20-TPP sweeps are
+separate empirical anchors.
 
 ## Two papers, not one
 
@@ -17,8 +22,9 @@ axes are covered:
 
 The `(d)` marks the added axes — token **d**uration and batch size — reading
 as both "CompleteP" and "Complete**d**P". It is *not* depth; CompleteP already
-had depth. That is why `m_D` here is the data/duration multiplier and why
-`sqrt(m_B / m_D)` exists at all: both come from the second paper.
+had depth. That is why the second paper writes `m_D` for a data/duration
+multiplier and uses `sqrt(m_B / m_D)`. This repository uses corrections of the
+same shape but defines both ratios locally, as described below.
 
 In its own words: *"we propose the Complete(d) Parameterisation that unifies
 scaling in width & depth — using an adaptation of CompleteP (Dey et al. 2025) —
@@ -31,13 +37,14 @@ transfer with the right layerwise rules, and that the original transformer
 recipe did not cover depth, Adam epsilon, weight decay, batch size, or
 training duration completely.
 
-Here we do observe the learning-rate and batch size transfer after implementing
-Complete(d)P.
+Here we observe a stable learning-rate and batch-size optimum under the local,
+fixed-TPP rules. That is evidence for this recipe, not evidence that the full
+cross-horizon Complete(d)P rule is necessary or correct for these runs.
 
-## What Complete(d)P changes in CompleteP, and what is implemented here
+## What is borrowed from Complete(d)P
 
 The paper makes three modifications. Two are implemented and covered by
-`tests/test_trainer_static.py::test_complete_d_p_tensor_and_horizon_multipliers`;
+`tests/test_trainer_static.py::test_fixed_tpp_completep_hybrid_tensor_and_ladder_multipliers`;
 the third is deliberately out of scope for this reproduction.
 
 | # | Change | Here |
@@ -46,11 +53,19 @@ the third is deliberately out of scope for this reproduction.
 | 2 | Corrects CompleteP's **AdamW epsilon for input embeddings** | **implemented**: `epsilon["token_embedding"] = 1 / m_N` |
 | 3 | **Reparameterizes the output layer**, removing the explicit unembedding forward multiplier by absorbing it into learning rate and initialization | **implemented**: `gpt_logits` applies no multiplier; the unembedding gets `lr = 1/m_N`, `epsilon = 1`, and init `init_std / m_N` |
 
-Beyond those three, the `(d)` itself — the batch and duration rules — is what
-the runtime applies globally as `sqrt(m_B / m_D)` and friends, tabulated below.
-Nothing in this section is a local invention: it is the second paper's
-prescription, and where this repository departs from it that is stated
-explicitly.
+The runtime also uses corrections shaped like `sqrt(m_B / m_D)` and its
+reciprocals. The important local choice is what those symbols mean here:
+
+- `m_B = batch_size / configured_batch_size`. Each recipe/profile owns its
+  batch anchor. The 1,024-token reference anchors at 128 sequences; the 8,192
+  and routed recipes anchor at 16.
+- `m_D_ladder = declared_parameters / base_parameters`. This is the data growth
+  induced by holding TPP fixed while moving up one model ladder.
+- There is no additional `TPP / TPP₀` term. At a given model size,
+  `m_D_ladder` is the same in a 5-TPP and 20-TPP run.
+
+These definitions are a project choice. They should not be attributed to the
+Complete(d)P paper without the `fixed-TPP` qualification.
 
 Primary sources:
 
@@ -66,20 +81,18 @@ Primary sources:
 
 ## Implementation details
 
-(authored by GPT 5.6)
-
 The 60M tier is the base discretization. Let `mN = width / 384`,
-`mL = layers / 12`, `mD = training tokens / base-tier training tokens`, and
-`mB = global batch / 128`. In a fixed-TPP ladder, `mD` is the tier's parameter
-count divided by the 60M parameter count. A fixed-step diagnostic sets `mD=1`
-so a profiling override does not silently alter the optimizer.
+`mL = layers / 12`, `mD_ladder = parameters / base_parameters`, and
+`mB = global_batch / configured_batch`. A diagnostic is an early-stopped
+prefix of the same fixed-TPP schedule, so it retains all four multipliers and
+the original warmup/cosine horizon.
 
 The model uses pre-RMSNorm, RoPE, GELU, a 4× MLP, untied embeddings, and a
 fixed 64-dimensional attention head. Scaling width therefore adds heads rather
 than changing head dimension. Attention follows the official nanoGPT-mup
 implementation and divides each head's QK contraction by its own head dimension.
 
-| Quantity | Complete(d)P multiplier |
+| Quantity | Tensor multiplier used here |
 |---|---:|
 | attention and MLP residual branches | `mL^-1` |
 | input embedding init std | `1` |
@@ -101,23 +114,21 @@ factor is absorbed into its initialization and learning rate, which keeps the
 memory-bounded tiled cross entropy straightforward. AdamW follows the PyTorch
 form, `parameter -= lr * (adam_update + weight_decay * parameter)`.
 
-Across batch and token horizon, the runtime additionally applies the current
-Complete(d)P SDE prescription:
+Across the recipe-local batch ratio and fixed-TPP model ladder, the runtime
+applies the following Complete(d)P-inspired corrections:
 
 | Quantity | Global multiplier |
 |---|---:|
-| learning rate | `sqrt(mB / mD)` |
-| Adam epsilon | `sqrt(mD / mB)` |
-| weight decay | `sqrt(mB / mD)` |
-| `1 - beta1`, `1 - beta2` | `mB / mD` |
-| optimizer steps | proportional to `mD / mB` |
+| learning rate | `sqrt(mB / mD_ladder)` |
+| Adam epsilon | `sqrt(mD_ladder / mB)` |
+| weight decay | `sqrt(mB / mD_ladder)` |
+| `1 - beta1`, `1 - beta2` | `mB / mD_ladder` |
+| optimizer steps within one fixed-TPP ladder | proportional to `mD_ladder / mB` |
 
 These are approximate finite-step transfer rules. They do not imply identical
 training trajectories, and a fitted optimum at 60M is not accepted as proof of
-transfer. Complete(d)P itself reports a small penalty when transferring from a
-58M proxy and nearly stabilized optima from about 136M upward. This is why the
-admission decision uses 60M, 125M, and 250M trends. The first-pass protocol
-stops there; 500M and 1B are reserved for later reproduction or hero runs.
+transfer. They also make no prediction here about how the optimum should move
+when TPP itself changes; that remains an explicit experimental question.
 
 ## Deliberately held fixed
 
@@ -131,7 +142,7 @@ stops there; 500M and 1B are reserved for later reproduction or hero runs.
   `1 / d_head` rule. The conflicting `1 / d_model` sentence in the CompleteP
   paper is not used; with width scaled by adding heads it would introduce an
   extra inverse-head-count factor.
-- We do not combine Complete(d)P with u-µP, Adam-atan2, GQA-specific µP, Muon,
+- We do not combine this hybrid with u-µP, Adam-atan2, GQA-specific µP, Muon,
   or per-module learning-rate tuning in the baseline. (Per-module tuning is one
   of the second paper's results — hyperparameters transfer even when tuned per
   module — but it is a tuning protocol, not a rule this family has to apply.) Each is a meaningful
@@ -157,9 +168,10 @@ modest depth point, not a reproduction of the paper's 2-to-128-layer experiment.
 ### Sweep protocol
 
 **Sweep the base LR, never the effective one.** The runtime applies
-`sqrt(mB / mD)`, so a fixed base LR is already a `sqrt(batch)` schedule on the
-effective LR. Grids are powers of two, wide enough that the winner has measured
-neighbours; an edge optimum is unbracketed, not a winner.
+`sqrt(mB / mD_ladder)`, so a fixed base LR is already a `sqrt(batch)` schedule
+on the effective LR relative to that recipe's configured batch. Grids are
+powers of two, wide enough that the winner has measured neighbours; an edge
+optimum is unbracketed, not a winner.
 
 **Ranking requires seeds.** One seed locates a region; ranking needs three and
 Welch's `t >= 2.5`. Never rank points within ~0.05 nats from single seeds — seed

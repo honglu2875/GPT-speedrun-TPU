@@ -1,10 +1,4 @@
-"""Training-budget routing for explicit dataset preparation.
-
-This module chooses the corpus that preparation installs and non-smoke runs use.
-Published
-scaled manifests are deliberately not synthesized here: until an immutable,
-URL-bearing manifest is checked in, a scaled route fails closed.
-"""
+"""Explicit named-dataset routing for preparation and training."""
 
 from __future__ import annotations
 
@@ -18,7 +12,6 @@ from typing import Any, Mapping
 from .data import DataError, FORMAT_VERSION, HEADER_BYTES, MAGIC, load_manifest
 
 
-CLASSIC_TRAIN_CAPACITY = 900_000_000
 SCALED_VALIDATION_TOKENS = 100_000_000
 SCALED_CACHE_SUBDIRECTORY = Path("fineweb-scaled")
 SCALED_MANIFEST_SUBDIRECTORY = "fineweb-scaled-gpt2"
@@ -64,9 +57,6 @@ SCALED_VARIANTS = (
     ScaledVariant("8B", 8_000_000_000),
     ScaledVariant("hero", 75_000_000_000),
 )
-MAX_SCALED_TRAIN_CAPACITY = SCALED_VARIANTS[-1].train_capacity
-
-
 @dataclass(frozen=True)
 class PreparationRoute:
     """One fully resolved preparation choice, before touching its cache."""
@@ -114,38 +104,14 @@ class PreparationRoute:
             raise DataError(f"scaled data path escapes data root: {target}") from exc
         return target
 
-    def summary(self, requested_tokens: int) -> str:
+    def summary(self) -> str:
         if not self.is_scaled:
-            if self.profile == "official":
-                return (
-                    f"{requested_tokens:,} training tokens select classic FineWeb "
-                    f"({CLASSIC_TRAIN_CAPACITY:,}-token nominal train capacity)"
-                )
-            return (
-                f"the explicit {self.profile} profile selects {self.label}; the "
-                f"{requested_tokens:,}-token corpus budget applies when preparing official data"
-            )
+            return f"{self.label}: {self.train_shards} train shard(s)"
         assert self.variant is not None
         return (
-            f"{requested_tokens:,} training tokens select scaled FineWeb "
-            f"{self.variant.name} "
-            f"({self.train_capacity:,}-token nominal train capacity)"
+            f"scaled FineWeb {self.variant.name}: {self.train_shards} train shard(s) "
+            f"({self.train_capacity:,} nominal train tokens)"
         )
-
-
-def scaled_variant_for_tokens(training_tokens: int) -> ScaledVariant | None:
-    """Return the smallest corpus beyond classic that fits ``training_tokens``."""
-
-    _validate_budget(training_tokens)
-    if training_tokens <= CLASSIC_TRAIN_CAPACITY:
-        return None
-    for variant in SCALED_VARIANTS:
-        if training_tokens <= variant.train_capacity:
-            return variant
-    raise DataError(
-        f"training-token budget {training_tokens:,} exceeds the largest prepared "
-        f"corpus capacity ({MAX_SCALED_TRAIN_CAPACITY:,} hero training tokens)"
-    )
 
 
 def scaled_variant_named(name: str) -> ScaledVariant:
@@ -158,50 +124,10 @@ def scaled_variant_named(name: str) -> ScaledVariant:
     raise DataError(f"unknown scaled FineWeb variant {name!r}; expected {choices}")
 
 
-def preparation_route(
-    profile: str,
-    training_tokens: int,
-    *,
-    manifest_root: Path | None = None,
-) -> PreparationRoute:
-    """Map personal preparation settings to one classic or scaled dataset."""
+def smoke_preparation_route() -> PreparationRoute:
+    """Return the sole generated-data route used by smoke tests."""
 
-    _validate_budget(training_tokens)
-    if profile == "smoke":
-        return PreparationRoute(profile, "smoke", "smoke", 1, None, Path())
-    if profile == "dev":
-        return PreparationRoute(
-            profile,
-            "classic FineWeb development shard",
-            "fineweb10b-gpt2",
-            1,
-            100_000_000,
-            Path(),
-        )
-    if profile != "official":
-        raise DataError(f"unknown data profile: {profile}")
-    variant = scaled_variant_for_tokens(training_tokens)
-    if variant is None:
-        return PreparationRoute(
-            profile,
-            "classic FineWeb",
-            "fineweb10b-gpt2",
-            9,
-            CLASSIC_TRAIN_CAPACITY,
-            Path(),
-        )
-    root = (
-        manifest_root or Path(__file__).resolve().parent.parent / "data" / "manifests"
-    )
-    return PreparationRoute(
-        profile,
-        f"scaled FineWeb {variant.name}",
-        root / SCALED_MANIFEST_SUBDIRECTORY / f"{variant.name}.json",
-        variant.train_shards,
-        variant.train_capacity,
-        SCALED_CACHE_SUBDIRECTORY / variant.name,
-        variant,
-    )
+    return PreparationRoute("smoke", "smoke", "smoke", 1, None, Path())
 
 
 def named_preparation_route(
@@ -212,13 +138,22 @@ def named_preparation_route(
 ) -> PreparationRoute:
     """Resolve a corpus by name rather than by capacity.
 
-    ``preparation_route`` picks the smallest corpus that covers a token budget,
-    which is indirect: a caller who wants "hero" has to know that some number
-    above the 8B capacity selects it, and a budget that overshoots the largest
-    corpus fails with an arithmetic complaint rather than a name. Naming the
-    dataset says what is meant, and lets a partial download be requested
-    honestly through ``train_shards``.
+    Naming the corpus makes data identity independent of a training horizon and
+    permits an explicit shard prefix without pretending it is a token budget.
     """
+
+    if name == "classic":
+        shards = 9 if train_shards is None else int(train_shards)
+        if not 1 <= shards <= 9:
+            raise DataError("classic publishes 9 train shards; train_shards must be 1..9")
+        return PreparationRoute(
+            "official",
+            "classic FineWeb",
+            "fineweb10b-gpt2",
+            shards,
+            shards * 100_000_000,
+            Path(),
+        )
 
     variant = scaled_variant_named(name)
     root = (
@@ -246,7 +181,7 @@ def named_preparation_route(
 def dataset_names() -> tuple[str, ...]:
     """Every corpus that can be requested by name."""
 
-    return tuple(variant.name for variant in SCALED_VARIANTS)
+    return ("classic", *(variant.name for variant in SCALED_VARIANTS))
 
 
 def resolve_preparation_manifest(route: PreparationRoute) -> str | Path:
@@ -433,20 +368,6 @@ def _validate_publication_urls(
             )
 
 
-def _validate_budget(training_tokens: int) -> None:
-    if (
-        isinstance(training_tokens, bool)
-        or not isinstance(training_tokens, int)
-        or training_tokens <= 0
-    ):
-        raise DataError("training-token budget must be a positive integer")
-    if training_tokens > MAX_SCALED_TRAIN_CAPACITY:
-        raise DataError(
-            f"training-token budget {training_tokens:,} exceeds the largest prepared "
-            f"corpus capacity ({MAX_SCALED_TRAIN_CAPACITY:,} hero training tokens)"
-        )
-
-
 def _regular_nonsymlink(path: Path) -> bool:
     try:
         parent_metadata = path.parent.lstat()
@@ -472,8 +393,6 @@ def _regular_nonsymlink(path: Path) -> bool:
 
 
 __all__ = [
-    "CLASSIC_TRAIN_CAPACITY",
-    "MAX_SCALED_TRAIN_CAPACITY",
     "PreparationRoute",
     "SCALED_CACHE_SUBDIRECTORY",
     "SCALED_BUILDER_SHA256",
@@ -489,9 +408,8 @@ __all__ = [
     "ScaledVariant",
     "dataset_names",
     "named_preparation_route",
-    "preparation_route",
     "resolve_preparation_manifest",
     "scaled_variant_named",
-    "scaled_variant_for_tokens",
+    "smoke_preparation_route",
     "validate_scaled_manifest_contract",
 ]

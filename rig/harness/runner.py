@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, TextIO
 
+from ..cohort import validate_cohort
+from ..plan import RecipePlan, validate_recipe_plan
 from .cluster import (
     build_distributed_launch_command,
     fetch_run_artifacts,
@@ -32,7 +34,6 @@ from .models import RunConfig, RunOutcome
 from .records import append_record
 from .validation import (
     parse_result_line,
-    reference_contract_dict,
     sha256_file,
     validate_result,
 )
@@ -44,7 +45,6 @@ _RESERVED_PASSTHROUGH_FLAGS = (
     "--config",
     "--output-dir",
     "--seed",
-    "--track",
     "--profile",
 )
 
@@ -64,6 +64,8 @@ def run_recipe(config: RunConfig) -> RunOutcome:
         runs_dir,
         records_path,
         configured_provenance,
+        plan,
+        cohort,
     ) = checked
     provenance = _collect_provenance(
         repo_root,
@@ -87,11 +89,9 @@ def run_recipe(config: RunConfig) -> RunOutcome:
         str(run_dir),
         "--seed",
         str(config.seed),
-        "--track",
-        config.track,
         "--profile",
         config.profile,
-        *[str(argument) for argument in config.passthrough_args],
+        *[str(argument) for argument in config.trainer_args],
     ]
     configured_environment = {
         str(key): str(value) for key, value in config.environment.items()
@@ -99,7 +99,6 @@ def run_recipe(config: RunConfig) -> RunOutcome:
     managed_environment = {
         "RIG_RUN_ID": run_id,
         "RIG_OUTPUT_DIR": str(run_dir),
-        "RIG_TRACK": config.track,
         "RIG_PROFILE": config.profile,
         # Every attempt receives a fresh persistent cache. This keeps cold
         # compilation reproducible and prevents run order from advantaging
@@ -221,9 +220,7 @@ def run_recipe(config: RunConfig) -> RunOutcome:
     validated = validate_result(
         payload,
         run_dir=run_dir,
-        track=config.track,
-        reference_contract=config.reference_contract,
-        expected_training_tokens=config.expected_training_tokens,
+        expected_training_tokens=plan.expected_tokens,
         expected_validation_tokens=config.expected_validation_tokens,
         expected_downstream_tokens=config.expected_downstream_tokens,
         require_checkpoint=config.require_checkpoint,
@@ -262,8 +259,11 @@ def run_recipe(config: RunConfig) -> RunOutcome:
         "qualified": qualified,
         "recipe": config.recipe,
         "name": config.name,
-        "track": config.track,
+        # Kept as a constant for readers of historical records. Competition
+        # tracks are no longer an experiment axis.
+        "track": "open",
         "profile": config.profile,
+        "run_kind": plan.run_kind,
         "seed": config.seed,
         "timestamps": {
             "started_at": started_at.isoformat(),
@@ -271,7 +271,7 @@ def run_recipe(config: RunConfig) -> RunOutcome:
         },
         "target_loss": float(config.target_loss),
         "constraints": {
-            "training_tokens": config.expected_training_tokens,
+            "training_tokens": plan.expected_tokens,
             "validation_tokens": config.expected_validation_tokens,
         },
         "timing": {"observed_wall_seconds": observed_seconds},
@@ -283,7 +283,9 @@ def run_recipe(config: RunConfig) -> RunOutcome:
             else None
         ),
         "system": payload.get("system"),
-        "reference_contract": reference_contract_dict(config.reference_contract),
+        "plan": {**plan.as_dict(), "sha256": plan.sha256},
+        "cohort": cohort,
+        "cohort_id": cohort.get("cohort_id") if cohort is not None else None,
         "checkpoint": (
             {
                 "path": relative_checkpoint,
@@ -513,7 +515,7 @@ def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
 
 
 def _validate_payload_identity(payload: Mapping[str, Any], config: RunConfig) -> None:
-    expected = {"track": config.track, "profile": config.profile, "seed": config.seed}
+    expected = {"profile": config.profile, "seed": config.seed}
     for name, expected_value in expected.items():
         actual = payload.get(name)
         if (
@@ -555,24 +557,29 @@ def _validate_official_system(value: Any, *, expected_process_count: int = 1) ->
 
 def _validate_config(
     config: RunConfig,
-) -> tuple[Path, Path, Path, Path, Path, dict[str, Any]]:
+) -> tuple[
+    Path,
+    Path,
+    Path,
+    Path,
+    Path,
+    dict[str, Any],
+    RecipePlan,
+    dict[str, Any] | None,
+]:
     if not _RECIPE_NAME.fullmatch(config.recipe):
         raise ConfigurationError(
             "recipe must be a simple name containing only letters, digits, '.', '_' or '-'"
         )
     if not _PROFILE_NAME.fullmatch(config.profile):
         raise ConfigurationError("profile must be a non-empty simple name")
-    if config.track not in ("open", "sample_efficiency"):
-        raise ConfigurationError("track must be 'open' or 'sample_efficiency'")
     if config.checkpoint_retention not in ("always", "qualifying", "none"):
         raise ConfigurationError("invalid checkpoint retention policy")
     if not isinstance(config.require_checkpoint, bool):
         raise ConfigurationError("require_checkpoint must be boolean")
-    if not config.require_checkpoint and (
-        config.track != "open" or config.profile != "dev"
-    ):
+    if not config.require_checkpoint and config.profile != "dev":
         raise ConfigurationError(
-            "checkpoint omission is restricted to open/dev research runs"
+            "checkpoint omission is restricted to development research runs"
         )
     if (
         isinstance(config.tpu_vm_count, bool)
@@ -599,23 +606,44 @@ def _validate_config(
     timeout_seconds = _finite_config_number(config.timeout_seconds)
     if timeout_seconds is None or timeout_seconds <= 0:
         raise ConfigurationError("timeout_seconds must be greater than zero")
-    if isinstance(config.passthrough_args, (str, bytes)) or not isinstance(
-        config.passthrough_args, Sequence
+    if isinstance(config.trainer_args, (str, bytes)) or not isinstance(
+        config.trainer_args, Sequence
     ):
-        raise ConfigurationError("passthrough_args must be a sequence of arguments")
+        raise ConfigurationError("trainer_args must be a sequence of arguments")
     target_loss = _finite_config_number(config.target_loss)
     if target_loss is None or target_loss < 0:
         raise ConfigurationError("target_loss must be a finite non-negative number")
-    for argument in config.passthrough_args:
+    for argument in config.trainer_args:
         rendered = str(argument)
         if "\x00" in rendered:
-            raise ConfigurationError("passthrough arguments may not contain NUL bytes")
+            raise ConfigurationError("trainer arguments may not contain NUL bytes")
         for flag in _RESERVED_PASSTHROUGH_FLAGS:
             if rendered == flag or rendered.startswith(flag + "="):
                 raise ConfigurationError(
-                    f"passthrough arguments may not override reserved flag {flag}"
+                    f"trainer arguments may not override reserved flag {flag}"
                 )
     configured_provenance = _copy_finite_mapping(config.provenance, "provenance")
+    try:
+        plan = validate_recipe_plan(config.plan)
+    except Exception as exc:
+        raise ConfigurationError(str(exc)) from exc
+    if plan.payload["profile"] != config.profile:
+        raise ConfigurationError(
+            "recipe plan profile must exactly match the run configuration"
+        )
+    if config.cohort is None:
+        cohort = None
+    else:
+        try:
+            cohort = validate_cohort(config.cohort)
+        except Exception as exc:
+            raise ConfigurationError(str(exc)) from exc
+    _validate_cohort_alignment(
+        cohort,
+        plan,
+        target_loss=float(target_loss),
+        tpu_vm_count=config.tpu_vm_count,
+    )
 
     repo_root = config.repo_root.resolve()
     if not repo_root.is_dir():
@@ -634,6 +662,13 @@ def _validate_config(
         raise ConfigurationError(
             f"recipe configuration file not found: {recipe_config}"
         )
+    actual_config_sha256 = sha256_file(recipe_config)
+    if plan.payload["config_sha256"] != actual_config_sha256:
+        raise ConfigurationError(
+            "recipe plan config_sha256 does not match the current sibling "
+            f"config.yaml: expected {actual_config_sha256}, "
+            f"got {plan.payload['config_sha256']}"
+        )
 
     runs_dir = _resolve_managed_path(
         repo_root, config.runs_dir, "runs_dir", directory=True
@@ -641,8 +676,6 @@ def _validate_config(
     records_path = _resolve_managed_path(repo_root, config.records_path, "records_path")
     runs_dir.mkdir(parents=True, exist_ok=True)
     records_path.parent.mkdir(parents=True, exist_ok=True)
-    if config.track == "sample_efficiency" and config.reference_contract is None:
-        raise ConfigurationError("sample_efficiency requires reference_contract")
     if config.expected_validation_tokens is not None and (
         isinstance(config.expected_validation_tokens, bool)
         or not isinstance(config.expected_validation_tokens, int)
@@ -651,12 +684,6 @@ def _validate_config(
         raise ConfigurationError(
             "expected_validation_tokens must be a positive integer"
         )
-    if config.expected_training_tokens is not None and (
-        isinstance(config.expected_training_tokens, bool)
-        or not isinstance(config.expected_training_tokens, int)
-        or config.expected_training_tokens <= 0
-    ):
-        raise ConfigurationError("expected_training_tokens must be a positive integer")
     if config.expected_downstream_tokens is not None:
         if not isinstance(config.expected_downstream_tokens, Mapping):
             raise ConfigurationError("expected_downstream_tokens must be a mapping")
@@ -673,11 +700,6 @@ def _validate_config(
                 raise ConfigurationError(
                     f"expected_downstream_tokens[{name!r}] must be a positive integer"
                 )
-    # Validate the configured contract before launching an expensive TPU job.
-    try:
-        reference_contract_dict(config.reference_contract)
-    except Exception as exc:
-        raise ConfigurationError(str(exc)) from exc
     return (
         repo_root,
         recipe_dir,
@@ -685,7 +707,56 @@ def _validate_config(
         runs_dir,
         records_path,
         configured_provenance,
+        plan,
+        cohort,
     )
+
+
+def _validate_cohort_alignment(
+    cohort: Mapping[str, Any] | None,
+    plan: RecipePlan,
+    *,
+    target_loss: float,
+    tpu_vm_count: int,
+) -> None:
+    if cohort is None:
+        return
+    if plan.run_kind != "full":
+        raise ConfigurationError("only a full recipe plan may carry a cohort")
+
+    payload = plan.payload
+    expected_fields = {
+        "profile": payload["profile"],
+        "tier": payload["tier"],
+        "declared_parameters": payload["declared_parameters"],
+    }
+    for name, expected in expected_fields.items():
+        if cohort[name] != expected:
+            raise ConfigurationError(
+                f"cohort {name} must match the recipe plan: "
+                f"expected {expected!r}, got {cohort[name]!r}"
+            )
+
+    expected_tpp = format(float(payload["target_tokens_per_parameter"]), ".15g")
+    actual_tpp = cohort["horizon"]["target_tokens_per_parameter"]
+    if actual_tpp != expected_tpp:
+        raise ConfigurationError(
+            "cohort target_tokens_per_parameter must match the recipe plan: "
+            f"expected {expected_tpp!r}, got {actual_tpp!r}"
+        )
+    expected_loss = format(target_loss, ".15g")
+    actual_loss = cohort["qualification"]["target_loss"]
+    if actual_loss != expected_loss:
+        raise ConfigurationError(
+            "cohort target_loss must match the run configuration: "
+            f"expected {expected_loss!r}, got {actual_loss!r}"
+        )
+    actual_hosts = cohort["hardware"]["tpu_vm_count"]
+    if actual_hosts != tpu_vm_count:
+        raise ConfigurationError(
+            "cohort tpu_vm_count must match the run configuration: "
+            f"expected {tpu_vm_count}, got {actual_hosts}"
+        )
 
 
 def _copy_finite_mapping(value: Any, label: str) -> dict[str, Any]:

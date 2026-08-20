@@ -266,6 +266,52 @@ class ActiveParameterTests(unittest.TestCase):
         )
 
 
+class WeightDecayPolicyTests(unittest.TestCase):
+    def test_stacked_expert_biases_are_not_decayed(self) -> None:
+        params = {
+            "token_embedding": np.zeros((16, 8), dtype=np.float32),
+            "blocks": [
+                {
+                    "router_w": np.zeros((8, 4), dtype=np.float32),
+                    "expert_up_w": np.zeros((4, 8, 16), dtype=np.float32),
+                    "expert_up_b": np.zeros((4, 16), dtype=np.float32),
+                    "expert_down_w": np.zeros((4, 16, 8), dtype=np.float32),
+                    "expert_down_b": np.zeros((4, 8), dtype=np.float32),
+                    "ln1_scale": np.ones((8,), dtype=np.float32),
+                }
+            ],
+            "output_embedding": np.zeros((16, 8), dtype=np.float32),
+        }
+
+        mask = trainer.weight_decay_mask(params)
+
+        self.assertTrue(mask["token_embedding"])
+        self.assertTrue(mask["output_embedding"])
+        self.assertTrue(mask["blocks"][0]["router_w"])
+        self.assertTrue(mask["blocks"][0]["expert_up_w"])
+        self.assertTrue(mask["blocks"][0]["expert_down_w"])
+        self.assertFalse(mask["blocks"][0]["expert_up_b"])
+        self.assertFalse(mask["blocks"][0]["expert_down_b"])
+        self.assertFalse(mask["blocks"][0]["ln1_scale"])
+
+    def test_new_parameter_roles_require_an_explicit_policy(self) -> None:
+        with self.assertRaisesRegex(ValueError, "no rule for parameter 'mystery'"):
+            trainer.weight_decay_mask({"mystery": np.zeros((8, 8), dtype=np.float32)})
+
+
+class ContextPresetTests(unittest.TestCase):
+    def test_moe_defaults_to_8k_and_can_select_the_aligned_1k_preset(self) -> None:
+        native = trainer.load_experiment_profile("dev")
+        short = trainer.load_experiment_profile("dev", context="1k")
+
+        self.assertEqual(native.context_preset, "8k")
+        self.assertEqual((native.seq_len, native.batch_size), (8192, 16))
+        self.assertTrue(native.document_masking)
+        self.assertEqual(short.context_preset, "1k")
+        self.assertEqual((short.seq_len, short.batch_size), (1024, 128))
+        self.assertFalse(short.document_masking)
+
+
 class RoutedModelTests(unittest.TestCase):
     def _config(self):
         parser = trainer.build_parser()

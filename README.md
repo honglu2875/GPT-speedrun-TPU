@@ -1,7 +1,7 @@
 # GPT TPU Rig
 
 A simple GPT pretraining rig for Cloud TPU slices, from a single host to
-larger multi-host v4 and v5e slices. Every algorithm is a polished JAX entry program named
+larger multi-host slices. Every algorithm is a polished JAX entry program named
 `train.py`, with a sibling `config.yaml`; shared code handles
 reproducible data, machine checks, run capture, protocol validation, and
 leaderboards.
@@ -9,20 +9,23 @@ leaderboards.
 Just copy the `recipes/reference` and start hacking.
 
 This is largely inspired by nano-GPT speedrun. The baseline is a GPT-2 with slightly modernized architecture choices (RoPE, GELU, etc).
-To ensure hyperparameter transfer, the family implements **Complete(d)P**, which is
-two papers rather than one:
+For hyperparameter transfer, the family implements an opinionated
+**fixed-TPP CompleteP hybrid** assembled from two papers:
 
 1. [CompleteP](https://arxiv.org/abs/2505.01618) extends muP with depth scaling for
    the pre-LN transformer (α=1 for L^{-α}), plus AdamW ϵ, weight decay, residual
    block, and embedding rules.
-2. [Complete(d)P](https://arxiv.org/abs/2512.22382) adds the two axes CompleteP left
-   out — **batch size and token duration** — as `sqrt(m_B / m_D)` scaling. The `(d)`
-   is *duration*, not depth. It also corrects two things in CompleteP, both
-   implemented here: the input-embedding AdamW ϵ (now `1/m_N`) and the unembedding's
-   forward multiplier (absorbed into init and learning rate). Its third change, a
-   QK-norm extension, is deliberately not implemented — this family uses no QK norm.
+2. [Complete(d)P](https://arxiv.org/abs/2512.22382) adds batch size and token
+   duration and corrects the input-embedding AdamW epsilon and unembedding
+   parameterization. This repository adopts those two tensor corrections and
+   recipe-local batch/data factors, but it does **not** apply a cross-horizon
+   `TPP / TPP₀` multiplier. Each fixed-TPP ladder is reanchored independently.
 
-I did successfully observe the optimal learning-rate on the 60M, 125M, 250M ladder with 5 token-per-parameter (TPP). I cannot try 20 TPP or higher ladders because of compute. The compute I used is a v4-32 multi-slice VM from Google TPU Research Cloud (TRC) program.
+The measured base-LR optimum is `2^-8` and the measured batch optimum is 128
+across the 60M–250M 5-TPP ladder, with the same neighborhood observed at 500M
+and 20 TPP. Those results support this repository's reanchored setup; they do
+not establish the full Complete(d)P duration prescription. The exact contract
+and limitations are in [docs/COMPLETEP.md](docs/COMPLETEP.md).
 
 ## Start here
 
@@ -57,16 +60,16 @@ process cannot initialize.
 `make prepare` runs these two commands:
 
 ```bash
-uv --cache-dir /tmp/uv-cache sync --frozen
+uv --cache-dir /tmp/uv-cache sync --frozen --group dev
 uv --cache-dir /tmp/uv-cache run --frozen --no-sync rig prepare \
-  --training-tokens 2600000000
+  --dataset 8B --train-shards 79
 ```
 
 It asks for the data-cache root, data and run profiles, persistent artifact
-directory, TPU VM host count, default track, checkpoint policy, colors, a
-smoke/development loss target, and an immutable corpus-capacity budget. The
-saved budget selects the dataset used by every non-smoke run; the default 2.6B
-request routes to the 4B corpus and covers the 500M × 5-TPP transfer point.
+directory, TPU VM host count, checkpoint policy, colors, a smoke/development
+loss target, and an explicit immutable corpus plus shard prefix. Data identity
+never depends on a training-horizon number: `8B` means the checked-in 8B
+manifest, and 79 means its complete train split.
 Training duration is independently specified by each family profile (20 TPP in
 the reference official profile) or by an explicit research study.
 The wizard can then probe JAX/TPU health and prepare the selected dataset;
@@ -79,7 +82,7 @@ tightened explicitly.
 `make run` requires that saved file to contain a default profile; otherwise it
 stops and asks for `make prepare`. `TARGET` defaults to `reference`. A custom
 target must be a folder beneath `recipes/` containing regular, non-symlink
-`train.py` and `config.yaml` files. New candidates use schema 2 family configs
+`train.py` and `config.yaml` files. New candidates use schema 3 family configs
 with 60M, 125M, 250M, 500M, and 1B tiers; `TIER` defaults to `125m`.
 
 For a multi-host run using the conventional `shm` cache, preparation requires
@@ -156,7 +159,8 @@ For automation on a four-host v4-32, bypass the questions:
 ```bash
 uv run --frozen --no-sync rig prepare \
   --non-interactive --path shm/ --profile official \
-  --run-profile official --track open --checkpoint-policy qualifying \
+  --run-profile official --checkpoint-policy qualifying \
+  --dataset 8B --train-shards 79 \
   --tpu-vm-count 4 --tpu-vm-hosts 't1v-n-a09f5679-w-[0-3]'
 ```
 
@@ -181,12 +185,12 @@ A cluster can name the corpus it expects:
 ```toml
 [cluster.v6e-8]
 dataset = "hero"
+train_shards = 105
 ```
 
-When set, that name is authoritative: a missing corpus stops the run with the
-commands that fix it, instead of quietly falling back to whichever corpus the
-`training_tokens` capacity happens to select. Leaving it empty keeps the
-capacity routing described above, so existing clusters are unaffected.
+The name and optional shard prefix are authoritative. A missing corpus stops
+the run with the commands that fix it; there is no capacity-based fallback and
+no silent switch to the classic corpus.
 
 ### Orchestrating a slice you are not part of
 
@@ -232,7 +236,7 @@ rig run reference --checkpoint-policy none        # never write them
 ```
 
 `none` skips the write rather than writing and deleting, which matters at 500M
-where a checkpoint is about 2 GB. It is restricted to open/dev research runs.
+where a checkpoint is about 2 GB. It is restricted to development research runs.
 
 ## Data profiles
 
@@ -240,30 +244,28 @@ All profiles use one well-defined token format; downloading and tokenization
 are never timed.
 
 | Profile | Data | Intended use |
+|---|---|---|
+| `smoke` | generated locally | CPU end-to-end wiring checks |
+| `dev` | selected named corpus | 5-TPP research runs and diagnostics |
+| `official` | selected named corpus plus Fresh10 | 20-TPP confirmation runs |
+
+Non-smoke data is selected directly:
+
+| Corpus | Full training split | Cache root |
 |---|---:|---|
-| `smoke` | generated locally | CPU/CI end-to-end checks |
-| `dev` | 100M train + 100M validation tokens (~400 MB cached) | quick TPU iteration |
-| `official` | 900M train + 100M validation tokens, plus Fresh10 (~2.0 GB cached) | record attempts |
+| `classic` | 900M tokens | `<data-path>/` |
+| `2B` | 1.9B tokens | `<data-path>/fineweb-scaled/2B/` |
+| `4B` | 3.9B tokens | `<data-path>/fineweb-scaled/4B/` |
+| `8B` | 7.9B tokens | `<data-path>/fineweb-scaled/8B/` |
+| `hero` | 74.9B tokens | `<data-path>/fineweb-scaled/hero/` |
 
-For official preparation, `training_tokens` selects the smallest corpus whose
-nominal training capacity fits the requested budget:
-
-| Requested preparation budget | Corpus | Training capacity | Cache root |
-|---:|---|---:|---|
-| up to 900M | classic | 900M | `<data-path>/` |
-| 900M+1 through 1.9B | scaled `2B` | 1.9B | `<data-path>/fineweb-scaled/2B/` |
-| 1.9B+1 through 3.9B | scaled `4B` | 3.9B | `<data-path>/fineweb-scaled/4B/` |
-| 3.9B+1 through 7.9B | scaled `8B` | 7.9B | `<data-path>/fineweb-scaled/8B/` |
-| 7.9B+1 through 74.9B | scaled `hero` | 74.9B | `<data-path>/fineweb-scaled/hero/` |
-
-The saved `training_tokens` route is used by preparation, doctor, profiling,
-and every non-smoke run, so a run cannot silently fall back to the classic
-dataset after a scaled preparation. Scaled preparation is fail-closed and
+`train_shards` may select an explicit prefix of a named manifest. Preparation,
+doctor, profiling, and every non-smoke run use that same selection. Scaled
+preparation is fail-closed and
 starts working only after the corresponding immutable, URL-bearing publication
 manifest is checked into `data/manifests/fineweb-scaled-gpt2/`; no placeholder
-manifest is accepted. `--check-only` verifies the same routed manifest and
-dedicated folder without mutation. Smoke and development profile selection is
-unchanged.
+manifest is accepted. `--check-only` verifies the same manifest and dedicated
+folder without mutation.
 
 Official evaluation covers exactly the first 10,485,760 validation predictions.
 The harness requires official result events to report that exact coverage;
@@ -291,28 +293,24 @@ uv run --frozen --no-sync rig run reference --profile smoke
 
 # Run the versioned official configuration (compare timings on like hardware)
 uv run --frozen --no-sync rig run reference \
-  --track open --profile official
-
-# Short diagnostic overrides follow --; experiment settings stay in config.yaml
-uv run --frozen --no-sync rig run reference --profile dev -- \
-  --steps 100
+  --profile official
 
 # Walk the first 100 steps of a full-horizon run, schedule untouched
 uv run --frozen --no-sync rig run reference --profile dev \
-  --tokens-per-parameter 20 --early-stopping-step 100
+  --tokens-per-parameter 5 --stop-after-step 100
 ```
 
-Those last two are not the same run. `--steps 100` builds a 100-step schedule —
-`m_D = 1`, warmup 10 steps — while `--early-stopping-step 100` keeps the full
-horizon's peak learning rate and warmup and simply stops early, so its curve is
-the long run's prefix step for step.
+Raw step and token-horizon overrides are intentionally absent. A diagnostic
+uses `--stop-after-step`, which keeps the full horizon's learning-rate schedule,
+warmup, and `m_D` and simply stops early. Its curve is the full run's prefix
+step for step, and its `run_kind=diagnostic` keeps it out of leaderboards.
 
 Sweeping a hyperparameter across the ladder is deliberately not built in. One
 run is one command, so a study is an ordinary shell loop over `rig run` with
 the tiers and overrides you care about, and each point lands in `runs/` as a
 normal recorded run. The parameterization rules that make a tier's learning
 rate comparable across sizes are in
-[the Complete(d)P contract](docs/COMPLETEP.md), and what those sweeps
+[the fixed-TPP parameterization contract](docs/COMPLETEP.md), and what those sweeps
 measured is in [the hyperparameter transfer note](docs/HYPERPARAMETER_TRANSFER.md).
 
 Name your runs. `make run NAME=cosine-floor` folds a label into the run
@@ -326,9 +324,10 @@ silently stay unnamed, so scripts cannot hang on a question nobody can answer.
 
 The harness creates a unique persistent run directory, captures stdout/stderr,
 validates the final result event and checkpoint, hashes artifacts, and appends a
-JSONL record. The trainer's synchronized accelerator time is the open-track
-score; cold process wall time is recorded separately. Human progress is streamed
-live while the machine-readable result remains isolated on stdout.
+JSONL record. Within a comparable cohort, the trainer's synchronized
+accelerator time is the leaderboard score; cold process wall time is recorded
+separately. Human progress is streamed live while the machine-readable result
+remains isolated on stdout.
 
 Every successful reference run also writes `training.riglog` inside its run
 directory: one packed record per optimizer step holding loss, learning rate, and
@@ -342,17 +341,16 @@ are documented in [docs/RIGLOG_FORMAT.md](docs/RIGLOG_FORMAT.md).
 The reference also writes `validation.csv`. On the official profile it probes
 the first eight validation batches every 500 optimizer steps by default, then
 records the exact canonical validation as its final FineWeb row. Fresh10 rows
-may follow it. Probe synchronization
-and evaluation are included in `train_seconds`; the final canonical evaluation
-is not. Both training and evaluation executables compile once on synthetic
-zero-valued inputs before timing. Use `--val-every N` for a temporary diagnostic
-cadence override; change `val_probe_batches` in a cloned YAML profile when the
-prefix size is part of the experiment. Smoke and development runs do not probe
-unless explicitly enabled.
+may follow it. Probe synchronization and evaluation are included in
+`train_seconds`; the final canonical evaluation is not. Both training and
+evaluation executables compile once on synthetic zero-valued inputs before
+timing. Validation cadence and prefix size live in the cloned recipe YAML.
+Smoke and development runs do not probe unless their profile enables it.
 
 The reference is intentionally readable. Its v3 model family uses RoPE,
 pre-RMSNorm, a 4× GELU MLP, untied embeddings, fixed 64-wide heads, and the
-Complete(d)P rules documented in [docs/COMPLETEP.md](docs/COMPLETEP.md). The
+fixed-TPP CompleteP hybrid documented in
+[docs/COMPLETEP.md](docs/COMPLETEP.md). The
 60M/125M/250M tiers determine candidate-admission trends; 500M and 1B are
 larger confirmation and hero tiers. The historical v1
 19,073-step calibration on a TPU v4-8 processed exactly **624,984,064**
@@ -372,7 +370,7 @@ like-for-like hardware comparison with the original v4-8 number.
 
 The reference [`config.yaml`](recipes/reference/config.yaml) pins the custom
 trainable Pallas attention with the memory-bounded tiled output loss. It also
-preserves the family shapes, Complete(d)P contract, objective, schedule,
+preserves the family shapes, fixed-TPP parameterization contract, objective, schedule,
 validation cadence, and TPP rule beside
 the entry script. `make run` supplies only saved machine/run policy and lets the
 trainer read that versioned file. To create a dense control, clone the reference
@@ -499,9 +497,14 @@ Useful commands:
 uv run --frozen --no-sync rig doctor --require-tpu
 uv run --frozen --no-sync rig settings
 uv run --frozen --no-sync rig verify RUN_ID
-uv run --frozen --no-sync rig leaderboard --track open
-uv run --frozen --no-sync rig leaderboard --track sample_efficiency
+uv run --frozen --no-sync rig leaderboard --profile official
 ```
+
+Leaderboards render one block per content-addressed cohort. A cohort fixes the
+tier, target TPP and rounding rule, selected data and validation prefix,
+qualification target, and hardware topology. Recipe, dense-versus-MoE
+architecture, optimizer, learning rate, batch size, and seed remain experiment
+dimensions. Early-stopped diagnostics are never ranked.
 
 ## Create an algorithm
 
@@ -530,21 +533,21 @@ The YAML is schema-versioned and contains complete `smoke`, `dev`, and
 caller's working directory—and rejects duplicate/unknown keys, unsafe YAML
 features, type/range errors, symlinks, and attempts to replace static settings
 with hidden launch flags. The harness records both the source SHA-256 and the
-fully resolved profile. Bounded operational overrides—duration and
-instrumentation cadence—are recorded explicitly; fold any setting that defines
-a new experiment back into the cloned YAML before publishing a result.
+fully resolved profile. The small public research surface—tier, context preset,
+TPP, base learning rate, batch size, and diagnostic stop point—is recorded explicitly;
+fold other experiment settings into the cloned YAML before publishing a result.
 
-## Tracks
+## Comparable cohorts
 
-- **Open:** reach the target in the least synchronized training time using the
-  fixed 624,984,064-token official budget. Model, optimizer, batching,
-  precision, kernels, and systems choices may all change.
-- **Sample efficiency:** reach the target with the fewest predicted training
-  tokens. The reference model/data/sequence contract is fixed; time breaks ties.
-
-Both tracks deliberately permit systems work. There is no composite score.
-Parameter count, FLOP estimates, throughput, MFU estimate, compilation time,
-tokens, and loss are emitted as diagnostics in the live trainer and run record.
+A full run receives a content-addressed cohort identity derived from the tier
+and parameter anchor, TPP horizon, selected immutable data, validation
+contract, target loss, profile, and accelerator topology. Only qualifying runs
+inside the same cohort are ranked together, by synchronized training time.
+Architecture, optimizer, schedule, precision, batch, learning rate, seed,
+sharding, and kernels remain free experiment dimensions. Diagnostics and smoke
+runs are never ranked, and records without an explicit cohort are not silently
+mixed. There is no composite score; parameter count, FLOP estimates,
+throughput, MFU estimate, compilation time, tokens, and loss remain diagnostics.
 
 The full timing, qualification, checkpoint, and human-review rules are in
 [docs/RULES.md](docs/RULES.md).
@@ -564,4 +567,3 @@ runs/                    gitignored persistent run artifacts
 The project is licensed under Apache-2.0.
 
 [1] Bordelon, B., Chaudhry, H., & Pehlevan, C. (2024). Infinite Limits of Multi-head Transformer Dynamics. In *Advances in Neural Information Processing Systems 37 (NeurIPS 2024)*. arXiv:2405.15712.
-

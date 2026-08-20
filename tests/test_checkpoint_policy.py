@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+from typing import get_args
 import unittest
 
 from rig.cli import _CHECKPOINT_POLICIES, _checkpoint_policy
 from rig.config import ConfigError
+from rig.harness.models import CheckpointRetention
 
 
 def _args(**overrides) -> argparse.Namespace:
@@ -18,10 +20,11 @@ def _args(**overrides) -> argparse.Namespace:
 class PolicyTests(unittest.TestCase):
     def test_the_three_outcomes(self) -> None:
         self.assertEqual(_CHECKPOINT_POLICIES, ("always", "qualifying", "none"))
+        self.assertEqual(get_args(CheckpointRetention), _CHECKPOINT_POLICIES)
 
     def test_settings_supply_the_default(self) -> None:
         self.assertEqual(
-            _checkpoint_policy(_args(), "qualifying", track="open", profile="dev"),
+            _checkpoint_policy(_args(), "qualifying", profile="dev"),
             "qualifying",
         )
 
@@ -32,42 +35,39 @@ class PolicyTests(unittest.TestCase):
         for gone in ("all", "none-after-validation"):
             with self.subTest(value=gone):
                 with self.assertRaisesRegex(ConfigError, "unknown checkpoint policy"):
-                    _checkpoint_policy(_args(), gone, track="open", profile="dev")
+                    _checkpoint_policy(_args(), gone, profile="dev")
 
     def test_an_unknown_policy_is_refused(self) -> None:
         with self.assertRaisesRegex(ConfigError, "unknown checkpoint policy"):
-            _checkpoint_policy(_args(), "keep-forever", track="open", profile="dev")
+            _checkpoint_policy(_args(), "keep-forever", profile="dev")
 
 
 class DefaultYieldsWhereNoneIsIllegalTests(unittest.TestCase):
     """A saved default of ``none`` must not refuse runs that require weights."""
 
     @staticmethod
-    def _resolve(explicit, track, profile):
+    def _resolve(explicit, profile):
         return _checkpoint_policy(
-            _args(checkpoint_policy=explicit), "none", track=track, profile=profile
+            _args(checkpoint_policy=explicit), "none", profile=profile
         )
 
     def test_the_default_yields_where_none_is_not_legal(self) -> None:
         # Sweep points keep no weights; that is the point of the default.
-        self.assertEqual(self._resolve(None, "open", "dev"), "none")
+        self.assertEqual(self._resolve(None, "dev"), "none")
         # Official runs require a checkpoint. Without this, flipping the saved
         # default to "none" refused every official run outright -- the guard
         # below rejects the policy the default had just chosen for it.
-        self.assertEqual(
-            self._resolve(None, "sample_efficiency", "official"), "qualifying"
-        )
-        self.assertEqual(self._resolve(None, "open", "official"), "qualifying")
+        self.assertEqual(self._resolve(None, "official"), "qualifying")
 
     def test_an_explicit_none_is_still_refused_where_it_is_illegal(self) -> None:
         # Yielding covers a default reaching somewhere it was not meant to,
         # never a caller asking for something disallowed.
-        self.assertEqual(self._resolve("none", "sample_efficiency", "official"), "none")
+        self.assertEqual(self._resolve("none", "official"), "none")
 
     def test_an_explicit_choice_always_wins(self) -> None:
         for policy in ("always", "qualifying", "none"):
             with self.subTest(policy=policy):
-                self.assertEqual(self._resolve(policy, "open", "dev"), policy)
+                self.assertEqual(self._resolve(policy, "dev"), policy)
 
 
 class EvaluatorRemovalTests(unittest.TestCase):
@@ -94,28 +94,25 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class RetiredFlagTests(unittest.TestCase):
-    """A removed flag must say what replaced it."""
+class PublicSurfaceTests(unittest.TestCase):
+    def test_unknown_trainer_arguments_are_not_forwarded(self) -> None:
+        from rig.cli import build_parser
 
-    def _run_cli(self, *argv: str) -> str:
-        import contextlib, io
-        from rig.cli import main
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(["run", "reference", "--layers", "13"])
 
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
-            main(["run", "reference", *argv])
-        return err.getvalue()
+    def test_supported_research_overrides_are_explicit(self) -> None:
+        from rig.cli import build_parser
 
-    def test_removed_checkpoint_flags_name_their_replacement(self) -> None:
-        # `rig run` forwards unknown arguments to the trainer, so a retired
-        # flag would otherwise surface as an argparse error from train.py
-        # about a flag the user had used correctly the day before.
-        self.assertIn("--checkpoint-policy", self._run_cli("--checkpoints", "always"))
-        self.assertIn("--checkpoint-policy none", self._run_cli("--omit-checkpoint"))
-
-    def test_genuine_trainer_arguments_still_pass_through(self) -> None:
-        # The forwarding itself is deliberate; only retired flags are caught.
-        from rig.cli import _RETIRED_FLAGS
-
-        self.assertNotIn("--base-learning-rate", _RETIRED_FLAGS)
-        self.assertNotIn("--study-batch-size", _RETIRED_FLAGS)
+        args = build_parser().parse_args(
+            [
+                "run",
+                "reference",
+                "--base-learning-rate",
+                "0.001",
+                "--batch-size",
+                "128",
+            ]
+        )
+        self.assertEqual(args.base_learning_rate, 0.001)
+        self.assertEqual(args.batch_size, 128)

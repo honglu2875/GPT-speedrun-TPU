@@ -12,9 +12,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from rig.cohort import CohortError, build_cohort, validate_cohort
 from rig.harness import (
     ConfigurationError,
-    ReferenceContract,
     ResultValidationError,
     RunConfig,
     RecipeError,
@@ -27,6 +27,7 @@ from rig.harness import (
     verify_run,
 )
 from rig.harness.runner import _validate_payload_identity
+from rig.plan import validate_recipe_plan
 
 
 FAKE_TRAINER = r"""from __future__ import annotations
@@ -40,7 +41,6 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--config", required=True)
 parser.add_argument("--output-dir", required=True)
 parser.add_argument("--seed", required=True, type=int)
-parser.add_argument("--track", required=True)
 parser.add_argument("--profile", required=True)
 parser.add_argument("--tag", action="append", default=[])
 parser.add_argument("--seeded", action="store_true")
@@ -65,11 +65,11 @@ if args.make_cache:
 if not args.omit_checkpoint:
     (output / "model.npz").write_bytes(b"tiny checkpoint")
 (output / "training.csv").write_text("step,train_loss\n1,2.5\n")
-(output / "seen.json").write_text(json.dumps({"config": args.config, "seed": args.seed, "track": args.track, "profile": args.profile, "tag": args.tag, "seeded": args.seeded}))
+(output / "seen.json").write_text(json.dumps({"config": args.config, "seed": args.seed, "profile": args.profile, "tag": args.tag, "seeded": args.seeded}))
 result = {
     "schema_version": 1,
     "status": "ok",
-    "track": args.track,
+    "track": "open",
     "profile": args.profile,
     "seed": args.seed,
     "checkpoint": None if args.omit_checkpoint else "model.npz",
@@ -100,6 +100,9 @@ print("human log output")
 print("RIG_RESULT=" + json.dumps(result, separators=(",", ":")))
 """
 
+FAKE_CONFIG = b"steps: 1\n"
+FAKE_CONFIG_SHA256 = hashlib.sha256(FAKE_CONFIG).hexdigest()
+
 
 class HarnessRunTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -108,7 +111,7 @@ class HarnessRunTests(unittest.TestCase):
         recipe = self.root / "recipes" / "tiny"
         recipe.mkdir(parents=True)
         (recipe / "train.py").write_text(FAKE_TRAINER, encoding="utf-8")
-        (recipe / "config.yaml").write_text("steps: 1\n", encoding="utf-8")
+        (recipe / "config.yaml").write_bytes(FAKE_CONFIG)
         (self.root / "uv.lock").write_bytes(b"version = 1\n")
 
     def tearDown(self) -> None:
@@ -121,10 +124,43 @@ class HarnessRunTests(unittest.TestCase):
             "runs_dir": Path("runs"),
             "records_path": Path("records/runs.jsonl"),
             "python_executable": sys.executable,
-            "passthrough_args": ("--tag", "one", "--tag", "two"),
+            "trainer_args": ("--tag", "one", "--tag", "two"),
         }
         values.update(changes)
+        values.setdefault(
+            "plan", self.plan(profile=str(values.get("profile", "default")))
+        )
         return RunConfig(**values)  # type: ignore[arg-type]
+
+    @staticmethod
+    def plan(
+        *, profile: str = "default", expected_tokens: int = 96
+    ) -> dict[str, object]:
+        return {
+            "schema_version": 2,
+            "config_schema_version": 4,
+            "config_sha256": FAKE_CONFIG_SHA256,
+            "profile": profile,
+            "context_preset": "tiny",
+            "document_masking": False,
+            "tier": "tiny",
+            "run_kind": "full",
+            "parameterization": "test",
+            "weight_decay_policy": "weights_and_embeddings_only_v2",
+            "declared_parameters": expected_tokens,
+            "batch_size": 1,
+            "sequence_length": 1,
+            "tokens_per_step": 1,
+            "target_tokens_per_parameter": 1.0,
+            "achieved_tokens_per_parameter": 1.0,
+            "schedule_steps": expected_tokens,
+            "stop_after_step": None,
+            "planned_tokens": expected_tokens,
+            "expected_tokens": expected_tokens,
+            "base_learning_rate": 0.001,
+            "batch_ratio": 1.0,
+            "ladder_data_multiplier": 1.0,
+        }
 
     @staticmethod
     def fresh10_evaluations(
@@ -182,7 +218,6 @@ class HarnessRunTests(unittest.TestCase):
             {
                 "config": str(self.root / "recipes" / "tiny" / "config.yaml"),
                 "seed": 1337,
-                "track": "open",
                 "profile": "default",
                 "tag": ["one", "two"],
                 "seeded": False,
@@ -268,8 +303,8 @@ class HarnessRunTests(unittest.TestCase):
         self.assertEqual(arguments["script"].name, "train.py")
         self.assertIn("runs", arguments["output_dir"].parts)
 
-    def test_rejects_reserved_passthrough_flags_but_not_prefixes(self) -> None:
-        for flag in ("--config", "--output-dir", "--seed", "--track", "--profile"):
+    def test_rejects_reserved_trainer_flags_but_not_other_arguments(self) -> None:
+        for flag in ("--config", "--output-dir", "--seed", "--profile"):
             for arguments in (
                 (flag, "value"),
                 (f"{flag}=value",),
@@ -277,9 +312,9 @@ class HarnessRunTests(unittest.TestCase):
             ):
                 with self.subTest(arguments=arguments):
                     with self.assertRaisesRegex(ConfigurationError, "reserved flag"):
-                        run_recipe(self.config(passthrough_args=arguments))
+                        run_recipe(self.config(trainer_args=arguments))
 
-        outcome = run_recipe(self.config(passthrough_args=("--seeded",)))
+        outcome = run_recipe(self.config(trainer_args=("--seeded",)))
         seen = json.loads((outcome.run_dir / "seen.json").read_text())
         self.assertTrue(seen["seeded"])
 
@@ -287,14 +322,11 @@ class HarnessRunTests(unittest.TestCase):
         trainer = self.root / "recipes" / "tiny" / "train.py"
         original = trainer.read_text(encoding="utf-8")
         variants = {
-            "track": original.replace(
-                '"track": args.track,', '"track": "sample_efficiency",'
-            ),
             "profile": original.replace(
                 '"profile": args.profile,', '"profile": "wrong",'
             ),
             "seed": original.replace('"seed": args.seed,', '"seed": True,'),
-            "missing": original.replace('    "track": args.track,\n', ""),
+            "missing": original.replace('    "profile": args.profile,\n', ""),
         }
         for label, source in variants.items():
             with self.subTest(label=label):
@@ -379,7 +411,7 @@ class HarnessRunTests(unittest.TestCase):
                 target_loss=2.6,
                 expected_validation_tokens=64,
                 expected_downstream_tokens=expected_tokens,
-                passthrough_args=("--evaluations-json", json.dumps(evaluations)),
+                trainer_args=("--evaluations-json", json.dumps(evaluations)),
             )
         )
 
@@ -497,7 +529,7 @@ class HarnessRunTests(unittest.TestCase):
         captured = io.StringIO()
         result: list[object] = []
         config = self.config(
-            passthrough_args=(
+            trainer_args=(
                 "--stderr-message",
                 "live marker",
                 "--sleep-after-stderr",
@@ -527,12 +559,12 @@ class HarnessRunTests(unittest.TestCase):
         captured = io.StringIO()
         with mock.patch("rig.harness.runner.sys.stderr", captured):
             outcome = run_recipe(
-                self.config(passthrough_args=("--stderr-bytes", str(512 * 1024)))
+                self.config(trainer_args=("--stderr-bytes", str(512 * 1024)))
             )
         self.assertEqual((outcome.run_dir / "stderr.log").stat().st_size, 512 * 1024)
 
         timeout_config = self.config(
-            passthrough_args=(
+            trainer_args=(
                 "--stderr-message",
                 "before timeout",
                 "--sleep-after-stderr",
@@ -551,7 +583,7 @@ class HarnessRunTests(unittest.TestCase):
         self.assertEqual((latest_run / "stderr.log").read_bytes(), b"before timeout")
 
     def test_discards_per_run_compilation_cache_and_rejects_bad_timeouts(self) -> None:
-        outcome = run_recipe(self.config(passthrough_args=("--make-cache",)))
+        outcome = run_recipe(self.config(trainer_args=("--make-cache",)))
         self.assertFalse((outcome.run_dir / ".jax_cache").exists())
 
         for value in (True, float("nan"), float("inf"), 10**10_000):
@@ -559,30 +591,14 @@ class HarnessRunTests(unittest.TestCase):
                 with self.assertRaisesRegex(ConfigurationError, "timeout_seconds"):
                     run_recipe(self.config(timeout_seconds=value))
 
-    def test_sample_efficiency_requires_and_enforces_contract(self) -> None:
-        with self.assertRaises(ConfigurationError):
-            run_recipe(self.config(track="sample_efficiency"))
+    def test_resolved_plan_is_recorded_and_must_match_profile(self) -> None:
+        outcome = run_recipe(self.config())
+        self.assertEqual(outcome.record["run_kind"], "full")
+        self.assertEqual(outcome.record["constraints"]["training_tokens"], 96)
+        self.assertEqual(len(outcome.record["plan"]["sha256"]), 64)
 
-        reference = ReferenceContract(
-            model_id="tiny-gpt-v1",
-            dataset_id="tiny-data-v1",
-            tokenizer_id="byte-v1",
-            sequence_length=8,
-        )
-        outcome = run_recipe(
-            self.config(track="sample_efficiency", reference_contract=reference)
-        )
-        self.assertEqual(outcome.record["track"], "sample_efficiency")
-        self.assertEqual(outcome.record["reference_contract"], reference.as_dict())
-
-        wrong = ReferenceContract(
-            model_id="different",
-            dataset_id="tiny-data-v1",
-            tokenizer_id="byte-v1",
-            sequence_length=8,
-        )
-        with self.assertRaisesRegex(ResultValidationError, "contract mismatch"):
-            run_recipe(self.config(track="sample_efficiency", reference_contract=wrong))
+        with self.assertRaisesRegex(ConfigurationError, "plan profile"):
+            run_recipe(self.config(plan=self.plan(profile="different")))
 
     def test_none_retention_records_the_digest_then_deletes(self) -> None:
         # The weights are still hashed into the record before removal, so the
@@ -604,7 +620,7 @@ class HarnessRunTests(unittest.TestCase):
     ) -> None:
         outcome = run_recipe(
             self.config(
-                passthrough_args=("--omit-checkpoint",),
+                trainer_args=("--omit-checkpoint",),
                 profile="dev",
                 require_checkpoint=False,
             )
@@ -613,20 +629,59 @@ class HarnessRunTests(unittest.TestCase):
         self.assertIsNone(outcome.record["checkpoint"])
         validated = verify_run(
             outcome.run_dir,
-            track="open",
             require_checkpoint=False,
         )
         self.assertIsNone(validated.checkpoint_path)
         with self.assertRaisesRegex(ResultValidationError, "checkpoint is required"):
-            verify_run(outcome.run_dir, track="open")
+            verify_run(outcome.run_dir)
 
-    def test_fixed_training_token_budget_is_enforced_and_recorded(self) -> None:
-        outcome = run_recipe(self.config(expected_training_tokens=96))
+    def test_plan_training_token_budget_is_enforced_and_recorded(self) -> None:
+        outcome = run_recipe(self.config())
         self.assertEqual(outcome.record["constraints"]["training_tokens"], 96)
         with self.assertRaisesRegex(ResultValidationError, "training-token budget"):
-            run_recipe(self.config(expected_training_tokens=95))
-        with self.assertRaisesRegex(ConfigurationError, "expected_training_tokens"):
-            run_recipe(self.config(expected_training_tokens=0))
+            run_recipe(self.config(plan=self.plan(expected_tokens=95)))
+        invalid = self.plan()
+        invalid["expected_tokens"] = 0
+        with self.assertRaisesRegex(ConfigurationError, "expected_tokens"):
+            run_recipe(self.config(plan=invalid))
+
+        wrong_config = self.plan()
+        wrong_config["config_sha256"] = "c" * 64
+        with self.assertRaisesRegex(ConfigurationError, "config_sha256"):
+            run_recipe(self.config(plan=wrong_config))
+
+    def test_cohort_must_align_with_the_plan_and_run_configuration(self) -> None:
+        plan = validate_recipe_plan(self.plan())
+        cohort = build_cohort(
+            plan=plan,
+            dataset_id="tiny-data-v1",
+            tokenizer_id="byte-v1",
+            dataset_provenance={
+                "dataset": {
+                    "manifest": {"canonical_sha256": "b" * 64},
+                    "train_files": ["train.bin"],
+                    "validation_files": ["val.bin"],
+                    "validation_prefix_tokens": 64,
+                }
+            },
+            accelerator="TPU v4",
+            tpu_vm_count=1,
+            chips_per_host=4,
+            target_loss=3.28,
+        )
+        assert cohort is not None
+
+        outcome = run_recipe(self.config(cohort=cohort))
+        self.assertEqual(outcome.record["cohort_id"], cohort["cohort_id"])
+
+        with self.assertRaisesRegex(ConfigurationError, "cohort profile"):
+            run_recipe(
+                self.config(
+                    profile="other",
+                    plan=self.plan(profile="other"),
+                    cohort=cohort,
+                )
+            )
 
     def test_rejects_recipe_and_checkpoint_path_traversal(self) -> None:
         with self.assertRaises(ConfigurationError):
@@ -647,7 +702,7 @@ class HarnessRunTests(unittest.TestCase):
             },
         }
         with self.assertRaisesRegex(ResultValidationError, "escapes"):
-            validate_result(payload, run_dir=run_dir, track="open")
+            validate_result(payload, run_dir=run_dir)
 
 
 class ProtocolAndScoringTests(unittest.TestCase):
@@ -675,7 +730,6 @@ class ProtocolAndScoringTests(unittest.TestCase):
             validated = validate_result(
                 base_payload,
                 run_dir=run_dir,
-                track="open",
                 expected_validation_tokens=64,
                 expected_downstream_tokens=expected,
             )
@@ -721,7 +775,6 @@ class ProtocolAndScoringTests(unittest.TestCase):
                         validate_result(
                             candidate,
                             run_dir=run_dir,
-                            track="open",
                             expected_validation_tokens=64,
                             expected_downstream_tokens=expected,
                         )
@@ -752,12 +805,11 @@ class ProtocolAndScoringTests(unittest.TestCase):
                 validate_result(
                     payload,
                     run_dir=run_dir,
-                    track="open",
                     expected_downstream_tokens=expected,
                 )
 
     def test_empty_leaderboard_renders(self) -> None:
-        rendered = render_leaderboard([], track="open")
+        rendered = render_leaderboard([])
         self.assertIn("No qualifying runs.", rendered)
 
     def test_result_must_be_final_line_and_finite(self) -> None:
@@ -782,108 +834,109 @@ class ProtocolAndScoringTests(unittest.TestCase):
                 },
             }
             with self.assertRaisesRegex(ResultValidationError, "implementation"):
-                validate_result(payload, run_dir=run_dir, track="open")
+                validate_result(payload, run_dir=run_dir)
 
-    def test_track_rankings_use_canonical_fields(self) -> None:
-        def record(name: str, seconds: float, tokens: int) -> dict[str, object]:
-            return {
-                "run_id": name + "-run",
-                "recipe": name,
-                "status": "ok",
-                "qualified": True,
-                "track": "sample_efficiency",
-                "profile": "tiny",
-                "timing": {"observed_wall_seconds": seconds / 10},
-                "metrics": {
-                    "train_seconds": seconds,
-                    "tokens_processed": tokens,
-                    "validation_loss": 2.0,
-                },
-            }
-
-        ranked = rank_records(
-            [
-                record("fast-many", 1.0, 20),
-                record("slow-few", 9.0, 10),
-                record("fast-few", 2.0, 10),
-            ],
-            track="sample_efficiency",
-            profile="tiny",
+    @staticmethod
+    def cohort(manifest_sha256: str = "b" * 64) -> dict[str, object]:
+        plan = validate_recipe_plan(HarnessRunTests.plan(profile="tiny"))
+        cohort = build_cohort(
+            plan=plan,
+            dataset_id="tiny-data-v1",
+            tokenizer_id="byte-v1",
+            dataset_provenance={
+                "dataset": {
+                    "manifest": {"canonical_sha256": manifest_sha256},
+                    "train_files": ["train.bin"],
+                    "validation_files": ["val.bin"],
+                    "validation_prefix_tokens": 64,
+                }
+            },
+            accelerator="TPU v4",
+            tpu_vm_count=1,
+            chips_per_host=4,
+            target_loss=3.28,
         )
-        self.assertEqual(
-            [item["recipe"] for item in ranked], ["fast-few", "slow-few", "fast-many"]
-        )
-        rendered = render_leaderboard(ranked, track="sample_efficiency")
-        self.assertIn("Sample Efficiency leaderboard", rendered)
-        self.assertIn("fast-few", rendered)
+        assert cohort is not None
+        return cohort
 
-    def test_open_ranking_uses_synchronized_time_not_wall_time(self) -> None:
-        records = [
-            {
-                "run_id": "a-run",
-                "recipe": "a",
-                "status": "ok",
-                "qualified": True,
-                "track": "open",
-                "profile": "tiny",
-                "timing": {"observed_wall_seconds": 100.0},
-                "metrics": {
-                    "train_seconds": 1.0,
-                    "tokens_processed": 8,
-                    "validation_loss": 2.0,
-                },
+    @staticmethod
+    def ranking_record(
+        name: str,
+        seconds: float,
+        cohort: dict[str, object],
+        *,
+        qualified: bool = True,
+        run_kind: str = "full",
+    ) -> dict[str, object]:
+        return {
+            "run_id": name + "-run",
+            "recipe": name,
+            "status": "ok",
+            "qualified": qualified,
+            "profile": "tiny",
+            "run_kind": run_kind,
+            "cohort": cohort,
+            "cohort_id": cohort["cohort_id"],
+            "timing": {"observed_wall_seconds": 100.0 / seconds},
+            "metrics": {
+                "train_seconds": seconds,
+                "tokens_processed": 96,
+                "validation_loss": 2.0,
             },
-            {
-                "run_id": "b-run",
-                "recipe": "b",
-                "status": "ok",
-                "qualified": True,
-                "track": "open",
-                "profile": "tiny",
-                "timing": {"observed_wall_seconds": 1.0},
-                "metrics": {
-                    "train_seconds": 2.0,
-                    "tokens_processed": 8,
-                    "validation_loss": 2.0,
-                },
-            },
-        ]
-        ranked = rank_records(records, track="open", profile="tiny")
-        self.assertEqual([item["recipe"] for item in ranked], ["a", "b"])
+        }
 
-    def test_leaderboard_can_requalify_records_for_one_shared_target(self) -> None:
+    def test_cohort_ranking_uses_synchronized_time_and_excludes_diagnostics(
+        self,
+    ) -> None:
+        cohort = self.cohort()
         records = [
-            {
-                "run_id": "loose-run",
-                "recipe": "loose",
-                "status": "ok",
-                "qualified": True,
-                "track": "open",
-                "profile": "official",
-                "metrics": {
-                    "train_seconds": 1.0,
-                    "tokens_processed": 8,
-                    "validation_loss": 4.0,
-                },
-            },
-            {
-                "run_id": "strict-run",
-                "recipe": "strict",
-                "status": "ok",
-                "qualified": False,
-                "track": "open",
-                "profile": "official",
-                "metrics": {
-                    "train_seconds": 2.0,
-                    "tokens_processed": 8,
-                    "validation_loss": 3.27,
-                },
-            },
+            self.ranking_record("dense", 2.0, cohort),
+            self.ranking_record("moe", 1.0, cohort),
+            self.ranking_record("diagnostic", 0.5, cohort, run_kind="diagnostic"),
+            self.ranking_record("unqualified", 0.25, cohort, qualified=False),
         ]
         ranked = rank_records(
-            records, track="open", profile="official", target_loss=3.28
+            records, cohort_id=str(cohort["cohort_id"]), profile="tiny"
         )
-        self.assertEqual([item["recipe"] for item in ranked], ["strict"])
+        self.assertEqual([item["recipe"] for item in ranked], ["moe", "dense"])
+        rendered = render_leaderboard(ranked, cohort_id=str(cohort["cohort_id"]))
+        self.assertIn(str(cohort["cohort_id"])[:12], rendered)
+        self.assertIn("moe", rendered)
+
+    def test_ranker_refuses_to_mix_cohorts(self) -> None:
+        first = self.cohort("b" * 64)
+        second = self.cohort("c" * 64)
+        records = [
+            self.ranking_record("first", 1.0, first),
+            self.ranking_record("second", 2.0, second),
+        ]
+        with self.assertRaisesRegex(ValueError, "multiple cohorts"):
+            rank_records(records, profile="tiny")
+        selected = rank_records(
+            records, cohort_id=str(second["cohort_id"]), profile="tiny"
+        )
+        self.assertEqual([item["recipe"] for item in selected], ["second"])
+
+    def test_cohort_validation_is_strict_even_when_rehashed(self) -> None:
+        cohort = self.cohort()
+        body = {key: value for key, value in cohort.items() if key != "cohort_id"}
+        body["surprise"] = True
+        cohort = {
+            **body,
+            "cohort_id": hashlib.sha256(
+                json.dumps(
+                    body,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest(),
+        }
+
+        with self.assertRaisesRegex(CohortError, "unknown field"):
+            validate_cohort(cohort)
+        self.assertEqual(rank_records([self.ranking_record("bad", 1.0, cohort)]), [])
 
 
 if __name__ == "__main__":

@@ -164,6 +164,7 @@ class ControllerIdentityTests(unittest.TestCase):
             recipe="reference",
             runs_dir=Path("/repo/runs"),
             records_path=Path("/repo/runs/records.jsonl"),
+            plan={},
             tpu_vm_count=4,
             tpu_vm_hosts="pod-w-[0-3]",
             **overrides,
@@ -248,6 +249,7 @@ class OpportunisticSalvageTests(unittest.TestCase):
             recipe="reference",
             runs_dir=Path("/repo/runs"),
             records_path=Path("/repo/runs/records.jsonl"),
+            plan={},
             tpu_vm_count=4,
         )
         self.assertIsNone(runner._artifact_puller(local, Path("/repo/runs/x"), {}))
@@ -261,6 +263,7 @@ class OpportunisticSalvageTests(unittest.TestCase):
             recipe="reference",
             runs_dir=Path("/repo/runs"),
             records_path=Path("/repo/runs/records.jsonl"),
+            plan={},
             tpu_vm_count=4,
             remote_controller=True,
             artifact_host="pod-w-0",

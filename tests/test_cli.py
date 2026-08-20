@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 import tempfile
 import unittest
@@ -9,6 +11,7 @@ from rig import cli
 from rig.config import ConfigError, LocalConfig
 from rig.data import DataError, Fresh10Domain, PreparedDataset, PreparedFresh10
 from rig.doctor import check_prepared_data
+from rig.plan import RecipePlan
 
 
 class CliTests(unittest.TestCase):
@@ -21,45 +24,33 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.status, "error")
         self.assertIn("make prepare", result.hint or "")
 
-    def test_official_open_budget_preserves_calibrated_baseline(self) -> None:
-        budget = cli.OFFICIAL_OPEN_TRAINING_TOKENS
-        self.assertEqual(budget, 624_984_064)
-        self.assertEqual(budget // (32 * 1024), 19_073)
-        self.assertEqual(budget % (32 * 1024), 0)
-
-    def test_sample_efficiency_contract_pins_semantic_vocabulary(self) -> None:
-        smoke = cli._reference_contract("smoke")
-        self.assertEqual(smoke.dataset_id, "smoke")
-        self.assertEqual(smoke.tokenizer_id, "synthetic-byte-v1")
-        contract = cli._reference_contract("official")
-        self.assertEqual(contract.extra["model"]["vocab_size"], 50_304)
-        self.assertEqual(contract.extra["model"]["semantic_vocab_size"], 50_304)
-
-    def test_reserved_trainer_arguments_cannot_override_harness(self) -> None:
-        for arguments in (
-            ["--seed", "7"],
-            ["--config", "/tmp/other.yaml"],
-            ["--conf=/tmp/other.yaml"],
-            ["--profile=smoke"],
-            ["--output-dir", "/tmp/elsewhere"],
-            ["--train-data", "other.bin"],
-            ["--color=always"],
-            ["--out", "/tmp/elsewhere"],
-            ["--prof=smoke"],
-            ["--data-f", "raw"],
-            ["--downstream-manifest", "other.json"],
-            ["--down", "other.json"],
-            ["--train-tokens", "100"],
-        ):
-            with (
-                self.subTest(arguments=arguments),
-                self.assertRaisesRegex(
-                    ConfigError, "harness-controlled|controlled by the harness"
-                ),
-            ):
-                cli._reject_reserved_trainer_args(arguments)
-
-        cli._reject_reserved_trainer_args(["--steps", "20", "--batch-size=32"])
+    def test_run_surface_exposes_only_supported_research_overrides(self) -> None:
+        parser = cli.build_parser()
+        args = parser.parse_args(
+            [
+                "run",
+                "reference",
+                "--tier",
+                "500m",
+                "--context",
+                "8k",
+                "--tokens-per-parameter",
+                "5",
+                "--base-learning-rate",
+                "0.001",
+                "--batch-size",
+                "128",
+                "--stop-after-step",
+                "100",
+            ]
+        )
+        self.assertEqual(args.tier, "500m")
+        self.assertEqual(args.context, "8k")
+        self.assertEqual(args.tokens_per_parameter, 5.0)
+        self.assertEqual(args.batch_size, 128)
+        for removed in ("--steps", "--train-tokens", "--track", "--layers"):
+            with self.subTest(removed=removed), self.assertRaises(SystemExit):
+                parser.parse_args(["run", "reference", removed, "1"])
 
     def test_clone_copies_recipe_config_byte_exactly(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -127,9 +118,8 @@ class CliTests(unittest.TestCase):
 
     def test_wizard_accepts_defaults_and_returns_complete_config(self) -> None:
         defaults = LocalConfig()
-        # Two path prompts, one host-count prompt, five menu prompts, one loss
-        # target, one token budget, and three confirmations. Dataset
-        # preparation is automatic.
+        # Empty answers accept every current machine, run, and dataset default;
+        # dataset preparation remains automatic.
         with patch("builtins.input", side_effect=[""] * 13) as prompt:
             result, diagnostics, require_tpu, download, save = cli._prepare_wizard(
                 defaults,
@@ -138,29 +128,78 @@ class CliTests(unittest.TestCase):
                 download=True,
                 save=True,
             )
-        self.assertEqual(result, defaults)
+        self.assertEqual(result.dataset, defaults.dataset)
+        self.assertEqual(result.train_shards, 9)
+        self.assertEqual(result.default_profile, defaults.default_profile)
         self.assertTrue(diagnostics)
         self.assertTrue(require_tpu)
         self.assertTrue(download)
         self.assertTrue(save)
         self.assertEqual(prompt.call_count, 13)
 
-    def test_prepare_training_budget_is_explicit_and_positive(self) -> None:
-        parser = cli.build_parser()
-        prepared = parser.parse_args(["prepare", "--training-tokens", "1250000000"])
-        self.assertEqual(prepared.training_tokens, 1_250_000_000)
-        with self.assertRaises(SystemExit):
-            parser.parse_args(["prepare", "--training-tokens", "0"])
-        self.assertFalse(
-            hasattr(parser.parse_args(["run", "reference"]), "training_tokens")
+    def test_wizard_resets_the_shard_default_when_dataset_changes(self) -> None:
+        defaults = LocalConfig(dataset="8B", train_shards=79)
+        answers = ["", "", "2B", "", *("" for _ in range(9))]
+        with patch("builtins.input", side_effect=answers):
+            result, *_ = cli._prepare_wizard(
+                defaults,
+                run_diagnostics=True,
+                require_tpu=True,
+                download=True,
+                save=True,
+            )
+        self.assertEqual(result.dataset, "2B")
+        self.assertEqual(result.train_shards, 19)
+
+    def test_noninteractive_dataset_change_does_not_reuse_the_old_prefix(self) -> None:
+        args = cli.build_parser().parse_args(
+            [
+                "prepare",
+                "--non-interactive",
+                "--dataset",
+                "2B",
+                "--no-download",
+                "--no-doctor",
+                "--no-save",
+            ]
         )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            current = LocalConfig(
+                data_path="data",
+                artifacts_path="runs",
+                dataset="8B",
+                train_shards=79,
+            )
+            with (
+                patch("rig.cli.repo_root", return_value=root),
+                patch("rig.cli.load_config", return_value=current),
+                patch(
+                    "rig.cli._route_for_config", wraps=cli._route_for_config
+                ) as routed,
+            ):
+                self.assertEqual(cli.command_prepare(args), 0)
+
+        proposed = routed.call_args.args[0]
+        self.assertEqual(proposed.dataset, "2B")
+        self.assertEqual(proposed.train_shards, 0)
+        self.assertEqual(cli._route_for_config(proposed, "official").train_shards, 19)
+
+    def test_prepare_dataset_and_shard_prefix_are_explicit(self) -> None:
+        parser = cli.build_parser()
+        prepared = parser.parse_args(
+            ["prepare", "--dataset", "2B", "--train-shards", "10"]
+        )
+        self.assertEqual(prepared.dataset, "2B")
+        self.assertEqual(prepared.train_shards, 10)
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["prepare", "--training-tokens", "1250000000"])
         action = next(
             item
             for item in parser._subparsers._group_actions[0].choices["prepare"]._actions
-            if item.dest == "training_tokens"
+            if item.dest == "dataset"
         )
-        self.assertIn("prepare and use", action.help)
-        self.assertIn("non-smoke runs", action.help)
+        self.assertIn("immutable corpus", action.help)
 
     def test_prepare_routes_scaled_data_to_dedicated_subfolder(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -196,8 +235,8 @@ class CliTests(unittest.TestCase):
                     str(base),
                     "--profile",
                     "official",
-                    "--training-tokens",
-                    "1900000000",
+                    "--dataset",
+                    "2B",
                 ]
             )
             with (
@@ -217,9 +256,10 @@ class CliTests(unittest.TestCase):
             verify.assert_called_once_with(manifest, scaled, train_shards=19)
             fresh.assert_called_once_with(base)
 
-    def test_remote_prepare_forwards_corpus_budget_to_every_peer(self) -> None:
+    def test_remote_prepare_forwards_named_corpus_to_every_peer(self) -> None:
         config = LocalConfig(
-            training_tokens=3_900_000_000,
+            dataset="4B",
+            train_shards=39,
             tpu_vm_count=2,
             tpu_vm_hosts="slice-w-[0-1]",
         ).validate()
@@ -238,7 +278,8 @@ class CliTests(unittest.TestCase):
         with patch("rig.cli.run_pdsh") as run:
             cli._run_cluster_prepare(config, args, inventory, root=Path("/repo"))
         remote = run.call_args.args[1]
-        self.assertIn("--training-tokens 3900000000", remote)
+        self.assertIn("--dataset 4B", remote)
+        self.assertIn("--train-shards 39", remote)
         self.assertIn("--profile official", remote)
         self.assertEqual(
             run.call_args.kwargs["timeout"], cli._remote_prepare_timeout(config, args)
@@ -247,21 +288,15 @@ class CliTests(unittest.TestCase):
     def test_remote_prepare_timeout_scales_with_routed_corpus_bytes(self) -> None:
         args = cli.build_parser().parse_args(["prepare", "--non-interactive"])
         classic = cli._remote_prepare_timeout(LocalConfig(), args)
-        two_b = cli._remote_prepare_timeout(
-            LocalConfig(training_tokens=1_000_000_000), args
-        )
-        eight_b = cli._remote_prepare_timeout(
-            LocalConfig(training_tokens=4_000_000_000), args
-        )
-        hero = cli._remote_prepare_timeout(
-            LocalConfig(training_tokens=8_000_000_000), args
-        )
+        two_b = cli._remote_prepare_timeout(LocalConfig(dataset="2B"), args)
+        eight_b = cli._remote_prepare_timeout(LocalConfig(dataset="8B"), args)
+        hero = cli._remote_prepare_timeout(LocalConfig(dataset="hero"), args)
         self.assertLess(classic, two_b)
         self.assertLess(two_b, eight_b)
         self.assertLess(eight_b, hero)
         self.assertGreaterEqual(hero, 6 * 3600)
 
-    def test_unsupported_prepare_budget_is_not_persisted(self) -> None:
+    def test_invalid_shard_prefix_is_not_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             args = cli.build_parser().parse_args(
@@ -274,41 +309,26 @@ class CliTests(unittest.TestCase):
                     str(root / "cache"),
                     "--profile",
                     "official",
-                    "--training-tokens",
-                    "74900000001",
+                    "--dataset",
+                    "2B",
+                    "--train-shards",
+                    "20",
                 ]
             )
             with patch("rig.cli.repo_root", return_value=root):
-                with self.assertRaisesRegex(DataError, "largest prepared corpus"):
+                with self.assertRaisesRegex(DataError, "publishes 19 train shards"):
                     cli.command_prepare(args)
             self.assertFalse((root / ".rig.toml").exists())
 
-    def test_scaled_budget_rejects_manual_shard_truncation(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            args = cli.build_parser().parse_args(
-                [
-                    "prepare",
-                    "--non-interactive",
-                    "--no-doctor",
-                    "--no-download",
-                    "--no-save",
-                    "--path",
-                    str(root / "cache"),
-                    "--profile",
-                    "official",
-                    "--training-tokens",
-                    "1000000000",
-                    "--train-shards",
-                    "1",
-                ]
-            )
-            with patch("rig.cli.repo_root", return_value=root):
-                with self.assertRaisesRegex(ConfigError, "cannot truncate"):
-                    cli.command_prepare(args)
+    def test_named_corpus_allows_an_honest_partial_prefix(self) -> None:
+        config = LocalConfig(dataset="2B", train_shards=1)
+        route = cli._route_for_config(config, "official")
+        self.assertEqual(route.train_shards, 1)
+        self.assertEqual(route.train_capacity, 100_000_000)
 
     def test_wizard_infers_cloud_tpu_host_expression(self) -> None:
-        answers = ["", "", "", "4"] + [""] * 10
+        # data path, preparation profile, dataset, shards, artifacts, host count
+        answers = ["", "", "", "", "", "4"] + [""] * 10
         with (
             patch("builtins.input", side_effect=answers),
             patch("rig.cli.infer_host_expression", return_value="slice-w-[0-3]"),
@@ -400,14 +420,20 @@ class CliTests(unittest.TestCase):
                     "variant",
                     "--output-dir",
                     "profiles/test",
-                    "--steps",
+                    "--stop-after-step",
                     "20",
                 ]
             )
             with (
                 patch("rig.cli.repo_root", return_value=root),
                 patch("rig.cli.load_config", return_value=config),
-                patch("rig.cli.data_selection", return_value=("dev", 1)),
+                patch(
+                    "rig.cli.resolve_recipe_plan",
+                    return_value=RecipePlan(
+                        payload={"stop_after_step": 20, "schedule_steps": 200},
+                        sha256="a" * 64,
+                    ),
+                ),
                 patch("rig.cli.verify_dataset", return_value=prepared),
                 patch("rig.cli._probe_configured_cluster", return_value=inventory),
                 patch("rig.cli.sync_workspace") as sync,
@@ -445,6 +471,24 @@ class CliTests(unittest.TestCase):
         self.assertIsNone(prepare.target_loss)
         with self.assertRaises(SystemExit):
             cli.build_parser().parse_args(["report", "--admission-loss", "3.9"])
+
+    def test_leaderboard_skips_malformed_cohort_records(self) -> None:
+        args = cli.build_parser().parse_args(["leaderboard", "--profile", "dev"])
+        malformed = {
+            "status": "ok",
+            "run_kind": "full",
+            "profile": "dev",
+            "cohort_id": "a" * 64,
+            "cohort": {"cohort_id": "a" * 64},
+        }
+        output = StringIO()
+        with (
+            patch("rig.cli.load_config", return_value=LocalConfig()),
+            patch("rig.cli.load_records", return_value=[malformed]),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(cli.command_leaderboard(args), 0)
+        self.assertIn("No cohort-tagged full dev runs", output.getvalue())
 
     def test_dataset_provenance_uses_stable_names_not_cache_paths(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

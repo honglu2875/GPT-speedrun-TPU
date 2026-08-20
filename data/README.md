@@ -68,17 +68,16 @@ network shards. A user-supplied shard is supported by placing it under the
 manifest filename and running verification; it is judged by header, length,
 and hash exactly like a downloaded shard.
 
-### Budget-routed scaled preparation
+### Named scaled corpora
 
-The `rig prepare --training-tokens N` setting selects the corpus prepared
-for the `official` data profile and used by subsequent non-smoke runs. Requests
-through 900M training tokens retain
-the classic nine-shard selection. Larger requests route to the smallest scaled
-prefix with enough nominal training capacity: `2B` through 1.9B, `4B` through
-3.9B, `8B` through 7.9B, and `hero` through 74.9B. Values above 74.9B are
-rejected. Scaled shards live under
-`<data-root>/fineweb-scaled/<variant>/`, so their filenames cannot collide with
-classic data.
+Corpus identity is selected directly: `classic`, `2B`, `4B`, `8B`, or `hero`.
+For example, `rig prepare --dataset 8B --train-shards 79` saves and prepares
+the complete 7.9B-token training prefix, while `rig dataset prepare 8B
+--shards 20` prepares a smaller explicit prefix without changing saved run
+settings. The published maxima are 9 classic train shards, 19 for `2B`, 39 for
+`4B`, 79 for `8B`, and 749 for `hero`; every shard holds 100M tokens. Scaled
+shards live under `<data-root>/fineweb-scaled/<variant>/`, so their filenames
+cannot collide with classic data.
 
 The routing layer trusts only a checked-in manifest under
 `data/manifests/fineweb-scaled-gpt2/`. That manifest must pin the published
@@ -89,9 +88,10 @@ real manifest, scaled `rig prepare` fails with an explicit message; it
 never manufactures a placeholder or treats a cache-local build plan as a
 download contract.
 
-Doctor, profiling, and runs resolve the same saved route, preventing accidental
-fallback to a different corpus. The setting does not determine trainer steps;
-family profiles and versioned studies define their own token horizons.
+Doctor, profiling, and runs resolve the same saved name and shard prefix. A
+missing selection fails with the exact preparation command instead of falling
+back to another corpus. Dataset choice does not determine trainer steps; the
+fixed-TPP recipe plan resolves the token horizon independently.
 
 ## Binary format
 

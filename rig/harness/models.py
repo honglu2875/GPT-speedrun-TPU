@@ -5,40 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
-from typing import Any, Callable, Literal, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 
 MAX_RUN_NAME = 40
 _RUN_NAME_STRIP = re.compile(r"[^a-z0-9]+")
 
-Track = Literal["open", "sample_efficiency"]
-CheckpointRetention = Literal["all", "qualifying", "none-after-validation"]
-
-
-@dataclass(frozen=True)
-class ReferenceContract:
-    """Pinned model/data identity for the sample-efficiency track.
-
-    The harness deliberately has no invented defaults. A competition owner creates
-    this value from its versioned profile/configuration and passes it to each run.
-    Extra fields permit a profile to pin details beyond the common four.
-    """
-
-    model_id: str
-    dataset_id: str
-    tokenizer_id: str
-    sequence_length: int
-    extra: Mapping[str, Any] = field(default_factory=dict)
-
-    def as_dict(self) -> dict[str, Any]:
-        result: dict[str, Any] = {
-            "model_id": self.model_id,
-            "dataset_id": self.dataset_id,
-            "tokenizer_id": self.tokenizer_id,
-            "sequence_length": self.sequence_length,
-        }
-        result.update(self.extra)
-        return result
+CheckpointRetention = Literal["always", "qualifying", "none"]
 
 
 @dataclass(frozen=True)
@@ -49,16 +22,15 @@ class RunConfig:
     recipe: str
     runs_dir: Path
     records_path: Path
-    track: Track = "open"
+    plan: Mapping[str, Any]
     profile: str = "default"
     seed: int = 1337
     target_loss: float = 3.28
-    expected_training_tokens: int | None = None
     expected_validation_tokens: int | None = None
     expected_downstream_tokens: Mapping[str, int] | None = None
     timeout_seconds: float = 900.0
-    passthrough_args: Sequence[str] = ()
-    reference_contract: ReferenceContract | Mapping[str, Any] | None = None
+    trainer_args: Sequence[str] = ()
+    cohort: Mapping[str, Any] | None = None
     checkpoint_retention: CheckpointRetention = "qualifying"
     python_executable: str | None = None
     environment: Mapping[str, str] = field(default_factory=dict)

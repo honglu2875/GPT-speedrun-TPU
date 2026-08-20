@@ -1,39 +1,33 @@
-# reference_8k — the reference family at 8,192-token context
+# reference_moe — routed fork of the reference family
 
-A fork of [`reference`](../reference/) that changes **two** things and nothing
-else: the context length, and document masking.
+A fork of [`reference`](../reference/) that replaces every dense MLP with an
+eight-expert, top-2 routed MLP. The fork keeps the same named context contracts;
+it defaults to `8k`, while `--context 1k` selects the short-context contract on
+demand.
 
-| | `reference` | `reference_8k` |
+| | `reference` | `reference_moe` |
 |---|---|---|
-| `seq_len` | 1,024 | **8,192** |
-| document masking | off | **on** |
-| `batch_size` (sequences) | 128 | **16** |
-| tokens per optimizer step | 131,072 | 131,072 |
-| optimizer steps at 60M / 5 TPP | 2,286 | 2,286 |
-| tiers, parameter counts, schedule | | identical |
+| context presets | `1k` default, `8k` optional | same presets, `8k` default |
+| MLP | dense 4× GELU | top-2 of 8 experts, 2× each |
+| active MLP width/token | 4× | 4× |
+| router auxiliary loss | none | 0.01 load-balancing coefficient |
+| token batch and schedule | 131,072 tokens/step | identical |
 
-The tiers are unchanged — parameter counts do not depend on `seq_len`, because
-positions are RoPE and carry no learned embedding.
+The declared tier parameter count is the **active/equi-FLOP ladder anchor**, not
+the total stored MoE parameter count. Top-2 × 2-wide experts matches the dense
+4× active MLP computation while eight replicated experts add inactive capacity.
 
-## Why batch 16 and not 128
+At the native 8k default, batch 16 is the recipe-local reference and therefore
+`m_B = 1`. Selecting `1k` selects batch 128 as its anchor, exactly as it does in
+the dense recipe. This reanchoring is an explicit project choice documented in
+[`docs/COMPLETEP.md`](../../docs/COMPLETEP.md).
 
-Holding `batch_size` at 128 would have multiplied tokens per step by eight,
-which multiplies the token batch by eight and divides the optimizer step count
-by eight — 286 steps at 60M / 5 TPP instead of 2,286. A comparison against
-`reference` would then confound three changes at once.
+AdamW decay follows parameter roles: embeddings and `*_w` tensors decay;
+router/expert biases and normalization scales do not. In particular, stacked
+expert biases are rank-2 arrays but remain biases—array rank is not a decay
+policy.
 
-Batch 16 holds **tokens per step and step count identical to `reference`**, so
-the ladders differ only in how those tokens are arranged into sequences and in
-whether attention crosses documents.
-
-Note the consequence for the parameterization: `m_B` counts *sequences*
-(`batch_size / 128`), which is the convention the scaling-literature uses, so
-this family runs at `m_B = 0.125` and its Complete(d)P learning-rate scaling
-differs from `reference` accordingly. **The base-LR optimum therefore does not
-transfer from `reference` and must be swept here.** That is why this family
-exists as its own ladder rather than as a flag.
-
-## Why masking is on here and off there
+## Why masking follows context
 
 A window is cut live from a flat token stream, so it can span several
 documents. Measured on a 100M-token FineWeb shard:
@@ -43,8 +37,8 @@ documents. Measured on a 100M-token FineWeb shard:
 | documents a random window spans | ~1.5 | **~11.8** |
 | tokens in documents at least that long | 53.0% | **8.5%** |
 
-At 1k the cross-document surface is about one boundary per window and
-`reference` leaves it unmasked, deliberately, to keep its recorded results
+At 1k the cross-document surface is about one boundary per window and both
+recipes leave it unmasked, deliberately, to keep recorded 1k results
 bit-reproducible. At 8k a window averages twelve documents and only 8.5% of
 tokens come from documents that long — unmasked, most of the added context
 would be attention across unrelated text, which is not what the extra compute
@@ -121,3 +115,10 @@ baseline: it adds active FLOPs, so it breaks the equi-FLOP identity against the
 dense ladder, and it confounds "did sparsity help" with "did extra dense
 capacity help". It is worth measuring — as an ablation forked from this recipe,
 with its own arm, so the two questions stay separable.
+
+Use the harness rather than invoking the trainer directly:
+
+```bash
+uv run --frozen --no-sync rig run reference_moe --tier 60m --profile dev
+uv run --frozen --no-sync rig run reference_moe --context 1k --tier 60m --profile dev
+```

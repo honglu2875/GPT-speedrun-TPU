@@ -18,7 +18,7 @@ from typing import Callable, Iterable, Literal
 
 from .config import repo_root
 from .data import DataError, verify_dataset, verify_fresh10
-from .data_routing import preparation_route, resolve_preparation_manifest
+from .data_routing import PreparationRoute, resolve_preparation_manifest
 
 
 CheckStatus = Literal["ok", "warning", "error"]
@@ -81,7 +81,7 @@ def environment_checks(
     expected_process_count: int = 1,
     accelerator: str = "TPU v4",
     chips_per_host: int = 4,
-    training_tokens: int | None = None,
+    route: PreparationRoute | None = None,
     check_data: bool = True,
     compile_probe: bool = True,
 ) -> list[Callable[[], CheckResult]]:
@@ -107,7 +107,7 @@ def environment_checks(
         if profile and check_data:
             checks.append(
                 lambda: check_prepared_data(
-                    data_path, profile, training_tokens=training_tokens
+                    data_path, profile, route=route
                 )
             )
     return checks
@@ -387,13 +387,12 @@ def check_storage(path: Path) -> CheckResult:
 
 
 def check_prepared_data(
-    path: Path, profile: str, *, training_tokens: int | None = None
+    path: Path, profile: str, *, route: PreparationRoute | None = None
 ) -> CheckResult:
-    if training_tokens is None:
+    if route is None:
         manifest, shards = data_selection(profile)
         data_root = path
     else:
-        route = preparation_route(profile, training_tokens)
         manifest = resolve_preparation_manifest(route)
         shards = route.train_shards
         data_root = route.data_root(path)
