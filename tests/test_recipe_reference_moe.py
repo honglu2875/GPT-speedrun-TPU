@@ -218,7 +218,7 @@ class ActiveParameterTests(unittest.TestCase):
         # executes, and parameter counts do not depend on the backend.
         parser = trainer.build_parser()
         return trainer.resolve_config(
-            parser.parse_args(["--tier", tier, "--profile", "dev"]), "tpu", 50_304
+            parser.parse_args(["--tier", tier, "--profile", "dev"]), "tpu"
         )
 
     def test_active_count_exceeds_the_dense_tier_only_by_the_router(self) -> None:
@@ -308,28 +308,34 @@ class ContextPresetTests(unittest.TestCase):
         )
 
     def test_moe_defaults_to_8k_and_can_select_the_aligned_1k_preset(self) -> None:
-        native = trainer.load_experiment_profile("dev")
-        short = trainer.load_experiment_profile("dev", context="1k")
+        experiment_config, _ = trainer.load_experiment_config()
+        native_tier, native_context = experiment_config.resolve_selection("dev")
+        short_tier, short_context = experiment_config.resolve_selection(
+            "dev", context="1k"
+        )
 
-        self.assertEqual(native.context_name, "8k")
+        self.assertEqual(native_tier, short_tier)
+        self.assertEqual(native_context, "8k")
+        native = experiment_config.family.contexts[native_context]
         self.assertEqual(
-            (native.context.seq_len, native.context.reference_batch_size),
+            (native.seq_len, native.reference_batch_size),
             (8192, 16),
         )
-        self.assertTrue(native.context.document_masking)
-        self.assertEqual(short.context_name, "1k")
+        self.assertTrue(native.document_masking)
+        self.assertEqual(short_context, "1k")
+        short = experiment_config.family.contexts[short_context]
         self.assertEqual(
-            (short.context.seq_len, short.context.reference_batch_size),
+            (short.seq_len, short.reference_batch_size),
             (1024, 128),
         )
-        self.assertFalse(short.context.document_masking)
+        self.assertFalse(short.document_masking)
 
 
 class RoutedModelTests(unittest.TestCase):
     def _config(self):
         parser = trainer.build_parser()
         config = trainer.resolve_config(
-            parser.parse_args(["--profile", "smoke"]), "cpu", 256
+            parser.parse_args(["--profile", "smoke"]), "cpu"
         )
         from dataclasses import replace
 

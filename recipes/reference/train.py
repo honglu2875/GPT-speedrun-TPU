@@ -472,33 +472,10 @@ class ExperimentConfig(ConfigSchema):
                     f"config.yaml profiles.{name}.evaluation.val_probe_batches "
                     "must not exceed eval_batches"
                 )
+        self._validate_official_evaluation(family.default_context)
 
-    def select(
-        self,
-        profile: str,
-        source_sha256: str,
-        *,
-        tier: str | None = None,
-        context: str | None = None,
-    ) -> SelectedExperiment:
-        """Validate runtime selectors and return a zero-copy view of this document."""
-
-        if profile not in _VALID_PROFILES:
-            raise ValueError(f"unknown experiment profile: {profile!r}")
-        self.validate()
-
-        tier_name = tier or self.family.default_tier
-        if tier_name not in self.family.tiers:
-            raise ValueError(
-                f"unknown model tier {tier_name!r}; expected "
-                + ", ".join(sorted(self.family.tiers))
-            )
-        context_name = context or self.family.default_context
-        if context_name not in self.family.contexts:
-            raise ValueError(
-                f"unknown context preset {context_name!r}; expected "
-                + ", ".join(sorted(self.family.contexts))
-            )
+    def _validate_official_evaluation(self, context_name: str) -> None:
+        """Check the fixed official validation prefix for one context preset."""
 
         official = self.profiles.official
         tokens_per_step = self.family.contexts[context_name].tokens_per_step
@@ -515,78 +492,50 @@ class ExperimentConfig(ConfigSchema):
                 f"{required_eval_batches} for the official validation prefix"
             )
 
-        return SelectedExperiment(
-            config=self,
-            source_sha256=source_sha256,
-            name=profile,
-            tier_name=tier_name,
-            context_name=context_name,
-        )
+    def resolve_selection(
+        self,
+        profile: str,
+        *,
+        tier: str | None = None,
+        context: str | None = None,
+    ) -> tuple[str, str]:
+        """Resolve runtime selectors on an already-validated config."""
 
+        if profile not in _VALID_PROFILES:
+            raise ValueError(f"unknown experiment profile: {profile!r}")
 
-@dataclass(frozen=True, slots=True)
-class SelectedExperiment:
-    """Runtime profile/tier/context selection over one decoded YAML config."""
+        tier_name = tier or self.family.default_tier
+        if tier_name not in self.family.tiers:
+            raise ValueError(
+                f"unknown model tier {tier_name!r}; expected "
+                + ", ".join(sorted(self.family.tiers))
+            )
+        context_name = context or self.family.default_context
+        if context_name not in self.family.contexts:
+            raise ValueError(
+                f"unknown context preset {context_name!r}; expected "
+                + ", ".join(sorted(self.family.contexts))
+            )
 
-    config: ExperimentConfig
-    source_sha256: str
-    name: str
-    tier_name: str
-    context_name: str
+        if profile == "official":
+            self._validate_official_evaluation(context_name)
 
-    @property
-    def profile(self) -> SmokeProfileDefinition | LadderProfileDefinition:
-        if self.name == "smoke":
-            return self.config.profiles.smoke
-        if self.name == "dev":
-            return self.config.profiles.dev
-        if self.name == "official":
-            return self.config.profiles.official
-        raise AssertionError(f"invalid selected profile: {self.name!r}")
-
-    @property
-    def tier(self) -> TierDefinition:
-        return self.config.family.tiers[self.tier_name]
-
-    @property
-    def context(self) -> ContextPreset:
-        return self.config.family.contexts[self.context_name]
-
-    @property
-    def model(self) -> ModelDefinition:
-        if self.name == "smoke":
-            profile = self.profile
-            if not isinstance(profile, SmokeProfileDefinition):
-                raise AssertionError("smoke selection resolved a ladder profile")
-            return profile.model
-        return self.tier.model
-
-    @property
-    def tpp_parameters(self) -> int | None:
-        return None if self.name == "smoke" else self.tier.tpp_parameters
-
-    @property
-    def base_tpp_parameters(self) -> int:
-        base_tier = self.config.family.parameterization.base_tier
-        return self.config.family.tiers[base_tier].tpp_parameters
+        return tier_name, context_name
 
 
 _UINT64_MASK = (1 << 64) - 1
 
 
-def load_experiment_profile(
-    profile: str,
+def load_experiment_config(
     requested_path: Path | None = None,
-    *,
-    tier: str | None = None,
-    context: str | None = None,
-) -> SelectedExperiment:
-    if profile not in _VALID_PROFILES:
-        raise ValueError(f"unknown experiment profile: {profile!r}")
+) -> tuple[ExperimentConfig, str]:
+    """Load and validate the typed YAML config with its source digest."""
+
     path = resolve_sibling_config_path(requested_path, CONFIG_PATH)
     mapping, source_sha256 = read_config_document(path)
     experiment_config = ExperimentConfig.from_mapping(mapping)
-    return experiment_config.select(profile, source_sha256, tier=tier, context=context)
+    experiment_config.validate()
+    return experiment_config, source_sha256
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -649,11 +598,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def validate_args(args: argparse.Namespace) -> SelectedExperiment:
-    experiment = load_experiment_profile(
-        selected_profile(args), args.config, tier=args.tier, context=args.context
-    )
-    if selected_profile(args) == "smoke" and args.context is not None:
+def validate_args(
+    args: argparse.Namespace,
+    experiment_config: ExperimentConfig | None = None,
+) -> None:
+    if experiment_config is None:
+        experiment_config, _ = load_experiment_config(args.config)
+    profile = selected_profile(args)
+    experiment_config.resolve_selection(profile, tier=args.tier, context=args.context)
+    if profile == "smoke" and args.context is not None:
         raise ValueError("--context is not applicable to the smoke profile")
     if args.tokens_per_parameter is not None and (
         not math.isfinite(args.tokens_per_parameter) or args.tokens_per_parameter <= 0.0
@@ -665,8 +618,7 @@ def validate_args(args: argparse.Namespace) -> SelectedExperiment:
         raise ValueError("--base-learning-rate must be finite and positive")
     validate_standard_data_arguments(args)
     validate_standard_reporting_arguments(args)
-    validate_standard_xprof_arguments(args, profile=selected_profile(args))
-    return experiment
+    validate_standard_xprof_arguments(args, profile=profile)
 
 
 def should_compile_evaluation(
@@ -686,29 +638,41 @@ def selected_profile(args: argparse.Namespace) -> str:
 def resolve_config(
     args: argparse.Namespace,
     platform: str,
-    vocab_size: int,
-    experiment: SelectedExperiment | None = None,
+    *,
+    experiment_config: ExperimentConfig | None = None,
+    config_sha256: str | None = None,
 ) -> Config:
-    profile = selected_profile(args)
-    experiment = experiment or load_experiment_profile(
-        profile, args.config, tier=args.tier, context=args.context
-    )
-    if experiment.name != profile:
-        raise ValueError(
-            f"resolved config profile {experiment.name!r} does not match {profile!r}"
-        )
+    if experiment_config is None:
+        if config_sha256 is not None:
+            raise ValueError("config_sha256 requires an explicit ExperimentConfig")
+        experiment_config, config_sha256 = load_experiment_config(args.config)
+    elif config_sha256 is None:
+        raise ValueError("an explicit ExperimentConfig requires config_sha256")
 
-    definition = experiment.profile
-    model = experiment.model
+    profile = selected_profile(args)
+    selected_tier_name, selected_context_name = experiment_config.resolve_selection(
+        profile, tier=args.tier, context=args.context
+    )
+    family = experiment_config.family
+    base_tier_name = family.parameterization.base_tier
+    base_tpp_parameters = family.tiers[base_tier_name].tpp_parameters
+    if profile == "smoke":
+        definition = experiment_config.profiles.smoke
+        model = definition.model
+        tpp_parameters = None
+    else:
+        definition = (
+            experiment_config.profiles.dev
+            if profile == "dev"
+            else experiment_config.profiles.official
+        )
+        tier = family.tiers[selected_tier_name]
+        model = tier.model
+        tpp_parameters = tier.tpp_parameters
     kernels = definition.kernels
     optimizer = definition.optimizer
     evaluation = definition.evaluation
     logging = definition.logging
-    if vocab_size != model.vocab_size:
-        raise ValueError(
-            "loaded dataset vocabulary does not match config.yaml: "
-            f"dataset={vocab_size}, configured={model.vocab_size}"
-        )
 
     if profile == "smoke":
         if not isinstance(definition, SmokeProfileDefinition):
@@ -731,13 +695,13 @@ def resolve_config(
         if not isinstance(definition, LadderProfileDefinition):
             raise AssertionError("ladder selection resolved the smoke profile")
         training = definition.training
-        context = experiment.context
-        family_parameterization = experiment.config.family.parameterization
+        context = family.contexts[selected_context_name]
+        family_parameterization = family.parameterization
         batch_anchor = context.reference_batch_size
         seq_len = context.seq_len
         document_masking = context.document_masking
         requested_tpp = args.tokens_per_parameter or training.tokens_per_parameter
-        tier_name = experiment.tier_name
+        tier_name = selected_tier_name
         parameterization = family_parameterization.name
         base_width = family_parameterization.base_width
         base_depth = family_parameterization.base_depth
@@ -745,12 +709,11 @@ def resolve_config(
         init_std = family_parameterization.init_std
         attention_scale = family_parameterization.attention_scale
         embeddings = family_parameterization.embeddings
-        context_preset = experiment.context_name
+        context_preset = selected_context_name
 
     batch_size = args.batch_size or batch_anchor
     tokens_per_step = batch_size * seq_len
     early_stop = getattr(args, "stop_after_step", None)
-    tpp_parameters = experiment.tpp_parameters
     if profile == "smoke":
         if args.tokens_per_parameter is not None:
             raise ValueError("--tokens-per-parameter cannot override the smoke profile")
@@ -843,7 +806,7 @@ def resolve_config(
     # model-size-induced data growth within one fixed-TPP ladder; it deliberately
     # omits any cross-horizon TPP / TPP_0 factor.
     data_multiplier = (
-        tpp_parameters / float(experiment.base_tpp_parameters)
+        tpp_parameters / float(base_tpp_parameters)
         if tpp_parameters is not None
         else 1.0
     )
@@ -874,7 +837,7 @@ def resolve_config(
         mlp_activation=model.mlp_activation,
         tier=tier_name,
         declared_parameters=tpp_parameters,
-        base_parameters=experiment.base_tpp_parameters,
+        base_parameters=base_tpp_parameters,
         parameterization=parameterization,
         base_width=base_width,
         base_depth=base_depth,
@@ -901,16 +864,16 @@ def resolve_config(
         val_probe_batches=val_probe_batches,
         diagnostics_every=diagnostics_every,
         log_every=log_every,
-        vocab_size=vocab_size,
+        vocab_size=model.vocab_size,
         semantic_vocab_size=model.semantic_vocab_size,
         attention_backend=attention_backend,
         loss_backend=kernels.loss_backend,
         vocab_tile_size=kernels.vocab_tile_size,
         compute_dtype=compute_dtype,
         dtype_name=dtype_name,
-        config_schema_version=experiment.config.schema_version,
-        config_sha256=experiment.source_sha256,
-        config_profile=experiment.name,
+        config_schema_version=experiment_config.schema_version,
+        config_sha256=config_sha256,
+        config_profile=profile,
         context_preset=context_preset,
         config_overrides=overrides,
     )
@@ -1720,7 +1683,8 @@ def traced_flops(config: Config, params: Mapping[str, Any]) -> FlopBreakdown:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any] | None:
-    experiment = validate_args(args)
+    experiment_config, config_sha256 = load_experiment_config(args.config)
+    validate_args(args, experiment_config)
     process_index, process_count = initialize_distributed_runtime()
     is_controller = is_controller_process(process_index)
     console = Console(args.color, active=is_controller)
@@ -1748,8 +1712,12 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         val_fraction=args.val_fraction,
         seed=args.seed,
     )
-    vocab_size = experiment.model.vocab_size
-    config = resolve_config(args, platform, vocab_size, experiment)
+    config = resolve_config(
+        args,
+        platform,
+        experiment_config=experiment_config,
+        config_sha256=config_sha256,
+    )
     capture_window = xprof_step_window(args, config.final_step)
     downstream_domains = load_downstream_domains(
         manifest=args.downstream_manifest,
@@ -2633,12 +2601,13 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.print_plan:
         try:
-            experiment = validate_args(args)
+            experiment_config, config_sha256 = load_experiment_config(args.config)
+            validate_args(args, experiment_config)
             planned = resolve_config(
                 args,
                 "cpu" if selected_profile(args) == "smoke" else "tpu",
-                experiment.model.vocab_size,
-                experiment,
+                experiment_config=experiment_config,
+                config_sha256=config_sha256,
             )
         except Exception as error:
             print(f"\nerror: {error}", file=sys.stderr)
