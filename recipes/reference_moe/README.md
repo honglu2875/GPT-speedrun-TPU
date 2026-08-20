@@ -27,6 +27,14 @@ router/expert biases and normalization scales do not. In particular, stacked
 expert biases are rank-2 arrays but remain biases—array rank is not a decay
 policy.
 
+> **Historical-run compatibility.** The archived MoE studies predate commit
+> `102a264672c8453700a02e321495a14c585e58ea`. Before that commit, the AdamW
+> mask inferred decay from array rank, so the stacked rank-2 `expert_up_b` and
+> `expert_down_b` bias tensors incorrectly received weight decay. We expect the
+> numerical effect to be minor, but the corrected recipe cannot reproduce those
+> runs bit-for-bit. Treat the archived metrics as observations of the pre-fix
+> recipe; reproduction commands use the corrected policy.
+
 ## Why masking follows context
 
 A window is cut live from a flat token stream, so it can span several

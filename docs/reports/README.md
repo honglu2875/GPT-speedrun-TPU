@@ -257,6 +257,17 @@ for lr in 0.015625 0.0078125 0.00390625 0.001953125 0.0009765625; do
 done
 ```
 
+## Historical MoE optimizer note
+
+Every archived `reference_moe` run in `moe-lr-sweep-8k`, and every routed arm
+in `batch-size-grid-8k`, predates commit
+`102a264672c8453700a02e321495a14c585e58ea`. The old AdamW mask inferred decay
+from array rank, so stacked rank-2 `expert_up_b` and `expert_down_b` bias
+tensors incorrectly received weight decay. We expect the numerical difference
+to be minor, but the corrected recipe cannot reproduce those runs bit-for-bit.
+The archived metrics remain observations of the pre-fix recipe; the commands
+below reproduce the study design with the corrected policy.
+
 ## moe-lr-sweep-8k.html
 
 18 runs of [`reference_moe`](../../recipes/reference_moe/) — top-2 of 8
