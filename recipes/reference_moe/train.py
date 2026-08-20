@@ -31,7 +31,7 @@ import socket
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -44,6 +44,16 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental.pallas.ops.tpu import megablox
 
 from rig import logpack
+from rig.attention import (
+    AttentionCallable,
+    AttentionRuntime,
+    attention_console_rows,
+    attention_runtime_metadata,
+    attention_softmax_scale,
+    document_segments,
+    make_mesh_attention,
+    resolve_attention_runtime,
+)
 from rig.metrics import DIAGNOSTIC_FAMILIES, DIAGNOSTIC_STATS
 from rig.configfile import (
     config_bool,
@@ -126,15 +136,10 @@ from rig.flops import (
 )
 from rig.kernels import (
     AttentionConfig,
-    AttentionTiles,
     make_causal_attention,
     select_attention_tiles,
     tiled_tied_cross_entropy,
     tiled_tied_cross_entropy_losses,
-)
-from rig.kernels.autotune import (
-    make_runtime_key,
-    resolve_attention_tile_plan,
 )
 
 
@@ -283,35 +288,6 @@ class ExperimentProfile:
     expert_top_k: int = 2
     expert_mult: int = 2
     router_aux_coefficient: float = 0.01
-
-
-@dataclass(frozen=True)
-class AttentionRuntime:
-    """One static attention plan resolved before any real-step compilation."""
-
-    key_digest: str | None
-    resolution_source: str
-    tiles: AttentionTiles | None
-    tune_seconds: float
-
-    def __post_init__(self) -> None:
-        if self.resolution_source not in (
-            "dense",
-            "cache",
-            "shipped",
-            "heuristic",
-            "autotuned",
-        ):
-            raise ValueError(
-                f"invalid attention resolution source: {self.resolution_source!r}"
-            )
-        if not math.isfinite(self.tune_seconds) or self.tune_seconds < 0.0:
-            raise ValueError("attention tune seconds must be finite and nonnegative")
-        if self.resolution_source == "dense":
-            if self.key_digest is not None or self.tiles is not None:
-                raise ValueError("dense attention must not carry a tuning key or tiles")
-        elif self.key_digest is None or self.tiles is None:
-            raise ValueError("non-dense attention requires a tuning key and tile plan")
 
 
 _UINT64_MASK = (1 << 64) - 1
@@ -1371,69 +1347,6 @@ def init_params(config: Config, seed: int) -> dict[str, Any]:
     return result
 
 
-AttentionCallable = Callable[[jax.Array, jax.Array, jax.Array], jax.Array]
-
-
-def attention_softmax_scale(config: Config) -> float:
-    if config.attention_scale == "inverse_head_dim":
-        return 1.0 / float(config.d_model // config.heads)
-    if config.attention_scale == "inverse_sqrt_head_dim":
-        return (config.d_model // config.heads) ** -0.5
-    raise ValueError(f"unsupported attention scale {config.attention_scale!r}")
-
-
-def attention_runtime_metadata(runtime: AttentionRuntime) -> dict[str, Any]:
-    """Return the JSON-safe attention tile provenance shared by all artifacts."""
-
-    return {
-        "key_digest": runtime.key_digest,
-        "resolution_source": runtime.resolution_source,
-        "tune_seconds": float(runtime.tune_seconds),
-        "tiles": None if runtime.tiles is None else runtime.tiles.to_dict(),
-    }
-
-
-def attention_console_rows(
-    runtime: AttentionRuntime,
-) -> tuple[tuple[str, str], ...]:
-    """Return compact, terminal-safe attention provenance rows."""
-
-    if runtime.tiles is None:
-        return (
-            ("attention tuning", "not applicable (dense)"),
-            ("attention plan", "not applicable"),
-        )
-    digest = runtime.key_digest or "unknown"
-    timing = f" · {runtime.tune_seconds:.3f}s" if runtime.tune_seconds > 0.0 else ""
-    tiles = runtime.tiles
-    assert tiles.block_q_dkv is not None
-    assert tiles.block_q_dkv_compute is not None
-    assert tiles.block_kv_dkv is not None
-    assert tiles.block_kv_dkv_compute is not None
-    assert tiles.block_q_dq is not None
-    assert tiles.block_kv_dq is not None
-    assert tiles.block_kv_dq_compute is not None
-    return (
-        (
-            "attention tuning",
-            f"{runtime.resolution_source}{timing} · key {digest[:12]}",
-        ),
-        (
-            "attention fwd",
-            f"q{tiles.block_q} · kv{tiles.block_kv}/{tiles.block_kv_compute}",
-        ),
-        (
-            "attention dK/dV",
-            f"q{tiles.block_q_dkv}/{tiles.block_q_dkv_compute} · "
-            f"kv{tiles.block_kv_dkv}/{tiles.block_kv_dkv_compute}",
-        ),
-        (
-            "attention dQ",
-            f"q{tiles.block_q_dq} · kv{tiles.block_kv_dq}/{tiles.block_kv_dq_compute}",
-        ),
-    )
-
-
 def contract_model_metadata(config: Config) -> dict[str, Any]:
     """Return the resolved model architecture metadata."""
 
@@ -1605,105 +1518,6 @@ def implementation_metadata(
         "document_masking": config.document_masking,
         "configuration": experiment_config_metadata(config),
     }
-
-
-def prepare_attention_runtime(
-    args: argparse.Namespace,
-    config: Config,
-    devices: Sequence[jax.Device],
-) -> AttentionRuntime:
-    """Resolve or synthetically tune attention before constructing shard_map.
-
-    Only static model shape, runtime identity, and deterministic synthetic BHSD
-    tensors reach the tuner. No training or validation dataset is accepted by
-    this boundary.
-    """
-
-    if config.attention_backend == "dense":
-        return AttentionRuntime(None, "dense", None, 0.0)
-    if not devices:
-        raise ValueError("attention tile resolution requires at least one device")
-    if config.batch_size % len(devices):
-        raise ValueError(
-            "global batch must divide the device count before attention tuning"
-        )
-    local_batch = config.batch_size // len(devices)
-    process_index = int(jax.process_index())
-    runtime_devices = tuple(
-        device
-        for device in devices
-        if int(getattr(device, "process_index", process_index)) == process_index
-    )
-    if not runtime_devices:
-        raise RuntimeError("JAX reported no addressable device for this process")
-    head_dim = config.d_model // config.heads
-    key = make_runtime_key(
-        backend=config.attention_backend,
-        dtype=config.compute_dtype,
-        batch=local_batch,
-        heads=config.heads,
-        sequence=config.seq_len,
-        head_dim=head_dim,
-        mode="forward_backward",
-        device=runtime_devices[0],
-    )
-    # Resolution is a pure function of the key -- shipped lookup, else shape
-    # heuristic -- so every process in the job derives identical tile constants
-    # without communicating. Measuring per host instead could select different
-    # winners for near-equal candidates and compile divergent HLO.
-    resolved = resolve_attention_tile_plan(key)
-    return AttentionRuntime(key.digest, resolved.source, resolved.tiles, 0.0)
-
-
-def make_mesh_attention(
-    config: Config,
-    mesh: Mesh,
-    tiles: AttentionTiles | None,
-) -> AttentionCallable | None:
-    """Build an explicitly data-sharded Pallas attention boundary.
-
-    Parameters and optimizer state remain replicated, while the leading batch
-    axis is partitioned over ``mesh['data']``.  Pallas/Mosaic calls require this
-    explicit boundary: automatic SPMD partitioning of a custom kernel is not
-    supported by JAX.  Each kernel invocation consequently receives the local
-    per-chip batch and performs no attention collectives.
-    """
-
-    if config.attention_backend == "dense":
-        return None
-    if tiles is None:
-        raise ValueError("non-dense attention requires a resolved tile plan")
-    local_attention = make_causal_attention(
-        AttentionConfig(
-            backend=config.attention_backend,
-            tiles=tiles,
-            softmax_scale=attention_softmax_scale(config),
-        )
-    )
-    batch_partition = P("data", None, None, None)
-    segment_partition = P("data", None)
-    in_specs = [batch_partition, batch_partition, batch_partition]
-    if config.document_masking:
-        in_specs.append(segment_partition)
-    return jax.shard_map(
-        local_attention,
-        mesh=mesh,
-        in_specs=tuple(in_specs),
-        out_specs=batch_partition,
-        check_vma=False,
-    )
-
-
-def document_segments(tokens: jax.Array, boundary_token: int) -> jax.Array:
-    """Index each position by which document it sits in, within its window.
-
-    The corpus prefixes every document with an EOT token, so a running count of
-    boundaries is the document index. Derived here rather than shipped from the
-    loader: ``tokens`` is already on the accelerator, and a cumulative sum over
-    [batch, sequence] costs nothing against attention.
-    """
-
-    return jnp.cumsum(tokens == boundary_token, axis=1).astype(jnp.int32)
 
 
 @jax.tree_util.register_dataclass
@@ -1931,7 +1745,7 @@ def gpt_hidden(
                 tiles=select_attention_tiles(
                     sequence=length, head_dim=head_dim, training=True
                 ),
-                softmax_scale=attention_softmax_scale(config),
+                softmax_scale=attention_softmax_scale(config.attention_scale, head_dim),
             )
         )
         causal = None
@@ -1968,7 +1782,9 @@ def gpt_hidden(
             attended = jnp.transpose(attended, (0, 2, 1, 3))
         else:
             scores = jnp.einsum("bthd,bshd->bhts", query, key)
-            scores = scores.astype(jnp.float32) * attention_softmax_scale(config)
+            scores = scores.astype(jnp.float32) * attention_softmax_scale(
+                config.attention_scale, head_dim
+            )
             visible = causal
             if segments is not None:
                 same = segments[:, None, :, None] == segments[:, None, None, :]
@@ -2728,7 +2544,15 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             "Attention tile preflight",
             "resolving the shipped lookup or shape heuristic",
         )
-    attention_runtime = prepare_attention_runtime(args, config, devices)
+    attention_runtime = resolve_attention_runtime(
+        backend=config.attention_backend,
+        dtype=config.compute_dtype,
+        global_batch_size=config.batch_size,
+        heads=config.heads,
+        sequence=config.seq_len,
+        head_dim=config.d_model // config.heads,
+        devices=devices,
+    )
     if (
         max(map(len, dataset.train.shards)) < config.seq_len + 1
         or max(map(len, dataset.validation.shards)) < config.seq_len + 1
@@ -2857,7 +2681,15 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     mesh = Mesh(np.asarray(devices, dtype=object), ("data",))
     replicated = NamedSharding(mesh, P())
     data_sharding = NamedSharding(mesh, P("data", None))
-    attention_fn = make_mesh_attention(config, mesh, attention_runtime.tiles)
+    attention_fn = make_mesh_attention(
+        backend=config.attention_backend,
+        mesh=mesh,
+        tiles=attention_runtime.tiles,
+        softmax_scale=attention_softmax_scale(
+            config.attention_scale, config.d_model // config.heads
+        ),
+        document_masking=config.document_masking,
+    )
     routed_fn = make_mesh_routed_mlp(config, mesh)
     params = put_replicated_tree(host_params, mesh, replicated, process_count)
     optimizer = put_replicated_tree(host_optimizer, mesh, replicated, process_count)
