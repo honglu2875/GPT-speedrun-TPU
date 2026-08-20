@@ -304,12 +304,18 @@ class ContextPresetTests(unittest.TestCase):
         native = trainer.load_experiment_profile("dev")
         short = trainer.load_experiment_profile("dev", context="1k")
 
-        self.assertEqual(native.context_preset, "8k")
-        self.assertEqual((native.seq_len, native.batch_size), (8192, 16))
-        self.assertTrue(native.document_masking)
-        self.assertEqual(short.context_preset, "1k")
-        self.assertEqual((short.seq_len, short.batch_size), (1024, 128))
-        self.assertFalse(short.document_masking)
+        self.assertEqual(native.context_name, "8k")
+        self.assertEqual(
+            (native.context.seq_len, native.context.reference_batch_size),
+            (8192, 16),
+        )
+        self.assertTrue(native.context.document_masking)
+        self.assertEqual(short.context_name, "1k")
+        self.assertEqual(
+            (short.context.seq_len, short.context.reference_batch_size),
+            (1024, 128),
+        )
+        self.assertFalse(short.context.document_masking)
 
 
 class RoutedModelTests(unittest.TestCase):

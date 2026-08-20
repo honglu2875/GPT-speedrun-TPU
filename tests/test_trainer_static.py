@@ -58,6 +58,54 @@ def _traced_per_token(config) -> int:
     return trainer.traced_flops(config, params).per_token(config.seq_len)
 
 
+def _replace_selected_experiment(
+    experiment,
+    *,
+    training: dict[str, object] | None = None,
+    model: dict[str, object] | None = None,
+    context: dict[str, object] | None = None,
+    kernels: dict[str, object] | None = None,
+):
+    """Apply deliberate test-only overrides to a nested selected experiment."""
+
+    document = experiment.document
+    family = document.family
+    definition = experiment.profile
+    if training:
+        definition = replace(
+            definition,
+            training=replace(definition.training, **training),
+        )
+    if kernels:
+        definition = replace(
+            definition,
+            kernels=replace(definition.kernels, **kernels),
+        )
+    if model:
+        if experiment.name == "smoke":
+            definition = replace(definition, model=replace(definition.model, **model))
+        else:
+            tier = replace(experiment.tier, model=replace(experiment.model, **model))
+            family = replace(
+                family,
+                tiers={**family.tiers, experiment.tier_name: tier},
+            )
+    if context:
+        selected_context = replace(experiment.context, **context)
+        family = replace(
+            family,
+            contexts={**family.contexts, experiment.context_name: selected_context},
+        )
+    profiles = replace(
+        document.profiles,
+        **{experiment.name: definition},
+    )
+    return replace(
+        experiment,
+        document=replace(document, family=family, profiles=profiles),
+    )
+
+
 @dataclass(frozen=True)
 class FakeDevice:
     platform: str
@@ -70,6 +118,7 @@ class TrainerStaticTests(unittest.TestCase):
         config = trainer.resolve_config(
             parser.parse_args(["--profile", "smoke"]), "cpu", 256
         )
+        self.assertFalse(hasattr(config, "__dict__"))
         params = trainer.init_params(config, 7)
         self.assertNotIn("position_embedding", params)
         self.assertNotIn("final_ln_bias", params)
@@ -108,6 +157,7 @@ class TrainerStaticTests(unittest.TestCase):
         for tier, (parameters, layers, width, heads) in expected.items():
             with self.subTest(tier=tier):
                 experiment = trainer.load_experiment_profile("official", tier=tier)
+                self.assertEqual(experiment.tier.tpp_parameters, parameters)
                 config = trainer.resolve_config(
                     parser.parse_args(["--profile", "official", "--tier", tier]),
                     "tpu",
@@ -191,15 +241,19 @@ class TrainerStaticTests(unittest.TestCase):
     def test_yaml_config_is_authoritative_strict_and_versioned(self) -> None:
         source = trainer.CONFIG_PATH.read_text(encoding="utf-8")
         official = trainer.load_experiment_profile("official")
-        self.assertEqual(official.schema_version, 4)
-        self.assertEqual(official.tokens_per_parameter, 20.0)
-        self.assertEqual(official.context_preset, "1k")
-        self.assertEqual(official.batch_size, 128)
-        self.assertEqual(official.seq_len, 1024)
-        self.assertFalse(official.document_masking)
-        self.assertEqual(official.attention_backend, "tpu_flash")
-        self.assertEqual(official.sampling, "shuffled_epochs")
-        self.assertEqual(official.dtype_name, "bfloat16")
+        self.assertEqual(official.document.schema_version, 4)
+        self.assertEqual(official.profile.training.tokens_per_parameter, 20.0)
+        self.assertEqual(official.context_name, "1k")
+        self.assertEqual(official.context.reference_batch_size, 128)
+        self.assertEqual(official.context.seq_len, 1024)
+        self.assertFalse(official.context.document_masking)
+        self.assertEqual(official.profile.kernels.attention_backend, "tpu_flash")
+        self.assertEqual(official.profile.training.sampling, "shuffled_epochs")
+        self.assertEqual(official.profile.training.dtype, "bfloat16")
+        self.assertFalse(hasattr(official, "__dict__"))
+        self.assertFalse(hasattr(official.document, "__dict__"))
+        self.assertFalse(hasattr(official.model, "__dict__"))
+        self.assertNotIn("\n      parameters:", source)
         self.assertEqual(
             official.source_sha256,
             hashlib.sha256(trainer.CONFIG_PATH.read_bytes()).hexdigest(),
@@ -269,15 +323,15 @@ class TrainerStaticTests(unittest.TestCase):
             path.write_text(shuffled_source, encoding="utf-8")
             with patch.object(trainer, "CONFIG_PATH", path):
                 self.assertEqual(
-                    trainer.load_experiment_profile("dev").sampling,
+                    trainer.load_experiment_profile("dev").profile.training.sampling,
                     "random_windows",
                 )
 
         long_context = trainer.load_experiment_profile("dev", context="8k")
-        self.assertEqual(long_context.context_preset, "8k")
-        self.assertEqual(long_context.batch_size, 16)
-        self.assertEqual(long_context.seq_len, 8192)
-        self.assertTrue(long_context.document_masking)
+        self.assertEqual(long_context.context_name, "8k")
+        self.assertEqual(long_context.context.reference_batch_size, 16)
+        self.assertEqual(long_context.context.seq_len, 8192)
+        self.assertTrue(long_context.context.document_masking)
         with self.assertRaisesRegex(ValueError, "unknown context preset"):
             trainer.load_experiment_profile("dev", context="not-defined")
 
@@ -539,10 +593,14 @@ class TrainerStaticTests(unittest.TestCase):
             parser.parse_args(["--profile", "official"]),
             "tpu",
             50_304,
-            replace(trainer.load_experiment_profile("official"), loss_backend="dense"),
+            _replace_selected_experiment(
+                trainer.load_experiment_profile("official"),
+                kernels={"loss_backend": "dense"},
+            ),
         )
-        experiment = replace(
-            trainer.load_experiment_profile("official"), loss_backend="tiled"
+        experiment = _replace_selected_experiment(
+            trainer.load_experiment_profile("official"),
+            kernels={"loss_backend": "tiled"},
         )
         tiled = trainer.resolve_config(
             parser.parse_args(["--profile", "official"]),
@@ -573,13 +631,21 @@ class TrainerStaticTests(unittest.TestCase):
             parser.parse_args(common),
             "tpu",
             50_304,
-            replace(base, seq_len=129, attention_backend="dense"),
+            _replace_selected_experiment(
+                base,
+                context={"seq_len": 129},
+                kernels={"attention_backend": "dense"},
+            ),
         )
         flash = trainer.resolve_config(
             parser.parse_args(common),
             "tpu",
             50_304,
-            replace(base, seq_len=129, attention_backend="tpu_flash"),
+            _replace_selected_experiment(
+                base,
+                context={"seq_len": 129},
+                kernels={"attention_backend": "tpu_flash"},
+            ),
         )
         # Flash right-pads q/k/v to 128-wide tiles, so an unaligned sequence
         # genuinely costs more there than in the dense path. The traced count
@@ -650,7 +716,9 @@ class TrainerStaticTests(unittest.TestCase):
         for backend in ("jax_flash", "tpu_flash"):
             with self.subTest(backend=backend):
                 args = parser.parse_args(["--profile", "dev"])
-                experiment = replace(base, attention_backend=backend)
+                experiment = _replace_selected_experiment(
+                    base, kernels={"attention_backend": backend}
+                )
                 with self.assertRaisesRegex(ValueError, "requires a TPU"):
                     trainer.resolve_config(args, "cpu", 50_304, experiment)
                 config = trainer.resolve_config(args, "tpu", 50_304, experiment)
@@ -662,7 +730,11 @@ class TrainerStaticTests(unittest.TestCase):
                         parser.parse_args(["--profile", "dev"]),
                         "tpu",
                         50_304,
-                        replace(base, attention_backend=backend, dtype_name="float32"),
+                        _replace_selected_experiment(
+                            base,
+                            training={"dtype": "float32"},
+                            kernels={"attention_backend": backend},
+                        ),
                     )
 
     def test_attention_backend_comes_from_the_profile_with_no_tuning_flags(
@@ -765,10 +837,10 @@ class TrainerStaticTests(unittest.TestCase):
 
     def test_kernel_provenance_does_not_change_fixed_model_contract(self) -> None:
         parser = trainer.build_parser()
-        experiment = replace(
+        experiment = _replace_selected_experiment(
             trainer.load_experiment_profile("official"),
-            loss_backend="tiled",
-            semantic_vocab_size=50_257,
+            kernels={"loss_backend": "tiled"},
+            model={"semantic_vocab_size": 50_257},
         )
         config = trainer.resolve_config(
             parser.parse_args(["--profile", "official"]),

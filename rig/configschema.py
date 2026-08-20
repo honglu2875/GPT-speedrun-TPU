@@ -95,6 +95,8 @@ class SchemaDefinitionError(TypeError):
 class ConfigSchema:
     """Opt-in classmethod for recipe-local dataclass schemas."""
 
+    __slots__ = ()
+
     @classmethod
     def from_mapping(cls, value: Any, *, label: str = "config.yaml") -> Self:
         return decode_dataclass(value, cls, label=label)

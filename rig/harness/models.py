@@ -14,7 +14,7 @@ _RUN_NAME_STRIP = re.compile(r"[^a-z0-9]+")
 CheckpointRetention = Literal["always", "qualifying", "none"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RunConfig:
     """Everything needed to execute one recipe reproducibly."""
 
