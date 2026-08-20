@@ -58,19 +58,30 @@ def _traced_per_token(config) -> int:
     return trainer.traced_flops(config, params).per_token(config.seq_len)
 
 
-def _replace_selected_experiment(
-    experiment,
+def _replace_experiment_config(
+    experiment_config,
     *,
+    profile: str,
+    tier: str | None = None,
+    context_name: str | None = None,
     training: dict[str, object] | None = None,
     model: dict[str, object] | None = None,
     context: dict[str, object] | None = None,
     kernels: dict[str, object] | None = None,
 ):
-    """Apply deliberate test-only overrides to a nested selected experiment."""
+    """Apply deliberate test-only overrides to a typed experiment config."""
 
-    experiment_config = experiment.config
     family = experiment_config.family
-    definition = experiment.profile
+    tier_name = tier or family.default_tier
+    selected_context_name = context_name or family.default_context
+    if profile == "smoke":
+        definition = experiment_config.profiles.smoke
+    elif profile == "dev":
+        definition = experiment_config.profiles.dev
+    elif profile == "official":
+        definition = experiment_config.profiles.official
+    else:
+        raise ValueError(f"unknown test profile: {profile!r}")
     if training:
         definition = replace(
             definition,
@@ -82,28 +93,29 @@ def _replace_selected_experiment(
             kernels=replace(definition.kernels, **kernels),
         )
     if model:
-        if experiment.name == "smoke":
+        if profile == "smoke":
             definition = replace(definition, model=replace(definition.model, **model))
         else:
-            tier = replace(experiment.tier, model=replace(experiment.model, **model))
+            selected_tier = family.tiers[tier_name]
+            selected_tier = replace(
+                selected_tier,
+                model=replace(selected_tier.model, **model),
+            )
             family = replace(
                 family,
-                tiers={**family.tiers, experiment.tier_name: tier},
+                tiers={**family.tiers, tier_name: selected_tier},
             )
     if context:
-        selected_context = replace(experiment.context, **context)
+        selected_context = replace(family.contexts[selected_context_name], **context)
         family = replace(
             family,
-            contexts={**family.contexts, experiment.context_name: selected_context},
+            contexts={**family.contexts, selected_context_name: selected_context},
         )
     profiles = replace(
         experiment_config.profiles,
-        **{experiment.name: definition},
+        **{profile: definition},
     )
-    return replace(
-        experiment,
-        config=replace(experiment_config, family=family, profiles=profiles),
-    )
+    return replace(experiment_config, family=family, profiles=profiles)
 
 
 @dataclass(frozen=True)
@@ -116,7 +128,7 @@ class TrainerStaticTests(unittest.TestCase):
     def test_reference_block_is_rope_rmsnorm_gelu(self) -> None:
         parser = trainer.build_parser()
         config = trainer.resolve_config(
-            parser.parse_args(["--profile", "smoke"]), "cpu", 256
+            parser.parse_args(["--profile", "smoke"]), "cpu"
         )
         self.assertFalse(hasattr(config, "__dict__"))
         params = trainer.init_params(config, 7)
@@ -154,15 +166,17 @@ class TrainerStaticTests(unittest.TestCase):
             "500m": (502_602_240, 19, 1280, 20),
             "1b": (989_943_808, 21, 1792, 28),
         }
+        experiment_config, config_sha256 = trainer.load_experiment_config()
         for tier, (parameters, layers, width, heads) in expected.items():
             with self.subTest(tier=tier):
-                experiment = trainer.load_experiment_profile("official", tier=tier)
-                self.assertEqual(experiment.tier.tpp_parameters, parameters)
+                self.assertEqual(
+                    experiment_config.family.tiers[tier].tpp_parameters, parameters
+                )
                 config = trainer.resolve_config(
                     parser.parse_args(["--profile", "official", "--tier", tier]),
                     "tpu",
-                    50_304,
-                    experiment,
+                    experiment_config=experiment_config,
+                    config_sha256=config_sha256,
                 )
                 self.assertEqual(config.declared_parameters, parameters)
                 self.assertEqual(
@@ -188,7 +202,7 @@ class TrainerStaticTests(unittest.TestCase):
         args = parser.parse_args(
             ["--profile", "dev", "--tier", "250m", "--tokens-per-parameter", "5"]
         )
-        config = trainer.resolve_config(args, "tpu", 50_304)
+        config = trainer.resolve_config(args, "tpu")
         params = {
             "token_embedding": np.zeros((1, 1), dtype=np.float32),
             "blocks": [
@@ -232,7 +246,6 @@ class TrainerStaticTests(unittest.TestCase):
                 ]
             ),
             "tpu",
-            50_304,
         )
         # Each TPP ladder is reanchored. m_D captures model-size growth within
         # the ladder and therefore does not gain a 20/5 horizon factor.
@@ -240,22 +253,25 @@ class TrainerStaticTests(unittest.TestCase):
 
     def test_yaml_config_is_authoritative_strict_and_versioned(self) -> None:
         source = trainer.CONFIG_PATH.read_text(encoding="utf-8")
-        official = trainer.load_experiment_profile("official")
-        self.assertEqual(official.config.schema_version, 4)
-        self.assertEqual(official.profile.training.tokens_per_parameter, 20.0)
-        self.assertEqual(official.context_name, "1k")
-        self.assertEqual(official.context.reference_batch_size, 128)
-        self.assertEqual(official.context.seq_len, 1024)
-        self.assertFalse(official.context.document_masking)
-        self.assertEqual(official.profile.kernels.attention_backend, "tpu_flash")
-        self.assertEqual(official.profile.training.sampling, "shuffled_epochs")
-        self.assertEqual(official.profile.training.dtype, "bfloat16")
-        self.assertFalse(hasattr(official, "__dict__"))
-        self.assertFalse(hasattr(official.config, "__dict__"))
-        self.assertFalse(hasattr(official.model, "__dict__"))
+        experiment_config, config_sha256 = trainer.load_experiment_config()
+        tier_name, context_name = experiment_config.resolve_selection("official")
+        official = experiment_config.profiles.official
+        context = experiment_config.family.contexts[context_name]
+        model = experiment_config.family.tiers[tier_name].model
+        self.assertEqual(experiment_config.schema_version, 4)
+        self.assertEqual(official.training.tokens_per_parameter, 20.0)
+        self.assertEqual(context_name, "1k")
+        self.assertEqual(context.reference_batch_size, 128)
+        self.assertEqual(context.seq_len, 1024)
+        self.assertFalse(context.document_masking)
+        self.assertEqual(official.kernels.attention_backend, "tpu_flash")
+        self.assertEqual(official.training.sampling, "shuffled_epochs")
+        self.assertEqual(official.training.dtype, "bfloat16")
+        self.assertFalse(hasattr(experiment_config, "__dict__"))
+        self.assertFalse(hasattr(model, "__dict__"))
         self.assertNotIn("\n      parameters:", source)
         self.assertEqual(
-            official.source_sha256,
+            config_sha256,
             hashlib.sha256(trainer.CONFIG_PATH.read_bytes()).hexdigest(),
         )
 
@@ -277,6 +293,9 @@ class TrainerStaticTests(unittest.TestCase):
             "invalid unselected profile": source.replace(
                 "warmup_ratio: 0.1", "warmup_ratio: -1", 1
             ),
+            "official validation prefix": source.replace(
+                "eval_batches: 80", "eval_batches: 79", 1
+            ),
             "missing sampling": source.replace(
                 "      sampling: random_windows\n", "", 1
             ),
@@ -291,14 +310,14 @@ class TrainerStaticTests(unittest.TestCase):
                         patch.object(trainer, "CONFIG_PATH", path),
                         self.assertRaises(ValueError),
                     ):
-                        trainer.load_experiment_profile("smoke")
+                        trainer.load_experiment_config()
             path = root / "config.yaml"
             path.write_bytes(b"#" * (configfile.MAX_CONFIG_BYTES + 1))
             with (
                 patch.object(trainer, "CONFIG_PATH", path),
                 self.assertRaisesRegex(ValueError, "safety limit"),
             ):
-                trainer.load_experiment_profile("smoke")
+                trainer.load_experiment_config()
 
             target = root / "target.yaml"
             target.write_text(source, encoding="utf-8")
@@ -308,12 +327,12 @@ class TrainerStaticTests(unittest.TestCase):
                 patch.object(trainer, "CONFIG_PATH", symlink),
                 self.assertRaisesRegex(ValueError, "non-symlink"),
             ):
-                trainer.load_experiment_profile("smoke")
+                trainer.load_experiment_config()
 
             alternate = root / "alternate.yaml"
             alternate.write_text(source, encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "beside train.py"):
-                trainer.load_experiment_profile("smoke", alternate)
+                trainer.load_experiment_config(alternate)
 
             shuffled_source = source.replace(
                 "      sampling: shuffled_epochs\n      dtype: bfloat16",
@@ -322,18 +341,20 @@ class TrainerStaticTests(unittest.TestCase):
             )
             path.write_text(shuffled_source, encoding="utf-8")
             with patch.object(trainer, "CONFIG_PATH", path):
+                shuffled, _ = trainer.load_experiment_config()
                 self.assertEqual(
-                    trainer.load_experiment_profile("dev").profile.training.sampling,
+                    shuffled.profiles.dev.training.sampling,
                     "random_windows",
                 )
 
-        long_context = trainer.load_experiment_profile("dev", context="8k")
-        self.assertEqual(long_context.context_name, "8k")
-        self.assertEqual(long_context.context.reference_batch_size, 16)
-        self.assertEqual(long_context.context.seq_len, 8192)
-        self.assertTrue(long_context.context.document_masking)
+        _, long_context_name = experiment_config.resolve_selection("dev", context="8k")
+        long_context = experiment_config.family.contexts[long_context_name]
+        self.assertEqual(long_context_name, "8k")
+        self.assertEqual(long_context.reference_batch_size, 16)
+        self.assertEqual(long_context.seq_len, 8192)
+        self.assertTrue(long_context.document_masking)
         with self.assertRaisesRegex(ValueError, "unknown context preset"):
-            trainer.load_experiment_profile("dev", context="not-defined")
+            experiment_config.resolve_selection("dev", context="not-defined")
 
     def test_static_cli_values_are_rejected_but_diagnostic_overrides_resolve(
         self,
@@ -359,7 +380,6 @@ class TrainerStaticTests(unittest.TestCase):
                 ]
             ),
             "tpu",
-            50_304,
         )
         self.assertEqual(config.steps, 18_838)
         self.assertEqual(config.final_step, 100)
@@ -373,7 +393,6 @@ class TrainerStaticTests(unittest.TestCase):
         context_config = trainer.resolve_config(
             parser.parse_args(["--profile", "dev", "--context", "8k"]),
             "tpu",
-            50_304,
         )
         self.assertEqual(context_config.context_preset, "8k")
         self.assertEqual(dict(context_config.config_overrides), {"context": "8k"})
@@ -390,7 +409,6 @@ class TrainerStaticTests(unittest.TestCase):
                 ]
             ),
             "tpu",
-            50_304,
         )
         expected = round(
             config.declared_parameters * 5 / (config.batch_size * config.seq_len)
@@ -404,12 +422,11 @@ class TrainerStaticTests(unittest.TestCase):
     def test_short_diagnostic_run_resolves_fractional_warmup(self) -> None:
         parser = trainer.build_parser()
         full = trainer.resolve_config(
-            parser.parse_args(["--profile", "official"]), "tpu", 50_304
+            parser.parse_args(["--profile", "official"]), "tpu"
         )
         config = trainer.resolve_config(
             parser.parse_args(["--profile", "official", "--stop-after-step", "100"]),
             "tpu",
-            50_304,
         )
         self.assertEqual(config.steps, full.steps)
         self.assertEqual(config.warmup_steps, full.warmup_steps)
@@ -533,7 +550,7 @@ class TrainerStaticTests(unittest.TestCase):
         parser = trainer.build_parser()
 
         official = trainer.resolve_config(
-            parser.parse_args(["--profile", "official"]), "tpu", 50_304
+            parser.parse_args(["--profile", "official"]), "tpu"
         )
         self.assertEqual(official.steps, 18_838)
         self.assertEqual(
@@ -545,11 +562,9 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertEqual(official.eval_batches, 80)
         self.assertEqual(official.diagnostics_every, 500)
 
-        smoke = trainer.resolve_config(
-            parser.parse_args(["--profile", "smoke"]), "cpu", 256
-        )
+        smoke = trainer.resolve_config(parser.parse_args(["--profile", "smoke"]), "cpu")
         development = trainer.resolve_config(
-            parser.parse_args(["--profile", "dev"]), "tpu", 50_304
+            parser.parse_args(["--profile", "dev"]), "tpu"
         )
         self.assertEqual(smoke.val_every, 0)
         self.assertEqual(smoke.diagnostics_every, 0)
@@ -567,7 +582,6 @@ class TrainerStaticTests(unittest.TestCase):
                 ]
             ),
             "tpu",
-            50_304,
         )
         self.assertEqual(diagnostic.steps, official.steps)
         self.assertEqual(diagnostic.final_step, 100)
@@ -589,24 +603,27 @@ class TrainerStaticTests(unittest.TestCase):
         self,
     ) -> None:
         parser = trainer.build_parser()
+        experiment_config, config_sha256 = trainer.load_experiment_config()
         dense = trainer.resolve_config(
             parser.parse_args(["--profile", "official"]),
             "tpu",
-            50_304,
-            _replace_selected_experiment(
-                trainer.load_experiment_profile("official"),
+            experiment_config=_replace_experiment_config(
+                experiment_config,
+                profile="official",
                 kernels={"loss_backend": "dense"},
             ),
+            config_sha256=config_sha256,
         )
-        experiment = _replace_selected_experiment(
-            trainer.load_experiment_profile("official"),
+        tiled_experiment_config = _replace_experiment_config(
+            experiment_config,
+            profile="official",
             kernels={"loss_backend": "tiled"},
         )
         tiled = trainer.resolve_config(
             parser.parse_args(["--profile", "official"]),
             "tpu",
-            50_304,
-            experiment,
+            experiment_config=tiled_experiment_config,
+            config_sha256=config_sha256,
         )
         self.assertEqual(dense.semantic_vocab_size, 50_304)
         # Switching kernels alone preserves the calibrated 50,304-class
@@ -626,26 +643,28 @@ class TrainerStaticTests(unittest.TestCase):
     def test_flash_flops_include_right_padding_for_odd_sequences(self) -> None:
         parser = trainer.build_parser()
         common = ["--profile", "dev"]
-        base = trainer.load_experiment_profile("dev")
+        experiment_config, config_sha256 = trainer.load_experiment_config()
         dense = trainer.resolve_config(
             parser.parse_args(common),
             "tpu",
-            50_304,
-            _replace_selected_experiment(
-                base,
+            experiment_config=_replace_experiment_config(
+                experiment_config,
+                profile="dev",
                 context={"seq_len": 129},
                 kernels={"attention_backend": "dense"},
             ),
+            config_sha256=config_sha256,
         )
         flash = trainer.resolve_config(
             parser.parse_args(common),
             "tpu",
-            50_304,
-            _replace_selected_experiment(
-                base,
+            experiment_config=_replace_experiment_config(
+                experiment_config,
+                profile="dev",
                 context={"seq_len": 129},
                 kernels={"attention_backend": "tpu_flash"},
             ),
+            config_sha256=config_sha256,
         )
         # Flash right-pads q/k/v to 128-wide tiles, so an unaligned sequence
         # genuinely costs more there than in the dense path. The traced count
@@ -712,29 +731,42 @@ class TrainerStaticTests(unittest.TestCase):
 
     def test_trainable_flash_attention_backends_are_tpu_only(self) -> None:
         parser = trainer.build_parser()
-        base = trainer.load_experiment_profile("dev")
+        experiment_config, config_sha256 = trainer.load_experiment_config()
         for backend in ("jax_flash", "tpu_flash"):
             with self.subTest(backend=backend):
                 args = parser.parse_args(["--profile", "dev"])
-                experiment = _replace_selected_experiment(
-                    base, kernels={"attention_backend": backend}
+                backend_config = _replace_experiment_config(
+                    experiment_config,
+                    profile="dev",
+                    kernels={"attention_backend": backend},
                 )
                 with self.assertRaisesRegex(ValueError, "requires a TPU"):
-                    trainer.resolve_config(args, "cpu", 50_304, experiment)
-                config = trainer.resolve_config(args, "tpu", 50_304, experiment)
+                    trainer.resolve_config(
+                        args,
+                        "cpu",
+                        experiment_config=backend_config,
+                        config_sha256=config_sha256,
+                    )
+                config = trainer.resolve_config(
+                    args,
+                    "tpu",
+                    experiment_config=backend_config,
+                    config_sha256=config_sha256,
+                )
                 self.assertEqual(config.attention_backend, backend)
         for backend in ("jax_flash", "tpu_flash"):
             with self.subTest(float32_backend=backend):
-                with self.assertRaisesRegex(ValueError, "requires dtype bfloat16"):
+                with self.assertRaisesRegex(ValueError, "requires .*bfloat16"):
                     trainer.resolve_config(
                         parser.parse_args(["--profile", "dev"]),
                         "tpu",
-                        50_304,
-                        _replace_selected_experiment(
-                            base,
+                        experiment_config=_replace_experiment_config(
+                            experiment_config,
+                            profile="dev",
                             training={"dtype": "float32"},
                             kernels={"attention_backend": backend},
                         ),
+                        config_sha256=config_sha256,
                     )
 
     def test_attention_backend_comes_from_the_profile_with_no_tuning_flags(
@@ -753,13 +785,11 @@ class TrainerStaticTests(unittest.TestCase):
                 parser.parse_args(["--profile", "official", flag, "x"])
 
         official = trainer.resolve_config(
-            parser.parse_args(["--profile", "official"]), "tpu", 50_304
+            parser.parse_args(["--profile", "official"]), "tpu"
         )
-        smoke = trainer.resolve_config(
-            parser.parse_args(["--profile", "smoke"]), "cpu", 256
-        )
+        smoke = trainer.resolve_config(parser.parse_args(["--profile", "smoke"]), "cpu")
         development = trainer.resolve_config(
-            parser.parse_args(["--profile", "dev"]), "tpu", 50_304
+            parser.parse_args(["--profile", "dev"]), "tpu"
         )
         self.assertEqual(official.attention_backend, "tpu_flash")
         self.assertEqual(smoke.attention_backend, "dense")
@@ -792,7 +822,7 @@ class TrainerStaticTests(unittest.TestCase):
     def test_attention_tuning_metadata_is_saved_with_exact_plan(self) -> None:
         parser = trainer.build_parser()
         config = trainer.resolve_config(
-            parser.parse_args(["--profile", "smoke"]), "cpu", 256
+            parser.parse_args(["--profile", "smoke"]), "cpu"
         )
         tiles = AttentionTiles(512, 512, 256, 512, 256, 512, 256, 256, 512, 256)
         runtime = trainer.AttentionRuntime("c" * 64, "cache", tiles, 0.0)
@@ -837,16 +867,18 @@ class TrainerStaticTests(unittest.TestCase):
 
     def test_kernel_provenance_does_not_change_fixed_model_contract(self) -> None:
         parser = trainer.build_parser()
-        experiment = _replace_selected_experiment(
-            trainer.load_experiment_profile("official"),
+        experiment_config, config_sha256 = trainer.load_experiment_config()
+        experiment_config = _replace_experiment_config(
+            experiment_config,
+            profile="official",
             kernels={"loss_backend": "tiled"},
             model={"semantic_vocab_size": 50_257},
         )
         config = trainer.resolve_config(
             parser.parse_args(["--profile", "official"]),
             "tpu",
-            50_304,
-            experiment,
+            experiment_config=experiment_config,
+            config_sha256=config_sha256,
         )
         tiles = AttentionTiles(512, 512, 256, 512, 256, 512, 256, 256, 512, 256)
         runtime = trainer.AttentionRuntime("d" * 64, "shipped", tiles, 0.0)
@@ -961,11 +993,10 @@ class TrainerStaticTests(unittest.TestCase):
     def test_stop_after_step_truncates_without_moving_the_schedule(self) -> None:
         parser = trainer.build_parser()
         horizon = ["--profile", "dev", "--tier", "250m", "--tokens-per-parameter", "5"]
-        full = trainer.resolve_config(parser.parse_args(horizon), "tpu", 50_304)
+        full = trainer.resolve_config(parser.parse_args(horizon), "tpu")
         stopped = trainer.resolve_config(
             parser.parse_args([*horizon, "--stop-after-step", "60"]),
             "tpu",
-            50_304,
         )
         # Everything the trajectory depends on has to be bit-identical, or the
         # truncated run samples a different curve than the one it stands in for.
@@ -991,7 +1022,6 @@ class TrainerStaticTests(unittest.TestCase):
             trainer.resolve_config(
                 parser.parse_args([*horizon, "--stop-after-step", str(full.steps + 1)]),
                 "tpu",
-                50_304,
             )
 
     def test_early_stopped_artifacts_cover_only_the_steps_taken(self) -> None:
@@ -1112,9 +1142,7 @@ class TrainerStaticTests(unittest.TestCase):
     ) -> None:
         parser = trainer.build_parser()
         config = replace(
-            trainer.resolve_config(
-                parser.parse_args(["--profile", "smoke"]), "cpu", 256
-            ),
+            trainer.resolve_config(parser.parse_args(["--profile", "smoke"]), "cpu"),
             diagnostics_every=1,
         )
         host_params = trainer.init_params(config, 7)
@@ -1489,7 +1517,7 @@ class SalvageTests(unittest.TestCase):
     def _config(self, steps: int = 200):
         parser = trainer.build_parser()
         resolved = trainer.resolve_config(
-            parser.parse_args(["--profile", "dev"]), "tpu", 50_304
+            parser.parse_args(["--profile", "dev"]), "tpu"
         )
         return replace(
             resolved,
