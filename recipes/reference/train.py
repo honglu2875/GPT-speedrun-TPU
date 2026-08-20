@@ -30,7 +30,7 @@ import socket
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Annotated, Any, Iterable, Literal, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -63,15 +63,16 @@ from rig.recipe_args import (
     validate_standard_xprof_arguments,
 )
 from rig.metrics import DIAGNOSTIC_FAMILIES, DIAGNOSTIC_STATS
-from rig.configfile import (
-    config_bool,
-    config_choice,
-    config_float,
-    config_int,
-    config_keys,
-    config_mapping,
-    read_config_document,
-    resolve_sibling_config_path,
+from rig.configfile import read_config_document, resolve_sibling_config_path
+from rig.configschema import (
+    Bounds,
+    ConfigSchema,
+    Length,
+    Matches,
+    NonnegativeFloat,
+    NonnegativeInt,
+    PositiveFloat,
+    PositiveInt,
 )
 from rig.runlog import (
     CHECKPOINT_NAME,
@@ -287,498 +288,370 @@ class ExperimentProfile:
     document_masking: bool = False
 
 
+TierName = Annotated[str, Matches(_TIER_NAME.pattern)]
+ContextName = Annotated[str, Matches(_CONTEXT_NAME.pattern)]
+Probability = Annotated[float, Bounds(ge=0.0, le=1.0)]
+OpenProbability = Annotated[float, Bounds(ge=0.0, lt=1.0)]
+DepthAlpha = Annotated[float, Bounds(ge=0.5, le=1.0)]
+
+
+@dataclass(frozen=True)
+class ContextPreset:
+    """One coupled sequence-length, batch-anchor, and masking preset."""
+
+    seq_len: PositiveInt
+    reference_batch_size: PositiveInt
+    document_masking: bool
+
+
+@dataclass(frozen=True)
+class ParameterizationDefinition:
+    """The fixed-TPP CompleteP contract shared by every family tier."""
+
+    name: Literal["completep_fixed_tpp_v1"]
+    base_tier: TierName
+    base_width: PositiveInt
+    base_depth: PositiveInt
+    depth_alpha: DepthAlpha
+    init_std: PositiveFloat
+    attention_scale: Literal["inverse_head_dim"]
+    embeddings: Literal["untied"]
+
+
+@dataclass(frozen=True)
+class ModelDefinition:
+    """Architecture fields represented literally in ``config.yaml``."""
+
+    layers: PositiveInt
+    heads: PositiveInt
+    d_model: PositiveInt
+    mlp_mult: PositiveInt
+    normalization: Literal["rms_norm"]
+    position_encoding: Literal["rope_base_10000"]
+    mlp_activation: Literal["gelu"]
+    vocab_size: PositiveInt
+    semantic_vocab_size: PositiveInt
+
+    def validate(self, label: str) -> None:
+        """Enforce architecture relations that no single annotation can express."""
+
+        if self.semantic_vocab_size > self.vocab_size:
+            raise ValueError(
+                f"config.yaml {label}.semantic_vocab_size must not exceed vocab_size"
+            )
+        if self.d_model % self.heads:
+            raise ValueError(f"config.yaml {label}.d_model must be divisible by heads")
+        if (self.d_model // self.heads) % 2:
+            raise ValueError(
+                f"config.yaml {label} head dimension must be even for RoPE"
+            )
+
+
+@dataclass(frozen=True)
+class TierDefinition:
+    parameters: PositiveInt
+    model: ModelDefinition
+
+
+@dataclass(frozen=True)
+class FamilyDefinition:
+    default_tier: TierName
+    default_context: ContextName
+    contexts: Annotated[dict[ContextName, ContextPreset], Length(ge=1)]
+    parameterization: ParameterizationDefinition
+    tiers: Annotated[dict[TierName, TierDefinition], Length(ge=1)]
+
+
+Sampling = Literal["random_windows", "shuffled_epochs"]
+ComputeDtype = Literal["bfloat16", "float32"]
+
+
+@dataclass(frozen=True)
+class SmokeTraining:
+    steps: PositiveInt
+    batch_size: PositiveInt
+    seq_len: PositiveInt
+    sampling: Sampling
+    dtype: ComputeDtype
+
+
+@dataclass(frozen=True)
+class LadderTraining:
+    tokens_per_parameter: PositiveFloat
+    sampling: Sampling
+    dtype: ComputeDtype
+
+
+@dataclass(frozen=True)
+class KernelSettings:
+    attention_backend: Literal["dense", "jax_flash", "tpu_flash"]
+    loss_backend: Literal["dense", "tiled"]
+    vocab_tile_size: PositiveInt
+
+
+@dataclass(frozen=True)
+class OptimizerSettings:
+    learning_rate: PositiveFloat
+    min_lr_ratio: Probability
+    warmup_ratio: OpenProbability
+    weight_decay: NonnegativeFloat
+    adam_epsilon: PositiveFloat
+    beta1: OpenProbability
+    beta2: OpenProbability
+    grad_clip: NonnegativeFloat
+
+
+@dataclass(frozen=True)
+class EvaluationSettings:
+    eval_batches: PositiveInt
+    val_every: NonnegativeInt
+    val_probe_batches: PositiveInt
+
+
+@dataclass(frozen=True)
+class LoggingSettings:
+    diagnostics_every: NonnegativeInt
+    log_every: PositiveInt
+
+
+@dataclass(frozen=True)
+class SmokeProfileDefinition:
+    training: SmokeTraining
+    model: ModelDefinition
+    kernels: KernelSettings
+    optimizer: OptimizerSettings
+    evaluation: EvaluationSettings
+    logging: LoggingSettings
+
+
+@dataclass(frozen=True)
+class LadderProfileDefinition:
+    training: LadderTraining
+    model: Literal["family_tier"]
+    kernels: KernelSettings
+    optimizer: OptimizerSettings
+    evaluation: EvaluationSettings
+    logging: LoggingSettings
+
+
+@dataclass(frozen=True)
+class ProfileDefinitions:
+    smoke: SmokeProfileDefinition
+    dev: LadderProfileDefinition
+    official: LadderProfileDefinition
+
+
+@dataclass(frozen=True)
+class ExperimentDocument(ConfigSchema):
+    """Strict nested representation of the complete recipe ``config.yaml``."""
+
+    schema_version: Literal[4]
+    family: FamilyDefinition
+    profiles: ProfileDefinitions
+
+    def validate(self) -> None:
+        """Enforce the few scientific contracts involving multiple fields."""
+
+        family = self.family
+        if family.default_context not in family.contexts:
+            raise ValueError(
+                "config.yaml family.default_context must name a defined context preset"
+            )
+        if family.default_tier not in family.tiers:
+            raise ValueError("config.yaml family.default_tier must name a defined tier")
+        base_tier = family.parameterization.base_tier
+        if base_tier not in family.tiers:
+            raise ValueError(
+                "config.yaml family.parameterization.base_tier must name a defined tier"
+            )
+
+        for tier_name, tier in family.tiers.items():
+            label = f"family.tiers.{tier_name}.model"
+            tier.model.validate(label)
+            if tier.model.d_model // tier.model.heads != 64:
+                raise ValueError(
+                    f"config.yaml family.tiers.{tier_name} must use 64-wide heads"
+                )
+            counted = _declared_family_parameter_count(tier.model)
+            if tier.parameters != counted:
+                raise ValueError(
+                    f"config.yaml family.tiers.{tier_name}.parameters is "
+                    f"{tier.parameters:,}, but this trainer counts {counted:,}"
+                )
+
+        self.profiles.smoke.model.validate("profiles.smoke.model")
+        for name, profile in (
+            ("smoke", self.profiles.smoke),
+            ("dev", self.profiles.dev),
+            ("official", self.profiles.official),
+        ):
+            if (
+                profile.kernels.attention_backend != "dense"
+                and profile.training.dtype != "bfloat16"
+            ):
+                raise ValueError(
+                    f"config.yaml profiles.{name}.kernels.attention_backend "
+                    f"{profile.kernels.attention_backend} requires "
+                    "training.dtype bfloat16"
+                )
+            if (
+                profile.evaluation.val_every
+                and profile.evaluation.val_probe_batches
+                > profile.evaluation.eval_batches
+            ):
+                raise ValueError(
+                    f"config.yaml profiles.{name}.evaluation.val_probe_batches "
+                    "must not exceed eval_batches"
+                )
+
+    def to_experiment_profile(
+        self,
+        profile: str,
+        source_sha256: str,
+        *,
+        tier: str | None = None,
+        context: str | None = None,
+    ) -> ExperimentProfile:
+        """Select one family/profile combination and export the flat runtime view."""
+
+        family = self.family
+        selected_context_name = context or family.default_context
+        if selected_context_name not in family.contexts:
+            raise ValueError(
+                f"unknown context preset {selected_context_name!r}; expected "
+                + ", ".join(sorted(family.contexts))
+            )
+        selected_tier_name = tier or family.default_tier
+        if selected_tier_name not in family.tiers:
+            raise ValueError(
+                f"unknown model tier {selected_tier_name!r}; expected "
+                + ", ".join(sorted(family.tiers))
+            )
+
+        if profile == "smoke":
+            selected = self.profiles.smoke
+            training = selected.training
+            model = selected.model
+            steps = training.steps
+            tokens_per_parameter = None
+            batch_size = training.batch_size
+            seq_len = training.seq_len
+            profile_tier = "smoke"
+            declared_parameters = None
+            parameterization = "standard"
+            base_width = model.d_model
+            base_depth = model.layers
+            depth_alpha = 0.0
+            init_std = 0.02
+            attention_scale = "inverse_sqrt_head_dim"
+            embeddings = "tied"
+            context_preset = "smoke"
+            document_masking = False
+        elif profile in ("dev", "official"):
+            selected = self.profiles.dev if profile == "dev" else self.profiles.official
+            training = selected.training
+            selected_tier = family.tiers[selected_tier_name]
+            selected_context = family.contexts[selected_context_name]
+            model = selected_tier.model
+            steps = None
+            tokens_per_parameter = training.tokens_per_parameter
+            batch_size = selected_context.reference_batch_size
+            seq_len = selected_context.seq_len
+            profile_tier = selected_tier_name
+            declared_parameters = selected_tier.parameters
+            parameterization = family.parameterization.name
+            base_width = family.parameterization.base_width
+            base_depth = family.parameterization.base_depth
+            depth_alpha = family.parameterization.depth_alpha
+            init_std = family.parameterization.init_std
+            attention_scale = family.parameterization.attention_scale
+            embeddings = family.parameterization.embeddings
+            context_preset = selected_context_name
+            document_masking = selected_context.document_masking
+        else:
+            raise ValueError(f"unknown experiment profile: {profile!r}")
+
+        kernels = selected.kernels
+        optimizer = selected.optimizer
+        evaluation = selected.evaluation
+        logging = selected.logging
+        result = ExperimentProfile(
+            schema_version=self.schema_version,
+            source_sha256=source_sha256,
+            name=profile,
+            context_preset=context_preset,
+            steps=steps,
+            tokens_per_parameter=tokens_per_parameter,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            sampling=training.sampling,
+            dtype_name=training.dtype,
+            layers=model.layers,
+            heads=model.heads,
+            d_model=model.d_model,
+            mlp_mult=model.mlp_mult,
+            normalization=model.normalization,
+            position_encoding=model.position_encoding,
+            mlp_activation=model.mlp_activation,
+            tier=profile_tier,
+            declared_parameters=declared_parameters,
+            base_parameters=family.tiers[family.parameterization.base_tier].parameters,
+            parameterization=parameterization,
+            base_width=base_width,
+            base_depth=base_depth,
+            depth_alpha=depth_alpha,
+            init_std=init_std,
+            attention_scale=attention_scale,
+            embeddings=embeddings,
+            vocab_size=model.vocab_size,
+            semantic_vocab_size=model.semantic_vocab_size,
+            attention_backend=kernels.attention_backend,
+            loss_backend=kernels.loss_backend,
+            vocab_tile_size=kernels.vocab_tile_size,
+            document_masking=document_masking,
+            learning_rate=optimizer.learning_rate,
+            min_lr_ratio=optimizer.min_lr_ratio,
+            warmup_ratio=optimizer.warmup_ratio,
+            weight_decay=optimizer.weight_decay,
+            adam_epsilon=optimizer.adam_epsilon,
+            beta1=optimizer.beta1,
+            beta2=optimizer.beta2,
+            grad_clip=optimizer.grad_clip,
+            eval_batches=evaluation.eval_batches,
+            val_every=evaluation.val_every,
+            val_probe_batches=evaluation.val_probe_batches,
+            diagnostics_every=logging.diagnostics_every,
+            log_every=logging.log_every,
+        )
+        if profile == "official":
+            validation_tokens = 10_485_760
+            tokens_per_step = result.batch_size * result.seq_len
+            if validation_tokens % tokens_per_step:
+                raise ValueError(
+                    "config.yaml profiles.official batch_size * seq_len must divide "
+                    f"the official {validation_tokens:,}-prediction validation prefix"
+                )
+            required_eval_batches = validation_tokens // tokens_per_step
+            if result.eval_batches != required_eval_batches:
+                raise ValueError(
+                    "config.yaml profiles.official.evaluation.eval_batches must be "
+                    f"{required_eval_batches} for the official validation prefix"
+                )
+        return result
+
+
 _UINT64_MASK = (1 << 64) - 1
 
 
-def _parse_model(value: Any, label: str) -> dict[str, Any]:
-    model = config_keys(
-        value,
-        label,
-        {
-            "layers",
-            "heads",
-            "d_model",
-            "mlp_mult",
-            "normalization",
-            "position_encoding",
-            "mlp_activation",
-            "vocab_size",
-            "semantic_vocab_size",
-        },
-    )
-    parsed = {
-        "layers": config_int(model["layers"], f"{label}.layers", minimum=1),
-        "heads": config_int(model["heads"], f"{label}.heads", minimum=1),
-        "d_model": config_int(model["d_model"], f"{label}.d_model", minimum=1),
-        "mlp_mult": config_int(model["mlp_mult"], f"{label}.mlp_mult", minimum=1),
-        "normalization": config_choice(
-            model["normalization"], f"{label}.normalization", ("rms_norm",)
-        ),
-        "position_encoding": config_choice(
-            model["position_encoding"],
-            f"{label}.position_encoding",
-            ("rope_base_10000",),
-        ),
-        "mlp_activation": config_choice(
-            model["mlp_activation"], f"{label}.mlp_activation", ("gelu",)
-        ),
-        "vocab_size": config_int(model["vocab_size"], f"{label}.vocab_size", minimum=1),
-        "semantic_vocab_size": config_int(
-            model["semantic_vocab_size"],
-            f"{label}.semantic_vocab_size",
-            minimum=1,
-        ),
-    }
-    if parsed["semantic_vocab_size"] > parsed["vocab_size"]:
-        raise ValueError(
-            f"config.yaml {label}.semantic_vocab_size must not exceed vocab_size"
-        )
-    if parsed["d_model"] % parsed["heads"]:
-        raise ValueError(f"config.yaml {label}.d_model must be divisible by heads")
-    if (parsed["d_model"] // parsed["heads"]) % 2:
-        raise ValueError(f"config.yaml {label} head dimension must be even for RoPE")
-    return parsed
-
-
-def _declared_family_parameter_count(model: Mapping[str, Any]) -> int:
+def _declared_family_parameter_count(model: ModelDefinition) -> int:
     """Count this trainer's untied, position-free RMSNorm transformer exactly."""
 
-    width = int(model["d_model"])
+    width = model.d_model
     return (
-        2 * int(model["vocab_size"]) * width
-        + int(model["layers"]) * (12 * width * width + 11 * width)
+        2 * model.vocab_size * width
+        + model.layers * (12 * width * width + 11 * width)
         + width
     )
-
-
-def _parse_experiment_profile(
-    payload: Mapping[str, Any],
-    profile: str,
-    source_sha256: str,
-    tier: str | None,
-    context: str | None,
-) -> ExperimentProfile:
-    top = config_keys(payload, "document", {"schema_version", "family", "profiles"})
-    schema_version = config_int(top["schema_version"], "schema_version", minimum=1)
-    if schema_version != CONFIG_SCHEMA_VERSION:
-        raise ValueError(
-            "unsupported config.yaml schema_version "
-            f"{schema_version}; expected {CONFIG_SCHEMA_VERSION}"
-        )
-    family = config_keys(
-        top["family"],
-        "family",
-        {
-            "default_tier",
-            "default_context",
-            "contexts",
-            "parameterization",
-            "tiers",
-        },
-    )
-    parameterization = config_keys(
-        family["parameterization"],
-        "family.parameterization",
-        {
-            "name",
-            "base_tier",
-            "base_width",
-            "base_depth",
-            "depth_alpha",
-            "init_std",
-            "attention_scale",
-            "embeddings",
-        },
-    )
-    parameterization_name = config_choice(
-        parameterization["name"],
-        "family.parameterization.name",
-        ("completep_fixed_tpp_v1",),
-    )
-    base_tier = parameterization["base_tier"]
-    if not isinstance(base_tier, str) or not _TIER_NAME.fullmatch(base_tier):
-        raise ValueError("config.yaml family.parameterization.base_tier is invalid")
-    base_width = config_int(
-        parameterization["base_width"],
-        "family.parameterization.base_width",
-        minimum=1,
-    )
-    base_depth = config_int(
-        parameterization["base_depth"],
-        "family.parameterization.base_depth",
-        minimum=1,
-    )
-    depth_alpha = config_float(
-        parameterization["depth_alpha"], "family.parameterization.depth_alpha"
-    )
-    init_std = config_float(
-        parameterization["init_std"], "family.parameterization.init_std"
-    )
-    if not 0.5 <= depth_alpha <= 1.0:
-        raise ValueError(
-            "config.yaml family.parameterization.depth_alpha must be in [0.5, 1]"
-        )
-    if init_std <= 0.0:
-        raise ValueError(
-            "config.yaml family.parameterization.init_std must be positive"
-        )
-    attention_scale = config_choice(
-        parameterization["attention_scale"],
-        "family.parameterization.attention_scale",
-        ("inverse_head_dim",),
-    )
-    embeddings = config_choice(
-        parameterization["embeddings"],
-        "family.parameterization.embeddings",
-        ("untied",),
-    )
-    raw_contexts = config_mapping(family["contexts"], "family.contexts")
-    if not raw_contexts:
-        raise ValueError("config.yaml family.contexts must define at least one preset")
-    invalid_contexts = sorted(
-        name for name in raw_contexts if not _CONTEXT_NAME.fullmatch(name)
-    )
-    if invalid_contexts:
-        raise ValueError(
-            "config.yaml family.contexts contains invalid name(s): "
-            + ", ".join(invalid_contexts)
-        )
-    default_context = family["default_context"]
-    if not isinstance(default_context, str) or default_context not in raw_contexts:
-        raise ValueError(
-            "config.yaml family.default_context must name a defined context preset"
-        )
-    selected_context = context or default_context
-    if selected_context not in raw_contexts:
-        raise ValueError(
-            f"unknown context preset {selected_context!r}; expected "
-            + ", ".join(sorted(raw_contexts))
-        )
-    parsed_contexts: dict[str, tuple[int, int, bool]] = {}
-    for context_name in sorted(raw_contexts):
-        context_value = config_keys(
-            raw_contexts[context_name],
-            f"family.contexts.{context_name}",
-            {"seq_len", "reference_batch_size", "document_masking"},
-        )
-        parsed_contexts[context_name] = (
-            config_int(
-                context_value["seq_len"],
-                f"family.contexts.{context_name}.seq_len",
-                minimum=1,
-            ),
-            config_int(
-                context_value["reference_batch_size"],
-                f"family.contexts.{context_name}.reference_batch_size",
-                minimum=1,
-            ),
-            config_bool(
-                context_value["document_masking"],
-                f"family.contexts.{context_name}.document_masking",
-            ),
-        )
-    raw_tiers = config_mapping(family["tiers"], "family.tiers")
-    if not raw_tiers:
-        raise ValueError("config.yaml family.tiers must define at least one tier")
-    invalid_tiers = sorted(name for name in raw_tiers if not _TIER_NAME.fullmatch(name))
-    if invalid_tiers:
-        raise ValueError(
-            "config.yaml family.tiers contains invalid name(s): "
-            + ", ".join(invalid_tiers)
-        )
-    default_tier = family["default_tier"]
-    if not isinstance(default_tier, str) or default_tier not in raw_tiers:
-        raise ValueError("config.yaml family.default_tier must name a defined tier")
-    if base_tier not in raw_tiers:
-        raise ValueError(
-            "config.yaml family.parameterization.base_tier must name a defined tier"
-        )
-    selected_family_tier = tier or default_tier
-    if selected_family_tier not in raw_tiers:
-        raise ValueError(
-            f"unknown model tier {selected_family_tier!r}; expected "
-            + ", ".join(sorted(raw_tiers))
-        )
-    parsed_tiers: dict[str, tuple[int, dict[str, Any]]] = {}
-    for tier_name in sorted(raw_tiers):
-        tier_value = config_keys(
-            raw_tiers[tier_name],
-            f"family.tiers.{tier_name}",
-            {"parameters", "model"},
-        )
-        declared = config_int(
-            tier_value["parameters"],
-            f"family.tiers.{tier_name}.parameters",
-            minimum=1,
-        )
-        tier_model = _parse_model(
-            tier_value["model"], f"family.tiers.{tier_name}.model"
-        )
-        if tier_model["d_model"] // tier_model["heads"] != 64:
-            raise ValueError(
-                f"config.yaml family.tiers.{tier_name} must use 64-wide heads"
-            )
-        counted = _declared_family_parameter_count(tier_model)
-        if declared != counted:
-            raise ValueError(
-                f"config.yaml family.tiers.{tier_name}.parameters is {declared:,}, "
-                f"but this trainer counts {counted:,}"
-            )
-        parsed_tiers[tier_name] = (declared, tier_model)
-    # The explicit width/depth anchor normally matches the smallest tier, but
-    # controlled aspect-ratio candidates may retain the reference anchor while
-    # changing that tier. The data-horizon anchor remains the candidate's own
-    # 60m parameter count below, keeping fixed-TPP comparisons well defined.
-
-    profiles = config_keys(top["profiles"], "profiles", set(_VALID_PROFILES))
-    selected = config_keys(
-        profiles[profile],
-        f"profiles.{profile}",
-        {"training", "model", "kernels", "optimizer", "evaluation", "logging"},
-    )
-    training = config_keys(
-        selected["training"],
-        f"profiles.{profile}.training",
-        (
-            {"batch_size", "seq_len", "sampling", "dtype", "steps"}
-            if profile == "smoke"
-            else {"tokens_per_parameter", "sampling", "dtype"}
-        ),
-    )
-    if profile == "smoke":
-        model = _parse_model(selected["model"], f"profiles.{profile}.model")
-        selected_tier = "smoke"
-        declared_parameters = None
-        selected_parameterization = "standard"
-        selected_base_width = model["d_model"]
-        selected_base_depth = model["layers"]
-        selected_depth_alpha = 0.0
-        selected_init_std = 0.02
-        selected_attention_scale = "inverse_sqrt_head_dim"
-        selected_embeddings = "tied"
-        selected_context_name = "smoke"
-        selected_seq_len = config_int(
-            training["seq_len"], f"profiles.{profile}.training.seq_len", minimum=1
-        )
-        selected_batch_size = config_int(
-            training["batch_size"],
-            f"profiles.{profile}.training.batch_size",
-            minimum=1,
-        )
-        selected_document_masking = False
-    else:
-        if selected["model"] != "family_tier":
-            raise ValueError(
-                f"config.yaml profiles.{profile}.model must be 'family_tier'"
-            )
-        declared_parameters, model = parsed_tiers[selected_family_tier]
-        selected_tier = selected_family_tier
-        selected_parameterization = parameterization_name
-        selected_base_width = base_width
-        selected_base_depth = base_depth
-        selected_depth_alpha = depth_alpha
-        selected_init_std = init_std
-        selected_attention_scale = attention_scale
-        selected_embeddings = embeddings
-        selected_context_name = selected_context
-        (
-            selected_seq_len,
-            selected_batch_size,
-            selected_document_masking,
-        ) = parsed_contexts[selected_context]
-    kernels = config_keys(
-        selected["kernels"],
-        f"profiles.{profile}.kernels",
-        {"attention_backend", "loss_backend", "vocab_tile_size"},
-    )
-    optimizer = config_keys(
-        selected["optimizer"],
-        f"profiles.{profile}.optimizer",
-        {
-            "learning_rate",
-            "min_lr_ratio",
-            "warmup_ratio",
-            "weight_decay",
-            "adam_epsilon",
-            "beta1",
-            "beta2",
-            "grad_clip",
-        },
-    )
-    evaluation = config_keys(
-        selected["evaluation"],
-        f"profiles.{profile}.evaluation",
-        {"eval_batches", "val_every", "val_probe_batches"},
-    )
-    logging = config_keys(
-        selected["logging"],
-        f"profiles.{profile}.logging",
-        {"diagnostics_every", "log_every"},
-    )
-    prefix = f"profiles.{profile}"
-    learning_rate = config_float(
-        optimizer["learning_rate"], f"{prefix}.optimizer.learning_rate"
-    )
-    min_lr_ratio = config_float(
-        optimizer["min_lr_ratio"], f"{prefix}.optimizer.min_lr_ratio"
-    )
-    weight_decay = config_float(
-        optimizer["weight_decay"], f"{prefix}.optimizer.weight_decay"
-    )
-    adam_epsilon = config_float(
-        optimizer["adam_epsilon"], f"{prefix}.optimizer.adam_epsilon"
-    )
-    warmup_ratio = config_float(
-        optimizer["warmup_ratio"], f"{prefix}.optimizer.warmup_ratio"
-    )
-    beta1 = config_float(optimizer["beta1"], f"{prefix}.optimizer.beta1")
-    beta2 = config_float(optimizer["beta2"], f"{prefix}.optimizer.beta2")
-    grad_clip = config_float(optimizer["grad_clip"], f"{prefix}.optimizer.grad_clip")
-    if learning_rate <= 0.0:
-        raise ValueError(
-            f"config.yaml {prefix}.optimizer.learning_rate must be positive"
-        )
-    if not 0.0 <= min_lr_ratio <= 1.0:
-        raise ValueError(
-            f"config.yaml {prefix}.optimizer.min_lr_ratio must be in [0, 1]"
-        )
-    if weight_decay < 0.0:
-        raise ValueError(
-            f"config.yaml {prefix}.optimizer.weight_decay must be nonnegative"
-        )
-    if adam_epsilon <= 0.0:
-        raise ValueError(
-            f"config.yaml {prefix}.optimizer.adam_epsilon must be positive"
-        )
-    if not 0.0 <= warmup_ratio < 1.0:
-        raise ValueError(
-            f"config.yaml {prefix}.optimizer.warmup_ratio must be in [0, 1)"
-        )
-    if not 0.0 <= beta1 < 1.0 or not 0.0 <= beta2 < 1.0:
-        raise ValueError(
-            f"config.yaml {prefix}.optimizer beta values must be in [0, 1)"
-        )
-    if grad_clip < 0.0:
-        raise ValueError(
-            f"config.yaml {prefix}.optimizer.grad_clip must be nonnegative"
-        )
-    result = ExperimentProfile(
-        schema_version=schema_version,
-        source_sha256=source_sha256,
-        name=profile,
-        context_preset=selected_context_name,
-        steps=(
-            config_int(training["steps"], f"{prefix}.training.steps", minimum=1)
-            if profile == "smoke"
-            else None
-        ),
-        tokens_per_parameter=(
-            config_float(
-                training["tokens_per_parameter"],
-                f"{prefix}.training.tokens_per_parameter",
-            )
-            if profile != "smoke"
-            else None
-        ),
-        batch_size=selected_batch_size,
-        seq_len=selected_seq_len,
-        sampling=config_choice(
-            training["sampling"],
-            f"{prefix}.training.sampling",
-            ("random_windows", "shuffled_epochs"),
-        ),
-        dtype_name=config_choice(
-            training["dtype"], f"{prefix}.training.dtype", ("bfloat16", "float32")
-        ),
-        layers=int(model["layers"]),
-        heads=int(model["heads"]),
-        d_model=int(model["d_model"]),
-        mlp_mult=int(model["mlp_mult"]),
-        normalization=str(model["normalization"]),
-        position_encoding=str(model["position_encoding"]),
-        mlp_activation=str(model["mlp_activation"]),
-        tier=selected_tier,
-        declared_parameters=declared_parameters,
-        base_parameters=parsed_tiers[base_tier][0],
-        parameterization=selected_parameterization,
-        base_width=selected_base_width,
-        base_depth=selected_base_depth,
-        depth_alpha=selected_depth_alpha,
-        init_std=selected_init_std,
-        attention_scale=selected_attention_scale,
-        embeddings=selected_embeddings,
-        vocab_size=int(model["vocab_size"]),
-        semantic_vocab_size=int(model["semantic_vocab_size"]),
-        attention_backend=config_choice(
-            kernels["attention_backend"],
-            f"{prefix}.kernels.attention_backend",
-            ("dense", "jax_flash", "tpu_flash"),
-        ),
-        loss_backend=config_choice(
-            kernels["loss_backend"],
-            f"{prefix}.kernels.loss_backend",
-            ("dense", "tiled"),
-        ),
-        vocab_tile_size=config_int(
-            kernels["vocab_tile_size"], f"{prefix}.kernels.vocab_tile_size", minimum=1
-        ),
-        document_masking=selected_document_masking,
-        learning_rate=learning_rate,
-        min_lr_ratio=min_lr_ratio,
-        warmup_ratio=warmup_ratio,
-        weight_decay=weight_decay,
-        adam_epsilon=adam_epsilon,
-        beta1=beta1,
-        beta2=beta2,
-        grad_clip=grad_clip,
-        eval_batches=config_int(
-            evaluation["eval_batches"], f"{prefix}.evaluation.eval_batches", minimum=1
-        ),
-        val_every=config_int(
-            evaluation["val_every"], f"{prefix}.evaluation.val_every", minimum=0
-        ),
-        val_probe_batches=config_int(
-            evaluation["val_probe_batches"],
-            f"{prefix}.evaluation.val_probe_batches",
-            minimum=1,
-        ),
-        diagnostics_every=config_int(
-            logging["diagnostics_every"],
-            f"{prefix}.logging.diagnostics_every",
-            minimum=0,
-        ),
-        log_every=config_int(
-            logging["log_every"], f"{prefix}.logging.log_every", minimum=1
-        ),
-    )
-    if result.tokens_per_parameter is not None and result.tokens_per_parameter <= 0.0:
-        raise ValueError(
-            f"config.yaml {prefix}.training.tokens_per_parameter must be positive"
-        )
-    if result.attention_backend != "dense" and result.dtype_name != "bfloat16":
-        raise ValueError(
-            f"config.yaml {prefix}.kernels.attention_backend "
-            f"{result.attention_backend} requires training.dtype bfloat16"
-        )
-    tokens_per_step = result.batch_size * result.seq_len
-    if profile == "official":
-        validation_tokens = 10_485_760
-        if validation_tokens % tokens_per_step:
-            raise ValueError(
-                f"config.yaml {prefix} batch_size * seq_len must divide the "
-                f"official {validation_tokens:,}-prediction validation prefix"
-            )
-        required_eval_batches = validation_tokens // tokens_per_step
-        if result.eval_batches != required_eval_batches:
-            raise ValueError(
-                f"config.yaml {prefix}.evaluation.eval_batches must be "
-                f"{required_eval_batches} for the official validation prefix"
-            )
-    if result.val_every and result.val_probe_batches > result.eval_batches:
-        raise ValueError(
-            f"config.yaml {prefix}.evaluation.val_probe_batches must not exceed eval_batches"
-        )
-    return result
 
 
 def load_experiment_profile(
@@ -792,8 +665,15 @@ def load_experiment_profile(
         raise ValueError(f"unknown experiment profile: {profile!r}")
     path = resolve_sibling_config_path(requested_path, CONFIG_PATH)
     mapping, source_sha256 = read_config_document(path)
+    document = ExperimentDocument.from_mapping(mapping)
+    document.validate()
     parsed = {
-        name: _parse_experiment_profile(mapping, name, source_sha256, tier, context)
+        name: document.to_experiment_profile(
+            name,
+            source_sha256,
+            tier=tier,
+            context=context,
+        )
         for name in _VALID_PROFILES
     }
     return parsed[profile]
