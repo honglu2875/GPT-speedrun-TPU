@@ -32,7 +32,6 @@ family:
     embeddings: untied
   tiers:
     60m:
-      parameters: 59918208
       model:
         layers: 12
         heads: 6
@@ -44,7 +43,6 @@ family:
         vocab_size: 50304
         semantic_vocab_size: 50304
     125m:
-      parameters: 123456640
       model:
         layers: 12
         heads: 10
@@ -56,7 +54,6 @@ family:
         vocab_size: 50304
         semantic_vocab_size: 50304
     250m:
-      parameters: 244444032
       model:
         layers: 16
         heads: 14
@@ -68,7 +65,6 @@ family:
         vocab_size: 50304
         semantic_vocab_size: 50304
     500m:
-      parameters: 502602240
       model:
         layers: 19
         heads: 20
@@ -80,7 +76,6 @@ family:
         vocab_size: 50304
         semantic_vocab_size: 50304
     1b:
-      parameters: 989943808
       model:
         layers: 21
         heads: 28

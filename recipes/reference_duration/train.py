@@ -166,7 +166,7 @@ _CONTEXT_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 # while the shuffled clauses prevent every training window from being identical.
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Config:
     steps: int
     batch_size: int
@@ -180,6 +180,8 @@ class Config:
     position_encoding: str
     mlp_activation: str
     tier: str
+    # Stable run-protocol names; both values are derived from the typed model
+    # definitions rather than declared independently in config.yaml.
     declared_parameters: int | None
     base_parameters: int
     parameterization: str
@@ -239,59 +241,6 @@ class Config:
         return self.stop_after_step or self.steps
 
 
-@dataclass(frozen=True)
-class ExperimentProfile:
-    """One fully explicit, versioned profile loaded from sibling config.yaml."""
-
-    schema_version: int
-    source_sha256: str
-    name: str
-    context_preset: str
-    steps: int | None
-    tokens_per_parameter: float | None
-    batch_size: int
-    seq_len: int
-    sampling: str
-    dtype_name: str
-    layers: int
-    heads: int
-    d_model: int
-    mlp_mult: int
-    normalization: str
-    position_encoding: str
-    mlp_activation: str
-    tier: str
-    declared_parameters: int | None
-    base_parameters: int
-    parameterization: str
-    base_width: int
-    base_depth: int
-    duration_anchor_tpp: float
-    depth_alpha: float
-    init_std: float
-    attention_scale: str
-    embeddings: str
-    vocab_size: int
-    semantic_vocab_size: int
-    attention_backend: str
-    loss_backend: str
-    vocab_tile_size: int
-    learning_rate: float
-    min_lr_ratio: float
-    warmup_ratio: float
-    weight_decay: float
-    adam_epsilon: float
-    beta1: float
-    beta2: float
-    grad_clip: float
-    eval_batches: int
-    val_every: int
-    val_probe_batches: int
-    diagnostics_every: int
-    log_every: int
-    document_masking: bool = False
-
-
 TierName = Annotated[str, Matches(_TIER_NAME.pattern)]
 ContextName = Annotated[str, Matches(_CONTEXT_NAME.pattern)]
 Probability = Annotated[float, Bounds(ge=0.0, le=1.0)]
@@ -299,7 +248,7 @@ OpenProbability = Annotated[float, Bounds(ge=0.0, lt=1.0)]
 DepthAlpha = Annotated[float, Bounds(ge=0.5, le=1.0)]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ContextPreset:
     """One coupled sequence-length, batch-anchor, and masking preset."""
 
@@ -307,8 +256,14 @@ class ContextPreset:
     reference_batch_size: PositiveInt
     document_masking: bool
 
+    @property
+    def tokens_per_step(self) -> int:
+        """Number of tokens in one recipe-default global optimizer step."""
 
-@dataclass(frozen=True)
+        return self.reference_batch_size * self.seq_len
+
+
+@dataclass(frozen=True, slots=True)
 class ParameterizationDefinition:
     """The Complete(d)P duration contract shared by every family tier."""
 
@@ -323,7 +278,7 @@ class ParameterizationDefinition:
     embeddings: Literal["untied"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ModelDefinition:
     """Architecture fields represented literally in ``config.yaml``."""
 
@@ -337,6 +292,12 @@ class ModelDefinition:
     vocab_size: PositiveInt
     semantic_vocab_size: PositiveInt
 
+    @property
+    def head_dim(self) -> int:
+        """Width of one attention head."""
+
+        return self.d_model // self.heads
+
     def validate(self, label: str) -> None:
         """Enforce architecture relations that no single annotation can express."""
 
@@ -346,19 +307,30 @@ class ModelDefinition:
             )
         if self.d_model % self.heads:
             raise ValueError(f"config.yaml {label}.d_model must be divisible by heads")
-        if (self.d_model // self.heads) % 2:
+        if self.head_dim % 2:
             raise ValueError(
                 f"config.yaml {label} head dimension must be even for RoPE"
             )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TierDefinition:
-    parameters: PositiveInt
     model: ModelDefinition
 
+    @property
+    def tpp_parameters(self) -> int:
+        """Parameter denominator used by the fixed-TPP ladder."""
 
-@dataclass(frozen=True)
+        model = self.model
+        width = model.d_model
+        return (
+            2 * model.vocab_size * width
+            + model.layers * (12 * width * width + 11 * width)
+            + width
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class FamilyDefinition:
     default_tier: TierName
     default_context: ContextName
@@ -371,7 +343,7 @@ Sampling = Literal["random_windows", "shuffled_epochs"]
 ComputeDtype = Literal["bfloat16", "float32"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SmokeTraining:
     steps: PositiveInt
     batch_size: PositiveInt
@@ -380,21 +352,21 @@ class SmokeTraining:
     dtype: ComputeDtype
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class LadderTraining:
     tokens_per_parameter: PositiveFloat
     sampling: Sampling
     dtype: ComputeDtype
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class KernelSettings:
     attention_backend: Literal["dense", "jax_flash", "tpu_flash"]
     loss_backend: Literal["dense", "tiled"]
     vocab_tile_size: PositiveInt
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class OptimizerSettings:
     learning_rate: PositiveFloat
     min_lr_ratio: Probability
@@ -406,20 +378,20 @@ class OptimizerSettings:
     grad_clip: NonnegativeFloat
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class EvaluationSettings:
     eval_batches: PositiveInt
     val_every: NonnegativeInt
     val_probe_batches: PositiveInt
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class LoggingSettings:
     diagnostics_every: NonnegativeInt
     log_every: PositiveInt
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SmokeProfileDefinition:
     training: SmokeTraining
     model: ModelDefinition
@@ -429,7 +401,7 @@ class SmokeProfileDefinition:
     logging: LoggingSettings
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class LadderProfileDefinition:
     training: LadderTraining
     model: Literal["family_tier"]
@@ -439,14 +411,14 @@ class LadderProfileDefinition:
     logging: LoggingSettings
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ProfileDefinitions:
     smoke: SmokeProfileDefinition
     dev: LadderProfileDefinition
     official: LadderProfileDefinition
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ExperimentDocument(ConfigSchema):
     """Strict nested representation of the complete recipe ``config.yaml``."""
 
@@ -473,15 +445,9 @@ class ExperimentDocument(ConfigSchema):
         for tier_name, tier in family.tiers.items():
             label = f"family.tiers.{tier_name}.model"
             tier.model.validate(label)
-            if tier.model.d_model // tier.model.heads != 64:
+            if tier.model.head_dim != 64:
                 raise ValueError(
                     f"config.yaml family.tiers.{tier_name} must use 64-wide heads"
-                )
-            counted = _declared_family_parameter_count(tier.model)
-            if tier.parameters != counted:
-                raise ValueError(
-                    f"config.yaml family.tiers.{tier_name}.parameters is "
-                    f"{tier.parameters:,}, but this trainer counts {counted:,}"
                 )
 
         self.profiles.smoke.model.validate("profiles.smoke.model")
@@ -509,155 +475,105 @@ class ExperimentDocument(ConfigSchema):
                     "must not exceed eval_batches"
                 )
 
-    def to_experiment_profile(
+    def select(
         self,
         profile: str,
         source_sha256: str,
         *,
         tier: str | None = None,
         context: str | None = None,
-    ) -> ExperimentProfile:
-        """Select one family/profile combination and export the flat runtime view."""
+    ) -> SelectedExperiment:
+        """Validate runtime selectors and return a zero-copy view of this document."""
 
-        family = self.family
-        selected_context_name = context or family.default_context
-        if selected_context_name not in family.contexts:
-            raise ValueError(
-                f"unknown context preset {selected_context_name!r}; expected "
-                + ", ".join(sorted(family.contexts))
-            )
-        selected_tier_name = tier or family.default_tier
-        if selected_tier_name not in family.tiers:
-            raise ValueError(
-                f"unknown model tier {selected_tier_name!r}; expected "
-                + ", ".join(sorted(family.tiers))
-            )
-
-        if profile == "smoke":
-            selected = self.profiles.smoke
-            training = selected.training
-            model = selected.model
-            steps = training.steps
-            tokens_per_parameter = None
-            batch_size = training.batch_size
-            seq_len = training.seq_len
-            profile_tier = "smoke"
-            declared_parameters = None
-            parameterization = "standard"
-            base_width = model.d_model
-            base_depth = model.layers
-            depth_alpha = 0.0
-            init_std = 0.02
-            attention_scale = "inverse_sqrt_head_dim"
-            embeddings = "tied"
-            context_preset = "smoke"
-            document_masking = False
-        elif profile in ("dev", "official"):
-            selected = self.profiles.dev if profile == "dev" else self.profiles.official
-            training = selected.training
-            selected_tier = family.tiers[selected_tier_name]
-            selected_context = family.contexts[selected_context_name]
-            model = selected_tier.model
-            steps = None
-            tokens_per_parameter = training.tokens_per_parameter
-            batch_size = selected_context.reference_batch_size
-            seq_len = selected_context.seq_len
-            profile_tier = selected_tier_name
-            declared_parameters = selected_tier.parameters
-            parameterization = family.parameterization.name
-            base_width = family.parameterization.base_width
-            base_depth = family.parameterization.base_depth
-            depth_alpha = family.parameterization.depth_alpha
-            init_std = family.parameterization.init_std
-            attention_scale = family.parameterization.attention_scale
-            embeddings = family.parameterization.embeddings
-            context_preset = selected_context_name
-            document_masking = selected_context.document_masking
-        else:
+        if profile not in _VALID_PROFILES:
             raise ValueError(f"unknown experiment profile: {profile!r}")
+        self.validate()
 
-        kernels = selected.kernels
-        optimizer = selected.optimizer
-        evaluation = selected.evaluation
-        logging = selected.logging
-        result = ExperimentProfile(
-            schema_version=self.schema_version,
+        tier_name = tier or self.family.default_tier
+        if tier_name not in self.family.tiers:
+            raise ValueError(
+                f"unknown model tier {tier_name!r}; expected "
+                + ", ".join(sorted(self.family.tiers))
+            )
+        context_name = context or self.family.default_context
+        if context_name not in self.family.contexts:
+            raise ValueError(
+                f"unknown context preset {context_name!r}; expected "
+                + ", ".join(sorted(self.family.contexts))
+            )
+
+        official = self.profiles.official
+        tokens_per_step = self.family.contexts[context_name].tokens_per_step
+        validation_tokens = 10_485_760
+        if validation_tokens % tokens_per_step:
+            raise ValueError(
+                "config.yaml profiles.official batch_size * seq_len must divide "
+                f"the official {validation_tokens:,}-prediction validation prefix"
+            )
+        required_eval_batches = validation_tokens // tokens_per_step
+        if official.evaluation.eval_batches != required_eval_batches:
+            raise ValueError(
+                "config.yaml profiles.official.evaluation.eval_batches must be "
+                f"{required_eval_batches} for the official validation prefix"
+            )
+
+        return SelectedExperiment(
+            document=self,
             source_sha256=source_sha256,
             name=profile,
-            context_preset=context_preset,
-            steps=steps,
-            tokens_per_parameter=tokens_per_parameter,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            sampling=training.sampling,
-            dtype_name=training.dtype,
-            layers=model.layers,
-            heads=model.heads,
-            d_model=model.d_model,
-            mlp_mult=model.mlp_mult,
-            normalization=model.normalization,
-            position_encoding=model.position_encoding,
-            mlp_activation=model.mlp_activation,
-            tier=profile_tier,
-            declared_parameters=declared_parameters,
-            base_parameters=family.tiers[family.parameterization.base_tier].parameters,
-            parameterization=parameterization,
-            base_width=base_width,
-            base_depth=base_depth,
-            duration_anchor_tpp=family.parameterization.base_tokens_per_parameter,
-            depth_alpha=depth_alpha,
-            init_std=init_std,
-            attention_scale=attention_scale,
-            embeddings=embeddings,
-            vocab_size=model.vocab_size,
-            semantic_vocab_size=model.semantic_vocab_size,
-            attention_backend=kernels.attention_backend,
-            loss_backend=kernels.loss_backend,
-            vocab_tile_size=kernels.vocab_tile_size,
-            document_masking=document_masking,
-            learning_rate=optimizer.learning_rate,
-            min_lr_ratio=optimizer.min_lr_ratio,
-            warmup_ratio=optimizer.warmup_ratio,
-            weight_decay=optimizer.weight_decay,
-            adam_epsilon=optimizer.adam_epsilon,
-            beta1=optimizer.beta1,
-            beta2=optimizer.beta2,
-            grad_clip=optimizer.grad_clip,
-            eval_batches=evaluation.eval_batches,
-            val_every=evaluation.val_every,
-            val_probe_batches=evaluation.val_probe_batches,
-            diagnostics_every=logging.diagnostics_every,
-            log_every=logging.log_every,
+            tier_name=tier_name,
+            context_name=context_name,
         )
-        if profile == "official":
-            validation_tokens = 10_485_760
-            tokens_per_step = result.batch_size * result.seq_len
-            if validation_tokens % tokens_per_step:
-                raise ValueError(
-                    "config.yaml profiles.official batch_size * seq_len must divide "
-                    f"the official {validation_tokens:,}-prediction validation prefix"
-                )
-            required_eval_batches = validation_tokens // tokens_per_step
-            if result.eval_batches != required_eval_batches:
-                raise ValueError(
-                    "config.yaml profiles.official.evaluation.eval_batches must be "
-                    f"{required_eval_batches} for the official validation prefix"
-                )
-        return result
+
+
+@dataclass(frozen=True, slots=True)
+class SelectedExperiment:
+    """Runtime profile/tier/context selection over one decoded YAML document."""
+
+    document: ExperimentDocument
+    source_sha256: str
+    name: str
+    tier_name: str
+    context_name: str
+
+    @property
+    def profile(self) -> SmokeProfileDefinition | LadderProfileDefinition:
+        if self.name == "smoke":
+            return self.document.profiles.smoke
+        if self.name == "dev":
+            return self.document.profiles.dev
+        if self.name == "official":
+            return self.document.profiles.official
+        raise AssertionError(f"invalid selected profile: {self.name!r}")
+
+    @property
+    def tier(self) -> TierDefinition:
+        return self.document.family.tiers[self.tier_name]
+
+    @property
+    def context(self) -> ContextPreset:
+        return self.document.family.contexts[self.context_name]
+
+    @property
+    def model(self) -> ModelDefinition:
+        if self.name == "smoke":
+            profile = self.profile
+            if not isinstance(profile, SmokeProfileDefinition):
+                raise AssertionError("smoke selection resolved a ladder profile")
+            return profile.model
+        return self.tier.model
+
+    @property
+    def tpp_parameters(self) -> int | None:
+        return None if self.name == "smoke" else self.tier.tpp_parameters
+
+    @property
+    def base_tpp_parameters(self) -> int:
+        base_tier = self.document.family.parameterization.base_tier
+        return self.document.family.tiers[base_tier].tpp_parameters
 
 
 _UINT64_MASK = (1 << 64) - 1
-
-
-def _declared_family_parameter_count(model: ModelDefinition) -> int:
-    """Count this trainer's untied, position-free RMSNorm transformer exactly."""
-
-    width = model.d_model
-    return (
-        2 * model.vocab_size * width
-        + model.layers * (12 * width * width + 11 * width)
-        + width
-    )
 
 
 def load_experiment_profile(
@@ -666,23 +582,13 @@ def load_experiment_profile(
     *,
     tier: str | None = None,
     context: str | None = None,
-) -> ExperimentProfile:
+) -> SelectedExperiment:
     if profile not in _VALID_PROFILES:
         raise ValueError(f"unknown experiment profile: {profile!r}")
     path = resolve_sibling_config_path(requested_path, CONFIG_PATH)
     mapping, source_sha256 = read_config_document(path)
     document = ExperimentDocument.from_mapping(mapping)
-    document.validate()
-    parsed = {
-        name: document.to_experiment_profile(
-            name,
-            source_sha256,
-            tier=tier,
-            context=context,
-        )
-        for name in _VALID_PROFILES
-    }
-    return parsed[profile]
+    return document.select(profile, source_sha256, tier=tier, context=context)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -745,7 +651,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def validate_args(args: argparse.Namespace) -> ExperimentProfile:
+def validate_args(args: argparse.Namespace) -> SelectedExperiment:
     experiment = load_experiment_profile(
         selected_profile(args), args.config, tier=args.tier, context=args.context
     )
@@ -783,7 +689,7 @@ def resolve_config(
     args: argparse.Namespace,
     platform: str,
     vocab_size: int,
-    experiment: ExperimentProfile | None = None,
+    experiment: SelectedExperiment | None = None,
 ) -> Config:
     profile = selected_profile(args)
     experiment = experiment or load_experiment_profile(
@@ -793,30 +699,75 @@ def resolve_config(
         raise ValueError(
             f"resolved config profile {experiment.name!r} does not match {profile!r}"
         )
-    if vocab_size != experiment.vocab_size:
+
+    definition = experiment.profile
+    model = experiment.model
+    kernels = definition.kernels
+    optimizer = definition.optimizer
+    evaluation = definition.evaluation
+    logging = definition.logging
+    duration_anchor_tpp = (
+        experiment.document.family.parameterization.base_tokens_per_parameter
+    )
+    if vocab_size != model.vocab_size:
         raise ValueError(
             "loaded dataset vocabulary does not match config.yaml: "
-            f"dataset={vocab_size}, configured={experiment.vocab_size}"
+            f"dataset={vocab_size}, configured={model.vocab_size}"
         )
-    batch_size = args.batch_size or experiment.batch_size
-    seq_len = experiment.seq_len
+
+    if profile == "smoke":
+        if not isinstance(definition, SmokeProfileDefinition):
+            raise AssertionError("smoke selection resolved a ladder profile")
+        training = definition.training
+        batch_anchor = training.batch_size
+        seq_len = training.seq_len
+        document_masking = False
+        requested_tpp = args.tokens_per_parameter
+        tier_name = "smoke"
+        parameterization = "standard"
+        base_width = model.d_model
+        base_depth = model.layers
+        depth_alpha = 0.0
+        init_std = 0.02
+        attention_scale = "inverse_sqrt_head_dim"
+        embeddings = "tied"
+        context_preset = "smoke"
+    else:
+        if not isinstance(definition, LadderProfileDefinition):
+            raise AssertionError("ladder selection resolved the smoke profile")
+        training = definition.training
+        context = experiment.context
+        family_parameterization = experiment.document.family.parameterization
+        batch_anchor = context.reference_batch_size
+        seq_len = context.seq_len
+        document_masking = context.document_masking
+        requested_tpp = args.tokens_per_parameter or training.tokens_per_parameter
+        tier_name = experiment.tier_name
+        parameterization = family_parameterization.name
+        base_width = family_parameterization.base_width
+        base_depth = family_parameterization.base_depth
+        depth_alpha = family_parameterization.depth_alpha
+        init_std = family_parameterization.init_std
+        attention_scale = family_parameterization.attention_scale
+        embeddings = family_parameterization.embeddings
+        context_preset = experiment.context_name
+
+    batch_size = args.batch_size or batch_anchor
     tokens_per_step = batch_size * seq_len
-    requested_tpp = args.tokens_per_parameter or experiment.tokens_per_parameter
     early_stop = getattr(args, "stop_after_step", None)
+    tpp_parameters = experiment.tpp_parameters
     if profile == "smoke":
         if args.tokens_per_parameter is not None:
             raise ValueError("--tokens-per-parameter cannot override the smoke profile")
         if early_stop is not None:
             raise ValueError("--stop-after-step requires a fixed-TPP profile")
-        if experiment.steps is None:
-            raise AssertionError("smoke profile did not resolve a step count")
-        steps = experiment.steps
+        steps = training.steps
     else:
         if requested_tpp is None:
             raise AssertionError("non-smoke profile did not resolve a TPP horizon")
-        if experiment.declared_parameters is None:
-            raise AssertionError("fixed-TPP profile has no declared parameter count")
-        ideal_tokens = float(experiment.declared_parameters) * requested_tpp
+        if tpp_parameters is None:
+            raise AssertionError("fixed-TPP profile has no parameter denominator")
+        ideal_tokens = float(tpp_parameters) * requested_tpp
         steps = max(1, int(math.floor(ideal_tokens / tokens_per_step + 0.5)))
     if early_stop is not None and requested_tpp is None:
         raise ValueError("--stop-after-step requires a fixed-TPP profile")
@@ -825,6 +776,7 @@ def resolve_config(
             f"--stop-after-step {early_stop:,} is past the {steps:,}-step "
             "horizon this configuration resolves to"
         )
+
     if profile == "official":
         validation_tokens = 10_485_760
         predictions_per_batch = batch_size * seq_len
@@ -834,26 +786,27 @@ def resolve_config(
                 f"{validation_tokens:,} exactly; got {predictions_per_batch:,}"
             )
         required_eval_batches = validation_tokens // predictions_per_batch
-        if experiment.eval_batches != required_eval_batches:
+        if evaluation.eval_batches != required_eval_batches:
             raise ValueError(
                 "official config.yaml validation must cover exactly 10,485,760 "
                 f"predictions; set eval_batches to {required_eval_batches}"
             )
         eval_batches = required_eval_batches
     else:
-        eval_batches = experiment.eval_batches
-    val_every = 0 if args.diagnostic_mode else experiment.val_every
-    val_probe_batches = experiment.val_probe_batches
+        eval_batches = evaluation.eval_batches
+    val_every = 0 if args.diagnostic_mode else evaluation.val_every
+    val_probe_batches = evaluation.val_probe_batches
     if val_every > 0 and val_probe_batches > eval_batches:
         raise ValueError(
             "config.yaml val_probe_batches must not exceed the canonical evaluation batch "
             f"count ({eval_batches}); got {val_probe_batches}"
         )
-    log_every = steps if args.diagnostic_mode else experiment.log_every
-    diagnostics_every = 0 if args.diagnostic_mode else experiment.diagnostics_every
-    dtype_name = experiment.dtype_name
+    log_every = steps if args.diagnostic_mode else logging.log_every
+    diagnostics_every = 0 if args.diagnostic_mode else logging.diagnostics_every
+
+    dtype_name = training.dtype
     compute_dtype = jnp.bfloat16 if dtype_name == "bfloat16" else jnp.float32
-    attention_backend = experiment.attention_backend
+    attention_backend = kernels.attention_backend
     if attention_backend != "dense" and platform != "tpu":
         raise ValueError(
             f"config.yaml attention_backend {attention_backend} requires a TPU runtime"
@@ -863,6 +816,7 @@ def resolve_config(
             f"config.yaml attention_backend {attention_backend} currently requires "
             "dtype bfloat16"
         )
+
     override_values: list[tuple[str, int | str]] = []
     for name, value in (
         (
@@ -881,95 +835,95 @@ def resolve_config(
     if args.context is not None:
         override_values.append(("context", args.context))
     overrides = tuple(override_values)
-    width_multiplier = experiment.d_model / float(experiment.base_width)
-    depth_multiplier = experiment.layers / float(experiment.base_depth)
-    batch_multiplier = batch_size / float(experiment.batch_size)
+
+    width_multiplier = model.d_model / float(base_width)
+    depth_multiplier = model.layers / float(base_depth)
+    batch_multiplier = batch_size / float(batch_anchor)
     achieved_tpp = (
-        steps * tokens_per_step / float(experiment.declared_parameters)
-        if experiment.declared_parameters is not None
+        steps * tokens_per_step / float(tpp_parameters)
+        if tpp_parameters is not None
         else None
     )
     ladder_data_multiplier = (
-        experiment.declared_parameters / float(experiment.base_parameters)
-        if experiment.declared_parameters is not None
+        tpp_parameters / float(experiment.base_tpp_parameters)
+        if tpp_parameters is not None
         else 1.0
     )
     # This experimental fork implements the Complete(d)P token-duration factor
-    # relative to the declared 5-TPP anchor. Use the requested horizon so the
+    # relative to the configured 5-TPP anchor. Use the requested horizon so the
     # anchor remains exactly identical to reference despite whole-step rounding.
     duration_multiplier = (
-        requested_tpp / experiment.duration_anchor_tpp
-        if requested_tpp is not None
-        else 1.0
+        requested_tpp / duration_anchor_tpp if requested_tpp is not None else 1.0
     )
     data_multiplier = ladder_data_multiplier * duration_multiplier
     base_learning_rate = (
         args.base_learning_rate
         if args.base_learning_rate is not None
-        else experiment.learning_rate
+        else optimizer.learning_rate
     )
-    warmup_steps = int(math.floor(steps * experiment.warmup_ratio + 0.5))
+    warmup_steps = int(math.floor(steps * optimizer.warmup_ratio + 0.5))
     if steps > 1:
         warmup_steps = min(warmup_steps, steps - 1)
     else:
         warmup_steps = 0
+
     return Config(
         steps=steps,
         stop_after_step=early_stop,
-        document_masking=experiment.document_masking,
+        document_masking=document_masking,
         batch_size=batch_size,
         seq_len=seq_len,
-        sampling=experiment.sampling,
-        layers=experiment.layers,
-        heads=experiment.heads,
-        d_model=experiment.d_model,
-        mlp_mult=experiment.mlp_mult,
-        normalization=experiment.normalization,
-        position_encoding=experiment.position_encoding,
-        mlp_activation=experiment.mlp_activation,
-        tier=experiment.tier,
-        declared_parameters=experiment.declared_parameters,
-        base_parameters=experiment.base_parameters,
-        parameterization=experiment.parameterization,
-        base_width=experiment.base_width,
-        base_depth=experiment.base_depth,
-        depth_alpha=experiment.depth_alpha,
-        init_std=experiment.init_std,
-        attention_scale=experiment.attention_scale,
-        embeddings=experiment.embeddings,
+        sampling=training.sampling,
+        layers=model.layers,
+        heads=model.heads,
+        d_model=model.d_model,
+        mlp_mult=model.mlp_mult,
+        normalization=model.normalization,
+        position_encoding=model.position_encoding,
+        mlp_activation=model.mlp_activation,
+        tier=tier_name,
+        declared_parameters=tpp_parameters,
+        base_parameters=experiment.base_tpp_parameters,
+        parameterization=parameterization,
+        base_width=base_width,
+        base_depth=base_depth,
+        depth_alpha=depth_alpha,
+        init_std=init_std,
+        attention_scale=attention_scale,
+        embeddings=embeddings,
         width_multiplier=width_multiplier,
         depth_multiplier=depth_multiplier,
         ladder_data_multiplier=ladder_data_multiplier,
         duration_multiplier=duration_multiplier,
-        duration_anchor_tpp=experiment.duration_anchor_tpp,
+        duration_anchor_tpp=duration_anchor_tpp,
         data_multiplier=data_multiplier,
         batch_multiplier=batch_multiplier,
         target_tokens_per_parameter=requested_tpp,
         tokens_per_parameter=achieved_tpp,
         learning_rate=base_learning_rate,
-        min_lr_ratio=experiment.min_lr_ratio,
+        min_lr_ratio=optimizer.min_lr_ratio,
         warmup_steps=warmup_steps,
-        weight_decay=experiment.weight_decay,
-        adam_epsilon=experiment.adam_epsilon,
-        beta1=experiment.beta1,
-        beta2=experiment.beta2,
-        grad_clip=experiment.grad_clip,
+        weight_decay=optimizer.weight_decay,
+        adam_epsilon=optimizer.adam_epsilon,
+        beta1=optimizer.beta1,
+        beta2=optimizer.beta2,
+        grad_clip=optimizer.grad_clip,
         eval_batches=eval_batches,
         val_every=val_every,
         val_probe_batches=val_probe_batches,
         diagnostics_every=diagnostics_every,
         log_every=log_every,
         vocab_size=vocab_size,
-        semantic_vocab_size=experiment.semantic_vocab_size,
+        semantic_vocab_size=model.semantic_vocab_size,
         attention_backend=attention_backend,
-        loss_backend=experiment.loss_backend,
-        vocab_tile_size=experiment.vocab_tile_size,
+        loss_backend=kernels.loss_backend,
+        vocab_tile_size=kernels.vocab_tile_size,
         compute_dtype=compute_dtype,
         dtype_name=dtype_name,
-        config_schema_version=experiment.schema_version,
+        config_schema_version=experiment.document.schema_version,
         config_sha256=experiment.source_sha256,
         config_profile=experiment.name,
-        context_preset=experiment.context_preset,
+        context_preset=context_preset,
         config_overrides=overrides,
     )
 
@@ -1809,7 +1763,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         val_fraction=args.val_fraction,
         seed=args.seed,
     )
-    vocab_size = experiment.vocab_size
+    vocab_size = experiment.model.vocab_size
     config = resolve_config(args, platform, vocab_size, experiment)
     capture_window = xprof_step_window(args, config.final_step)
     downstream_domains = load_downstream_domains(
@@ -2698,7 +2652,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             planned = resolve_config(
                 args,
                 "cpu" if selected_profile(args) == "smoke" else "tpu",
-                experiment.vocab_size,
+                experiment.model.vocab_size,
                 experiment,
             )
         except Exception as error:

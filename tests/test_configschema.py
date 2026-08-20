@@ -25,7 +25,7 @@ Name = Annotated[str, Matches(r"[a-z][a-z0-9_-]*")]
 Probability = Annotated[float, Bounds(ge=0.0, le=1.0)]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Child(ConfigSchema):
     count: PositiveInt
     ratio: Probability
@@ -33,7 +33,7 @@ class Child(ConfigSchema):
     mode: Literal["dense", "tiled"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Document(ConfigSchema):
     schema_version: Literal[4]
     children: Annotated[dict[Name, Child], Length(ge=1)]
@@ -84,6 +84,8 @@ class ConfigSchemaDecodingTests(unittest.TestCase):
         self.assertIs(type(result.children["main"].ratio), float)
         self.assertEqual(result.labels, {})
         self.assertIsNone(result.optional_count)
+        self.assertFalse(hasattr(result, "__dict__"))
+        self.assertFalse(hasattr(result.children["main"], "__dict__"))
 
     def test_unknown_and_missing_keys_are_rejected_at_the_exact_path(self) -> None:
         unknown = valid_document()

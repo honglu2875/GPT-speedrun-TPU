@@ -28,7 +28,7 @@ _CLUSTER_FIELDS = (
 )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ClusterProfile:
     """One named accelerator cluster: its hosts and what it is supposed to be."""
 
@@ -62,7 +62,7 @@ class ClusterProfile:
         }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class LocalConfig:
     data_path: str = "shm"
     artifacts_path: str = "runs"
