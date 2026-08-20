@@ -53,6 +53,18 @@ def _resolve(module, *, tpp: float, batch: int = 128, learning_rate: float = 2**
 
 
 class ReferenceDurationTests(unittest.TestCase):
+    def test_default_output_directory_tracks_each_recipe_folder(self) -> None:
+        for module, name in (
+            (reference, "reference"),
+            (duration, "reference_duration"),
+        ):
+            with self.subTest(recipe=name):
+                self.assertEqual(module.RECIPE_NAME, name)
+                self.assertEqual(
+                    module.build_parser().parse_args([]).output_dir,
+                    Path("runs") / name,
+                )
+
     def test_five_tpp_anchor_matches_reanchored_reference(self) -> None:
         control = _resolve(reference, tpp=5)
         treatment = _resolve(duration, tpp=5)

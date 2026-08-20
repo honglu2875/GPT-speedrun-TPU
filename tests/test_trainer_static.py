@@ -68,8 +68,8 @@ def _replace_selected_experiment(
 ):
     """Apply deliberate test-only overrides to a nested selected experiment."""
 
-    document = experiment.document
-    family = document.family
+    experiment_config = experiment.config
+    family = experiment_config.family
     definition = experiment.profile
     if training:
         definition = replace(
@@ -97,12 +97,12 @@ def _replace_selected_experiment(
             contexts={**family.contexts, experiment.context_name: selected_context},
         )
     profiles = replace(
-        document.profiles,
+        experiment_config.profiles,
         **{experiment.name: definition},
     )
     return replace(
         experiment,
-        document=replace(document, family=family, profiles=profiles),
+        config=replace(experiment_config, family=family, profiles=profiles),
     )
 
 
@@ -241,7 +241,7 @@ class TrainerStaticTests(unittest.TestCase):
     def test_yaml_config_is_authoritative_strict_and_versioned(self) -> None:
         source = trainer.CONFIG_PATH.read_text(encoding="utf-8")
         official = trainer.load_experiment_profile("official")
-        self.assertEqual(official.document.schema_version, 4)
+        self.assertEqual(official.config.schema_version, 4)
         self.assertEqual(official.profile.training.tokens_per_parameter, 20.0)
         self.assertEqual(official.context_name, "1k")
         self.assertEqual(official.context.reference_batch_size, 128)
@@ -251,7 +251,7 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertEqual(official.profile.training.sampling, "shuffled_epochs")
         self.assertEqual(official.profile.training.dtype, "bfloat16")
         self.assertFalse(hasattr(official, "__dict__"))
-        self.assertFalse(hasattr(official.document, "__dict__"))
+        self.assertFalse(hasattr(official.config, "__dict__"))
         self.assertFalse(hasattr(official.model, "__dict__"))
         self.assertNotIn("\n      parameters:", source)
         self.assertEqual(

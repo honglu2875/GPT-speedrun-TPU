@@ -300,6 +300,13 @@ class WeightDecayPolicyTests(unittest.TestCase):
 
 
 class ContextPresetTests(unittest.TestCase):
+    def test_default_output_directory_tracks_recipe_folder(self) -> None:
+        self.assertEqual(trainer.RECIPE_NAME, "reference_moe")
+        self.assertEqual(
+            trainer.build_parser().parse_args([]).output_dir,
+            Path("runs/reference_moe"),
+        )
+
     def test_moe_defaults_to_8k_and_can_select_the_aligned_1k_preset(self) -> None:
         native = trainer.load_experiment_profile("dev")
         short = trainer.load_experiment_profile("dev", context="1k")

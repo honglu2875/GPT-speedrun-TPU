@@ -158,7 +158,9 @@ from rig.kernels import (
 SCHEMA_VERSION = 1
 CONFIG_SCHEMA_VERSION = 4
 CONFIG_FILENAME = "config.yaml"
-CONFIG_PATH = Path(__file__).resolve().with_name(CONFIG_FILENAME)
+RECIPE_DIR = Path(__file__).resolve().parent
+RECIPE_NAME = RECIPE_DIR.name
+CONFIG_PATH = RECIPE_DIR / CONFIG_FILENAME
 _VALID_PROFILES = ("smoke", "dev", "official")
 _DOMAIN_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _TIER_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
@@ -439,8 +441,8 @@ class ProfileDefinitions:
 
 
 @dataclass(frozen=True, slots=True)
-class ExperimentDocument(ConfigSchema):
-    """Strict nested representation of the complete recipe ``config.yaml``."""
+class ExperimentConfig(ConfigSchema):
+    """Complete typed representation of the recipe's ``config.yaml``."""
 
     schema_version: Literal[4]
     family: FamilyDefinition
@@ -538,7 +540,7 @@ class ExperimentDocument(ConfigSchema):
             )
 
         return SelectedExperiment(
-            document=self,
+            config=self,
             source_sha256=source_sha256,
             name=profile,
             tier_name=tier_name,
@@ -548,9 +550,9 @@ class ExperimentDocument(ConfigSchema):
 
 @dataclass(frozen=True, slots=True)
 class SelectedExperiment:
-    """Runtime profile/tier/context selection over one decoded YAML document."""
+    """Runtime profile/tier/context selection over one decoded YAML config."""
 
-    document: ExperimentDocument
+    config: ExperimentConfig
     source_sha256: str
     name: str
     tier_name: str
@@ -559,20 +561,20 @@ class SelectedExperiment:
     @property
     def profile(self) -> SmokeProfileDefinition | LadderProfileDefinition:
         if self.name == "smoke":
-            return self.document.profiles.smoke
+            return self.config.profiles.smoke
         if self.name == "dev":
-            return self.document.profiles.dev
+            return self.config.profiles.dev
         if self.name == "official":
-            return self.document.profiles.official
+            return self.config.profiles.official
         raise AssertionError(f"invalid selected profile: {self.name!r}")
 
     @property
     def tier(self) -> TierDefinition:
-        return self.document.family.tiers[self.tier_name]
+        return self.config.family.tiers[self.tier_name]
 
     @property
     def context(self) -> ContextPreset:
-        return self.document.family.contexts[self.context_name]
+        return self.config.family.contexts[self.context_name]
 
     @property
     def model(self) -> ModelDefinition:
@@ -589,8 +591,8 @@ class SelectedExperiment:
 
     @property
     def base_tpp_parameters(self) -> int:
-        base_tier = self.document.family.parameterization.base_tier
-        return self.document.family.tiers[base_tier].tpp_parameters
+        base_tier = self.config.family.parameterization.base_tier
+        return self.config.family.tiers[base_tier].tpp_parameters
 
 
 _UINT64_MASK = (1 << 64) - 1
@@ -607,8 +609,8 @@ def load_experiment_profile(
         raise ValueError(f"unknown experiment profile: {profile!r}")
     path = resolve_sibling_config_path(requested_path, CONFIG_PATH)
     mapping, source_sha256 = read_config_document(path)
-    document = ExperimentDocument.from_mapping(mapping)
-    return document.select(profile, source_sha256, tier=tier, context=context)
+    experiment_config = ExperimentConfig.from_mapping(mapping)
+    return experiment_config.select(profile, source_sha256, tier=tier, context=context)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -621,7 +623,7 @@ def build_parser() -> argparse.ArgumentParser:
     run = parser.add_argument_group("run")
     add_standard_config_arguments(
         run,
-        default_output_dir=Path("runs/reference"),
+        default_output_dir=Path("runs") / RECIPE_NAME,
         profiles=_VALID_PROFILES,
     )
     environment_tier = os.environ.get("RIG_TIER")
@@ -754,7 +756,7 @@ def resolve_config(
             raise AssertionError("ladder selection resolved the smoke profile")
         training = definition.training
         context = experiment.context
-        family_parameterization = experiment.document.family.parameterization
+        family_parameterization = experiment.config.family.parameterization
         batch_anchor = context.reference_batch_size
         seq_len = context.seq_len
         document_masking = context.document_masking
@@ -934,7 +936,7 @@ def resolve_config(
         vocab_tile_size=kernels.vocab_tile_size,
         compute_dtype=compute_dtype,
         dtype_name=dtype_name,
-        config_schema_version=experiment.document.schema_version,
+        config_schema_version=experiment.config.schema_version,
         config_sha256=experiment.source_sha256,
         config_profile=experiment.name,
         context_preset=context_preset,
