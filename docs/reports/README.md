@@ -47,7 +47,7 @@ by-product:
 | 3-seed-gradient-spike | 1,440 | 8 | 6.6 MB |
 | 8k-lr-sweep-60M | 1,440 | 8 | 2.4 MB |
 | moe-lr-sweep-8k | 1,440 | 8 | 7.2 MB |
-| seed-variance | 1,440 | — | 9.0 MB |
+| seed-variance | 1,440 | — | 8.4 MB |
 
 The two large ones carry layer detail because gradient spikes are visible in
 it, and studying them is the point. This is deliberate discretion, not a
@@ -65,10 +65,12 @@ do not apply to part of the selection, and a grid of empty frames would bury
 the ones that do.
 
 `seed-variance.html` uses a different reduction: it first computes the
-across-seed sample standard deviation at each exact logged step, then thins
-each derived curve to at most 1,440 points. It exposes all 141 training and 288
-diagnostic series rather than the smaller declared chart list used by the
-general reports.
+across-seed mean and sample standard deviation at each exact logged step. Each
+metric gets two mean ±1 SD panels and two SD-only panels. Mean- and SD-based
+LTTB selections are unioned into at most 1,440 retained steps. The selector
+exposes 45 training and 288 diagnostic series; 96 expert-indexed load series
+are deliberately omitted because expert identities are permutation-symmetric
+across seeds. Permutation-invariant router summaries remain available.
 
 Which metrics get charted is a declared list in `rig/report.py`, separate from
 the metric registry, because how a quantity should be drawn is a judgement the
@@ -351,12 +353,14 @@ excluded because it came from a dirty, different `train.py`; all 63 retained
 runs share the same recipe and configuration hashes. Final FineWeb validation
 loss is 3.9357 ± 0.0167 at 60M and 3.5814 ± 0.0055 at 125M (mean ± sample SD).
 
-The report defaults to training-loss SD against cumulative training FLOPs and
-can switch to every logged training or diagnostic metric. Runs were aligned by
-exact optimizer step and rejected if their column layout, token accounting, or
-FLOP accounting differed. Curves longer than 1,440 points were thinned only
-after computing the across-seed statistic. The checked-in HTML is
-self-contained; no bespoke plotting script is retained.
+The report defaults to training loss against cumulative training FLOPs. Its top
+row plots the mean with a shaded ±1 sample-SD band; its bottom row plots the SD
+directly. The selector can switch among all retained training and diagnostic
+metrics. Runs were aligned by exact optimizer step and rejected if their column
+layout, token accounting, or FLOP accounting differed. Curves longer than
+1,440 points were jointly thinned against the mean and SD only after computing
+both across-seed statistics. The checked-in HTML is self-contained; no bespoke
+plotting script is retained.
 
 Because the seed controls both initialization and shuffled data order, raw
 training-loss and gradient SD includes current-batch composition. Fixed-set
