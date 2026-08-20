@@ -1,0 +1,568 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MoE seed variance across training</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17201d;
+      --muted: #65706b;
+      --paper: #f5f2ea;
+      --panel: #fffdf8;
+      --line: #d9d4c8;
+      --grid: #e8e4da;
+      --accent: #215b4f;
+      --accent-soft: #dfece7;
+      --warning: #8a4b20;
+      --warning-bg: #f7e9d8;
+      --series-a: #236b5b;
+      --series-b: #b2572b;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 8% 0%, rgba(33, 91, 79, .09), transparent 28rem),
+        var(--paper);
+    }
+    main { width: min(1480px, calc(100% - 32px)); margin: 0 auto; padding: 42px 0 60px; }
+    header { max-width: 930px; }
+    .eyebrow {
+      color: var(--accent);
+      font-size: .76rem;
+      font-weight: 750;
+      letter-spacing: .13em;
+      text-transform: uppercase;
+    }
+    h1 { margin: .42rem 0 .65rem; font-size: clamp(2rem, 4vw, 3.5rem); line-height: 1.03; }
+    .lede { margin: 0; color: var(--muted); font-size: 1.04rem; line-height: 1.62; }
+    code {
+      border-radius: 4px;
+      background: rgba(23, 32, 29, .07);
+      padding: .08em .28em;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: .88em;
+    }
+    .warning {
+      margin: 24px 0;
+      padding: 15px 18px;
+      border: 1px solid #e3c6a7;
+      border-left: 4px solid var(--warning);
+      border-radius: 8px;
+      color: #603518;
+      background: var(--warning-bg);
+      line-height: 1.52;
+    }
+    .warning strong { color: #4b2914; }
+    .study-grid, .chart-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .study-card, .controls, .chart-card, .method {
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: var(--panel);
+      box-shadow: 0 6px 22px rgba(35, 42, 38, .035);
+    }
+    .study-card { padding: 18px 20px; }
+    .study-card h2 { margin: 0; font-size: 1.15rem; }
+    .cohort-count { margin: 7px 0 10px; font-size: 1.75rem; font-weight: 760; letter-spacing: -.03em; }
+    .cohort-count span { color: var(--muted); font-size: .88rem; font-weight: 600; letter-spacing: 0; }
+    .progress { height: 6px; overflow: hidden; border-radius: 999px; background: #e9e5dc; }
+    .progress span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
+    .study-detail { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; margin: 13px 0 0; font-size: .84rem; }
+    .study-detail dt { color: var(--muted); }
+    .study-detail dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+    .controls {
+      display: grid;
+      grid-template-columns: minmax(210px, .8fr) minmax(290px, 1.5fr) auto auto;
+      gap: 14px;
+      align-items: end;
+      margin: 16px 0;
+      padding: 16px;
+    }
+    label, fieldset legend { color: var(--muted); font-size: .75rem; font-weight: 730; letter-spacing: .04em; text-transform: uppercase; }
+    input[type="search"], select {
+      display: block;
+      width: 100%;
+      height: 42px;
+      margin-top: 6px;
+      border: 1px solid #c9c5ba;
+      border-radius: 7px;
+      color: var(--ink);
+      background: #fff;
+      padding: 0 11px;
+      font: inherit;
+    }
+    select { font-size: .88rem; }
+    fieldset { margin: 0; padding: 0; border: 0; }
+    .segmented { display: flex; height: 42px; margin-top: 6px; overflow: hidden; border: 1px solid #c9c5ba; border-radius: 7px; }
+    .segmented label {
+      display: grid;
+      place-items: center;
+      min-width: 67px;
+      padding: 0 12px;
+      color: var(--ink);
+      background: #fff;
+      cursor: pointer;
+      font-size: .78rem;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+    .segmented label + label { border-left: 1px solid #c9c5ba; }
+    .segmented input { position: absolute; opacity: 0; pointer-events: none; }
+    .segmented label:has(input:checked) { color: #fff; background: var(--accent); }
+    .metric-note { min-height: 25px; margin: 0 0 9px; color: var(--muted); font-size: .85rem; }
+    .chart-card { position: relative; min-width: 0; padding: 17px 15px 12px; }
+    .chart-card h3 { margin: 0 0 2px 7px; font-size: 1.05rem; }
+    .chart-card .subhead { margin: 0 0 4px 7px; color: var(--muted); font-size: .78rem; }
+    canvas { display: block; width: 100%; height: 390px; }
+    .tooltip {
+      position: absolute;
+      z-index: 3;
+      display: none;
+      min-width: 184px;
+      border: 1px solid rgba(23, 32, 29, .2);
+      border-radius: 7px;
+      color: #fff;
+      background: rgba(23, 32, 29, .94);
+      padding: 9px 11px;
+      font-size: .75rem;
+      line-height: 1.5;
+      pointer-events: none;
+      box-shadow: 0 7px 20px rgba(0, 0, 0, .15);
+      font-variant-numeric: tabular-nums;
+    }
+    .tooltip strong { display: block; margin-bottom: 2px; font-size: .8rem; }
+    .method { margin-top: 16px; padding: 18px 20px; color: var(--muted); font-size: .88rem; line-height: 1.58; }
+    .method strong { color: var(--ink); }
+    .method p { margin: 0; }
+    .method p + p { margin-top: 8px; }
+    #loading { padding: 24px 0; color: var(--muted); }
+    .error { color: #8b251e !important; }
+    @media (max-width: 850px) {
+      main { width: min(100% - 20px, 720px); padding-top: 26px; }
+      .study-grid, .chart-grid, .controls { grid-template-columns: 1fr; }
+      canvas { height: 340px; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">Seed-variance study</div>
+    <h1>How much do identical MoE runs separate?</h1>
+    <p class="lede">
+      Each curve is the sample standard deviation across seeds at the exact same
+      optimizer step, plotted against cumulative training FLOPs. The default is
+      training loss; the selector exposes every training and long-form diagnostic
+      series recorded by both studies.
+    </p>
+  </header>
+
+  <aside class="warning">
+    <strong>Historical optimizer boundary.</strong> Every run here predates commit
+    <code>102a264672c8453700a02e321495a14c585e58ea</code>. The earlier AdamW mask
+    treated stacked rank-2 <code>expert_up_b</code> and <code>expert_down_b</code>
+    bias tensors as weights and decayed them. The effect is expected to be minor,
+    but a current checkout uses the corrected policy and cannot reproduce these
+    trajectories bit-for-bit.
+  </aside>
+
+  <div id="loading">Loading the compressed report payload…</div>
+  <section id="report" hidden>
+    <div class="study-grid" id="study-grid"></div>
+
+    <div class="controls">
+      <label>Filter metrics
+        <input id="metric-filter" type="search" placeholder="loss, router, grad, block 7…">
+      </label>
+      <label>Displayed metric
+        <select id="metric-select"></select>
+      </label>
+      <fieldset>
+        <legend>FLOP scale</legend>
+        <div class="segmented">
+          <label><input type="radio" name="x-scale" value="log" checked>Log</label>
+          <label><input type="radio" name="x-scale" value="linear">Linear</label>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>Vertical range</legend>
+        <div class="segmented">
+          <label><input type="radio" name="y-range" value="shared" checked>Shared</label>
+          <label><input type="radio" name="y-range" value="panel">Per panel</label>
+        </div>
+      </fieldset>
+    </div>
+
+    <p class="metric-note" id="metric-note"></p>
+    <div class="chart-grid" id="chart-grid"></div>
+
+    <section class="method">
+      <p><strong>Estimator.</strong> Values are aligned by exact optimizer step and
+      reduced with the sample standard deviation (<em>n</em> − 1). A tooltip reports
+      the number of finite seeds contributing at that point. Hovering either chart
+      places the crosshair at the same FLOP budget in both studies.</p>
+      <p><strong>Resolution.</strong> The archived <code>.riglog</code> files remain
+      full resolution. Curves longer than <span id="max-points">1,440</span>
+      samples are thinned only after the
+      across-seed statistic is computed, using largest-triangle-three-buckets in
+      FLOP coordinates. Endpoints are always retained.</p>
+      <p><strong>Interpretation.</strong> The seed changes both initialization and
+      shuffled training-data order. Raw training-loss and gradient variance
+      therefore includes the loss composition of each seed's current batch; it
+      is not a pure measure of parameter-state separation. The fixed final
+      validation set is the cleaner endpoint comparison.</p>
+    </section>
+  </section>
+</main>
+
+<script id="payload" type="application/octet-stream">__PAYLOAD_BASE64__</script>
+<script>
+"use strict";
+
+const colors = ["#236b5b", "#b2572b"];
+let payload;
+let metricById;
+let currentMetric;
+let xScale = "log";
+let yRange = "shared";
+let hoverFlops = null;
+
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function concise(value, digits = 3) {
+  if (!Number.isFinite(value)) return "—";
+  const absolute = Math.abs(value);
+  if (absolute === 0) return "0";
+  if (absolute >= 1e4 || absolute < 1e-4) return value.toExponential(2);
+  return Number(value.toPrecision(digits)).toString();
+}
+
+function flopsLabel(value) {
+  const units = [[1e21, "ZFLOP"], [1e18, "EFLOP"], [1e15, "PFLOP"], [1e12, "TFLOP"]];
+  for (const [scale, unit] of units) {
+    if (value >= scale) return `${concise(value / scale, 3)} ${unit}`;
+  }
+  return value.toExponential(2);
+}
+
+function seedRanges(seeds) {
+  if (!seeds.length) return "none";
+  const ranges = [];
+  let start = seeds[0], previous = seeds[0];
+  for (const seed of seeds.slice(1)) {
+    if (seed === previous + 1) { previous = seed; continue; }
+    ranges.push(start === previous ? `${start}` : `${start}–${previous}`);
+    start = previous = seed;
+  }
+  ranges.push(start === previous ? `${start}` : `${start}–${previous}`);
+  return ranges.join(", ");
+}
+
+function renderStudyCards() {
+  const grid = document.getElementById("study-grid");
+  for (const study of payload.studies) {
+    const card = el("article", "study-card");
+    card.append(el("h2", "", study.label));
+    const count = el("div", "cohort-count");
+    count.append(document.createTextNode(`${study.completed} `));
+    count.append(el("span", "", `/ ${study.planned} planned seeds complete`));
+    card.append(count);
+    const progress = el("div", "progress");
+    const bar = el("span");
+    bar.style.width = `${Math.min(100, study.progress * 100)}%`;
+    progress.append(bar);
+    card.append(progress);
+    const detail = el("dl", "study-detail");
+    const rows = [
+      ["Completion", `${(study.progress * 100).toFixed(1)}%`],
+      ["Seeds", seedRanges(study.seeds)],
+      ["Final validation", `${study.finalValidationMean.toFixed(4)} ± ${study.finalValidationSd.toFixed(4)} SD`],
+      ["Hardware", study.hardware],
+    ];
+    for (const [term, value] of rows) {
+      detail.append(el("dt", "", term), el("dd", "", value));
+    }
+    card.append(detail);
+    grid.append(card);
+  }
+}
+
+function renderChartShells() {
+  const grid = document.getElementById("chart-grid");
+  payload.studies.forEach((study, index) => {
+    const card = el("article", "chart-card");
+    card.dataset.index = index;
+    card.append(el("h3", "", study.label));
+    card.append(el("p", "subhead", `${study.completed} independent seeds`));
+    const canvas = document.createElement("canvas");
+    canvas.setAttribute("aria-label", `${study.label} seed standard deviation chart`);
+    canvas.dataset.index = index;
+    const tooltip = el("div", "tooltip");
+    card.append(canvas, tooltip);
+    grid.append(card);
+
+    canvas.addEventListener("pointermove", event => {
+      const metric = currentMetric;
+      const points = metric.series[index];
+      if (!points.length) return;
+      const box = canvas.getBoundingClientRect();
+      const left = 70, right = 18;
+      const fraction = Math.max(0, Math.min(1, (event.clientX - box.left - left) / (box.width - left - right)));
+      const first = pointFlops(points[0], study);
+      const last = pointFlops(points[points.length - 1], study);
+      hoverFlops = xScale === "log"
+        ? 10 ** (Math.log10(first) + fraction * (Math.log10(last) - Math.log10(first)))
+        : first + fraction * (last - first);
+      drawAll();
+    });
+    canvas.addEventListener("pointerleave", () => { hoverFlops = null; drawAll(); });
+  });
+}
+
+function populateMetricSelect(query = "") {
+  const select = document.getElementById("metric-select");
+  const previous = select.value || payload.meta.defaultMetric;
+  const needle = query.trim().toLowerCase();
+  select.replaceChildren();
+  const groups = new Map();
+  for (const metric of payload.metrics) {
+    const haystack = `${metric.label} ${metric.raw}`.toLowerCase();
+    if (needle && !haystack.includes(needle)) continue;
+    if (!groups.has(metric.source)) {
+      const group = document.createElement("optgroup");
+      group.label = metric.source;
+      groups.set(metric.source, group);
+      select.append(group);
+    }
+    const option = document.createElement("option");
+    option.value = metric.id;
+    option.textContent = metric.label;
+    groups.get(metric.source).append(option);
+  }
+  const available = [...select.options].map(option => option.value);
+  if (!available.length) {
+    const option = document.createElement("option");
+    option.textContent = "No matching metrics";
+    option.disabled = true;
+    select.append(option);
+    return;
+  }
+  select.value = available.includes(previous) ? previous : available[0];
+  currentMetric = metricById.get(select.value);
+  drawAll();
+}
+
+function pointFlops(point, study) {
+  return point[0] * study.flopsPerStep;
+}
+
+function nearestPoint(points, target, study) {
+  if (!points.length || target < pointFlops(points[0], study) || target > pointFlops(points[points.length - 1], study)) return null;
+  let low = 0, high = points.length - 1;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (pointFlops(points[middle], study) < target) low = middle + 1;
+    else high = middle;
+  }
+  if (low === 0) return points[0];
+  return Math.abs(pointFlops(points[low], study) - target) < Math.abs(pointFlops(points[low - 1], study) - target)
+    ? points[low] : points[low - 1];
+}
+
+function niceCeiling(value) {
+  if (!(value > 0)) return 1e-9;
+  const power = 10 ** Math.floor(Math.log10(value));
+  const fraction = value / power;
+  const nice = fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 5 ? 5 : 10;
+  return nice * power;
+}
+
+function canvasContext(canvas) {
+  const ratio = window.devicePixelRatio || 1;
+  const width = Math.max(320, canvas.clientWidth);
+  const height = canvas.clientHeight;
+  const pixelWidth = Math.round(width * ratio), pixelHeight = Math.round(height * ratio);
+  if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+    canvas.width = pixelWidth;
+    canvas.height = pixelHeight;
+  }
+  const context = canvas.getContext("2d");
+  context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  context.clearRect(0, 0, width, height);
+  return {context, width, height};
+}
+
+function drawChart(canvas, points, study, index, yMaximum) {
+  const {context: ctx, width, height} = canvasContext(canvas);
+  const margin = {left: 70, right: 18, top: 24, bottom: 58};
+  const plotWidth = width - margin.left - margin.right;
+  const plotHeight = height - margin.top - margin.bottom;
+  const tooltip = canvas.parentElement.querySelector(".tooltip");
+  tooltip.style.display = "none";
+
+  ctx.fillStyle = "#fffdf8";
+  ctx.fillRect(0, 0, width, height);
+  if (!points.length) {
+    ctx.fillStyle = "#65706b";
+    ctx.font = "13px system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("This metric was not recorded in this study", width / 2, height / 2);
+    return;
+  }
+
+  const xMin = pointFlops(points[0], study), xMax = pointFlops(points[points.length - 1], study);
+  const tx = value => xScale === "log" ? Math.log10(value) : value;
+  const txMin = tx(xMin), txMax = tx(xMax);
+  const xPixel = value => margin.left + (tx(value) - txMin) / (txMax - txMin) * plotWidth;
+  const yPixel = value => margin.top + (1 - value / yMaximum) * plotHeight;
+
+  ctx.strokeStyle = "#e8e4da";
+  ctx.lineWidth = 1;
+  ctx.fillStyle = "#65706b";
+  ctx.font = "11px ui-monospace, monospace";
+  for (let tick = 0; tick <= 4; tick++) {
+    const fraction = tick / 4;
+    const y = margin.top + (1 - fraction) * plotHeight;
+    ctx.beginPath(); ctx.moveTo(margin.left, y); ctx.lineTo(width - margin.right, y); ctx.stroke();
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    ctx.fillText(concise(fraction * yMaximum, 3), margin.left - 8, y);
+  }
+  for (let tick = 0; tick <= 4; tick++) {
+    const fraction = tick / 4;
+    const transformed = txMin + fraction * (txMax - txMin);
+    const value = xScale === "log" ? 10 ** transformed : transformed;
+    const x = margin.left + fraction * plotWidth;
+    ctx.beginPath(); ctx.moveTo(x, margin.top); ctx.lineTo(x, height - margin.bottom); ctx.stroke();
+    ctx.textAlign = tick === 0 ? "left" : tick === 4 ? "right" : "center";
+    ctx.textBaseline = "top";
+    ctx.fillText(flopsLabel(value), x, height - margin.bottom + 9);
+  }
+
+  ctx.save();
+  ctx.translate(15, margin.top + plotHeight / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#65706b";
+  ctx.font = "11px system-ui, sans-serif";
+  ctx.fillText("sample standard deviation", 0, 0);
+  ctx.restore();
+  ctx.textAlign = "center";
+  ctx.textBaseline = "bottom";
+  ctx.fillText("cumulative training FLOPs", margin.left + plotWidth / 2, height - 2);
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(margin.left, margin.top, plotWidth, plotHeight);
+  ctx.clip();
+  ctx.strokeStyle = colors[index];
+  ctx.lineWidth = 2;
+  ctx.lineJoin = "round";
+  ctx.beginPath();
+  points.forEach((point, pointIndex) => {
+    const x = xPixel(pointFlops(point, study)), y = yPixel(point[1]);
+    if (pointIndex === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+
+  const hovered = hoverFlops === null ? null : nearestPoint(points, hoverFlops, study);
+  if (hovered) {
+    const hoveredFlops = pointFlops(hovered, study);
+    const x = xPixel(hoveredFlops), y = yPixel(hovered[1]);
+    ctx.strokeStyle = "rgba(23, 32, 29, .45)";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(x, margin.top); ctx.lineTo(x, height - margin.bottom); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = colors[index];
+    ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2); ctx.fill();
+    tooltip.replaceChildren();
+    tooltip.append(el("strong", "", study.label));
+    tooltip.append(
+      document.createTextNode(`step ${hovered[0].toLocaleString()}\n`),
+      document.createElement("br"),
+      document.createTextNode(`${flopsLabel(hoveredFlops)}\n`),
+      document.createElement("br"),
+      document.createTextNode(`SD ${concise(hovered[1], 5)} · n=${hovered[2]}`),
+    );
+    tooltip.style.display = "block";
+    const left = Math.min(width - 204, Math.max(8, x + 14));
+    const top = Math.min(height - 98, Math.max(48, y - 32));
+    tooltip.style.left = `${left}px`;
+    tooltip.style.top = `${top}px`;
+  }
+  ctx.restore();
+}
+
+function drawAll() {
+  if (!currentMetric) return;
+  const panelMaximums = currentMetric.series.map(points =>
+    niceCeiling(Math.max(0, ...points.map(point => point[1])) * 1.06)
+  );
+  const sharedMaximum = Math.max(...panelMaximums);
+  document.getElementById("metric-note").textContent =
+    `${currentMetric.source} · ${currentMetric.raw} · ${yRange === "shared" ? "shared vertical scale" : "independent panel scales"}`;
+  document.querySelectorAll("canvas").forEach((canvas, index) => {
+    const yMaximum = yRange === "shared" ? sharedMaximum : panelMaximums[index];
+    drawChart(canvas, currentMetric.series[index], payload.studies[index], index, yMaximum);
+  });
+}
+
+async function unpackPayload() {
+  const binary = atob(document.getElementById("payload").textContent.trim());
+  const bytes = Uint8Array.from(binary, character => character.charCodeAt(0));
+  if (!("DecompressionStream" in window)) {
+    throw new Error("This report needs a browser with gzip DecompressionStream support.");
+  }
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+  return JSON.parse(await new Response(stream).text());
+}
+
+async function start() {
+  const loading = document.getElementById("loading");
+  try {
+    payload = await unpackPayload();
+    document.getElementById("max-points").textContent = payload.meta.maxPoints.toLocaleString();
+    metricById = new Map(payload.metrics.map(metric => [metric.id, metric]));
+    currentMetric = metricById.get(payload.meta.defaultMetric);
+    renderStudyCards();
+    renderChartShells();
+    populateMetricSelect();
+    document.getElementById("metric-select").addEventListener("change", event => {
+      currentMetric = metricById.get(event.target.value);
+      hoverFlops = null;
+      drawAll();
+    });
+    document.getElementById("metric-filter").addEventListener("input", event => {
+      populateMetricSelect(event.target.value);
+    });
+    document.querySelectorAll('input[name="x-scale"]').forEach(input => {
+      input.addEventListener("change", event => { xScale = event.target.value; hoverFlops = null; drawAll(); });
+    });
+    document.querySelectorAll('input[name="y-range"]').forEach(input => {
+      input.addEventListener("change", event => { yRange = event.target.value; drawAll(); });
+    });
+    new ResizeObserver(drawAll).observe(document.getElementById("chart-grid"));
+    loading.hidden = true;
+    document.getElementById("report").hidden = false;
+    drawAll();
+  } catch (error) {
+    loading.classList.add("error");
+    loading.textContent = `Could not load report: ${error.message}`;
+  }
+}
+
+start();
+</script>
+</body>
+</html>
