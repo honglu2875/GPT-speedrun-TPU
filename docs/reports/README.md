@@ -8,10 +8,10 @@ exact.
 ## The logs live on HuggingFace
 
 **[huggingface.co/datasets/quintic/rig-logs](https://huggingface.co/datasets/quintic/rig-logs)**
-— 177 runs across six studies, laid out as `<study>/<run-name>/`, at full
+— 300 runs across ten studies, laid out as `<study>/<run-name>/`, at full
 recorded resolution. That is the archive of record; its
 [dataset card](https://huggingface.co/datasets/quintic/rig-logs/blob/main/README.md)
-is a copy of this file.
+mirrors this catalog and adds archive and reproduction metadata.
 
 The dashboards committed here are **summaries** of those logs, thinned so they
 stay portable. Nothing in them is a substitute for the logs: they are one
@@ -47,6 +47,7 @@ by-product:
 | 3-seed-gradient-spike | 1,440 | 8 | 6.6 MB |
 | 8k-lr-sweep-60M | 1,440 | 8 | 2.4 MB |
 | moe-lr-sweep-8k | 1,440 | 8 | 7.2 MB |
+| seed-variance | 1,440 | — | 9.0 MB |
 
 The two large ones carry layer detail because gradient spikes are visible in
 it, and studying them is the point. This is deliberate discretion, not a
@@ -62,6 +63,12 @@ all — the panel is hidden rather than left as an empty frame. Routed runs
 record routing series a dense run never will, so most reports carry charts that
 do not apply to part of the selection, and a grid of empty frames would bury
 the ones that do.
+
+`seed-variance.html` uses a different reduction: it first computes the
+across-seed sample standard deviation at each exact logged step, then thins
+each derived curve to at most 1,440 points. It exposes all 141 training and 288
+diagnostic series rather than the smaller declared chart list used by the
+general reports.
 
 Which metrics get charted is a declared list in `rig/report.py`, separate from
 the metric registry, because how a quantity should be drawn is a judgement the
@@ -90,9 +97,10 @@ attention tile plan; what differs is that gradients reduce across a different
 number of devices and each chip holds a different share of the batch.
 
 Every dashboard therefore shows chip kind, chip count, and process count beside
-each run, and the run filter matches on chip. Every study is TPU v4, 4
-processes, 16 chips, except `batch-size-sweep-500M`, which mixes that with 6
-runs on TPU v6 lite at 1 process and 8 chips — its 20-TPP arm.
+each run, and the run filter matches on chip. The 60M seed cohort is entirely
+TPU v6 lite at 1 process and 8 chips; the 125M cohort is entirely TPU v4 at 4
+processes and 16 chips. `batch-size-sweep-500M` remains the only individual
+study that mixes the two topologies.
 
 ## Contents
 
@@ -106,11 +114,12 @@ runs on TPU v6 lite at 1 process and 8 chips — its 20-TPP arm.
 | [8k-lr-sweep-60M](8k-lr-sweep-60M.html) | 15 | 60M | LR × seed at 8k context | [`lr-sweep-8k-60M`](https://huggingface.co/datasets/quintic/rig-logs/tree/main/lr-sweep-8k-60M) |
 | [moe-lr-sweep-8k](moe-lr-sweep-8k.html) | 18 | 60M/125M | LR × seed, top-2 of 8 experts | [`moe-lr-sweep-8k`](https://huggingface.co/datasets/quintic/rig-logs/tree/main/moe-lr-sweep-8k) |
 | [batch-size-grid-8k](batch-size-grid-8k.html) | 42 | 60M/125M | batch × LR × seed at 8k, dense and routed | [`batch-size-grid-8k`](https://huggingface.co/datasets/quintic/rig-logs/tree/main/batch-size-grid-8k) |
+| [seed-variance](seed-variance.html) | 63 | 60M/125M | seed at a fixed MoE recipe | [`seed-variance-60M`](https://huggingface.co/datasets/quintic/rig-logs/tree/main/seed-variance-60M), [`seed-variance-125M`](https://huggingface.co/datasets/quintic/rig-logs/tree/main/seed-variance-125M) |
 | [transfer-charts](transfer-charts.html) | — | — | derived figures, not a run dashboard | — |
 
-Each study also carries a `snapshot.json.gz` (loss curves only, 0.05–0.30 MB)
-and, for the two above, a `snapshot-diagnostics.json.gz` (1.0–3.5 MB). These
-are what the study browser loads before you ask it for anything larger.
+Each study also carries a compact `snapshot.json.gz` (0.05–1.0 MB of thinned
+curves). Some studies carry a separate diagnostic snapshot. These are what the
+study browser and derived visualizations load before anything larger.
 
 ---
 
@@ -259,8 +268,8 @@ done
 
 ## Historical MoE optimizer note
 
-Every archived `reference_moe` run in `moe-lr-sweep-8k`, and every routed arm
-in `batch-size-grid-8k`, predates commit
+Every archived `reference_moe` run in `moe-lr-sweep-8k`, every routed arm in
+`batch-size-grid-8k`, and both seed-variance cohorts predate commit
 `102a264672c8453700a02e321495a14c585e58ea`. The old AdamW mask inferred decay
 from array rank, so stacked rank-2 `expert_up_b` and `expert_down_b` bias
 tensors incorrectly received weight decay. We expect the numerical difference
@@ -334,14 +343,35 @@ for recipe in reference reference_moe; do
 done
 ```
 
+## seed-variance.html
+
+Two incomplete but already substantial fixed-recipe cohorts: **41 of 64**
+planned seeds at 60M and **22 of 64** at 125M. The 60M seed-1369 artifact is
+excluded because it came from a dirty, different `train.py`; all 63 retained
+runs share the same recipe and configuration hashes. Final FineWeb validation
+loss is 3.9357 ± 0.0167 at 60M and 3.5814 ± 0.0055 at 125M (mean ± sample SD).
+
+The report defaults to training-loss SD against cumulative training FLOPs and
+can switch to every logged training or diagnostic metric. Runs were aligned by
+exact optimizer step and rejected if their column layout, token accounting, or
+FLOP accounting differed. Curves longer than 1,440 points were thinned only
+after computing the across-seed statistic. The checked-in HTML is
+self-contained; no bespoke plotting script is retained.
+
+Because the seed controls both initialization and shuffled data order, raw
+training-loss and gradient SD includes current-batch composition. Fixed-set
+final validation is the cleaner endpoint model-variance estimate. The two
+cohorts also ran on different TPU topologies, so the paired display is not a
+hardware-controlled test of variance scaling with model size.
+
+The two Hugging Face study cards hold the current reproduction commands and
+the pre-`102a264672c8453700a02e321495a14c585e58ea` AdamW compatibility note.
+
 ## transfer-charts.html
 
-Not a run dashboard. Derived figures built from recorded results by
-[`make_transfer_charts.py`](make_transfer_charts.py), committed beside it.
-
-```bash
-uv run --frozen --no-sync python docs/reports/make_transfer_charts.py
-```
+Not a run dashboard. It is a self-contained derived visualization built from
+the compact Hugging Face curve snapshots. The HTML is retained; a bespoke
+plotting script is not.
 
 ---
 
@@ -350,7 +380,7 @@ uv run --frozen --no-sync python docs/reports/make_transfer_charts.py
 Download a study from the dataset and point `rig report` at it:
 
 ```bash
-huggingface-cli download quintic/rig-logs --repo-type dataset \
+hf download quintic/rig-logs --repo-type dataset \
   --include 'batch-sweep-60M/*' --local-dir /tmp/rig-logs
 rig report --runs /tmp/rig-logs/batch-sweep-60M \
   --max-points 1440 --layer-snapshots 400 \

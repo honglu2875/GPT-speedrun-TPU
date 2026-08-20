@@ -527,5 +527,6 @@ Two artifact-format changes make older runs non-comparable in specific ways:
 Study 3's dashboard is
 [batch-size-sweep-500M.html](reports/batch-size-sweep-500M.html), which plots
 all twelve 500M runs — both token budgets, both artifact formats, and all three
-archives — in one place. Rebuild it with
-[`docs/reports/build_500m_report.py`](reports/build_500m_report.py).
+archives — in one place. Its raw-log location and the general `rig report`
+rebuild workflow are documented in the [reports README](reports/README.md); no
+study-specific builder is retained.
