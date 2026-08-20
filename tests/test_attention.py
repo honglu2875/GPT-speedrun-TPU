@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -12,6 +14,9 @@ import numpy as np
 
 from rig import attention
 from rig.kernels import AttentionTiles
+
+
+ROOT = Path(__file__).parents[1]
 
 
 def _tiles() -> AttentionTiles:
@@ -204,6 +209,38 @@ class MeshAttentionTests(unittest.TestCase):
             attention.document_segments(tokens, 9),
             np.asarray([[1, 1, 1, 2, 2], [0, 1, 1, 2, 3]], np.int32),
         )
+
+
+class RecipeAttentionWiringTests(unittest.TestCase):
+    def test_recipe_forks_do_not_reimplement_shared_attention_plumbing(self) -> None:
+        shared = {
+            "AttentionCallable",
+            "AttentionRuntime",
+            "attention_console_rows",
+            "attention_runtime_metadata",
+            "attention_softmax_scale",
+            "document_segments",
+            "make_mesh_attention",
+            "resolve_attention_runtime",
+        }
+        for recipe in ("reference", "reference_duration", "reference_moe"):
+            with self.subTest(recipe=recipe):
+                path = ROOT / "recipes" / recipe / "train.py"
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+                definitions = {
+                    node.name
+                    for node in tree.body
+                    if isinstance(node, (ast.ClassDef, ast.FunctionDef))
+                }
+                imported = {
+                    alias.asname or alias.name
+                    for node in tree.body
+                    if isinstance(node, ast.ImportFrom)
+                    and node.module == "rig.attention"
+                    for alias in node.names
+                }
+                self.assertTrue(shared.isdisjoint(definitions))
+                self.assertTrue(shared <= imported)
 
 
 if __name__ == "__main__":  # pragma: no cover

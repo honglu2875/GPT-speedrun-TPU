@@ -19,8 +19,10 @@ from unittest.mock import patch
 
 import numpy as np
 
+from rig import attention as rig_attention
 from rig import configfile, evaluation, logpack, metrics, runlog
 from rig import tokens as rig_tokens
+from rig.kernels import AttentionTiles
 
 
 TRAINER_PATH = Path(__file__).parents[1] / "recipes" / "reference" / "train.py"
@@ -120,7 +122,10 @@ class TrainerStaticTests(unittest.TestCase):
                 self.assertEqual(config.d_model // config.heads, 64)
                 self.assertEqual(config.attention_scale, "inverse_head_dim")
                 self.assertAlmostEqual(
-                    trainer.attention_softmax_scale(config), 1.0 / 64.0
+                    trainer.attention_softmax_scale(
+                        config.attention_scale, config.d_model // config.heads
+                    ),
+                    1.0 / 64.0,
                 )
                 self.assertAlmostEqual(config.tokens_per_parameter, 20.0, places=3)
                 self.assertEqual(
@@ -374,22 +379,6 @@ class TrainerStaticTests(unittest.TestCase):
         )
         trainer.validate_args(valid)
 
-        with patch.object(trainer, "make_runtime_key") as make_key:
-            runtime = trainer.prepare_attention_runtime(
-                defaults,
-                SimpleNamespace(attention_backend="dense"),
-                (),
-            )
-        make_key.assert_not_called()
-        self.assertEqual(
-            trainer.attention_runtime_metadata(runtime),
-            {
-                "key_digest": None,
-                "resolution_source": "dense",
-                "tune_seconds": 0.0,
-                "tiles": None,
-            },
-        )
         self.assertEqual(trainer.xprof_step_window(valid, 100), (11, 30))
         self.assertFalse(
             trainer.should_compile_evaluation(valid, SimpleNamespace(val_every=0), ())
@@ -704,48 +693,21 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertEqual(smoke.attention_backend, "dense")
         self.assertEqual(development.attention_backend, "tpu_flash")
 
-    def test_ordinary_attention_resolution_uses_exact_local_shape(self) -> None:
-        parser = trainer.build_parser()
-        args = parser.parse_args(["--profile", "official"])
-        config = trainer.resolve_config(args, "tpu", 50_304)
-        devices = [FakeDevice("tpu", "TPU v4") for _ in range(4)]
-        tiles = trainer.AttentionTiles(512, 512, 256, 512, 256, 512, 256, 256, 512, 256)
-        key = SimpleNamespace(digest="a" * 64)
-        resolved = SimpleNamespace(source="shipped", tiles=tiles)
-        with (
-            patch.object(trainer, "make_runtime_key", return_value=key) as make_key,
-            patch.object(
-                trainer, "resolve_attention_tile_plan", return_value=resolved
-            ) as resolve,
-        ):
-            runtime = trainer.prepare_attention_runtime(args, config, devices)
-
-        key_arguments = make_key.call_args.kwargs
-        self.assertEqual(key_arguments["backend"], "tpu_flash")
-        self.assertEqual(key_arguments["batch"], 32)
-        self.assertEqual(key_arguments["heads"], 10)
-        self.assertEqual(key_arguments["sequence"], 1_024)
-        self.assertEqual(key_arguments["head_dim"], 64)
-        self.assertEqual(key_arguments["mode"], "forward_backward")
-        self.assertIs(key_arguments["device"], devices[0])
-        # Resolved from the key alone: no path, no measurement, no I/O.
-        resolve.assert_called_once_with(key)
-        self.assertEqual(runtime.key_digest, "a" * 64)
-        self.assertEqual(runtime.resolution_source, "shipped")
-        self.assertEqual(runtime.tiles, tiles)
-        self.assertEqual(runtime.tune_seconds, 0.0)
+    def test_attention_runtime_is_shared_and_resolved_before_mesh_creation(
+        self,
+    ) -> None:
+        self.assertIs(
+            trainer.resolve_attention_runtime, rig_attention.resolve_attention_runtime
+        )
+        self.assertIs(trainer.make_mesh_attention, rig_attention.make_mesh_attention)
         source = TRAINER_PATH.read_text(encoding="utf-8")
         self.assertLess(
-            source.index(
-                "attention_runtime = prepare_attention_runtime(args, config, devices)"
-            ),
+            source.index("attention_runtime = resolve_attention_runtime("),
             source.index('mesh = Mesh(np.asarray(devices, dtype=object), ("data",))'),
         )
         self.assertLess(
             source.index('mesh = Mesh(np.asarray(devices, dtype=object), ("data",))'),
-            source.index(
-                "attention_fn = make_mesh_attention(config, mesh, attention_runtime.tiles)"
-            ),
+            source.index("attention_fn = make_mesh_attention("),
         )
 
     def test_trainer_never_benchmarks_kernels_at_runtime(self) -> None:
@@ -755,42 +717,12 @@ class TrainerStaticTests(unittest.TestCase):
             with self.subTest(symbol=banned):
                 self.assertNotIn(banned, source)
 
-    def test_mesh_attention_uses_pre_resolved_exact_plan(self) -> None:
-        parser = trainer.build_parser()
-        config = trainer.resolve_config(
-            parser.parse_args(["--profile", "official"]),
-            "tpu",
-            50_304,
-        )
-        tiles = trainer.AttentionTiles(512, 512, 256, 512, 256, 512, 256, 256, 512, 256)
-        local_attention = object()
-        with (
-            patch.object(
-                trainer, "make_causal_attention", return_value=local_attention
-            ) as make_attention,
-            patch.object(trainer.jax, "shard_map", return_value="mapped") as shard,
-        ):
-            actual = trainer.make_mesh_attention(config, object(), tiles)
-
-        self.assertEqual(actual, "mapped")
-        attention_config = make_attention.call_args.args[0]
-        self.assertEqual(attention_config.backend, "tpu_flash")
-        self.assertEqual(attention_config.tiles, tiles)
-        self.assertIs(shard.call_args.args[0], local_attention)
-        with self.assertRaisesRegex(ValueError, "resolved tile plan"):
-            trainer.make_mesh_attention(config, object(), None)
-        self.assertIsNone(
-            trainer.make_mesh_attention(
-                SimpleNamespace(attention_backend="dense"), object(), None
-            )
-        )
-
     def test_attention_tuning_metadata_is_saved_with_exact_plan(self) -> None:
         parser = trainer.build_parser()
         config = trainer.resolve_config(
             parser.parse_args(["--profile", "smoke"]), "cpu", 256
         )
-        tiles = trainer.AttentionTiles(512, 512, 256, 512, 256, 512, 256, 256, 512, 256)
+        tiles = AttentionTiles(512, 512, 256, 512, 256, 512, 256, 256, 512, 256)
         runtime = trainer.AttentionRuntime("c" * 64, "cache", tiles, 0.0)
         expected = trainer.attention_runtime_metadata(runtime)
         self.assertEqual(expected["key_digest"], "c" * 64)
@@ -844,7 +776,7 @@ class TrainerStaticTests(unittest.TestCase):
             50_304,
             experiment,
         )
-        tiles = trainer.AttentionTiles(512, 512, 256, 512, 256, 512, 256, 256, 512, 256)
+        tiles = AttentionTiles(512, 512, 256, 512, 256, 512, 256, 256, 512, 256)
         runtime = trainer.AttentionRuntime("d" * 64, "shipped", tiles, 0.0)
         self.assertEqual(
             trainer.contract_model_metadata(config),
