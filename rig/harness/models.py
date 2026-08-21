@@ -11,7 +11,7 @@ from typing import Any, Literal, Mapping, Sequence
 MAX_RUN_NAME = 40
 _RUN_NAME_STRIP = re.compile(r"[^a-z0-9]+")
 
-CheckpointRetention = Literal["always", "qualifying", "none"]
+CheckpointPolicy = Literal["always", "qualifying", "none"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,7 +31,7 @@ class RunConfig:
     timeout_seconds: float = 900.0
     trainer_args: Sequence[str] = ()
     cohort: Mapping[str, Any] | None = None
-    checkpoint_retention: CheckpointRetention = "qualifying"
+    checkpoint_policy: CheckpointPolicy = "qualifying"
     python_executable: str | None = None
     environment: Mapping[str, str] = field(default_factory=dict)
     provenance: Mapping[str, Any] = field(default_factory=dict)
@@ -47,7 +47,6 @@ class RunConfig:
     # against socket.gethostname() to decide who writes artifacts, so it
     # must be the reported name, not the ssh target.
     artifact_hostname: str = ""
-    require_checkpoint: bool = True
 
 
 @dataclass(frozen=True)

@@ -11,6 +11,7 @@ from rig.data_routing import (
     SCALED_CORE_SHA256,
     SCALED_ENTRYPOINT_SHA256,
     SCALED_EXCLUSION_POLICY_SHA256,
+    SCALED_SHARD_TOKENS,
     SCALED_SOURCE_INVENTORY_SHA256,
     SCALED_SOURCE_REPOSITORY,
     SCALED_SOURCE_REVISION,
@@ -76,7 +77,7 @@ def publication_manifest(variant: str = "2B") -> dict[str, object]:
             "nested_prefix": True,
         },
         "default_train_shards": train_shards,
-        "validation_prefix_tokens": 100_000_000,
+        "validation_prefix_tokens": 10_485_760,
         "files": [
             {
                 "path": name,
@@ -122,6 +123,42 @@ class DataRoutingTests(unittest.TestCase):
             named_preparation_route("unknown")
         with self.assertRaises(DataError):
             named_preparation_route("2B", train_shards=20)
+
+    def test_checked_in_scaled_variants_share_the_published_validation_split(
+        self,
+    ) -> None:
+        validation_hashes: set[str] = set()
+        boundary_records: set[tuple[int, str]] = set()
+        for name in ("2B", "4B", "8B", "hero"):
+            with self.subTest(name=name):
+                route = named_preparation_route(name)
+                manifest_path = resolve_preparation_manifest(route)
+                payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+                validation = payload["files"][0]
+                self.assertEqual(validation["path"], "fineweb_val_000000.bin")
+                self.assertEqual(validation["split"], "validation")
+                self.assertEqual(validation["tokens"], SCALED_SHARD_TOKENS)
+                self.assertEqual(payload["validation_prefix_tokens"], 10_485_760)
+                self.assertTrue(
+                    payload["preparation"]["validation_train_document_disjoint"]
+                )
+                self.assertNotIn(
+                    validation["sha256"],
+                    {entry["sha256"] for entry in payload["files"][1:]},
+                )
+                validation_hashes.add(validation["sha256"])
+                boundary_records.add(
+                    (
+                        payload["preparation"]["validation_boundary_discarded_tokens"],
+                        payload["preparation"][
+                            "validation_boundary_document_id_sha256"
+                        ],
+                    )
+                )
+        self.assertEqual(len(validation_hashes), 1)
+        self.assertEqual(len(boundary_records), 1)
+        discarded_tokens, _ = next(iter(boundary_records))
+        self.assertGreater(discarded_tokens, 0)
 
     def test_smoke_is_the_only_non_named_route(self) -> None:
         route = smoke_preparation_route()

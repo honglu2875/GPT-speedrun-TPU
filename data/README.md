@@ -4,7 +4,7 @@ No training corpus is stored in Git, and importing `rig.data` never
 downloads or generates anything. Only explicit preparation—through the command
 or its programmatic API—performs network access.
 
-## Profiles
+## Corpora
 
 `smoke` is a tiny, deterministic synthetic stream with a 256-token vocabulary.
 It is generated locally from a specified algorithm and seeds, so CPU tests work
@@ -15,8 +15,8 @@ expected hashes of the generated shards.
 same prebuilt shard convention used by llm.c and Modded-NanoGPT. The initial
 selection contains:
 
-- `fineweb_val_000000.bin`, of which the first 10,485,760 tokens form the fixed
-  validation prefix;
+- `fineweb_val_000000.bin`, whose first 10,485,760 next-token predictions form
+  the fixed validation prefix;
 - `fineweb_train_000001.bin` through `fineweb_train_000009.bin`, 100,000,000
   tokens each.
 
@@ -83,10 +83,13 @@ The routing layer trusts only a checked-in manifest under
 `data/manifests/fineweb-scaled-gpt2/`. That manifest must pin the published
 repository and commit, provide an immutable URL and SHA-256 for every exact
 100M-token shard, and match the builder's source, tokenizer, temporal cutoff,
-and document-disjoint validation contract. Until publication produces that
-real manifest, scaled `rig prepare` fails with an explicit message; it
-never manufactures a placeholder or treats a cache-local build plan as a
-download contract.
+and document-disjoint validation contract. Each scaled validation file holds
+100M tokens, while `validation_prefix_tokens` binds official scoring to its
+first 10,485,760 predictions. The contract guarantees that no source document
+crosses from validation into training; it does not claim semantic
+near-duplicate removal. Until publication produces that real manifest, scaled
+`rig prepare` fails with an explicit message; it never manufactures a
+placeholder or treats a cache-local build plan as a download contract.
 
 Doctor, profiling, and runs resolve the same saved name and shard prefix. A
 missing selection fails with the exact preparation command instead of falling

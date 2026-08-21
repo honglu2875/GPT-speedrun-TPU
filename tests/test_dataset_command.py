@@ -9,7 +9,7 @@ import unittest
 from rig.cli import (
     _require_prepared_dataset,
     _route_for_config,
-    _runtime_data_profile,
+    _runtime_preparation_type,
 )
 from rig.config import ConfigError, LocalConfig
 from rig.data_routing import DataError, dataset_names, named_preparation_route
@@ -40,7 +40,7 @@ class NamedRoutingTests(unittest.TestCase):
 
 class ResolutionTests(unittest.TestCase):
     def _config(self, **kwargs) -> LocalConfig:
-        base = dict(data_profile="official", dataset="8B", train_shards=79)
+        base = dict(dataset="8B", train_shards=79)
         base.update(kwargs)
         return LocalConfig(**base)
 
@@ -58,20 +58,20 @@ class ResolutionTests(unittest.TestCase):
         self.assertEqual(route.variant.name, "hero")
 
     def test_runtime_profile_cannot_route_development_to_smoke_data(self) -> None:
-        config = self._config(data_profile="smoke", dataset="hero")
-        route = _route_for_config(config, _runtime_data_profile("dev"))
+        config = self._config(dataset="hero")
+        route = _route_for_config(config, _runtime_preparation_type("dev"))
         self.assertEqual(route.variant.name, "hero")
 
     def test_smoke_runtime_uses_only_the_generated_route(self) -> None:
         config = self._config(dataset="hero")
-        route = _route_for_config(config, _runtime_data_profile("smoke"))
+        route = _route_for_config(config, _runtime_preparation_type("smoke"))
         self.assertEqual(route.profile, "smoke")
         self.assertIsNone(route.variant)
 
 
 class PresenceGuardTests(unittest.TestCase):
     def test_a_missing_named_corpus_names_the_fixing_commands(self) -> None:
-        config = LocalConfig(dataset="hero", data_profile="official")
+        config = LocalConfig(dataset="hero")
         route = _route_for_config(config, "official")
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(ConfigError) as caught:
@@ -83,7 +83,7 @@ class PresenceGuardTests(unittest.TestCase):
         self.assertIn("rig dataset ship hero --cluster v6e-8", message)
 
     def test_a_present_corpus_passes(self) -> None:
-        config = LocalConfig(dataset="hero", data_profile="official")
+        config = LocalConfig(dataset="hero")
         route = _route_for_config(config, "official")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -93,14 +93,14 @@ class PresenceGuardTests(unittest.TestCase):
             _require_prepared_dataset(config, route, root, cluster=None)
 
     def test_classic_is_guarded_like_every_other_named_corpus(self) -> None:
-        config = LocalConfig(data_profile="official", dataset="classic")
+        config = LocalConfig(dataset="classic")
         route = _route_for_config(config, "official")
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ConfigError, "dataset 'classic'"):
                 _require_prepared_dataset(config, route, Path(directory), cluster=None)
 
     def test_missing_smoke_data_names_the_smoke_preparation_command(self) -> None:
-        config = LocalConfig(dataset="hero", data_profile="smoke")
+        config = LocalConfig(dataset="hero")
         route = _route_for_config(config, "smoke")
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(

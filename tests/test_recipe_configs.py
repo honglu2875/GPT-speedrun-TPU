@@ -25,14 +25,17 @@ class StandaloneRecipeConfigTests(unittest.TestCase):
                     document, _ = read_config_document(
                         ROOT / "recipes" / recipe / filename
                     )
-                    self.assertEqual(document["schema_version"], 5)
+                    self.assertEqual(document["schema_version"], 6)
                     self.assertEqual(document["execution_type"], execution_type)
-                    self.assertEqual(set(document), {
-                        "schema_version",
-                        "execution_type",
-                        "family",
-                        "run",
-                    })
+                    self.assertEqual(
+                        set(document),
+                        {
+                            "schema_version",
+                            "execution_type",
+                            "family",
+                            "run",
+                        },
+                    )
                     self.assertNotIn("profiles", document)
 
     def test_dev_and_official_scientific_families_cannot_drift(self) -> None:
@@ -42,11 +45,15 @@ class StandaloneRecipeConfigTests(unittest.TestCase):
                 official, _ = read_config_document(root / "config.yaml")
                 dev, _ = read_config_document(root / "dev.yaml")
                 self.assertEqual(dev["family"], official["family"])
+                self.assertEqual(dev["run"]["kernels"], official["run"]["kernels"])
+                self.assertEqual(dev["run"]["optimizer"], official["run"]["optimizer"])
                 self.assertEqual(
-                    dev["run"]["kernels"], official["run"]["kernels"]
+                    dev["run"]["training"]["sampling"],
+                    official["run"]["training"]["sampling"],
                 )
                 self.assertEqual(
-                    dev["run"]["optimizer"], official["run"]["optimizer"]
+                    dev["run"]["training"]["dtype"],
+                    official["run"]["training"]["dtype"],
                 )
 
     def test_duration_policy_is_explicit_in_each_document(self) -> None:
@@ -59,9 +66,7 @@ class StandaloneRecipeConfigTests(unittest.TestCase):
                     {"tokens_per_parameter"},
                 )
             smoke, _ = read_config_document(root / "smoke.yaml")
-            self.assertEqual(
-                set(smoke["run"]["training"]["duration"]), {"steps"}
-            )
+            self.assertEqual(set(smoke["run"]["training"]["duration"]), {"steps"})
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -61,6 +61,10 @@ class RecipePlanTests(unittest.TestCase):
         self.assertTrue(plans["dense_8k"].payload["document_masking"])
         self.assertEqual(plans["moe_8k"].payload["context_preset"], "8k")
         self.assertEqual(plans["moe_1k"].payload["context_preset"], "1k")
+        self.assertEqual(
+            {plan.validation_predictions for plan in plans.values()},
+            {1_048_576},
+        )
 
     def test_stop_after_step_is_a_full_schedule_prefix(self) -> None:
         common = (

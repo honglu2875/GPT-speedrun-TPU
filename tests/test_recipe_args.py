@@ -103,6 +103,13 @@ class RecipeArgumentDeclarationTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             _parser().parse_args(["--diag"])
 
+    def test_internal_checkpoint_signal_is_not_a_second_user_facing_policy(
+        self,
+    ) -> None:
+        parser = _parser()
+        self.assertNotIn("--omit-checkpoint", parser.format_help())
+        self.assertTrue(parser.parse_args(["--omit-checkpoint"]).omit_checkpoint)
+
 
 class RecipeArgumentValidationTests(unittest.TestCase):
     def parse(self, *arguments: str) -> argparse.Namespace:

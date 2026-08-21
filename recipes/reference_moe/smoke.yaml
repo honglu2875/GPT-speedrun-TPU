@@ -1,5 +1,5 @@
 # Standalone CPU smoke configuration for recipes/reference_moe/train.py.
-schema_version: 5
+schema_version: 6
 execution_type: smoke
 family:
   default_tier: smoke
@@ -13,8 +13,6 @@ family:
   parameterization:
     name: standard
     base_tier: smoke
-    base_width: 64
-    base_depth: 2
     depth_alpha: 0.0
     init_std: 0.02
     attention_scale: inverse_sqrt_head_dim
@@ -56,10 +54,8 @@ run:
     beta2: 0.95
     grad_clip: 0.0
   evaluation:
-    prediction_budget: 0
-    eval_batches: 1
-    val_every: 0
-    val_probe_batches: 1
+    final_predictions: 256
+    probe: null
   logging:
     diagnostics_every: 0
     log_every: 10

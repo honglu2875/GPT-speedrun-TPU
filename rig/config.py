@@ -16,15 +16,29 @@ class ConfigError(ValueError):
     """A local configuration file or requested setting is invalid."""
 
 
-_CLUSTER_FIELDS = (
+_TOPOLOGY_FIELDS = (
     "tpu_vm_count",
     "tpu_vm_hosts",
     "accelerator",
     "chips_per_host",
     "remote_controller",
     "artifact_host",
-    "dataset",
-    "train_shards",
+)
+_DATA_FIELDS = ("dataset", "train_shards")
+_RIG_FIELDS = (
+    "data_path",
+    "artifacts_path",
+    "active_cluster",
+    "default_profile",
+    "checkpoint_policy",
+    "color",
+    "target_loss",
+)
+_LEGACY_RIG_FIELDS = (
+    *_TOPOLOGY_FIELDS,
+    *_DATA_FIELDS,
+    "data_profile",
+    "checkpoint_retention",
 )
 
 
@@ -45,9 +59,6 @@ class ClusterProfile:
     # the expression. Naming one explicitly matters on preemptible pods,
     # where you may want artifacts off a host you expect to lose.
     artifact_host: str = ""
-    # Explicit immutable corpus and optional train-shard prefix (0 = manifest default).
-    dataset: str = "classic"
-    train_shards: int = 0
 
     def overlay(self) -> dict[str, Any]:
         return {
@@ -57,8 +68,6 @@ class ClusterProfile:
             "chips_per_host": self.chips_per_host,
             "remote_controller": self.remote_controller,
             "artifact_host": self.artifact_host,
-            "dataset": self.dataset,
-            "train_shards": self.train_shards,
         }
 
 
@@ -81,9 +90,8 @@ class LocalConfig:
     dataset: str = "classic"
     train_shards: int = 0
     active_cluster: str = ""
-    data_profile: str = "official"
     default_profile: str = "official"
-    checkpoint_retention: str = "qualifying"
+    checkpoint_policy: str = "qualifying"
     color: str = "auto"
     target_loss: float = 3.28
 
@@ -120,7 +128,9 @@ class LocalConfig:
             raise ConfigError("artifact_host requires tpu_vm_hosts")
         if self.dataset not in {"classic", "2B", "4B", "8B", "hero"}:
             raise ConfigError("dataset must be classic, 2B, 4B, 8B, or hero")
-        if isinstance(self.train_shards, bool) or not isinstance(self.train_shards, int):
+        if isinstance(self.train_shards, bool) or not isinstance(
+            self.train_shards, int
+        ):
             raise ConfigError("train_shards must be a nonnegative integer")
         if self.train_shards < 0:
             raise ConfigError("train_shards must be a nonnegative integer")
@@ -132,14 +142,10 @@ class LocalConfig:
             raise ConfigError("chips_per_host must be a positive integer")
         if self.chips_per_host <= 0:
             raise ConfigError("chips_per_host must be a positive integer")
-        if self.data_profile not in {"smoke", "dev", "official"}:
-            raise ConfigError("data_profile must be smoke, dev, or official")
         if self.default_profile not in {"smoke", "dev", "official"}:
             raise ConfigError("default_profile must be smoke, dev, or official")
-        if self.checkpoint_retention not in {"always", "qualifying", "none"}:
-            raise ConfigError(
-                "checkpoint_retention must be always, qualifying, or none"
-            )
+        if self.checkpoint_policy not in {"always", "qualifying", "none"}:
+            raise ConfigError("checkpoint_policy must be always, qualifying, or none")
         if self.color not in {"auto", "always", "never"}:
             raise ConfigError("color must be auto, always, or never")
         if not math.isfinite(self.target_loss) or self.target_loss < 0:
@@ -182,12 +188,15 @@ def load_clusters(root: Path | None = None) -> dict[str, ClusterProfile]:
     for name, table in tables.items():
         if not isinstance(table, dict):
             raise ConfigError(f"{path}: [cluster.{name}] must be a table")
-        unknown = sorted(set(table) - set(_CLUSTER_FIELDS))
+        # Older files attached corpus selection to each cluster. Accept those
+        # two keys during migration, but dataset choice is now authoritative in
+        # the single top-level [data] table and never changes with --cluster.
+        unknown = sorted(set(table) - set((*_TOPOLOGY_FIELDS, *_DATA_FIELDS)))
         if unknown:
             raise ConfigError(
                 f"{path}: unknown setting(s) in [cluster.{name}]: {', '.join(unknown)}"
             )
-        values = {field: table.get(field, base[field]) for field in _CLUSTER_FIELDS}
+        values = {field: table.get(field, base[field]) for field in _TOPOLOGY_FIELDS}
         profile = ClusterProfile(name=name, **values)
         # Validate through LocalConfig so a cluster cannot encode a state the
         # rest of the tool would reject later.
@@ -215,10 +224,37 @@ def load_config(root: Path | None = None, cluster: str | None = None) -> LocalCo
     if not isinstance(section, dict):
         raise ConfigError(f"{path} must contain a [rig] table")
     defaults = asdict(LocalConfig())
-    unknown = sorted(set(section) - set(defaults))
+    allowed_rig = set((*_RIG_FIELDS, *_LEGACY_RIG_FIELDS))
+    unknown = sorted(set(section) - allowed_rig)
     if unknown:
         raise ConfigError(f"unknown setting(s) in {path}: {', '.join(unknown)}")
-    defaults.update(section)
+    for field in (*_RIG_FIELDS, *_TOPOLOGY_FIELDS, *_DATA_FIELDS):
+        if field in section:
+            defaults[field] = section[field]
+    legacy_policy = section.get("checkpoint_retention")
+    current_policy = section.get("checkpoint_policy")
+    if (
+        legacy_policy is not None
+        and current_policy is not None
+        and legacy_policy != current_policy
+    ):
+        raise ConfigError(
+            f"{path}: checkpoint_policy conflicts with legacy checkpoint_retention"
+        )
+    if current_policy is None and legacy_policy is not None:
+        defaults["checkpoint_policy"] = legacy_policy
+
+    data_section = payload.get("data", {})
+    if not isinstance(data_section, dict):
+        raise ConfigError(f"{path}: [data] must be a table")
+    unknown_data = sorted(set(data_section) - set(_DATA_FIELDS))
+    if unknown_data:
+        raise ConfigError(
+            f"{path}: unknown setting(s) in [data]: {', '.join(unknown_data)}"
+        )
+    for field in _DATA_FIELDS:
+        if field in data_section:
+            defaults[field] = data_section[field]
     profiles = load_clusters(root)
     selected = cluster or str(defaults.get("active_cluster") or "")
     if selected:
@@ -254,29 +290,55 @@ def save_config(
     if clusters is None:
         clusters = load_clusters(root)
     values = asdict(config)
-    if clusters and not str(values.get("active_cluster") or "").strip():
+    resolved_clusters = dict(clusters)
+    if resolved_clusters and not str(values.get("active_cluster") or "").strip():
         matching = [
             name
-            for name, profile in clusters.items()
+            for name, profile in resolved_clusters.items()
             if profile.tpu_vm_hosts == config.tpu_vm_hosts
             and profile.tpu_vm_count == config.tpu_vm_count
         ]
         if len(matching) != 1:
             raise ConfigError(
                 "refusing to save a config with clusters but no active_cluster; "
-                f"pass --cluster (known: {', '.join(sorted(clusters))})"
+                f"pass --cluster (known: {', '.join(sorted(resolved_clusters))})"
             )
         values["active_cluster"] = matching[0]
+    if resolved_clusters:
+        active = str(values["active_cluster"])
+        if active not in resolved_clusters:
+            raise ConfigError(
+                f"cannot save unknown active_cluster {active!r}; known: "
+                + ", ".join(sorted(resolved_clusters))
+            )
+        resolved_clusters[active] = ClusterProfile(
+            name=active,
+            **{field: values[field] for field in _TOPOLOGY_FIELDS},
+        )
     lines = [
         "# Personal defaults written by `rig prepare`.",
         "# Official constants live in data/manifests and docs/RULES.md.",
-        "# dataset and train_shards select the immutable corpus used by non-smoke runs.",
         "[rig]",
     ]
-    for key, value in values.items():
+    rig_fields = list(_RIG_FIELDS)
+    if not resolved_clusters:
+        # A simple one-cluster file remains flat. Named-cluster files keep all
+        # topology in [cluster.*] so the active overlay has one source of truth.
+        rig_fields.extend(_TOPOLOGY_FIELDS)
+    for key in rig_fields:
+        value = values[key]
         lines.append(f"{key} = {_toml_scalar(key, value)}")
-    for name in sorted(clusters):
-        profile = clusters[name]
+    lines.extend(
+        (
+            "",
+            "# Immutable corpus selection used by every non-smoke execution type.",
+            "[data]",
+        )
+    )
+    for key in _DATA_FIELDS:
+        lines.append(f"{key} = {_toml_scalar(key, values[key])}")
+    for name in sorted(resolved_clusters):
+        profile = resolved_clusters[name]
         lines.append("")
         lines.append(f"[cluster.{name}]")
         for key, value in profile.overlay().items():

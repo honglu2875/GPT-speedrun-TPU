@@ -138,7 +138,7 @@ class HarnessRunTests(unittest.TestCase):
         *, profile: str = "default", expected_tokens: int = 96
     ) -> dict[str, object]:
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "config_schema_version": 4,
             "config_sha256": FAKE_CONFIG_SHA256,
             "profile": profile,
@@ -158,6 +158,7 @@ class HarnessRunTests(unittest.TestCase):
             "stop_after_step": None,
             "planned_tokens": expected_tokens,
             "expected_tokens": expected_tokens,
+            "validation_predictions": 64,
             "base_learning_rate": 0.001,
             "batch_ratio": 1.0,
             "ladder_data_multiplier": 1.0,
@@ -304,7 +305,7 @@ class HarnessRunTests(unittest.TestCase):
         self.assertIn("runs", arguments["output_dir"].parts)
 
     def test_rejects_reserved_trainer_flags_but_not_other_arguments(self) -> None:
-        for flag in ("--output-dir", "--seed", "--profile"):
+        for flag in ("--output-dir", "--seed", "--profile", "--omit-checkpoint"):
             for arguments in (
                 (flag, "value"),
                 (f"{flag}=value",),
@@ -600,14 +601,12 @@ class HarnessRunTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigurationError, "plan profile"):
             run_recipe(self.config(plan=self.plan(profile="different")))
 
-    def test_none_retention_records_the_digest_then_deletes(self) -> None:
-        # The weights are still hashed into the record before removal, so the
-        # run remains attributable to a specific model even without them.
-        outcome = run_recipe(self.config(checkpoint_retention="none"))
+    def test_none_policy_never_writes_a_checkpoint(self) -> None:
+        outcome = run_recipe(self.config(checkpoint_policy="none", profile="dev"))
         self.assertIsNone(outcome.checkpoint_path)
         self.assertFalse((outcome.run_dir / "model.npz").exists())
-        self.assertFalse(outcome.record["checkpoint"]["retained"])
-        self.assertEqual(len(outcome.record["checkpoint"]["sha256"]), 64)
+        self.assertIsNone(outcome.record["checkpoint"])
+        self.assertIn("--omit-checkpoint", outcome.record["trainer_command"])
 
     def test_qualifying_retention_removes_nonqualifying_checkpoint(self) -> None:
         outcome = run_recipe(self.config(target_loss=2.0))
@@ -620,9 +619,8 @@ class HarnessRunTests(unittest.TestCase):
     ) -> None:
         outcome = run_recipe(
             self.config(
-                trainer_args=("--omit-checkpoint",),
                 profile="dev",
-                require_checkpoint=False,
+                checkpoint_policy="none",
             )
         )
         self.assertIsNone(outcome.checkpoint_path)

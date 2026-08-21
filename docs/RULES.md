@@ -96,7 +96,7 @@ recipes/<algorithm>/dev.yaml
 recipes/<algorithm>/smoke.yaml
 ```
 
-A schema-5 candidate directory defines a family, not one isolated shape. Its
+A schema-6 candidate directory defines a family, not one isolated shape. Its
 entry must resolve the 60M, 125M, 250M, 500M, and 1B ballparks through `--tier`;
 `make run` defaults to 125M. Candidate admission is based on the 60M, 125M, and
 250M scaling trend. The 500M and 1B tiers are confirmation/hero runs and are not
@@ -112,13 +112,21 @@ Runtime paths, seed, profile identity, and profiling destinations may stay as
 arguments. Avoid vendored frameworks, generated code, or hidden
 algorithm-specific modules.
 
+Evaluation config declares semantic work rather than derived loop counts:
+`final_predictions` fixes the canonical pass, while `probe` is either `null` or
+contains `every_steps` and `predictions`. The recipe derives batch counts from
+the selected context and any research batch-size override, and rejects a budget
+that cannot be divided exactly.
+
 A completed run emits the versioned machine-readable result required by the
-harness and writes a portable parameter checkpoint beneath its assigned output
-directory. Human-oriented colored output must not corrupt the result record.
-The last non-empty stdout line is `RIG_RESULT=<json>`; human output belongs
-on stderr. Version one requires `profile`, `seed`, a contained relative
-`checkpoint`, and finite `metrics.train_seconds`, `metrics.tokens_processed`,
-and `metrics.validation_loss`. Official results must additionally report
+harness. Official runs must write a portable parameter checkpoint beneath their
+assigned output directory; a development research run may omit it only through
+the harness's `none` checkpoint policy. Human-oriented colored output must not
+corrupt the result record. The last non-empty stdout line is
+`RIG_RESULT=<json>`; human output belongs on stderr. Version one requires
+`profile`, `seed`, a checkpoint path or an explicitly permitted null, and finite
+`metrics.train_seconds`, `metrics.tokens_processed`, and
+`metrics.validation_loss`. Official results must additionally report
 `metrics.validation_tokens = 10485760` and the configured TPU v4 system
 identity: four local devices per JAX process and four times the process count
 globally. Extra finite JSON diagnostics are retained verbatim.
@@ -129,7 +137,7 @@ learning rate, loss, and gradient norm. Estimated FLOPs are a versioned analytic
 model diagnostic rather than a hardware-counter score.
 
 The reference additionally records sparse optimizer diagnostics at step 1,
-every 250 steps, and the final step. Each point contains post-update parameter,
+every 500 steps, and the final step. Each point contains post-update parameter,
 pre-clipping gradient, and signed actual-update L1/L2 norms, mean, population
 standard deviation, and centered third/fourth moments for the whole model and
 each logical scope. Diagnostic compilation is outside `train_seconds`; sampled

@@ -17,7 +17,7 @@ import subprocess
 from typing import Any, Mapping, Sequence
 
 
-PLAN_SCHEMA_VERSION = 2
+PLAN_SCHEMA_VERSION = 3
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _RUN_KINDS = {"smoke", "full", "diagnostic"}
 
@@ -41,6 +41,10 @@ class RecipePlan:
     def run_kind(self) -> str:
         return str(self.payload["run_kind"])
 
+    @property
+    def validation_predictions(self) -> int:
+        return int(self.payload["validation_predictions"])
+
     def as_dict(self) -> dict[str, Any]:
         return dict(self.payload)
 
@@ -62,7 +66,7 @@ def canonical_json_sha256(value: Mapping[str, Any]) -> str:
 
 
 def validate_recipe_plan(value: Mapping[str, Any]) -> RecipePlan:
-    """Validate the v2 plan protocol and return an immutable JSON copy."""
+    """Validate the v3 plan protocol and return an immutable JSON copy."""
 
     if not isinstance(value, Mapping):
         raise PlanError("recipe plan must be a JSON object")
@@ -101,6 +105,7 @@ def validate_recipe_plan(value: Mapping[str, Any]) -> RecipePlan:
         "stop_after_step",
         "planned_tokens",
         "expected_tokens",
+        "validation_predictions",
         "base_learning_rate",
         "batch_ratio",
         "ladder_data_multiplier",
@@ -146,6 +151,7 @@ def validate_recipe_plan(value: Mapping[str, Any]) -> RecipePlan:
     )
     planned_tokens = _positive_integer(payload["planned_tokens"], "planned_tokens")
     expected_tokens = _positive_integer(payload["expected_tokens"], "expected_tokens")
+    _positive_integer(payload["validation_predictions"], "validation_predictions")
     _positive_number(payload["base_learning_rate"], "base_learning_rate")
     _positive_number(payload["batch_ratio"], "batch_ratio")
     _positive_number(payload["ladder_data_multiplier"], "ladder_data_multiplier")

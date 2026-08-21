@@ -8,7 +8,7 @@ import unittest
 
 from rig.cli import _CHECKPOINT_POLICIES, _checkpoint_policy
 from rig.config import ConfigError
-from rig.harness.models import CheckpointRetention
+from rig.harness.models import CheckpointPolicy
 
 
 def _args(**overrides) -> argparse.Namespace:
@@ -20,7 +20,7 @@ def _args(**overrides) -> argparse.Namespace:
 class PolicyTests(unittest.TestCase):
     def test_the_three_outcomes(self) -> None:
         self.assertEqual(_CHECKPOINT_POLICIES, ("always", "qualifying", "none"))
-        self.assertEqual(get_args(CheckpointRetention), _CHECKPOINT_POLICIES)
+        self.assertEqual(get_args(CheckpointPolicy), _CHECKPOINT_POLICIES)
 
     def test_settings_supply_the_default(self) -> None:
         self.assertEqual(

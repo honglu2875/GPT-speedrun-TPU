@@ -99,6 +99,7 @@ def _replace_experiment_config(
     model: dict[str, object] | None = None,
     context: dict[str, object] | None = None,
     kernels: dict[str, object] | None = None,
+    evaluation: dict[str, object] | None = None,
 ):
     """Apply deliberate test-only overrides to a typed experiment config."""
 
@@ -117,6 +118,11 @@ def _replace_experiment_config(
         definition = replace(
             definition,
             kernels=replace(definition.kernels, **kernels),
+        )
+    if evaluation:
+        definition = replace(
+            definition,
+            evaluation=replace(definition.evaluation, **evaluation),
         )
     if model:
         selected_tier = family.tiers[tier_name]
@@ -286,7 +292,7 @@ class TrainerStaticTests(unittest.TestCase):
         official = experiment_config.run
         context = experiment_config.family.contexts[context_name]
         model = experiment_config.family.tiers[tier_name].model
-        self.assertEqual(experiment_config.schema_version, 5)
+        self.assertEqual(experiment_config.schema_version, 6)
         self.assertEqual(experiment_config.execution_type, "official")
         self.assertEqual(official.training.duration.tokens_per_parameter, 20.0)
         self.assertEqual(context_name, "1k")
@@ -321,24 +327,26 @@ class TrainerStaticTests(unittest.TestCase):
 
         invalid = {
             "duplicate": source.replace(
-                "schema_version: 5", "schema_version: 5\nschema_version: 5", 1
+                "schema_version: 6", "schema_version: 6\nschema_version: 6", 1
             ),
             "unknown": source + "\nunknown: true\n",
             "route mismatch": source.replace(
                 "execution_type: official", "execution_type: dev", 1
             ),
-            "anchor": source.replace("schema_version: 5", "schema_version: &v 5", 1),
+            "anchor": source.replace("schema_version: 6", "schema_version: &v 6", 1),
             "alias": source.replace(
-                "schema_version: 5", "schema_version: &v 5\nextra: *v", 1
+                "schema_version: 6", "schema_version: &v 6\nextra: *v", 1
             ),
-            "tag": source.replace("schema_version: 5", "schema_version: !!int 5", 1),
+            "tag": source.replace("schema_version: 6", "schema_version: !!int 6", 1),
             "directive": "%YAML 1.2\n---\n" + source,
             "multiple documents": source + "\n---\n{}\n",
             "nonfinite": source.replace(
                 "learning_rate: 0.00390625", "learning_rate: .nan", 1
             ),
             "official validation prefix": source.replace(
-                "eval_batches: 80", "eval_batches: 79", 1
+                "final_predictions: 10485760",
+                "final_predictions: 10485759",
+                1,
             ),
             "missing sampling": source.replace(
                 "    sampling: shuffled_epochs\n", "", 1
@@ -429,16 +437,13 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertEqual(config.val_every, 0)
         self.assertEqual(config.diagnostics_every, 0)
         self.assertEqual(config.log_every, config.steps)
-        self.assertEqual(
-            dict(config.config_overrides),
-            {"diagnostic_mode": 1},
-        )
+        self.assertFalse(hasattr(config, "config_overrides"))
         context_config = _resolve_config(
             parser.parse_args(["--profile", "dev", "--context", "8k"]),
             "tpu",
         )
         self.assertEqual(context_config.context_preset, "8k")
-        self.assertEqual(dict(context_config.config_overrides), {"context": "8k"})
+        self.assertEqual(context_config.context_preset, "8k")
 
     def test_fixed_tpp_derives_complete_steps_and_rejects_custom_horizons(self) -> None:
         parser = trainer.build_parser()
@@ -599,13 +604,24 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertEqual(official.val_every, 500)
         self.assertEqual(official.val_probe_batches, 8)
         self.assertEqual(official.eval_batches, 80)
+        self.assertEqual(official.validation_predictions, 10_485_760)
         self.assertEqual(official.diagnostics_every, 500)
+
+        smaller_batch = _resolve_config(
+            parser.parse_args(["--profile", "official", "--batch-size", "64"]),
+            "tpu",
+        )
+        self.assertEqual(smaller_batch.eval_batches, 160)
+        self.assertEqual(smaller_batch.val_probe_batches, 16)
+        self.assertEqual(smaller_batch.validation_predictions, 10_485_760)
 
         smoke = _resolve_config(parser.parse_args(["--profile", "smoke"]), "cpu")
         development = _resolve_config(parser.parse_args(["--profile", "dev"]), "tpu")
         self.assertEqual(smoke.val_every, 0)
         self.assertEqual(smoke.diagnostics_every, 0)
         self.assertEqual(development.val_every, 0)
+        self.assertEqual(development.val_probe_batches, 0)
+        self.assertEqual(development.eval_batches, 8)
         self.assertEqual(development.diagnostics_every, 10)
 
         diagnostic = _resolve_config(
@@ -689,6 +705,7 @@ class TrainerStaticTests(unittest.TestCase):
                 profile="dev",
                 context={"seq_len": 129},
                 kernels={"attention_backend": "dense"},
+                evaluation={"final_predictions": 129 * 128},
             ),
             config_sha256=config_sha256,
         )
@@ -700,6 +717,7 @@ class TrainerStaticTests(unittest.TestCase):
                 profile="dev",
                 context={"seq_len": 129},
                 kernels={"attention_backend": "tpu_flash"},
+                evaluation={"final_predictions": 129 * 128},
             ),
             config_sha256=config_sha256,
         )

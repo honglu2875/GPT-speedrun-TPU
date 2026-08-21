@@ -113,8 +113,8 @@ validate-target:
 	    printf '%s\n' "Missing regular target config: recipes/$(TARGET)/$$config" >&2; \
 	    exit 2; \
 	  fi; \
-	  if ! grep -Eq '^schema_version:[[:space:]]*5[[:space:]]*$$' "$(TARGET_DIR)/$$config"; then \
-	    printf '%s\n' "TARGET config $$config is not a current schema-5 family document." >&2; \
+	  if ! grep -Eq '^schema_version:[[:space:]]*6[[:space:]]*$$' "$(TARGET_DIR)/$$config"; then \
+	    printf '%s\n' "TARGET config $$config is not a current schema-6 family document." >&2; \
 	    exit 2; \
 	  fi; \
 	done

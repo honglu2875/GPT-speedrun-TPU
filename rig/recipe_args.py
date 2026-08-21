@@ -78,10 +78,10 @@ def add_standard_xprof_arguments(parser: argparse.ArgumentParser) -> None:
     profiling.add_argument(
         "--omit-checkpoint",
         action="store_true",
-        help=(
-            "non-official research only: retain final validation and metrics but omit "
-            "the parameter checkpoint"
-        ),
+        # Internal harness control. Users choose one public
+        # `rig run --checkpoint-policy` value; keeping this accepted but hidden
+        # lets the generic harness tell a standalone recipe not to serialize.
+        help=argparse.SUPPRESS,
     )
 
 

@@ -35,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--path", type=Path, help="exact dataset cache root (for example shm/)"
     )
     prepare.add_argument(
-        "--profile", choices=PROFILES, help="dataset profile to prepare"
+        "--profile", choices=PROFILES, help="execution type to prepare"
     )
     prepare.add_argument(
         "--artifacts", type=Path, help="persistent run artifact directory"
@@ -48,7 +48,9 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument(
         "--tpu-vm-hosts", help="pdsh expression containing every TPU VM host"
     )
-    prepare.add_argument("--run-profile", choices=PROFILES, help="default run profile")
+    prepare.add_argument(
+        "--run-profile", choices=PROFILES, help="default run execution type"
+    )
     prepare.add_argument(
         "--checkpoint-policy",
         choices=CHECKPOINT_POLICIES,
@@ -109,7 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     doctor.add_argument("--path", type=Path, help="dataset cache root")
-    doctor.add_argument("--profile", choices=PROFILES, help="data/run profile")
+    doctor.add_argument("--profile", choices=PROFILES, help="execution type")
     doctor.add_argument(
         "--require-tpu",
         action="store_true",
@@ -182,7 +184,9 @@ def build_parser() -> argparse.ArgumentParser:
     profile.add_argument(
         "recipe", nargs="?", default="reference", help="folder name beneath recipes/"
     )
-    profile.add_argument("--profile", choices=PROFILES, help="saved profile override")
+    profile.add_argument(
+        "--profile", choices=PROFILES, help="default execution-type override"
+    )
     profile.add_argument(
         "--tier", help="model-family tier; defaults to family.default_tier"
     )

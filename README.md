@@ -69,13 +69,16 @@ uv --cache-dir /tmp/uv-cache run --frozen --no-sync rig prepare \
   --dataset 8B --train-shards 79
 ```
 
-It asks for the data-cache root, data and run profiles, persistent artifact
-directory, TPU VM host count, checkpoint policy, colors, a smoke/development
-loss target, and an explicit immutable corpus plus shard prefix. Data identity
+It asks for the data-cache root, the execution type for this preparation, the
+default run type, persistent artifact directory, TPU VM host count, checkpoint
+policy, colors, a smoke/development loss target, and an explicit immutable
+corpus plus shard prefix. The preparation type is transient; the selected
+corpus is saved under `[data]` and applies to every non-smoke run. Data identity
 never depends on a training-horizon number: `8B` means the checked-in 8B
 manifest, and 79 means its complete train split.
-Training duration is independently specified by each family profile (20 TPP in
-the reference official profile) or by an explicit research study.
+Training duration is independently specified by each family configuration
+(20 TPP in the reference official configuration) or by an explicit research
+study.
 The wizard can then probe JAX/TPU health and prepare the selected dataset;
 only the explicit CLI flag `--no-download` skips data preparation. Personal
 choices are stored in the gitignored `.rig.toml`; official constants
@@ -83,11 +86,12 @@ remain versioned in Git. The personal loss target applies only to
 smoke/development work; the official target is fixed at 3.28 and may only be
 tightened explicitly.
 
-`make run` requires that saved file to contain a default profile; otherwise it
-stops and asks for `make prepare`. `TARGET` defaults to `reference`. A custom
+`make run` requires the saved file to contain a default execution type;
+otherwise it stops and asks for `make prepare`. `TARGET` defaults to
+`reference`. A custom
 target must be a folder beneath `recipes/` containing regular, non-symlink
 `train.py`, `config.yaml`, `dev.yaml`, and `smoke.yaml` files. New candidates
-use schema 5 family configs
+use schema 6 family configs
 with 60M, 125M, 250M, 500M, and 1B tiers; `TIER` defaults to `125m`.
 
 For a multi-host run using the conventional `shm` cache, preparation requires
@@ -185,17 +189,17 @@ rig dataset status --cluster v6e-8      # presence here and on the cluster
 19 GiB rather than 140 GiB. Shipping is idempotent, so an interrupted transfer
 resumes rather than failing.
 
-A cluster can name the corpus it expects:
+Corpus choice is independent of the active cluster:
 
 ```toml
-[cluster.v6e-8]
+[data]
 dataset = "hero"
 train_shards = 105
 ```
 
-The name and optional shard prefix are authoritative. A missing corpus stops
-the run with the commands that fix it; there is no capacity-based fallback and
-no silent switch to the classic corpus.
+The name and optional shard prefix are authoritative across clusters. A missing
+corpus stops the run with the commands that fix it; there is no capacity-based
+fallback and no silent switch to the classic corpus.
 
 ### Orchestrating a slice you are not part of
 
@@ -243,12 +247,12 @@ rig run reference --checkpoint-policy none        # never write them
 `none` skips the write rather than writing and deleting, which matters at 500M
 where a checkpoint is about 2 GB. It is restricted to development research runs.
 
-## Data profiles
+## Execution types and data
 
-All profiles use one well-defined token format; downloading and tokenization
+All execution types use one well-defined token format; downloading and tokenization
 are never timed.
 
-| Profile | Data | Intended use |
+| Execution type | Data | Intended use |
 |---|---|---|
 | `smoke` | generated locally | CPU end-to-end wiring checks |
 | `dev` | selected named corpus | 5-TPP research runs and diagnostics |
@@ -272,12 +276,18 @@ manifest is checked into `data/manifests/fineweb-scaled-gpt2/`; no placeholder
 manifest is accepted. `--check-only` verifies the same manifest and dedicated
 folder without mutation.
 
-Official evaluation covers exactly the first 10,485,760 validation predictions.
-The harness requires official result events to report that exact coverage;
-smoke and development profiles deliberately use shorter diagnostic evaluation.
-The source is the pinned `kjj0/fineweb10B-gpt2` revision used by
-[Modded-NanoGPT](https://github.com/KellerJordan/modded-nanogpt). See
-[data/README.md](data/README.md) for provenance and the binary contract.
+Each named corpus supplies its own validation file; training never substitutes
+the classic validation split for a scaled corpus or routes a validation entry
+into the training file list. The `2B`, `4B`, `8B`, and `hero` corpora are nested
+prefixes and intentionally share one document-disjoint 100M-token validation
+shard. Official evaluation scores exactly its first 10,485,760 predictions.
+The harness binds that coverage to the recipe plan before launch; smoke and
+development execution types deliberately use shorter diagnostic evaluation.
+Document-disjoint means the boundary document is removed from training; it is
+not a claim of fuzzy or semantic near-duplicate decontamination.
+The classic corpus is the pinned `kjj0/fineweb10B-gpt2` revision used by
+[Modded-NanoGPT](https://github.com/KellerJordan/modded-nanogpt); scaled corpus
+provenance is separate. See [data/README.md](data/README.md) for both contracts.
 
 ## Run an algorithm
 
@@ -328,8 +338,8 @@ callers — a study loop, a piped shell, a peer worker — are never prompted an
 silently stay unnamed, so scripts cannot hang on a question nobody can answer.
 
 The harness creates a unique persistent run directory, captures stdout/stderr,
-validates the final result event and checkpoint, hashes artifacts, and appends a
-JSONL record. Within a comparable cohort, the trainer's synchronized
+validates the final result event and any required checkpoint, hashes artifacts,
+and appends a JSONL record. Within a comparable cohort, the trainer's synchronized
 accelerator time is the leaderboard score; cold process wall time is recorded
 separately. Human progress is streamed live while the machine-readable result
 remains isolated on stdout.
@@ -344,8 +354,9 @@ across runs. The byte layout, the column schema, and the permanent metric ids
 are documented in [docs/RIGLOG_FORMAT.md](docs/RIGLOG_FORMAT.md).
 
 The reference also writes `validation.csv`. On the official profile it probes
-the first eight validation batches every 500 optimizer steps by default, then
-records the exact canonical validation as its final FineWeb row. Fresh10 rows
+the first 1,048,576 validation predictions every 500 optimizer steps by default,
+then records the exact canonical validation as its final FineWeb row. The actual
+batch count is derived from the selected context and batch size. Fresh10 rows
 may follow it. Probe synchronization and evaluation are included in
 `train_seconds`; the final canonical evaluation is not. Both training and
 evaluation executables compile once on synthetic zero-valued inputs before
@@ -440,7 +451,7 @@ rather than silently dropped.
 One global selector switches every time-series chart
 between **equi-FLOP** (the default, using analytic cumulative estimated FLOPs)
 and **equi-step**. Official reference runs record `diagnostics.riglog` at step 1,
-every 250 steps, and the final step. The report exposes separate
+every 500 steps, and the final step. The report exposes separate
 **Gradient / Update / Parameter** buttons, with one chart for each L1/L2 norm,
 mean, standard deviation, and centered third/fourth moment. Timeline charts use
 the whole-model values; final-snapshot charts show embeddings, every transformer

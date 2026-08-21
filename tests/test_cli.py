@@ -87,7 +87,7 @@ class CliTests(unittest.TestCase):
                 data_path="data",
                 artifacts_path="runs",
                 default_profile="dev",
-                checkpoint_retention="none",
+                checkpoint_policy="none",
                 color="never",
             )
             args = cli.build_parser().parse_args(
@@ -138,6 +138,18 @@ class CliTests(unittest.TestCase):
             self.assertNotIn("--profile", run_config.trainer_args)
             self.assertIn("--tier", run_config.trainer_args)
             self.assertIn("--batch-size", run_config.trainer_args)
+            self.assertEqual(
+                run_config.trainer_args[
+                    run_config.trainer_args.index("--train-data") + 1
+                ],
+                str(prepared.train_files[0]),
+            )
+            self.assertEqual(
+                run_config.trainer_args[
+                    run_config.trainer_args.index("--val-data") + 1
+                ],
+                str(prepared.validation_files[0]),
+            )
 
     def test_clone_copies_recipe_config_byte_exactly(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -209,13 +221,47 @@ class CliTests(unittest.TestCase):
             4.0,
         )
 
+    def test_official_validation_mismatch_fails_before_launch(self) -> None:
+        prepared = PreparedDataset(
+            name="tiny",
+            root=Path("data"),
+            manifest_path=Path("manifest.json"),
+            manifest_sha256="a" * 64,
+            train_files=(Path("train.bin"),),
+            validation_files=(Path("val.bin"),),
+            train_tokens=100,
+            validation_tokens=100_000_000,
+            validation_prefix_tokens=10_485_760,
+        )
+        matching = RecipePlan(
+            payload={"validation_predictions": 10_485_760}, sha256="b" * 64
+        )
+        self.assertEqual(
+            cli._validation_contract(matching, prepared, "official"),
+            10_485_760,
+        )
+        mismatch = RecipePlan(
+            payload={"validation_predictions": 100_000_000}, sha256="c" * 64
+        )
+        with self.assertRaisesRegex(ConfigError, "does not match"):
+            cli._validation_contract(mismatch, prepared, "official")
+        self.assertIsNone(cli._validation_contract(mismatch, prepared, "dev"))
+
     def test_wizard_accepts_defaults_and_returns_complete_config(self) -> None:
         defaults = LocalConfig()
         # Empty answers accept every current machine, run, and dataset default;
         # dataset preparation remains automatic.
         with patch("builtins.input", side_effect=[""] * 13) as prompt:
-            result, diagnostics, require_tpu, download, save = cli._prepare_wizard(
+            (
+                result,
+                preparation_type,
+                diagnostics,
+                require_tpu,
+                download,
+                save,
+            ) = cli._prepare_wizard(
                 defaults,
+                preparation_type="official",
                 run_diagnostics=True,
                 require_tpu=True,
                 download=True,
@@ -224,6 +270,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.dataset, defaults.dataset)
         self.assertEqual(result.train_shards, 9)
         self.assertEqual(result.default_profile, defaults.default_profile)
+        self.assertEqual(preparation_type, "official")
         self.assertTrue(diagnostics)
         self.assertTrue(require_tpu)
         self.assertTrue(download)
@@ -236,6 +283,7 @@ class CliTests(unittest.TestCase):
         with patch("builtins.input", side_effect=answers):
             result, *_ = cli._prepare_wizard(
                 defaults,
+                preparation_type="official",
                 run_diagnostics=True,
                 require_tpu=True,
                 download=True,
@@ -309,7 +357,7 @@ class CliTests(unittest.TestCase):
                 validation_files=(scaled / "fineweb_val_000000.bin",),
                 train_tokens=1_900_000_000,
                 validation_tokens=100_000_000,
-                validation_prefix_tokens=100_000_000,
+                validation_prefix_tokens=10_485_760,
             )
             fresh10 = PreparedFresh10(
                 name="fresh10-v1",
@@ -369,21 +417,34 @@ class CliTests(unittest.TestCase):
         )
         args = cli.build_parser().parse_args(["prepare", "--non-interactive"])
         with patch("rig.cli.run_pdsh") as run:
-            cli._run_cluster_prepare(config, args, inventory, root=Path("/repo"))
+            cli._run_cluster_prepare(
+                config,
+                args,
+                inventory,
+                preparation_type="official",
+                root=Path("/repo"),
+            )
         remote = run.call_args.args[1]
         self.assertIn("--dataset 4B", remote)
         self.assertIn("--train-shards 39", remote)
         self.assertIn("--profile official", remote)
         self.assertEqual(
-            run.call_args.kwargs["timeout"], cli._remote_prepare_timeout(config, args)
+            run.call_args.kwargs["timeout"],
+            cli._remote_prepare_timeout(config, args, "official"),
         )
 
     def test_remote_prepare_timeout_scales_with_routed_corpus_bytes(self) -> None:
         args = cli.build_parser().parse_args(["prepare", "--non-interactive"])
-        classic = cli._remote_prepare_timeout(LocalConfig(), args)
-        two_b = cli._remote_prepare_timeout(LocalConfig(dataset="2B"), args)
-        eight_b = cli._remote_prepare_timeout(LocalConfig(dataset="8B"), args)
-        hero = cli._remote_prepare_timeout(LocalConfig(dataset="hero"), args)
+        classic = cli._remote_prepare_timeout(LocalConfig(), args, "official")
+        two_b = cli._remote_prepare_timeout(
+            LocalConfig(dataset="2B"), args, "official"
+        )
+        eight_b = cli._remote_prepare_timeout(
+            LocalConfig(dataset="8B"), args, "official"
+        )
+        hero = cli._remote_prepare_timeout(
+            LocalConfig(dataset="hero"), args, "official"
+        )
         self.assertLess(classic, two_b)
         self.assertLess(two_b, eight_b)
         self.assertLess(eight_b, hero)
@@ -428,6 +489,7 @@ class CliTests(unittest.TestCase):
         ):
             result, *_ = cli._prepare_wizard(
                 LocalConfig(),
+                preparation_type="official",
                 run_diagnostics=True,
                 require_tpu=True,
                 download=True,
@@ -453,7 +515,13 @@ class CliTests(unittest.TestCase):
             },
         )
         with patch("rig.cli.run_pdsh") as run:
-            cli._run_cluster_prepare(config, args, inventory, root=Path("/repo"))
+            cli._run_cluster_prepare(
+                config,
+                args,
+                inventory,
+                preparation_type="official",
+                root=Path("/repo"),
+            )
 
         self.assertEqual(run.call_args.args[0], inventory.hosts)
         remote = run.call_args.args[1]
@@ -695,6 +763,28 @@ class CliTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(cli.HarnessError, "training-token"):
             cli._recorded_training_tokens({"constraints": {"training_tokens": 0}})
+
+    def test_verify_recovers_validation_budget_and_checkpoint_retention(self) -> None:
+        self.assertIsNone(cli._recorded_validation_tokens({}))
+        self.assertEqual(
+            cli._recorded_validation_tokens(
+                {"constraints": {"validation_tokens": 10_485_760}}
+            ),
+            10_485_760,
+        )
+        with self.assertRaisesRegex(cli.HarnessError, "validation-token"):
+            cli._recorded_validation_tokens({"constraints": {"validation_tokens": 0}})
+
+        self.assertTrue(cli._record_requires_checkpoint(None))
+        self.assertTrue(
+            cli._record_requires_checkpoint({"checkpoint": {"retained": True}})
+        )
+        self.assertFalse(
+            cli._record_requires_checkpoint({"checkpoint": {"retained": False}})
+        )
+        self.assertFalse(cli._record_requires_checkpoint({"checkpoint": None}))
+        with self.assertRaisesRegex(cli.HarnessError, "retention state"):
+            cli._record_requires_checkpoint({"checkpoint": {"retained": "sometimes"}})
 
 
 if __name__ == "__main__":

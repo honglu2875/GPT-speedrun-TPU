@@ -22,16 +22,22 @@ trainer.
 
 Each folder is independently usable after its `manifest.json` is present:
 
-| folder | validation tokens | training tokens |
-|---|---:|---:|
-| `2B/` | 100,000,000 | 1,900,000,000 |
-| `4B/` | 100,000,000 | 3,900,000,000 |
-| `8B/` | 100,000,000 | 7,900,000,000 |
-| `hero/` | 100,000,000 | 74,900,000,000 |
+| folder | validation shard | official scored prefix | training tokens |
+|---|---:|---:|---:|
+| `2B/` | 100,000,000 | 10,485,760 | 1,900,000,000 |
+| `4B/` | 100,000,000 | 10,485,760 | 3,900,000,000 |
+| `8B/` | 100,000,000 | 10,485,760 | 7,900,000,000 |
+| `hero/` | 100,000,000 | 10,485,760 | 74,900,000,000 |
 
 The variants are exact nested prefixes: the validation shard and early
 training shards have identical SHA-256 values across folders. Repeated Hub
 paths are expected to deduplicate at the content-storage layer.
+
+The 100M figure is the capacity of the immutable validation file. Official
+recipe evaluation scores its first 10,485,760 next-token predictions, as
+recorded by `validation_prefix_tokens` in each manifest. Keeping those two
+counts distinct lets the harness verify evaluation coverage without treating
+the rest of the published validation shard as training data.
 
 Every `.bin` file has a 1,024-byte header of 256 little-endian signed int32
 values. Header slots 0, 1, and 2 contain magic `20240520`, version `1`, and the
@@ -63,6 +69,11 @@ are training. Ordinary training-shard boundaries may split a document. At the
 validation boundary only, the remainder of the crossing document is discarded
 so validation and training are document-disjoint; the manifest records the
 discarded-token count and a hash-safe document identifier.
+
+This is an exact document-boundary guarantee. It does not claim fuzzy or
+semantic near-duplicate removal between later training documents and the
+validation documents; upstream corpus deduplication remains the only broader
+duplicate-control layer.
 
 The preparation code uses one verified source Parquet at a time, bounded
 PyArrow batches, streaming output writes, exact row-level checkpoints, atomic

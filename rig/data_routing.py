@@ -10,9 +10,10 @@ import stat
 from typing import Any, Mapping
 
 from .data import DataError, FORMAT_VERSION, HEADER_BYTES, MAGIC, load_manifest
+from .rules import OFFICIAL_VALIDATION_PREDICTIONS
 
 
-SCALED_VALIDATION_TOKENS = 100_000_000
+SCALED_SHARD_TOKENS = 100_000_000
 SCALED_CACHE_SUBDIRECTORY = Path("fineweb-scaled")
 SCALED_MANIFEST_SUBDIRECTORY = "fineweb-scaled-gpt2"
 SCALED_PREPARED_REPOSITORY = "quintic/fineweb-scaled-gpt2"
@@ -40,11 +41,11 @@ class ScaledVariant:
 
     @property
     def train_capacity(self) -> int:
-        return self.total_tokens - SCALED_VALIDATION_TOKENS
+        return self.total_tokens - SCALED_SHARD_TOKENS
 
     @property
     def train_shards(self) -> int:
-        return self.train_capacity // SCALED_VALIDATION_TOKENS
+        return self.train_capacity // SCALED_SHARD_TOKENS
 
     @property
     def dataset_name(self) -> str:
@@ -57,6 +58,8 @@ SCALED_VARIANTS = (
     ScaledVariant("8B", 8_000_000_000),
     ScaledVariant("hero", 75_000_000_000),
 )
+
+
 @dataclass(frozen=True)
 class PreparationRoute:
     """One fully resolved preparation choice, before touching its cache."""
@@ -145,7 +148,9 @@ def named_preparation_route(
     if name == "classic":
         shards = 9 if train_shards is None else int(train_shards)
         if not 1 <= shards <= 9:
-            raise DataError("classic publishes 9 train shards; train_shards must be 1..9")
+            raise DataError(
+                "classic publishes 9 train shards; train_shards must be 1..9"
+            )
         return PreparationRoute(
             "official",
             "classic FineWeb",
@@ -172,7 +177,7 @@ def named_preparation_route(
         f"scaled FineWeb {variant.name}",
         root / SCALED_MANIFEST_SUBDIRECTORY / f"{variant.name}.json",
         shards,
-        shards * SCALED_VALIDATION_TOKENS,
+        shards * SCALED_SHARD_TOKENS,
         SCALED_CACHE_SUBDIRECTORY / variant.name,
         variant,
     )
@@ -236,9 +241,10 @@ def validate_scaled_manifest_contract(
             f"{source}: {variant.name} must provide exactly {variant.train_shards} "
             "default training shards"
         )
-    if payload.get("validation_prefix_tokens") != SCALED_VALIDATION_TOKENS:
+    if payload.get("validation_prefix_tokens") != OFFICIAL_VALIDATION_PREDICTIONS:
         raise DataError(
-            f"{source}: scaled validation must contain exactly 100,000,000 tokens"
+            f"{source}: scaled validation scoring prefix must contain exactly "
+            f"{OFFICIAL_VALIDATION_PREDICTIONS:,} predictions"
         )
 
     expected_paths = ["fineweb_val_000000.bin"] + [
@@ -255,14 +261,14 @@ def validate_scaled_manifest_contract(
         expected_split = "validation" if index == 0 else "train"
         if entry.get("split") != expected_split:
             raise DataError(f"{source}: invalid split for {entry.get('path')}")
-        if entry.get("tokens") != SCALED_VALIDATION_TOKENS:
+        if entry.get("tokens") != SCALED_SHARD_TOKENS:
             raise DataError(
                 f"{source}: every scaled shard must contain 100,000,000 tokens"
             )
-        if entry.get("bytes") != HEADER_BYTES + 2 * SCALED_VALIDATION_TOKENS:
+        if entry.get("bytes") != HEADER_BYTES + 2 * SCALED_SHARD_TOKENS:
             raise DataError(
                 f"{source}: every scaled shard must contain exactly "
-                f"{HEADER_BYTES + 2 * SCALED_VALIDATION_TOKENS:,} bytes"
+                f"{HEADER_BYTES + 2 * SCALED_SHARD_TOKENS:,} bytes"
             )
         digest = entry.get("sha256")
         if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
@@ -329,7 +335,7 @@ def validate_scaled_manifest_contract(
         or preparation.get("builder_module_sha256") != SCALED_BUILDER_SHA256
         or preparation.get("entrypoint_sha256") != SCALED_ENTRYPOINT_SHA256
         or preparation.get("pyarrow_version") != "19.0.1"
-        or preparation.get("shard_tokens") != SCALED_VALIDATION_TOKENS
+        or preparation.get("shard_tokens") != SCALED_SHARD_TOKENS
         or preparation.get("validation_train_document_disjoint") is not True
         or preparation.get("nested_prefix") is not True
         or isinstance(boundary_tokens, bool)

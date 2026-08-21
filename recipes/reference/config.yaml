@@ -3,7 +3,7 @@
 # This is a complete standalone document: no defaults are inherited from the
 # development or smoke configurations. The family uses the fixed-TPP CompleteP
 # hybrid described in docs/COMPLETEP.md.
-schema_version: 5
+schema_version: 6
 execution_type: official
 family:
   default_tier: 125m
@@ -22,8 +22,6 @@ family:
   parameterization:
     name: completep_fixed_tpp_v1
     base_tier: 60m
-    base_width: 384
-    base_depth: 12
     depth_alpha: 1.0
     init_std: 0.02
     # Match the official nanoGPT-mup implementation: each head contracts over
@@ -109,10 +107,10 @@ run:
     beta2: 0.95
     grad_clip: 0.0
   evaluation:
-    prediction_budget: 10485760
-    eval_batches: 80
-    val_every: 500
-    val_probe_batches: 8
+    final_predictions: 10485760
+    probe:
+      every_steps: 500
+      predictions: 1048576
   logging:
     diagnostics_every: 500
     log_every: 500

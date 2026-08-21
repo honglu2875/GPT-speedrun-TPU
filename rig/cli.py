@@ -31,7 +31,7 @@ from .harness import (
     verify_run,
 )
 from .cohort import CohortError, build_cohort, validate_cohort
-from .plan import resolve_recipe_plan
+from .plan import RecipePlan, resolve_recipe_plan
 from .harness.cluster import (
     ClusterError,
     ClusterInventory,
@@ -86,6 +86,7 @@ from .doctor import (
 )
 from .console import Console
 from .report import build_report, export_study
+from .rules import OFFICIAL_TARGET_LOSS, OFFICIAL_VALIDATION_PREDICTIONS
 
 
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -123,7 +124,6 @@ def _is_research_run(profile: str) -> bool:
     return profile == "dev"
 
 
-OFFICIAL_TARGET_LOSS = 3.28
 _CLUSTER_WORKER_ENV = "RIG_CLUSTER_WORKER"
 _CONTROLLER_HOST_ENV = "RIG_CONTROLLER_HOSTNAME"
 _DISTRIBUTED_ENV = "RIG_DISTRIBUTED"
@@ -248,15 +248,15 @@ def command_prepare(args: argparse.Namespace) -> int:
             "active_cluster": getattr(args, "cluster", None),
             "tpu_vm_count": args.tpu_vm_count,
             "tpu_vm_hosts": args.tpu_vm_hosts,
-            "data_profile": args.profile,
             "default_profile": args.run_profile,
-            "checkpoint_retention": args.checkpoint_policy,
+            "checkpoint_policy": args.checkpoint_policy,
             "color": args.color,
             "target_loss": args.target_loss,
             "dataset": args.dataset,
             "train_shards": train_shards_override,
         },
     )
+    preparation_type = args.profile or proposed.default_profile
     interactive = not (args.non_interactive or args.yes)
     if interactive and not sys.stdin.isatty():
         raise ConfigError(
@@ -267,8 +267,16 @@ def command_prepare(args: argparse.Namespace) -> int:
     require_tpu = proposed.default_profile == "official"
     save = not args.no_save
     if interactive:
-        proposed, run_diagnostics, require_tpu, data_work, save = _prepare_wizard(
+        (
             proposed,
+            preparation_type,
+            run_diagnostics,
+            require_tpu,
+            data_work,
+            save,
+        ) = _prepare_wizard(
+            proposed,
+            preparation_type=preparation_type,
             run_diagnostics=run_diagnostics,
             require_tpu=require_tpu,
             download=data_work,
@@ -280,7 +288,7 @@ def command_prepare(args: argparse.Namespace) -> int:
     data_path = resolve_path(proposed.data_path, root)
     artifacts_path = resolve_path(proposed.artifacts_path, root)
     _ensure_artifacts_inside_repo(artifacts_path, root)
-    route = _route_for_config(proposed, proposed.data_profile)
+    route = _route_for_config(proposed, preparation_type)
     route_root = route.data_root(data_path)
     route_manifest = (
         resolve_preparation_manifest(route) if data_work else route.manifest
@@ -313,7 +321,7 @@ def command_prepare(args: argparse.Namespace) -> int:
         results = run_doctor(
             environment_checks(
                 data_path=data_path,
-                profile=proposed.data_profile,
+                profile=preparation_type,
                 require_tpu=require_tpu,
                 expected_process_count=_expected_process_count(proposed),
                 accelerator=proposed.accelerator,
@@ -335,7 +343,13 @@ def command_prepare(args: argparse.Namespace) -> int:
             f"preparing datasets and validations concurrently on "
             f"{len(inventory.hosts)} TPU VMs"
         )
-        _run_cluster_prepare(proposed, args, inventory, root=root)
+        _run_cluster_prepare(
+            proposed,
+            args,
+            inventory,
+            preparation_type=preparation_type,
+            root=root,
+        )
     else:
         style.heading("Dataset cache")
         shards = route.train_shards
@@ -353,7 +367,7 @@ def command_prepare(args: argparse.Namespace) -> int:
                 timeout=args.timeout,
             )
         _print_prepared(prepared, style)
-        if proposed.data_profile == "official":
+        if preparation_type == "official":
             style.heading("Fresh-domain diagnostic")
             if args.check_only:
                 fresh10 = verify_fresh10(data_path)
@@ -373,7 +387,7 @@ def command_prepare(args: argparse.Namespace) -> int:
             _run_cluster_doctor(
                 proposed,
                 inventory,
-                profile=proposed.data_profile,
+                profile=preparation_type,
                 data_path=proposed.data_path,
                 require_tpu=require_tpu,
                 # Each remote scaled prepare already verifies its routed
@@ -420,7 +434,7 @@ def command_doctor(args: argparse.Namespace) -> int:
             expected_process_count=_expected_process_count(config),
             accelerator=config.accelerator,
             chips_per_host=config.chips_per_host,
-            route=_route_for_config(config, _runtime_data_profile(profile)),
+            route=_route_for_config(config, _runtime_preparation_type(profile)),
             check_data=not args.skip_data,
             compile_probe=not args.quick,
         )
@@ -516,8 +530,8 @@ def command_run(args: argparse.Namespace) -> int:
     # shard prefix control which immutable FineWeb corpus backs non-smoke runs.
     # Keeping those axes separate lets a short dev study consume the same
     # rank-disjoint corpus as the eventual official family run.
-    run_data_profile = _runtime_data_profile(profile)
-    route = _route_for_config(config, run_data_profile)
+    run_data_type = _runtime_preparation_type(profile)
+    route = _route_for_config(config, run_data_type)
     _require_prepared_dataset(
         config, route, data_path, cluster=getattr(args, "cluster", None)
     )
@@ -540,6 +554,7 @@ def command_run(args: argparse.Namespace) -> int:
         style.note(
             "SHA-256 scan skipped; headers and exact shard selection still checked"
         )
+    expected_validation_tokens = _validation_contract(plan, prepared, profile)
 
     fresh10: PreparedFresh10 | None = None
     if profile == "official":
@@ -572,7 +587,7 @@ def command_run(args: argparse.Namespace) -> int:
             )
 
     dataset_id, tokenizer_id = _data_identity(
-        run_data_profile, prepared_name=prepared.name
+        run_data_type, prepared_name=prepared.name
     )
     trainer_args = [
         *scientific_args,
@@ -595,16 +610,11 @@ def command_run(args: argparse.Namespace) -> int:
     timeout = (
         args.timeout or {"smoke": 300.0, "dev": 3600.0, "official": 21600.0}[profile]
     )
-    policy = _checkpoint_policy(args, config.checkpoint_retention, profile=profile)
+    policy = _checkpoint_policy(args, config.checkpoint_policy, profile=profile)
     if policy == "none" and not _is_research_run(profile):
         raise ConfigError(
             "--checkpoint-policy none is restricted to development research runs"
         )
-    if policy == "none":
-        # Skip writing rather than write-then-delete. Nothing reads the weights
-        # between those two points, so a 500M run would spend ~2 GB for nothing.
-        trainer_args.append("--omit-checkpoint")
-    retention = policy
     study_values = (args.study_id, args.study_point, args.study_suite_sha256)
     if any(value is not None for value in study_values) and not all(
         value is not None for value in study_values
@@ -622,7 +632,7 @@ def command_run(args: argparse.Namespace) -> int:
         raise ConfigError("study suite SHA-256 must be 64 lowercase hexadecimal digits")
     provenance = _data_provenance(
         prepared,
-        profile=run_data_profile,
+        profile=run_data_type,
         integrity="headers+size" if args.skip_data_check else "sha256",
         repo=root,
         fresh10=fresh10,
@@ -651,16 +661,14 @@ def command_run(args: argparse.Namespace) -> int:
             seed=args.seed,
             timeout_seconds=timeout,
             target_loss=target_loss,
-            expected_validation_tokens=(
-                prepared.validation_prefix_tokens if profile == "official" else None
-            ),
+            expected_validation_tokens=expected_validation_tokens,
             expected_downstream_tokens=(
                 {domain.name: domain.scored_tokens for domain in fresh10.domains}
                 if fresh10 is not None
                 else None
             ),
             trainer_args=tuple(trainer_args),
-            checkpoint_retention=retention,
+            checkpoint_policy=policy,
             python_executable=str(python_executable),
             remote_controller=config.remote_controller,
             artifact_host=artifact_target,
@@ -686,7 +694,6 @@ def command_run(args: argparse.Namespace) -> int:
             },
             tpu_vm_count=config.tpu_vm_count,
             tpu_vm_hosts=config.tpu_vm_hosts,
-            require_checkpoint=policy != "none",
         )
     )
     metrics = outcome.record["metrics"]
@@ -751,8 +758,8 @@ def command_profile(args: argparse.Namespace) -> int:
     if _work_runs_elsewhere(config):
         configured_data_path = _cluster_data_argument(configured_data_path, root)
     data_path = resolve_path(configured_data_path, root)
-    run_data_profile = _runtime_data_profile(profile)
-    route = _route_for_config(config, run_data_profile)
+    run_data_type = _runtime_preparation_type(profile)
+    route = _route_for_config(config, run_data_type)
     manifest = resolve_preparation_manifest(route)
     route_root = route.data_root(data_path)
     shards = route.train_shards
@@ -766,7 +773,7 @@ def command_profile(args: argparse.Namespace) -> int:
     output_dir = resolve_path(args.output_dir, root)
     xprof_dir = output_dir / "xprof"
     dataset_id, tokenizer_id = _data_identity(
-        run_data_profile, prepared_name=prepared.name
+        run_data_type, prepared_name=prepared.name
     )
     trainer_color = "always" if style.enabled else "never"
     trainer_command = [
@@ -875,21 +882,25 @@ def command_verify(args: argparse.Namespace) -> int:
     profile = args.profile or (
         str(record["profile"]) if record is not None else config.default_profile
     )
+    require_checkpoint = _record_requires_checkpoint(record)
     expected_downstream = (
         _recorded_downstream_tokens(record)
         if profile == "official" and record is not None
         else None
     )
+    expected_validation = None
+    if profile == "official":
+        expected_validation = (
+            _recorded_validation_tokens(record) if record is not None else None
+        ) or OFFICIAL_VALIDATION_PREDICTIONS
     result = verify_run(
         run_dir,
         expected_training_tokens=(
             _recorded_training_tokens(record) if record is not None else None
         ),
-        expected_validation_tokens=10_485_760 if profile == "official" else None,
+        expected_validation_tokens=expected_validation,
         expected_downstream_tokens=expected_downstream,
-        require_checkpoint=(
-            record is None or isinstance(record.get("checkpoint"), dict)
-        ),
+        require_checkpoint=require_checkpoint,
     )
     if record is not None:
         stdout_sha256 = sha256_file(run_dir / "stdout.log")
@@ -901,7 +912,7 @@ def command_verify(args: argparse.Namespace) -> int:
         recorded_checkpoint = record.get("checkpoint")
         expected_checkpoint = (
             recorded_checkpoint.get("sha256")
-            if isinstance(recorded_checkpoint, dict)
+            if require_checkpoint and isinstance(recorded_checkpoint, dict)
             else None
         )
         if result.checkpoint_sha256 != expected_checkpoint:
@@ -931,6 +942,25 @@ def _dataset_cache_root(config: LocalConfig, override: Path | None = None) -> Pa
     return resolve_path(str(override) if override else config.data_path)
 
 
+def _validation_contract(
+    plan: RecipePlan,
+    prepared: PreparedDataset,
+    profile: str,
+) -> int | None:
+    """Bind official recipe coverage to the selected corpus before launch."""
+
+    if profile != "official":
+        return None
+    expected = prepared.validation_prefix_tokens
+    if plan.validation_predictions != expected:
+        raise ConfigError(
+            "official recipe validation coverage does not match the selected "
+            f"dataset: plan={plan.validation_predictions:,}, "
+            f"manifest={expected:,} predictions"
+        )
+    return expected
+
+
 def _dataset_presence(root: Path) -> dict[str, tuple[int, int]]:
     """Map corpus name -> (shard files present, bytes) in a local cache root."""
 
@@ -945,10 +975,10 @@ def _dataset_presence(root: Path) -> dict[str, tuple[int, int]]:
     return found
 
 
-def _route_for_config(config: LocalConfig, data_profile: str):
+def _route_for_config(config: LocalConfig, preparation_type: str):
     """Resolve the explicit corpus, with smoke as the sole inline exception."""
 
-    if data_profile == "smoke":
+    if preparation_type == "smoke":
         return smoke_preparation_route()
     return named_preparation_route(
         config.dataset,
@@ -956,7 +986,7 @@ def _route_for_config(config: LocalConfig, data_profile: str):
     )
 
 
-def _runtime_data_profile(profile: str) -> str:
+def _runtime_preparation_type(profile: str) -> str:
     """Map an execution profile to synthetic or named immutable data."""
 
     return "smoke" if profile == "smoke" else "official"
@@ -1314,6 +1344,7 @@ def _run_cluster_prepare(
     args: argparse.Namespace,
     inventory: ClusterInventory,
     *,
+    preparation_type: str,
     root: Path,
 ) -> None:
     if not inventory.hosts:
@@ -1330,7 +1361,7 @@ def _run_cluster_prepare(
         "--path",
         data_argument,
         "--profile",
-        config.data_profile,
+        preparation_type,
         "--artifacts",
         config.artifacts_path,
         "--tpu-vm-count",
@@ -1340,7 +1371,7 @@ def _run_cluster_prepare(
         "--run-profile",
         config.default_profile,
         "--checkpoint-policy",
-        config.checkpoint_retention,
+        config.checkpoint_policy,
         "--color",
         "never",
         "--dataset",
@@ -1369,11 +1400,15 @@ def _run_cluster_prepare(
         inventory.hosts,
         remote,
         labels=True,
-        timeout=_remote_prepare_timeout(config, args),
+        timeout=_remote_prepare_timeout(config, args, preparation_type),
     )
 
 
-def _remote_prepare_timeout(config: LocalConfig, args: argparse.Namespace) -> float:
+def _remote_prepare_timeout(
+    config: LocalConfig,
+    args: argparse.Namespace,
+    preparation_type: str,
+) -> float:
     """Return a whole-peer cap distinct from the per-request HTTP timeout.
 
     The explicit dataset selection determines the nominal bytes each peer installs.
@@ -1384,10 +1419,10 @@ def _remote_prepare_timeout(config: LocalConfig, args: argparse.Namespace) -> fl
     duration.
     """
 
-    route = _route_for_config(config, config.data_profile)
+    route = _route_for_config(config, preparation_type)
     token_bytes = 2 * (
         (route.train_capacity or route.train_shards * 100_000_000)
-        + (100_000_000 if config.data_profile != "smoke" else 0)
+        + (100_000_000 if preparation_type != "smoke" else 0)
     )
     transfer_and_verify = token_bytes / (10 * 1024**2)
     route_deadline = transfer_and_verify * 1.5 + 30 * 60.0
@@ -1525,21 +1560,22 @@ def _initialize_distributed_worker(config: LocalConfig) -> int:
 def _prepare_wizard(
     config: LocalConfig,
     *,
+    preparation_type: str,
     run_diagnostics: bool,
     require_tpu: bool,
     download: bool,
     save: bool,
-) -> tuple[LocalConfig, bool, bool, bool, bool]:
+) -> tuple[LocalConfig, str, bool, bool, bool, bool]:
     style = Style(config.color)
     style.banner("interactive preparation")
     print(
         "  Choose personal defaults. Official data/model rules remain versioned in Git.\n"
     )
     data_path = _ask("Data cache root", config.data_path, style)
-    data_profile = _choose(
-        "Preparation profile",
+    preparation_type = _choose(
+        "Preparation execution type",
         _PROFILES,
-        config.data_profile,
+        preparation_type,
         style,
         descriptions={
             "smoke": "tiny generated CI data",
@@ -1571,11 +1607,13 @@ def _prepare_wizard(
         tpu_vm_hosts = _ask("pdsh host expression", default_hosts, style)
     else:
         tpu_vm_hosts = ""
-    run_profile = _choose("Default run profile", _PROFILES, data_profile, style)
-    retention = _choose(
+    run_profile = _choose(
+        "Default run execution type", _PROFILES, config.default_profile, style
+    )
+    checkpoint_policy = _choose(
         "Checkpoint policy",
         _CHECKPOINT_POLICIES,
-        config.checkpoint_retention,
+        config.checkpoint_policy,
         style,
         descriptions={
             "always": "keep the final weights",
@@ -1597,20 +1635,29 @@ def _prepare_wizard(
             style,
         )
     save = _confirm("Save these personal defaults", save, style)
-    resolved = LocalConfig(
-        data_path=data_path,
-        artifacts_path=artifacts,
-        tpu_vm_count=tpu_vm_count,
-        tpu_vm_hosts=tpu_vm_hosts,
-        data_profile=data_profile,
-        dataset=dataset,
-        train_shards=train_shards,
-        default_profile=run_profile,
-        checkpoint_retention=retention,
-        color=color,
-        target_loss=target,
-    ).validate()
-    return resolved, run_diagnostics, require_tpu, download, save
+    resolved = with_overrides(
+        config,
+        {
+            "data_path": data_path,
+            "artifacts_path": artifacts,
+            "tpu_vm_count": tpu_vm_count,
+            "tpu_vm_hosts": tpu_vm_hosts,
+            "dataset": dataset,
+            "train_shards": train_shards,
+            "default_profile": run_profile,
+            "checkpoint_policy": checkpoint_policy,
+            "color": color,
+            "target_loss": target,
+        },
+    )
+    return (
+        resolved,
+        preparation_type,
+        run_diagnostics,
+        require_tpu,
+        download,
+        save,
+    )
 
 
 def _resolve_run_name(args: argparse.Namespace, style: Style) -> str:
@@ -1912,6 +1959,38 @@ def _recorded_training_tokens(record: dict[str, Any]) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise HarnessError("recorded training-token constraint is invalid")
     return value
+
+
+def _recorded_validation_tokens(record: dict[str, Any]) -> int | None:
+    """Recover the exact validation coverage captured for a prior run."""
+
+    constraints = record.get("constraints")
+    if constraints is None:
+        return None
+    if not isinstance(constraints, dict):
+        raise HarnessError("recorded run constraints are invalid")
+    value = constraints.get("validation_tokens")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise HarnessError("recorded validation-token constraint is invalid")
+    return value
+
+
+def _record_requires_checkpoint(record: dict[str, Any] | None) -> bool:
+    """Recover whether a prior run intentionally retained its checkpoint."""
+
+    if record is None:
+        return True
+    checkpoint = record.get("checkpoint")
+    if checkpoint is None:
+        return False
+    if not isinstance(checkpoint, dict):
+        raise HarnessError("recorded checkpoint metadata is invalid")
+    retained = checkpoint.get("retained", True)
+    if not isinstance(retained, bool):
+        raise HarnessError("recorded checkpoint retention state is invalid")
+    return retained
 
 
 def _ensure_artifacts_inside_repo(path: Path, root: Path) -> None:

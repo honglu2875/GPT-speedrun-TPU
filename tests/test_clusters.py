@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import tempfile
+import tomllib
 import unittest
 import unittest.mock
 
@@ -14,6 +15,7 @@ from rig.config import (
     load_clusters,
     load_config,
     save_config,
+    with_overrides,
 )
 from rig.doctor import check_devices
 
@@ -96,6 +98,47 @@ class ClusterProfileTests(unittest.TestCase):
             names = sorted(load_clusters(root))
             self.assertEqual(names, ["v4-32", "v5e-64"])
             self.assertEqual(load_config(root, cluster="v4-32").tpu_vm_count, 4)
+
+    def test_saved_settings_separate_preferences_data_and_topology(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".rig.toml").write_text(BOTH, encoding="utf-8")
+            config = with_overrides(
+                load_config(root),
+                {"dataset": "8B", "train_shards": 79},
+            )
+            path = save_config(config, root)
+            payload = tomllib.loads(path.read_text(encoding="utf-8"))
+
+            self.assertEqual(payload["data"], {"dataset": "8B", "train_shards": 79})
+            self.assertNotIn("dataset", payload["rig"])
+            self.assertNotIn("tpu_vm_count", payload["rig"])
+            self.assertNotIn("dataset", payload["cluster"]["v5e-64"])
+            self.assertEqual(load_config(root, cluster="v4-32").dataset, "8B")
+
+    def test_legacy_overlaps_load_without_changing_dataset_by_cluster(self) -> None:
+        legacy = """
+[rig]
+active_cluster = "a"
+dataset = "8B"
+train_shards = 79
+data_profile = "dev"
+checkpoint_retention = "none"
+
+[cluster.a]
+tpu_vm_count = 1
+tpu_vm_hosts = ""
+dataset = "2B"
+train_shards = 19
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".rig.toml").write_text(legacy, encoding="utf-8")
+            config = load_config(root)
+            self.assertEqual(config.dataset, "8B")
+            self.assertEqual(config.train_shards, 79)
+            self.assertEqual(config.checkpoint_policy, "none")
+            self.assertFalse(hasattr(config, "data_profile"))
 
     def test_cluster_tables_reject_unknown_and_invalid_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

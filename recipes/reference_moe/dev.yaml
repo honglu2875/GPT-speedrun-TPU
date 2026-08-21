@@ -1,5 +1,5 @@
 # Standalone development configuration for recipes/reference_moe/train.py.
-schema_version: 5
+schema_version: 6
 execution_type: dev
 family:
   default_tier: 125m
@@ -16,8 +16,6 @@ family:
   parameterization:
     name: completep_fixed_tpp_v1
     base_tier: 60m
-    base_width: 384
-    base_depth: 12
     depth_alpha: 1.0
     init_std: 0.02
     attention_scale: inverse_head_dim
@@ -119,10 +117,8 @@ run:
     beta2: 0.95
     grad_clip: 0.0
   evaluation:
-    prediction_budget: 0
-    eval_batches: 8
-    val_every: 0
-    val_probe_batches: 8
+    final_predictions: 1048576
+    probe: null
   logging:
     diagnostics_every: 10
     log_every: 10

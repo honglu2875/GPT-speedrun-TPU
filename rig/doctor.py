@@ -411,7 +411,7 @@ def check_prepared_data(
                 "dataset",
                 "error",
                 f"FineWeb is ready, but Fresh10 is not: {exc}",
-                "run `make prepare` with the official data profile",
+                "run `make prepare` with the official execution type",
             )
         fresh_detail = (
             f" + Fresh10 {len(downstream.domains)} domains / "

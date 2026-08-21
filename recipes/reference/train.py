@@ -161,7 +161,6 @@ from rig.kernels import (
 
 
 SCHEMA_VERSION = 1
-CONFIG_SCHEMA_VERSION = 5
 RECIPE_DIR = Path(__file__).resolve().parent
 RECIPE_NAME = RECIPE_DIR.name
 _VALID_PROFILES = ("smoke", "dev", "official")
@@ -226,7 +225,6 @@ class Config:
     config_filename: str
     execution_type: str
     context_preset: str
-    config_overrides: tuple[tuple[str, int | str], ...]
     # Optimizer step after which to stop. steps, warmup, and m_D still resolve
     # from the full horizon, so the trajectory matches the untruncated run up
     # to this point. None runs to completion.
@@ -268,6 +266,12 @@ class Config:
         )
 
     @property
+    def validation_predictions(self) -> int:
+        """Number of next-token predictions in the final validation pass."""
+
+        return self.eval_batches * self.batch_size * self.seq_len
+
+    @property
     def compute_dtype(self) -> Any:
         """JAX dtype derived from the serializable dtype name."""
 
@@ -302,8 +306,6 @@ class ParameterizationDefinition:
 
     name: Literal["standard", "completep_fixed_tpp_v1"]
     base_tier: TierName
-    base_width: PositiveInt
-    base_depth: PositiveInt
     depth_alpha: DepthAlpha
     init_std: PositiveFloat
     attention_scale: Literal["inverse_sqrt_head_dim", "inverse_head_dim"]
@@ -370,6 +372,24 @@ class FamilyDefinition:
     parameterization: ParameterizationDefinition
     tiers: Annotated[dict[TierName, TierDefinition], Length(ge=1)]
 
+    @property
+    def base_model(self) -> ModelDefinition:
+        """Architecture anchoring the parameterization multipliers."""
+
+        return self.tiers[self.parameterization.base_tier].model
+
+    @property
+    def base_width(self) -> int:
+        return self.base_model.d_model
+
+    @property
+    def base_depth(self) -> int:
+        return self.base_model.layers
+
+    @property
+    def base_tpp_parameters(self) -> int:
+        return self.tiers[self.parameterization.base_tier].tpp_parameters
+
 
 Sampling = Literal["random_windows", "shuffled_epochs"]
 ComputeDtype = Literal["bfloat16", "float32"]
@@ -420,11 +440,15 @@ class OptimizerSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class ValidationProbeSettings:
+    every_steps: PositiveInt
+    predictions: PositiveInt
+
+
+@dataclass(frozen=True, slots=True)
 class EvaluationSettings:
-    prediction_budget: NonnegativeInt
-    eval_batches: PositiveInt
-    val_every: NonnegativeInt
-    val_probe_batches: PositiveInt
+    final_predictions: PositiveInt
+    probe: ValidationProbeSettings | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -446,7 +470,7 @@ class RunDefinition:
 class ExperimentConfig(ConfigSchema):
     """Complete typed representation of one selected standalone YAML file."""
 
-    schema_version: Literal[5]
+    schema_version: Literal[6]
     execution_type: StandardExecutionType
     family: FamilyDefinition
     run: RunDefinition
@@ -488,34 +512,28 @@ class ExperimentConfig(ConfigSchema):
                 f"{label} run.kernels.attention_backend "
                 f"{run.kernels.attention_backend} requires training.dtype bfloat16"
             )
-        if (
-            run.evaluation.val_every
-            and run.evaluation.val_probe_batches > run.evaluation.eval_batches
-        ):
+        probe = run.evaluation.probe
+        if probe is not None and probe.predictions > run.evaluation.final_predictions:
             raise ValueError(
-                f"{label} run.evaluation.val_probe_batches must not exceed eval_batches"
+                f"{label} run.evaluation.probe.predictions must not exceed "
+                "final_predictions"
             )
         self._validate_evaluation(family.default_context, label)
 
     def _validate_evaluation(self, context_name: str, label: str) -> None:
         """Check an explicitly requested fixed validation prediction budget."""
 
-        evaluation = self.run.evaluation
-        validation_tokens = evaluation.prediction_budget
-        if not validation_tokens:
-            return
         tokens_per_step = self.family.contexts[context_name].tokens_per_step
-        if validation_tokens % tokens_per_step:
-            raise ValueError(
-                f"{label} batch_size * seq_len must divide the configured "
-                f"{validation_tokens:,}-prediction validation prefix"
-            )
-        required_eval_batches = validation_tokens // tokens_per_step
-        if evaluation.eval_batches != required_eval_batches:
-            raise ValueError(
-                f"{label} run.evaluation.eval_batches must be {required_eval_batches} "
-                "for the configured validation prefix"
-            )
+        evaluation = self.run.evaluation
+        budgets = [("final_predictions", evaluation.final_predictions)]
+        if evaluation.probe is not None:
+            budgets.append(("probe.predictions", evaluation.probe.predictions))
+        for field, predictions in budgets:
+            if predictions % tokens_per_step:
+                raise ValueError(
+                    f"{label} batch_size * seq_len must divide "
+                    f"run.evaluation.{field} ({predictions:,})"
+                )
 
     def resolve_selection(
         self,
@@ -574,7 +592,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = new_recipe_parser(
         description=(
             "Train a decoder-only GPT with JAX. Static experiment settings come "
-            "from the profile-selected YAML beside this entry script."
+            "from the execution-type-selected YAML beside this entry script."
         )
     )
     run = parser.add_argument_group("run")
@@ -598,8 +616,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=positive_int,
         default=None,
         help=(
-            "stop after this optimizer step while keeping the full schedule; "
-            "requires --tokens-per-parameter so the horizon is unchanged"
+            "stop after this optimizer step while keeping the configured "
+            "fixed-TPP schedule unchanged"
         ),
     )
     run.add_argument(
@@ -680,8 +698,7 @@ def resolve_config(
         tier=args.tier, context=args.context, label=config_filename
     )
     family = experiment_config.family
-    base_tier_name = family.parameterization.base_tier
-    base_tpp_parameters = family.tiers[base_tier_name].tpp_parameters
+    base_tpp_parameters = family.base_tpp_parameters
     definition = experiment_config.run
     tier = family.tiers[selected_tier_name]
     model = tier.model
@@ -704,8 +721,8 @@ def resolve_config(
     )
     tier_name = selected_tier_name
     parameterization = family_parameterization.name
-    base_width = family_parameterization.base_width
-    base_depth = family_parameterization.base_depth
+    base_width = family.base_width
+    base_depth = family.base_depth
     depth_alpha = family_parameterization.depth_alpha
     init_std = family_parameterization.init_std
     attention_scale = family_parameterization.attention_scale
@@ -732,39 +749,30 @@ def resolve_config(
             raise AssertionError("fixed-TPP duration has no parameter denominator")
         ideal_tokens = float(tpp_parameters) * requested_tpp
         steps = max(1, int(math.floor(ideal_tokens / tokens_per_step + 0.5)))
-    if early_stop is not None and requested_tpp is None:
-        raise ValueError("--stop-after-step requires a fixed-TPP configuration")
     if early_stop is not None and early_stop > steps:
         raise ValueError(
             f"--stop-after-step {early_stop:,} is past the {steps:,}-step "
             "horizon this configuration resolves to"
         )
 
-    if evaluation.prediction_budget:
-        validation_tokens = evaluation.prediction_budget
-        predictions_per_batch = batch_size * seq_len
-        if validation_tokens % predictions_per_batch:
+    predictions_per_batch = batch_size * seq_len
+
+    def evaluation_batches(predictions: int, field: str) -> int:
+        if predictions % predictions_per_batch:
             raise ValueError(
-                "configured validation requires batch_size * seq_len to divide "
-                f"{validation_tokens:,} exactly; got {predictions_per_batch:,}"
+                f"{config_filename} run.evaluation.{field} requires batch_size * "
+                f"seq_len ({predictions_per_batch:,}) to divide {predictions:,} exactly"
             )
-        required_eval_batches = validation_tokens // predictions_per_batch
-        if evaluation.eval_batches != required_eval_batches:
-            raise ValueError(
-                f"{config_filename} validation must cover exactly "
-                f"{validation_tokens:,} "
-                f"predictions; set eval_batches to {required_eval_batches}"
-            )
-        eval_batches = required_eval_batches
-    else:
-        eval_batches = evaluation.eval_batches
-    val_every = 0 if args.diagnostic_mode else evaluation.val_every
-    val_probe_batches = evaluation.val_probe_batches
-    if val_every > 0 and val_probe_batches > eval_batches:
-        raise ValueError(
-            f"{config_filename} val_probe_batches must not exceed the canonical evaluation batch "
-            f"count ({eval_batches}); got {val_probe_batches}"
-        )
+        return predictions // predictions_per_batch
+
+    eval_batches = evaluation_batches(evaluation.final_predictions, "final_predictions")
+    probe = evaluation.probe
+    val_every = 0 if args.diagnostic_mode or probe is None else probe.every_steps
+    val_probe_batches = (
+        evaluation_batches(probe.predictions, "probe.predictions")
+        if probe is not None
+        else 0
+    )
     log_every = steps if args.diagnostic_mode else logging.log_every
     diagnostics_every = 0 if args.diagnostic_mode else logging.diagnostics_every
 
@@ -780,25 +788,6 @@ def resolve_config(
             f"{config_filename} attention_backend {attention_backend} currently requires "
             "dtype bfloat16"
         )
-
-    override_values: list[tuple[str, int | str]] = []
-    for name, value in (
-        (
-            "tokens_per_parameter_micros",
-            (
-                round(args.tokens_per_parameter * 1_000_000)
-                if args.tokens_per_parameter is not None
-                else None
-            ),
-        ),
-        ("batch_size", args.batch_size),
-        ("diagnostic_mode", 1 if args.diagnostic_mode else None),
-    ):
-        if value is not None:
-            override_values.append((name, int(value)))
-    if args.context is not None:
-        override_values.append(("context", args.context))
-    overrides = tuple(override_values)
 
     batch_multiplier = batch_size / float(batch_anchor)
     # This project reanchors every TPP ladder. The multiplier captures only the
@@ -870,7 +859,6 @@ def resolve_config(
         config_filename=config_filename,
         execution_type=experiment_config.execution_type,
         context_preset=context_preset,
-        config_overrides=overrides,
     )
 
 
@@ -956,7 +944,6 @@ def experiment_config_metadata(config: Config) -> dict[str, Any]:
         "sha256": config.config_sha256,
         "profile": config.execution_type,
         "context_preset": config.context_preset,
-        "overrides": dict(config.config_overrides),
         "resolved": {
             "training": {
                 "steps": config.steps,
@@ -1000,8 +987,12 @@ def experiment_config_metadata(config: Config) -> dict[str, Any]:
                 "embeddings": config.embeddings,
             },
             "evaluation": {
+                "final_predictions": config.validation_predictions,
                 "eval_batches": config.eval_batches,
                 "val_every": config.val_every,
+                "probe_predictions": (
+                    config.val_probe_batches * config.batch_size * config.seq_len
+                ),
                 "val_probe_batches": config.val_probe_batches,
             },
             "logging": {
@@ -1017,7 +1008,7 @@ def resolved_plan_metadata(config: Config) -> dict[str, Any]:
 
     tokens_per_step = config.batch_size * config.seq_len
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "config_schema_version": config.config_schema_version,
         "config_sha256": config.config_sha256,
         "profile": config.execution_type,
@@ -1041,6 +1032,7 @@ def resolved_plan_metadata(config: Config) -> dict[str, Any]:
         "stop_after_step": config.stop_after_step,
         "planned_tokens": config.steps * tokens_per_step,
         "expected_tokens": config.final_step * tokens_per_step,
+        "validation_predictions": config.validation_predictions,
         "base_learning_rate": config.learning_rate,
         "batch_ratio": config.batch_multiplier,
         "ladder_data_multiplier": config.data_multiplier,

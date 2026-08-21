@@ -46,6 +46,7 @@ _RESERVED_PASSTHROUGH_FLAGS = (
     "--output-dir",
     "--seed",
     "--profile",
+    "--omit-checkpoint",
 )
 
 
@@ -89,6 +90,7 @@ def run_recipe(config: RunConfig) -> RunOutcome:
         str(config.seed),
         "--profile",
         config.profile,
+        *(["--omit-checkpoint"] if config.checkpoint_policy == "none" else []),
         *[str(argument) for argument in config.trainer_args],
     ]
     configured_environment = {
@@ -220,7 +222,7 @@ def run_recipe(config: RunConfig) -> RunOutcome:
         expected_training_tokens=plan.expected_tokens,
         expected_validation_tokens=config.expected_validation_tokens,
         expected_downstream_tokens=config.expected_downstream_tokens,
-        require_checkpoint=config.require_checkpoint,
+        require_checkpoint=config.checkpoint_policy != "none",
     )
     # Preserve the exact accepted payload independently from potentially noisy logs.
     result_path.write_text(
@@ -316,8 +318,8 @@ def run_recipe(config: RunConfig) -> RunOutcome:
         # the entire accepted evaluation block without retaining caller aliases.
         record["evaluations"] = dict(validated.evaluations)
 
-    keep_checkpoint = config.checkpoint_retention == "always" or (
-        config.checkpoint_retention == "qualifying" and qualified
+    keep_checkpoint = config.checkpoint_policy == "always" or (
+        config.checkpoint_policy == "qualifying" and qualified
     )
     checkpoint_path: Path | None = validated.checkpoint_path
     if checkpoint_path is not None and not keep_checkpoint:
@@ -570,11 +572,9 @@ def _validate_config(
         )
     if not _PROFILE_NAME.fullmatch(config.profile):
         raise ConfigurationError("profile must be a non-empty simple name")
-    if config.checkpoint_retention not in ("always", "qualifying", "none"):
-        raise ConfigurationError("invalid checkpoint retention policy")
-    if not isinstance(config.require_checkpoint, bool):
-        raise ConfigurationError("require_checkpoint must be boolean")
-    if not config.require_checkpoint and config.profile != "dev":
+    if config.checkpoint_policy not in ("always", "qualifying", "none"):
+        raise ConfigurationError("invalid checkpoint policy")
+    if config.checkpoint_policy == "none" and config.profile != "dev":
         raise ConfigurationError(
             "checkpoint omission is restricted to development research runs"
         )
