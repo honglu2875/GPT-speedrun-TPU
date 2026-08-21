@@ -1672,14 +1672,15 @@ def build_study_browser(
     The committed reports are summaries; this page is the way to the logs
     behind them. It ships the same charting code with an empty payload, lists
     the studies, and fetches nothing until one is chosen -- then only that
-    study's overview, a fraction of a megabyte. The full logs are a second,
-    separately labelled click that says how many megabytes it is about to pull,
+    study's overview, a fraction of a megabyte. Every study also links to its
+    raw files. When a study publishes a larger full report payload, that is a
+    separate, labelled click that says how many megabytes it is about to pull,
     because on a metered connection a page that helpfully preloaded a hundred
     megabytes would be a hostile page.
 
-    Every tier it fetches is an ordinary report payload, so nothing here needs
-    to understand the packed log format. That keeps the browser and the writer
-    from having to agree about anything but JSON.
+    Every report payload it fetches is ordinary report JSON, so nothing here
+    needs to understand the packed raw-log format. That keeps the browser and
+    the writer from having to agree about anything but JSON.
     """
 
     payload = {
@@ -1809,10 +1810,11 @@ _HTML = r"""<!doctype html>
 .study-detail{border-top:1px solid var(--line);padding-top:18px}
 .study-doc{max-width:760px}
 .study-actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:20px 0 8px}
-.study-go,.study-full{padding:9px 15px;border-radius:8px;border:1px solid var(--line);
+.study-go,.study-action{padding:9px 15px;border-radius:8px;border:1px solid var(--line);
  background:var(--panel2);color:var(--text);cursor:pointer;font:inherit;font-size:13px}
 .study-go{border-color:#4d8dfd}
-.study-full:disabled{opacity:.5;cursor:default}
+.study-action{text-decoration:none;display:inline-flex;align-items:center}
+.study-action:disabled{opacity:.5;cursor:default}
 .study-warn{color:#d7a44a;font-size:12px;flex:1 1 260px}
 .study-status{color:#91a0b8;font-size:13px;min-height:18px}
 .study-status.bad{color:#e0736b}
@@ -1933,7 +1935,7 @@ function chooseStudy(remote){
   const root=document.createElement('div');root.className='study-picker';
   root.innerHTML='<div class="study-inner"><h1 class="study-title">rig training logs</h1>'
    +'<p class="study-sub">'+esc(remote.studies.length)+' studies · '
-   +esc(remote.studies.reduce((a,s)=>a+s.runs,0))+' runs · full logs at '
+   +esc(remote.studies.reduce((a,s)=>a+s.runs,0))+' runs · raw logs at '
    +'<a href="'+HF+esc(remote.repo)+'" target="_blank" rel="noopener">'+esc(remote.repo)+'</a></p>'
    +'<div class="study-grid">'+remote.studies.map((s,i)=>
      '<button class="study-card" data-index="'+i+'">'
@@ -1949,15 +1951,17 @@ function chooseStudy(remote){
     root.querySelectorAll('.study-card').forEach(b=>b.classList.toggle('on',b===button));
     detail.innerHTML='<div class="study-status">Loading overview…</div>';
     try{
-     const base=HF+remote.repo+'/resolve/main/'+study.name+'/';
+     const base=HF+remote.repo+'/resolve/main/'+study.name+'/',
+      browse=HF+remote.repo+'/tree/main/'+study.name;
      let card='';
      try{const r=await fetch(base+'README.md');if(r.ok)card=mdToHtml(await r.text())}catch(e){}
      const payload=await fetchGzipJson(base+'snapshot.json.gz');
      detail.innerHTML='<div class="study-doc">'+card+'</div>'
       +'<div class="study-actions"><button class="study-go" id="study-go">Open overview</button>'
-      +(study.full?'<button class="study-full" id="study-full">Download full logs ('
-        +mb(study.full)+')</button><span class="study-warn">Downloads '+mb(study.full)
-        +' from HuggingFace. Nothing is fetched until you click.</span>':'')
+      +'<a class="study-action" href="'+esc(browse)+'" target="_blank" rel="noopener">Browse raw logs</a>'
+      +(study.full?'<button class="study-action" id="study-full">Load full report ('
+        +mb(study.full)+')</button><span class="study-warn">Loads a '+mb(study.full)
+        +' report payload from Hugging Face. Nothing is fetched until you click.</span>':'')
       +'</div><div class="study-status" id="study-progress"></div>';
      detail.querySelector('#study-go').onclick=()=>{cameFromPicker=true;root.remove();resolve(payload)};
      const fullButton=detail.querySelector('#study-full');

@@ -23,10 +23,11 @@
 .study-detail{border-top:1px solid var(--line);padding-top:18px}
 .study-doc{max-width:760px}
 .study-actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:20px 0 8px}
-.study-go,.study-full{padding:9px 15px;border-radius:8px;border:1px solid var(--line);
+.study-go,.study-action{padding:9px 15px;border-radius:8px;border:1px solid var(--line);
  background:var(--panel2);color:var(--text);cursor:pointer;font:inherit;font-size:13px}
 .study-go{border-color:#4d8dfd}
-.study-full:disabled{opacity:.5;cursor:default}
+.study-action{text-decoration:none;display:inline-flex;align-items:center}
+.study-action:disabled{opacity:.5;cursor:default}
 .study-warn{color:#d7a44a;font-size:12px;flex:1 1 260px}
 .study-status{color:#91a0b8;font-size:13px;min-height:18px}
 .study-status.bad{color:#e0736b}
@@ -100,7 +101,7 @@
     <div class="focus-canvas"><canvas id="focus-canvas"></canvas></div>
   </div>
 </dialog>
-<script type="application/gzip-base64" id="report-data">H4sIAAAAAAACA4WVy3LbIBSGX4XRtlbLRSDkXdqmK2fqSbLoTCYLLGGHsSxchJK0GT9HH6X79sV6sGVb8q0zWgh+OHz85wBv0UJ7FQ3fopmutFNeF1c+GkYUUxFjGVNyT/AQPi7eU8pIJt5hPMQ4GkSmysum0EU0xIOonpvlsv0v9FQ1pf929WpqCDUt7bKO9t13uSo19Jd2Br1rdaQmuoSu69qbRWBAebNoSuXNs0ZfRl/HYf5CvX56Us6Prak8BCYJhsWWzk7NOp6dTk1uVBmtBpHTC+t12JbTSwvi9wYmmfyDM7MYFg7xat8URkOgh7eoUosQYqJ8/hTXL1ovY4FvYJA3fh38Y1DQ319odIuUR1tRO9A2DddUECvlELhSy/rJgo00k5JT2LpRs8rC5nIYwjiVlErYelPCpjkmNMsSvBrsMEoXd0kI5RdQduqapW1tYGjahSFEpIk8gMFbDCoxkKSig9FloPySHTt1zdC2NgxM9Bg4l+lZBpFmKc14eoaB40sMQR0g/2LRpClm2td7oHbiBojQLpDE9IiHgA8pF1sqwiTGhDHSz5B3qqqn2h1aM9LKVaaaoXCYtuYMEEO11kV9xqU+FKdMpmcTxXFGMsz6NBuH5PygbI9g5BzltvL61ffqF/35DdIep1fFAgt+PmcsJUlKOzQLq+MOUYfm1jbhbMv5EHkLNYXsFEmkX5faddMFPB9CHQeoG3u9p5JdqkQIQtgBFk8oBaJd6pJUZlzK44IyP3U8c6boA25KKogbrwao0FUNjapAbg1/mrJjXdLLpEhwxslhfREukjCuhcRMyDThHchQKvGzckZVuT5I6R1oaKu1d1FrUz+fXesS0juFmCU8I+ePIRxCTPFZoIML6YhobUsP6VQ6ab/mM5pQfA4ppTyTjHeRigZq2tgqVpNy89P36XOroxrem3AETlzbAYlidD8e76l6TmWEEXJx0QMvTq16fEP/f10mBFs9rrbqw2OYv9DrB7Bt753q9pbqh3bdjsrCCN02ds/0w+PqHx2jhlX7BwAA</script>
+<script type="application/gzip-base64" id="report-data">H4sIAAAAAAAC/4WVzXLbIBSFX4XRtlYLSCDkXdqmK2fqSbLoTCYLLGGHsQQuQknajJ+jj9J9+2IFSbYl+aczWggOXD7OvcBbUArLg+lbsBJKGG5FfmWDaYAhpiFkIUb3CE7dR+h7jCOU0ncQTiEMJoFUWVHnIg+mcBJUa7nZdP+5WPK6sN+uXmXlQi0LvamCQ/ddxgvh+gu9cr2NOuMLUbiu68rK0jOArC7rglv5LMCX2de5n1/y109P3Ni5lsq6wCiGbrGN0UvZxNPLpcwkL4LtJDCi1Fb4bRmx0U78XrtJMvtg5Cp0C/t4la1zKVygh7dA8dKHWHCbPYXVixCbkMIbN8hK2wT/6BXw9xeY3QJuwU4Uxmltw9TKxUqIC6z4pnrSzkacMkaw27rkK6Xd5jI3JCKYYczc1uvCbZpAhNM0htvJHqMwYZ8EYXIBZa82LF2rhcFJHwYhmsRsBAN3GJhBR5LQHkafAZNLduzVhqFrtQwRHTAQwpKzDDRJE5yS5AwDgZcYvDoB9kWDRZ2vhK0OQN3EFgjhPhCD+IgHOR8SQndUKGIQoihCwwxZw1W1FGZszUxwo6RaAX+YduZMQAQqIfLqjEtDKIIjlpxNFIEpSmE0pGkdYutR2R7BsDXItLLi1Q7qF/z57aQDzqCKKaTkfM6iBMUJ7tGUWoQ9oh7Nra792WbrKbDa1RTQS8CAeN0I00+X4/ng69hD3ejrAxXrU8WUIhSNsEiMsSPapy5OWEoYOy4o+VOEKyPzIWBbUl5svZqAXKjKNVQOTAN/mrJnXTzIJI1hStC4vhChsR/XQcKIsiQmPUhfKuEzN5KrTIxSeuc0sNO6u6izaZjPvnUxGpxCGMUkHWPBswCjC+iIoLFhgHAqfXhY4ymOMbyAkNeuZqVWIV8U7c/Qh8+dDir3nvgSP3EtewQMwf18fqAYOJGiCKGLi472fmrV4xv4/+tGlEbbx+1OfXj080vRPHBd++BMv7fgP4TpdyjtRoiusX+GHx63/wArqZUB2wcAAA==</script>
 <script>
 (()=>{'use strict';
 let D, runMap, visible, cameFromPicker=false;
@@ -147,7 +148,7 @@ function chooseStudy(remote){
   const root=document.createElement('div');root.className='study-picker';
   root.innerHTML='<div class="study-inner"><h1 class="study-title">rig training logs</h1>'
    +'<p class="study-sub">'+esc(remote.studies.length)+' studies · '
-   +esc(remote.studies.reduce((a,s)=>a+s.runs,0))+' runs · full logs at '
+   +esc(remote.studies.reduce((a,s)=>a+s.runs,0))+' runs · raw logs at '
    +'<a href="'+HF+esc(remote.repo)+'" target="_blank" rel="noopener">'+esc(remote.repo)+'</a></p>'
    +'<div class="study-grid">'+remote.studies.map((s,i)=>
      '<button class="study-card" data-index="'+i+'">'
@@ -163,15 +164,17 @@ function chooseStudy(remote){
     root.querySelectorAll('.study-card').forEach(b=>b.classList.toggle('on',b===button));
     detail.innerHTML='<div class="study-status">Loading overview…</div>';
     try{
-     const base=HF+remote.repo+'/resolve/main/'+study.name+'/';
+     const base=HF+remote.repo+'/resolve/main/'+study.name+'/',
+      browse=HF+remote.repo+'/tree/main/'+study.name;
      let card='';
      try{const r=await fetch(base+'README.md');if(r.ok)card=mdToHtml(await r.text())}catch(e){}
      const payload=await fetchGzipJson(base+'snapshot.json.gz');
      detail.innerHTML='<div class="study-doc">'+card+'</div>'
       +'<div class="study-actions"><button class="study-go" id="study-go">Open overview</button>'
-      +(study.full?'<button class="study-full" id="study-full">Download full logs ('
-        +mb(study.full)+')</button><span class="study-warn">Downloads '+mb(study.full)
-        +' from HuggingFace. Nothing is fetched until you click.</span>':'')
+      +'<a class="study-action" href="'+esc(browse)+'" target="_blank" rel="noopener">Browse raw logs</a>'
+      +(study.full?'<button class="study-action" id="study-full">Load full report ('
+        +mb(study.full)+')</button><span class="study-warn">Loads a '+mb(study.full)
+        +' report payload from Hugging Face. Nothing is fetched until you click.</span>':'')
       +'</div><div class="study-status" id="study-progress"></div>';
      detail.querySelector('#study-go').onclick=()=>{cameFromPicker=true;root.remove();resolve(payload)};
      const fullButton=detail.querySelector('#study-full');

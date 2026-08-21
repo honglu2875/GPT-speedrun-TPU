@@ -23,6 +23,7 @@ from rig.report import (
     _compact,
     _subsample_indices,
     build_report,
+    build_study_browser,
 )
 
 
@@ -770,6 +771,26 @@ class StudyExportTests(unittest.TestCase):
         self.assertEqual(snapshot["diagnosticCharts"], [])
         self.assertEqual(snapshot["layerCharts"], [])
         self.assertTrue(snapshot["timeCharts"])
+
+
+class StudyBrowserTests(unittest.TestCase):
+    def test_raw_logs_are_always_linked_and_full_reports_are_optional(self) -> None:
+        studies = [
+            {"name": "with-report", "title": "With report", "runs": 2, "full": 123},
+            {"name": "raw-only", "title": "Raw only", "runs": 3},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "study-browser.html"
+            build_study_browser(output, repo="owner/logs", studies=studies)
+            html = output.read_text(encoding="utf-8")
+
+        payload = _payload(html)
+        self.assertEqual(payload["remote"]["studies"], studies)
+        self.assertIn("'/tree/main/'", html)
+        self.assertIn("Browse raw logs", html)
+        self.assertIn("Load full report (", html)
+        self.assertIn("study.full?", html)
+        self.assertNotIn("Download full logs", html)
 
 
 def _payload(html: str) -> dict[str, object]:

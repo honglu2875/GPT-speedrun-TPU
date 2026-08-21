@@ -84,12 +84,15 @@ bent into a timeline.
 [`study-browser.html`](study-browser.html) carries no run data at all — about
 56 KB. It
 lists the studies, renders each one's card from the dataset, and fetches only
-that study's overview (0.05–1.0 MB) when you pick one. The full logs are a
-second, separately labelled click that states the size before it starts:
+that study's overview (0.05–1.0 MB) when you pick one. Each study always links
+to its raw files on Hugging Face. When a study also publishes a full report
+payload, a second, separately labelled click states the size before it starts:
 6.4 MB for the 8k sweep, 138 MB for the 500M one. Nothing downloads on load.
 
-Everything it fetches is an ordinary report payload, so the page never needs to
-understand the packed log format — the two only have to agree about JSON.
+The seed-variance studies currently publish raw logs and overview snapshots,
+but no `full.json.gz`; their cards therefore link to the raw files without
+offering a nonexistent full report. Every report payload the browser fetches
+is ordinary JSON, so the page never needs to understand the packed log format.
 
 ## Hardware is part of a result
 
