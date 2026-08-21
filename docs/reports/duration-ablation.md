@@ -1,20 +1,47 @@
 # Complete(d)P token-horizon ablation at 60M and 125M
 
-The small-tier matrix is complete: **42/42 runs**, split into two 21-run
-studies. It tests whether adding Complete(d)P's cross-horizon duration factor
-to this repository's fixed-TPP CompleteP hybrid improves 20-TPP training.
+This study tests whether adding Complete(d)P's cross-horizon
+duration factor to this repository's fixed-TPP CompleteP hybrid improves
+20-TPP training. Note that I do not aim to refute the claims in Complete(d)P,
+and there are minor setups not being equivalent to what the paper
+did. But a useful scientific findings are those that generalize, and I am
+testing whether the cross-horizon optimal transfer applies to my simple
+ladder or not.
 
-The answer for this recipe is **no**. At 125M the fixed-TPP reference is
-clearly better, and the base learning rate remains `2^-8`. Doubling the
-duration arm's base LR—the move that compensates for its 4x duration factor—
-makes validation loss worse. At 60M the direction is the same, although three
+In the `recipes/reference` baseline, I calculated
+```text
+m_D = (parameters / 60M_parameters)
+```
+whereas in Complete(d)P paper, this should have involved a ration between
+token-horizon against some baseline:
+```text
+m_D_total = (parameters / 60M_parameters) * (target_TPP / 5)
+```
+This adjustment is implemented in `recipes/reference_duration` clone.
+
+This started off as an implementation mistake because I did intend to make `reference`
+baseline consistent with Complete(d)P. If this were indeed an error, I should have
+felt a big impact because many of my experiments were run
+using `TPP = 5`, with a smaller amount of runs promoted to `TPP = 20`. A factor
+of `4` in training horizon does make a big difference in hyperparameter choices, yet
+I find that the optimal transfer tends to happen better without this
+TPP/base_TPP adjustment.
+
+This study performs a 21-run sweep for each of the 60M and 125M tiers, and concluded
+that in my case, **without token-horizon adjustment**, the optimal hyperparameter transfers
+better. For example, the optimal learning rate for the `reference` baseline is `2^-8`, and
+the base learning rate remains `2^-8`. Doubling the
+base learning rate — the move that compensates for its 4x duration factor —
+makes validation loss worse. At 60M the conclusion is the same, although three
 seeds do not separate the two duration learning rates. The batch-512
 iso-horizon construction is not better at either tier.
 
-This is evidence about the usefulness of the rule in this codebase, not a
-general refutation of Complete(d)P. The treatment changes LR, Adam betas,
-epsilon, and weight decay together, and the experiment uses this project's
-architecture, schedule, and fixed-TPP ladder.
+The original Complete(d)P's conclusion might be affected by many things such as architecture,
+scale, etc. But I do not have a good explanatin about the counter-evidence in my case. Scale
+issue feels slightly more likely, as Complete(d)P paper compares training runs up to 32B tokens
+which my v4-32 pod cannot afford.
+
+(below are the experiment details documented by GPT-5.6)
 
 ## Design
 
