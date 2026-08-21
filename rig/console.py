@@ -1,9 +1,10 @@
 """Terminal rendering shared by every recipe.
 
 A recipe's progress output is not part of what it measures, so it does not
-belong in the entry program. What each recipe still owns is *what* to say --
-the run-configuration table names its own config fields -- while the rendering,
-the colour policy, and the shapes of the standard lines live here.
+belong in the entry program. Stable run-card groups, rendering, and colour
+policy live here. Each recipe still supplies its architecture rows explicitly,
+so a fork can describe new science without teaching a shared formatter how to
+inspect arbitrary recipe configs.
 
 Writes to stderr throughout, because stdout carries the machine-readable
 result line that the harness parses.
@@ -11,11 +12,165 @@ result line that the harness parses.
 
 from __future__ import annotations
 
-from typing import Sequence
+from typing import TYPE_CHECKING, Iterable, Sequence
 import os
 import sys
 
 import jax
+
+
+if TYPE_CHECKING:
+    from rig.evaluation import EvaluationReport
+
+
+ConsoleRow = tuple[str, object]
+ConsoleRows = tuple[ConsoleRow, ...]
+
+
+def standard_identity_rows(
+    *,
+    config_filename: str,
+    config_profile: str,
+    config_sha256: str,
+    devices: Sequence[jax.Device],
+    process_count: int,
+    process_index: int,
+) -> ConsoleRows:
+    """Return experiment config, devices, JAX processes, and mesh rows."""
+
+    return (
+        (
+            "experiment config",
+            f"{config_filename} · {config_profile} · sha256:{config_sha256[:12]}",
+        ),
+        ("devices", f"{len(devices)} × {device_label(devices)}"),
+        ("JAX processes", f"{process_count} (this rank {process_index})"),
+        ("mesh", f"data={len(devices)} (replicated model)"),
+    )
+
+
+def standard_data_rows(
+    *,
+    source: str,
+    train_tokens: int,
+    validation_tokens: int,
+    downstream_domains: int,
+    downstream_tokens: int,
+) -> ConsoleRows:
+    """Return dataset, train/validation token, and downstream rows."""
+
+    downstream = (
+        f"{downstream_domains} domains / {downstream_tokens:,} scored"
+        if downstream_domains
+        else "not requested"
+    )
+    return (
+        ("dataset", source),
+        ("train / val tokens", f"{train_tokens:,} / {validation_tokens:,}"),
+        ("downstream", downstream),
+    )
+
+
+def standard_training_rows(
+    *,
+    parameterization: str,
+    width_multiplier: float,
+    depth_multiplier: float,
+    data_multiplier: float,
+    batch_size: int,
+    seq_len: int,
+    sampling: str,
+    usable_tokens_per_epoch: int | None,
+    dtype_name: str,
+) -> ConsoleRows:
+    """Return parameterization, global batch, sampling, and compute rows."""
+
+    if sampling == "shuffled_epochs":
+        if usable_tokens_per_epoch is None:
+            raise ValueError("shuffled-epoch display needs usable tokens per epoch")
+        sampling_detail = (
+            f"shuffled epochs · {usable_tokens_per_epoch:,} unique targets/epoch"
+        )
+    elif sampling == "random_windows":
+        sampling_detail = "random windows with replacement"
+    else:
+        raise ValueError(f"unsupported standard sampling display: {sampling!r}")
+    return (
+        (
+            "parameterization",
+            f"{parameterization} · mN={width_multiplier:.4g} · "
+            f"mL={depth_multiplier:.4g} · mD={data_multiplier:.4g}",
+        ),
+        ("global batch", f"{batch_size} × {seq_len} tokens"),
+        ("train sampling", sampling_detail),
+        ("compute", dtype_name),
+    )
+
+
+def standard_kernel_rows(
+    *,
+    attention_backend: str,
+    attention_rows: Sequence[ConsoleRow],
+    loss_backend: str,
+    semantic_vocab_size: int,
+    vocab_tile_size: int,
+) -> ConsoleRows:
+    """Return attention, attention-detail, and output-loss rows."""
+
+    if loss_backend == "tiled":
+        loss = f"tiled CE (semantic {semantic_vocab_size:,}, tile {vocab_tile_size:,})"
+    elif loss_backend == "dense":
+        loss = f"dense CE ({semantic_vocab_size:,} classes)"
+    else:
+        raise ValueError(f"unsupported standard loss display: {loss_backend!r}")
+    return (
+        ("attention", attention_backend),
+        *attention_rows,
+        ("output loss", loss),
+    )
+
+
+def standard_schedule_rows(
+    *,
+    diagnostics_every: int,
+    final_step: int,
+    schedule_steps: int,
+    early_stopped: bool,
+    tokens_processed: int,
+    total_flops: int,
+    flop_breakdown: Iterable[tuple[str, str]],
+    capture_window: tuple[int, int] | None,
+    xprof_destination: object | None,
+) -> ConsoleRows:
+    """Return diagnostics, duration, tokens, FLOPs, breakdown, and XProf rows."""
+
+    diagnostics = (
+        f"step 1 / every {diagnostics_every} / final"
+        if diagnostics_every
+        else "disabled"
+    )
+    duration = (
+        f"{final_step:,} of {schedule_steps:,} scheduled steps (early stop)"
+        if early_stopped
+        else f"{schedule_steps:,} steps"
+    )
+    breakdown = (
+        " · ".join(f"{label} {share}" for label, share in flop_breakdown) or "none"
+    )
+    if capture_window is None:
+        xprof = "disabled"
+    else:
+        if xprof_destination is None:
+            raise ValueError("an XProf capture window needs a destination")
+        xprof = f"steps {capture_window[0]}..{capture_window[1]} → {xprof_destination}"
+    return (
+        ("diagnostics", diagnostics),
+        ("duration", duration),
+        ("train tokens", format_count(tokens_processed)),
+        ("traced FLOPs", format_count(total_flops)),
+        ("FLOP breakdown", breakdown),
+        ("XProf", xprof),
+    )
 
 
 class Console:
@@ -187,6 +342,28 @@ class Console:
             f"ppl {perplexity:.2f}  {tokens:,} tokens in {elapsed:.3f}s",
             file=sys.stderr,
         )
+
+    def evaluations(self, report: EvaluationReport) -> None:
+        """Render downstream domains and their fixed unweighted macro."""
+
+        for entry in report.downstream:
+            result = entry.result
+            self.downstream(
+                entry.name,
+                result.loss,
+                result.perplexity,
+                result.scored_tokens,
+                result.seconds,
+            )
+        macro = report.macro
+        if macro is not None:
+            self.downstream(
+                f"{report.downstream_name} macro",
+                macro.loss,
+                macro.perplexity,
+                macro.scored_tokens,
+                macro.seconds,
+            )
 
 
 def format_count(value: float) -> str:

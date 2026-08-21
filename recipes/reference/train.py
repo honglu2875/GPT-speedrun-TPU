@@ -96,9 +96,9 @@ from rig.runlog import (
     xprof_step_window,
 )
 from rig.evaluation import (
-    evaluate_downstream_domain,
+    EvaluationReport,
+    evaluate_downstream_domains,
     evaluate_validation_prefix,
-    perplexity_from_loss,
     should_run_diagnostics,
     should_run_validation_probe,
 )
@@ -120,7 +120,16 @@ from rig.tokens import (
     load_dataset,
     load_downstream_domains,
 )
-from rig.console import Console, device_label, format_count, format_rate
+from rig.console import (
+    Console,
+    format_count,
+    format_rate,
+    standard_data_rows,
+    standard_identity_rows,
+    standard_kernel_rows,
+    standard_schedule_rows,
+    standard_training_rows,
+)
 from rig.mesh import (
     finite_metric,
     initialize_distributed_runtime,
@@ -937,6 +946,21 @@ def contract_model_metadata(config: Config) -> dict[str, Any]:
     }
 
 
+def model_console_rows(
+    config: Config, total_parameters: int
+) -> tuple[tuple[str, object], ...]:
+    """Describe the recipe-owned architecture inside the standard run card."""
+
+    return (
+        (
+            "model",
+            f"{config.tier} · L{config.layers} D{config.d_model} H{config.heads} "
+            f"RoPE RMSNorm GELU MLP×{config.mlp_mult}",
+        ),
+        ("parameters", format_count(total_parameters)),
+    )
+
+
 def experiment_config_metadata(config: Config) -> dict[str, Any]:
     """Return stable source identity and the fully resolved experiment values."""
 
@@ -1680,94 +1704,59 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     console.table(
         "run configuration",
         (
-            (
-                "experiment config",
-                f"{CONFIG_FILENAME} · {config.config_profile} · "
-                f"sha256:{config.config_sha256[:12]}",
+            *standard_identity_rows(
+                config_filename=CONFIG_FILENAME,
+                config_profile=config.config_profile,
+                config_sha256=config.config_sha256,
+                devices=devices,
+                process_count=process_count,
+                process_index=process_index,
             ),
-            ("devices", f"{len(devices)} × {device_label(devices)}"),
-            ("JAX processes", f"{process_count} (this rank {process_index})"),
-            ("mesh", f"data={len(devices)} (replicated model)"),
-            ("dataset", dataset.source),
-            (
-                "train / val tokens",
-                f"{len(dataset.train):,} / {len(dataset.validation):,}",
-            ),
-            (
-                "downstream",
-                (
-                    f"{len(downstream_domains)} domains / "
-                    f"{sum(domain.scored_tokens for domain in downstream_domains):,} scored"
-                    if downstream_domains
-                    else "not requested"
+            *standard_data_rows(
+                source=dataset.source,
+                train_tokens=len(dataset.train),
+                validation_tokens=len(dataset.validation),
+                downstream_domains=len(downstream_domains),
+                downstream_tokens=sum(
+                    domain.scored_tokens for domain in downstream_domains
                 ),
             ),
-            (
-                "model",
-                f"{config.tier} · L{config.layers} D{config.d_model} H{config.heads} "
-                f"RoPE RMSNorm GELU MLP×{config.mlp_mult}",
-            ),
-            ("parameters", format_count(params_total)),
-            (
-                "parameterization",
-                f"{config.parameterization} · mN={config.width_multiplier:.4g} · "
-                f"mL={config.depth_multiplier:.4g} · mD={config.data_multiplier:.4g}",
-            ),
-            ("global batch", f"{config.batch_size} × {config.seq_len} tokens"),
-            (
-                "train sampling",
-                (
-                    f"shuffled epochs · "
-                    f"{shuffled_train_stream.usable_tokens_per_epoch:,} unique targets/epoch"
+            *model_console_rows(config, params_total),
+            *standard_training_rows(
+                parameterization=config.parameterization,
+                width_multiplier=config.width_multiplier,
+                depth_multiplier=config.depth_multiplier,
+                data_multiplier=config.data_multiplier,
+                batch_size=config.batch_size,
+                seq_len=config.seq_len,
+                sampling=config.sampling,
+                usable_tokens_per_epoch=(
+                    shuffled_train_stream.usable_tokens_per_epoch
                     if shuffled_train_stream is not None
-                    else "random windows with replacement"
+                    else None
                 ),
+                dtype_name=config.dtype_name,
             ),
-            ("compute", config.dtype_name),
-            ("attention", config.attention_backend),
-            *attention_console_rows(attention_runtime),
-            (
-                "output loss",
-                (
-                    f"tiled CE (semantic {config.semantic_vocab_size:,}, "
-                    f"tile {config.vocab_tile_size:,})"
-                    if config.loss_backend == "tiled"
-                    else f"dense CE ({config.semantic_vocab_size:,} classes)"
-                ),
+            *standard_kernel_rows(
+                attention_backend=config.attention_backend,
+                attention_rows=attention_console_rows(attention_runtime),
+                loss_backend=config.loss_backend,
+                semantic_vocab_size=config.semantic_vocab_size,
+                vocab_tile_size=config.vocab_tile_size,
             ),
-            (
-                "diagnostics",
-                (
-                    f"step 1 / every {config.diagnostics_every} / final"
-                    if config.diagnostics_every
-                    else "disabled"
-                ),
-            ),
-            (
-                "duration",
-                (
-                    f"{config.final_step:,} of {config.steps:,} scheduled steps "
-                    "(early stop)"
-                    if config.stop_after_step is not None
-                    else f"{config.steps:,} steps"
-                ),
-            ),
-            ("train tokens", format_count(tokens_processed)),
-            ("traced FLOPs", format_count(flops_per_token * tokens_processed)),
-            (
-                "FLOP breakdown",
-                " · ".join(
-                    f"{label} {share}" for label, share in describe(flop_breakdown)
-                )
-                or "none",
-            ),
-            (
-                "XProf",
-                (
-                    f"steps {capture_window[0]}..{capture_window[1]} → "
-                    f"{args.xprof_dir.expanduser().resolve()}"
+            *standard_schedule_rows(
+                diagnostics_every=config.diagnostics_every,
+                final_step=config.final_step,
+                schedule_steps=config.steps,
+                early_stopped=config.stop_after_step is not None,
+                tokens_processed=tokens_processed,
+                total_flops=flops_per_token * tokens_processed,
+                flop_breakdown=describe(flop_breakdown),
+                capture_window=capture_window,
+                xprof_destination=(
+                    args.xprof_dir.expanduser().resolve()
                     if capture_window is not None
-                    else "disabled"
+                    else None
                 ),
             ),
         ),
@@ -2014,7 +2003,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                     sync_tree((params, optimizer, last_metrics))
                     if compiled_eval is None:  # defensive configuration invariant
                         raise AssertionError("validation executable was not compiled")
-                    probe_loss, probe_seconds = evaluate_validation_prefix(
+                    probe = evaluate_validation_prefix(
                         params,
                         dataset,
                         compiled_eval,
@@ -2027,27 +2016,23 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                         process_index=process_index,
                         process_count=process_count,
                     )
-                    probe_tokens = (
-                        config.val_probe_batches * config.batch_size * config.seq_len
-                    )
-                    validation_probe_seconds += probe_seconds
+                    validation_probe_seconds += probe.seconds
                     validation_rows.append(
-                        ValidationRow(
+                        probe.validation_row(
                             step=step_index,
                             tokens_processed=(
                                 step_index * config.batch_size * config.seq_len
                             ),
                             kind="fineweb_probe",
                             domain="fineweb",
-                            validation_tokens=probe_tokens,
-                            validation_loss=probe_loss,
-                            perplexity=perplexity_from_loss(probe_loss),
-                            validation_seconds=probe_seconds,
                             canonical=False,
                         )
                     )
                     console.validation_probe(
-                        step_index, probe_loss, config.val_probe_batches, probe_seconds
+                        step_index,
+                        probe.loss,
+                        config.val_probe_batches,
+                        probe.seconds,
                     )
                 should_log = (
                     step_index == 1
@@ -2182,7 +2167,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     )
     if compiled_eval is None:  # defensive configuration invariant
         raise AssertionError("final validation executable was not compiled")
-    validation_loss, final_validation_seconds = evaluate_validation_prefix(
+    canonical_evaluation = evaluate_validation_prefix(
         params,
         dataset,
         compiled_eval,
@@ -2195,94 +2180,36 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         process_index=process_index,
         process_count=process_count,
     )
-    validation_rows.append(
-        ValidationRow(
-            step=config.final_step,
-            tokens_processed=tokens_processed,
-            kind="fineweb",
-            domain="fineweb",
-            validation_tokens=config.eval_batches * config.batch_size * config.seq_len,
-            validation_loss=validation_loss,
-            perplexity=perplexity_from_loss(validation_loss),
-            validation_seconds=final_validation_seconds,
-            canonical=True,
-        )
-    )
 
-    downstream_results: dict[str, dict[str, float | int]] = {}
+    downstream_evaluations = ()
     if downstream_domains:
         console.phase(
             "Fresh-domain validation",
             f"{len(downstream_domains)} domains outside train_seconds",
         )
-        for domain in downstream_domains:
-            domain_result = evaluate_downstream_domain(
-                params,
-                domain,
-                compiled_eval,
-                data_sharding,
-                batch_size=config.batch_size,
-                seq_len=config.seq_len,
-                mesh=mesh,
-                process_index=process_index,
-                process_count=process_count,
-            )
-            downstream_results[domain.name] = domain_result
-            validation_rows.append(
-                ValidationRow(
-                    step=config.final_step,
-                    tokens_processed=tokens_processed,
-                    kind="downstream",
-                    domain=domain.name,
-                    validation_tokens=int(domain_result["scored_tokens"]),
-                    validation_loss=float(domain_result["loss"]),
-                    perplexity=float(domain_result["perplexity"]),
-                    validation_seconds=float(domain_result["seconds"]),
-                    canonical=False,
-                )
-            )
-            console.downstream(
-                domain.name,
-                float(domain_result["loss"]),
-                float(domain_result["perplexity"]),
-                int(domain_result["scored_tokens"]),
-                float(domain_result["seconds"]),
-            )
-        macro_loss = finite_metric(
-            "fresh10 macro loss",
-            float(np.mean([float(row["loss"]) for row in downstream_results.values()])),
-        )
-        macro_perplexity = perplexity_from_loss(macro_loss)
-        downstream_seconds = finite_metric(
-            "fresh10 seconds",
-            sum(float(row["seconds"]) for row in downstream_results.values()),
-            positive=True,
-        )
-        downstream_scored_tokens = sum(
-            int(row["scored_tokens"]) for row in downstream_results.values()
-        )
-        validation_rows.append(
-            ValidationRow(
-                step=config.final_step,
-                tokens_processed=tokens_processed,
-                kind="downstream_macro",
-                domain="fresh10_macro",
-                validation_tokens=downstream_scored_tokens,
-                validation_loss=macro_loss,
-                perplexity=macro_perplexity,
-                validation_seconds=downstream_seconds,
-                canonical=False,
-            )
-        )
-        console.downstream(
-            "fresh10 macro",
-            macro_loss,
-            macro_perplexity,
-            downstream_scored_tokens,
-            downstream_seconds,
+        downstream_evaluations = evaluate_downstream_domains(
+            params,
+            downstream_domains,
+            compiled_eval,
+            data_sharding,
+            batch_size=config.batch_size,
+            seq_len=config.seq_len,
+            mesh=mesh,
+            process_index=process_index,
+            process_count=process_count,
         )
     else:
         console.phase("Fresh-domain validation", "skipped; no downstream data supplied")
+    evaluation_report = EvaluationReport(canonical_evaluation, downstream_evaluations)
+    console.evaluations(evaluation_report)
+    validation_rows.extend(
+        evaluation_report.validation_rows(
+            step=config.final_step,
+            tokens_processed=tokens_processed,
+        )
+    )
+    validation_loss = canonical_evaluation.loss
+    final_validation_seconds = canonical_evaluation.seconds
 
     output_dir = args.output_dir.expanduser().resolve()
     artifact_names = [TRAINING_LOG_NAME, VALIDATION_CSV_NAME]
@@ -2330,26 +2257,6 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         "builtin-byte-v1" if smoke_contract else "fineweb10b-gpt2"
     )
     tokenizer_id = args.tokenizer_id or ("byte" if smoke_contract else "gpt2")
-    fineweb_tokens = config.eval_batches * config.batch_size * config.seq_len
-    evaluations: dict[str, Any] = {
-        "fineweb": {
-            "loss": validation_loss,
-            "perplexity": perplexity_from_loss(validation_loss),
-            "scored_tokens": int(fineweb_tokens),
-            "seconds": finite_metric(
-                "final_validation_seconds", final_validation_seconds, positive=True
-            ),
-            "canonical": True,
-        }
-    }
-    if downstream_results:
-        evaluations["fresh10"] = {
-            "domains": downstream_results,
-            "macro_loss": macro_loss,
-            "macro_perplexity": macro_perplexity,
-            "scored_tokens": int(downstream_scored_tokens),
-            "seconds": downstream_seconds,
-        }
     result: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "status": "ok",
@@ -2377,7 +2284,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         # Keep kernel choices in implementation provenance so the architecture
         # metadata remains easy to compare across otherwise different recipes.
         "implementation": implementation_metadata(config, attention_runtime),
-        "evaluations": evaluations,
+        "evaluations": evaluation_report.metadata(),
         "metrics": {
             "train_seconds": finite_metric(
                 "train_seconds", train_seconds, positive=True
@@ -2426,7 +2333,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                 positive=True,
             ),
             "validation_loss": validation_loss,
-            "validation_tokens": int(fineweb_tokens),
+            "validation_tokens": canonical_evaluation.scored_tokens,
             "validation_probe_count": sum(
                 row.kind == "fineweb_probe" for row in validation_rows
             ),

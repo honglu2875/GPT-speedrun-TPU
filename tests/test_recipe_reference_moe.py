@@ -232,6 +232,20 @@ class ActiveParameterTests(unittest.TestCase):
             parser.parse_args(["--tier", tier, "--profile", "dev"]), "tpu"
         )
 
+    def test_run_card_names_routing_and_active_versus_total_scale(self) -> None:
+        rows = dict(
+            trainer.model_console_rows(
+                self._config("60m"),
+                total_parameters=102_510_000,
+                active_parameters=60_110_000,
+            )
+        )
+
+        self.assertIn("MoE 8×top-2", rows["model"])
+        self.assertEqual(rows["parameters"], "60.11M active / 102.51M total")
+        self.assertIn("dropless", rows["routing"])
+        self.assertIn("0.01", rows["routing"])
+
     def test_active_count_exceeds_the_dense_tier_only_by_the_router(self) -> None:
         """A routed tier is sized by its *active* parameters, not its total.
 

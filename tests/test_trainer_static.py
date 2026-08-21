@@ -1008,7 +1008,7 @@ class TrainerStaticTests(unittest.TestCase):
         with patch.object(
             evaluation.jax, "device_put", side_effect=lambda value, _sharding: value
         ):
-            loss, elapsed = evaluation.evaluate_validation_prefix(
+            result = evaluation.evaluate_validation_prefix(
                 object(),
                 dataset,
                 compiled_eval,
@@ -1019,8 +1019,9 @@ class TrainerStaticTests(unittest.TestCase):
                 batches=3,
             )
         self.assertEqual(dataset.indices, [0, 1, 2])
-        self.assertAlmostEqual(loss, 2.0)
-        self.assertGreater(elapsed, 0.0)
+        self.assertAlmostEqual(result.loss, 2.0)
+        self.assertEqual(result.scored_tokens, 24)
+        self.assertGreater(result.seconds, 0.0)
 
     def test_training_log_contains_every_step(self) -> None:
         history = np.asarray(
