@@ -63,7 +63,7 @@ from rig.recipe_args import (
     validate_standard_xprof_arguments,
 )
 from rig.metrics import DIAGNOSTIC_FAMILIES, DIAGNOSTIC_STATS
-from rig.configfile import read_config_document, resolve_sibling_config_path
+from rig.configfile import read_config_document
 from rig.configschema import (
     Bounds,
     ConfigSchema,
@@ -529,13 +529,10 @@ class ExperimentConfig(ConfigSchema):
 _UINT64_MASK = (1 << 64) - 1
 
 
-def load_experiment_config(
-    requested_path: Path | None = None,
-) -> tuple[ExperimentConfig, str]:
+def load_experiment_config() -> tuple[ExperimentConfig, str]:
     """Load and validate the typed YAML config with its source digest."""
 
-    path = resolve_sibling_config_path(requested_path, CONFIG_PATH)
-    mapping, source_sha256 = read_config_document(path)
+    mapping, source_sha256 = read_config_document(CONFIG_PATH)
     experiment_config = ExperimentConfig.from_mapping(mapping)
     experiment_config.validate()
     return experiment_config, source_sha256
@@ -554,10 +551,9 @@ def build_parser() -> argparse.ArgumentParser:
         default_output_dir=Path("runs") / RECIPE_NAME,
         profiles=_VALID_PROFILES,
     )
-    environment_tier = os.environ.get("RIG_TIER")
     run.add_argument(
         "--tier",
-        default=environment_tier,
+        default=None,
         help="model-family size tier; defaults to family.default_tier",
     )
     run.add_argument(
@@ -603,10 +599,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def validate_args(
     args: argparse.Namespace,
-    experiment_config: ExperimentConfig | None = None,
+    experiment_config: ExperimentConfig,
 ) -> None:
-    if experiment_config is None:
-        experiment_config, _ = load_experiment_config(args.config)
     profile = selected_profile(args)
     experiment_config.resolve_selection(profile, tier=args.tier, context=args.context)
     if profile == "smoke" and args.context is not None:
@@ -642,16 +636,9 @@ def resolve_config(
     args: argparse.Namespace,
     platform: str,
     *,
-    experiment_config: ExperimentConfig | None = None,
-    config_sha256: str | None = None,
+    experiment_config: ExperimentConfig,
+    config_sha256: str,
 ) -> Config:
-    if experiment_config is None:
-        if config_sha256 is not None:
-            raise ValueError("config_sha256 requires an explicit ExperimentConfig")
-        experiment_config, config_sha256 = load_experiment_config(args.config)
-    elif config_sha256 is None:
-        raise ValueError("an explicit ExperimentConfig requires config_sha256")
-
     profile = selected_profile(args)
     selected_tier_name, selected_context_name = experiment_config.resolve_selection(
         profile, tier=args.tier, context=args.context
@@ -1696,7 +1683,7 @@ def traced_flops(config: Config, params: Mapping[str, Any]) -> FlopBreakdown:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any] | None:
-    experiment_config, config_sha256 = load_experiment_config(args.config)
+    experiment_config, config_sha256 = load_experiment_config()
     validate_args(args, experiment_config)
     process_index, process_count = initialize_distributed_runtime()
     is_controller = is_controller_process(process_index)
@@ -2614,7 +2601,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.print_plan:
         try:
-            experiment_config, config_sha256 = load_experiment_config(args.config)
+            experiment_config, config_sha256 = load_experiment_config()
             validate_args(args, experiment_config)
             planned = resolve_config(
                 args,

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import os
 from pathlib import Path
 from typing import Sequence
 
@@ -33,22 +32,13 @@ def add_standard_config_arguments(
     default_output_dir: Path,
     profiles: Sequence[str],
 ) -> None:
-    """Add ``--config``, ``--output-dir``, ``--seed``, ``--profile``,
-    ``--color``, and the hidden ``--print-plan`` harness protocol flag.
+    """Add ``--output-dir``, ``--seed``, ``--profile``, ``--color``, and the
+    hidden ``--print-plan`` harness protocol flag.
     """
 
-    group.add_argument(
-        "--config",
-        type=Path,
-        default=None,
-        help="experiment definition (must resolve to the config.yaml beside train.py)",
-    )
     group.add_argument("--output-dir", type=Path, default=default_output_dir)
     group.add_argument("--seed", type=int, default=1337)
-    environment_profile = os.environ.get("RIG_PROFILE")
-    if environment_profile not in profiles:
-        environment_profile = None
-    group.add_argument("--profile", choices=profiles, default=environment_profile)
+    group.add_argument("--profile", choices=profiles, default=None)
     group.add_argument("--color", choices=COLORS, default="auto")
     group.add_argument("--print-plan", action="store_true", help=argparse.SUPPRESS)
 

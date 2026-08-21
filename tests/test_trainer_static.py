@@ -9,6 +9,7 @@ import inspect
 from io import StringIO
 import json
 import math
+import os
 import re
 from pathlib import Path
 import sys
@@ -32,6 +33,29 @@ if SPEC is None or SPEC.loader is None:  # pragma: no cover - importlib invarian
 trainer = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = trainer
 SPEC.loader.exec_module(trainer)
+
+_EXPERIMENT_CONFIG, _CONFIG_SHA256 = trainer.load_experiment_config()
+
+
+def _resolve_config(
+    args,
+    platform: str,
+    *,
+    experiment_config=None,
+    config_sha256: str | None = None,
+):
+    """Resolve through the one production API while keeping tests concise."""
+
+    return trainer.resolve_config(
+        args,
+        platform,
+        experiment_config=experiment_config or _EXPERIMENT_CONFIG,
+        config_sha256=config_sha256 or _CONFIG_SHA256,
+    )
+
+
+def _validate_args(args, experiment_config=None) -> None:
+    trainer.validate_args(args, experiment_config or _EXPERIMENT_CONFIG)
 
 
 # Tracing needs real parameters, so shrink the model to keep these tests
@@ -127,9 +151,7 @@ class FakeDevice:
 class TrainerStaticTests(unittest.TestCase):
     def test_reference_block_is_rope_rmsnorm_gelu(self) -> None:
         parser = trainer.build_parser()
-        config = trainer.resolve_config(
-            parser.parse_args(["--profile", "smoke"]), "cpu"
-        )
+        config = _resolve_config(parser.parse_args(["--profile", "smoke"]), "cpu")
         self.assertFalse(hasattr(config, "__dict__"))
         params = trainer.init_params(config, 7)
         self.assertNotIn("position_embedding", params)
@@ -172,7 +194,7 @@ class TrainerStaticTests(unittest.TestCase):
                 self.assertEqual(
                     experiment_config.family.tiers[tier].tpp_parameters, parameters
                 )
-                config = trainer.resolve_config(
+                config = _resolve_config(
                     parser.parse_args(["--profile", "official", "--tier", tier]),
                     "tpu",
                     experiment_config=experiment_config,
@@ -202,7 +224,7 @@ class TrainerStaticTests(unittest.TestCase):
         args = parser.parse_args(
             ["--profile", "dev", "--tier", "250m", "--tokens-per-parameter", "5"]
         )
-        config = trainer.resolve_config(args, "tpu")
+        config = _resolve_config(args, "tpu")
         params = {
             "token_embedding": np.zeros((1, 1), dtype=np.float32),
             "blocks": [
@@ -234,7 +256,7 @@ class TrainerStaticTests(unittest.TestCase):
             config.learning_rate / math.sqrt(config.data_multiplier),
         )
 
-        twenty_tpp = trainer.resolve_config(
+        twenty_tpp = _resolve_config(
             parser.parse_args(
                 [
                     "--profile",
@@ -329,11 +351,6 @@ class TrainerStaticTests(unittest.TestCase):
             ):
                 trainer.load_experiment_config()
 
-            alternate = root / "alternate.yaml"
-            alternate.write_text(source, encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "beside train.py"):
-                trainer.load_experiment_config(alternate)
-
             shuffled_source = source.replace(
                 "      sampling: shuffled_epochs\n      dtype: bfloat16",
                 "      sampling: random_windows\n      dtype: bfloat16",
@@ -359,7 +376,9 @@ class TrainerStaticTests(unittest.TestCase):
     def test_static_cli_values_are_rejected_but_diagnostic_overrides_resolve(
         self,
     ) -> None:
-        parser = trainer.build_parser()
+        with patch.dict(os.environ, {"RIG_TIER": "500m"}):
+            parser = trainer.build_parser()
+        self.assertIsNone(parser.parse_args([]).tier)
         for option in (
             ("--layers", "13"),
             ("--attention-backend", "dense"),
@@ -369,7 +388,7 @@ class TrainerStaticTests(unittest.TestCase):
             with self.subTest(option=option), redirect_stderr(StringIO()):
                 with self.assertRaises(SystemExit):
                     parser.parse_args(["--profile", "official", *option])
-        config = trainer.resolve_config(
+        config = _resolve_config(
             parser.parse_args(
                 [
                     "--profile",
@@ -390,7 +409,7 @@ class TrainerStaticTests(unittest.TestCase):
             dict(config.config_overrides),
             {"diagnostic_mode": 1},
         )
-        context_config = trainer.resolve_config(
+        context_config = _resolve_config(
             parser.parse_args(["--profile", "dev", "--context", "8k"]),
             "tpu",
         )
@@ -399,7 +418,7 @@ class TrainerStaticTests(unittest.TestCase):
 
     def test_fixed_tpp_derives_complete_steps_and_rejects_custom_horizons(self) -> None:
         parser = trainer.build_parser()
-        config = trainer.resolve_config(
+        config = _resolve_config(
             parser.parse_args(
                 [
                     "--profile",
@@ -421,10 +440,8 @@ class TrainerStaticTests(unittest.TestCase):
 
     def test_short_diagnostic_run_resolves_fractional_warmup(self) -> None:
         parser = trainer.build_parser()
-        full = trainer.resolve_config(
-            parser.parse_args(["--profile", "official"]), "tpu"
-        )
-        config = trainer.resolve_config(
+        full = _resolve_config(parser.parse_args(["--profile", "official"]), "tpu")
+        config = _resolve_config(
             parser.parse_args(["--profile", "official", "--stop-after-step", "100"]),
             "tpu",
         )
@@ -448,7 +465,7 @@ class TrainerStaticTests(unittest.TestCase):
                 "--diagnostic-mode",
             ]
         )
-        trainer.validate_args(valid)
+        _validate_args(valid)
 
         self.assertEqual(trainer.xprof_step_window(valid, 100), (11, 30))
         self.assertFalse(
@@ -456,7 +473,7 @@ class TrainerStaticTests(unittest.TestCase):
         )
 
         normal = parser.parse_args([])
-        trainer.validate_args(normal)
+        _validate_args(normal)
         self.assertIsNone(trainer.xprof_step_window(normal, 100))
         self.assertTrue(
             trainer.should_compile_evaluation(normal, SimpleNamespace(val_every=0), ())
@@ -490,7 +507,7 @@ class TrainerStaticTests(unittest.TestCase):
         )
         for command in invalid_commands:
             with self.subTest(command=command), self.assertRaises(ValueError):
-                trainer.validate_args(parser.parse_args(command))
+                _validate_args(parser.parse_args(command))
         with self.assertRaisesRegex(ValueError, "must fit inside"):
             trainer.xprof_step_window(valid, 25)
 
@@ -508,7 +525,7 @@ class TrainerStaticTests(unittest.TestCase):
     def test_checkpoint_omission_is_restricted_to_development_research(self) -> None:
         parser = trainer.build_parser()
         valid = parser.parse_args(["--profile", "dev", "--omit-checkpoint"])
-        trainer.validate_args(valid)
+        _validate_args(valid)
         invalid_commands = (
             ["--profile", "official", "--omit-checkpoint"],
             [
@@ -526,7 +543,7 @@ class TrainerStaticTests(unittest.TestCase):
         )
         for command in invalid_commands:
             with self.subTest(command=command), self.assertRaises(ValueError):
-                trainer.validate_args(parser.parse_args(command))
+                _validate_args(parser.parse_args(command))
 
     def test_multihost_xprof_capture_is_owned_by_controller(self) -> None:
         source = TRAINER_PATH.read_text(encoding="utf-8")
@@ -549,9 +566,7 @@ class TrainerStaticTests(unittest.TestCase):
     def test_periodic_validation_defaults_and_diagnostic_mode(self) -> None:
         parser = trainer.build_parser()
 
-        official = trainer.resolve_config(
-            parser.parse_args(["--profile", "official"]), "tpu"
-        )
+        official = _resolve_config(parser.parse_args(["--profile", "official"]), "tpu")
         self.assertEqual(official.steps, 18_838)
         self.assertEqual(
             official.steps * official.batch_size * official.seq_len,
@@ -562,16 +577,14 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertEqual(official.eval_batches, 80)
         self.assertEqual(official.diagnostics_every, 500)
 
-        smoke = trainer.resolve_config(parser.parse_args(["--profile", "smoke"]), "cpu")
-        development = trainer.resolve_config(
-            parser.parse_args(["--profile", "dev"]), "tpu"
-        )
+        smoke = _resolve_config(parser.parse_args(["--profile", "smoke"]), "cpu")
+        development = _resolve_config(parser.parse_args(["--profile", "dev"]), "tpu")
         self.assertEqual(smoke.val_every, 0)
         self.assertEqual(smoke.diagnostics_every, 0)
         self.assertEqual(development.val_every, 0)
         self.assertEqual(development.diagnostics_every, 10)
 
-        diagnostic = trainer.resolve_config(
+        diagnostic = _resolve_config(
             parser.parse_args(
                 [
                     "--profile",
@@ -604,7 +617,7 @@ class TrainerStaticTests(unittest.TestCase):
     ) -> None:
         parser = trainer.build_parser()
         experiment_config, config_sha256 = trainer.load_experiment_config()
-        dense = trainer.resolve_config(
+        dense = _resolve_config(
             parser.parse_args(["--profile", "official"]),
             "tpu",
             experiment_config=_replace_experiment_config(
@@ -619,7 +632,7 @@ class TrainerStaticTests(unittest.TestCase):
             profile="official",
             kernels={"loss_backend": "tiled"},
         )
-        tiled = trainer.resolve_config(
+        tiled = _resolve_config(
             parser.parse_args(["--profile", "official"]),
             "tpu",
             experiment_config=tiled_experiment_config,
@@ -644,7 +657,7 @@ class TrainerStaticTests(unittest.TestCase):
         parser = trainer.build_parser()
         common = ["--profile", "dev"]
         experiment_config, config_sha256 = trainer.load_experiment_config()
-        dense = trainer.resolve_config(
+        dense = _resolve_config(
             parser.parse_args(common),
             "tpu",
             experiment_config=_replace_experiment_config(
@@ -655,7 +668,7 @@ class TrainerStaticTests(unittest.TestCase):
             ),
             config_sha256=config_sha256,
         )
-        flash = trainer.resolve_config(
+        flash = _resolve_config(
             parser.parse_args(common),
             "tpu",
             experiment_config=_replace_experiment_config(
@@ -741,13 +754,13 @@ class TrainerStaticTests(unittest.TestCase):
                     kernels={"attention_backend": backend},
                 )
                 with self.assertRaisesRegex(ValueError, "requires a TPU"):
-                    trainer.resolve_config(
+                    _resolve_config(
                         args,
                         "cpu",
                         experiment_config=backend_config,
                         config_sha256=config_sha256,
                     )
-                config = trainer.resolve_config(
+                config = _resolve_config(
                     args,
                     "tpu",
                     experiment_config=backend_config,
@@ -757,7 +770,7 @@ class TrainerStaticTests(unittest.TestCase):
         for backend in ("jax_flash", "tpu_flash"):
             with self.subTest(float32_backend=backend):
                 with self.assertRaisesRegex(ValueError, "requires .*bfloat16"):
-                    trainer.resolve_config(
+                    _resolve_config(
                         parser.parse_args(["--profile", "dev"]),
                         "tpu",
                         experiment_config=_replace_experiment_config(
@@ -784,13 +797,9 @@ class TrainerStaticTests(unittest.TestCase):
             with self.subTest(flag=flag), self.assertRaises(SystemExit):
                 parser.parse_args(["--profile", "official", flag, "x"])
 
-        official = trainer.resolve_config(
-            parser.parse_args(["--profile", "official"]), "tpu"
-        )
-        smoke = trainer.resolve_config(parser.parse_args(["--profile", "smoke"]), "cpu")
-        development = trainer.resolve_config(
-            parser.parse_args(["--profile", "dev"]), "tpu"
-        )
+        official = _resolve_config(parser.parse_args(["--profile", "official"]), "tpu")
+        smoke = _resolve_config(parser.parse_args(["--profile", "smoke"]), "cpu")
+        development = _resolve_config(parser.parse_args(["--profile", "dev"]), "tpu")
         self.assertEqual(official.attention_backend, "tpu_flash")
         self.assertEqual(smoke.attention_backend, "dense")
         self.assertEqual(development.attention_backend, "tpu_flash")
@@ -821,9 +830,7 @@ class TrainerStaticTests(unittest.TestCase):
 
     def test_attention_tuning_metadata_is_saved_with_exact_plan(self) -> None:
         parser = trainer.build_parser()
-        config = trainer.resolve_config(
-            parser.parse_args(["--profile", "smoke"]), "cpu"
-        )
+        config = _resolve_config(parser.parse_args(["--profile", "smoke"]), "cpu")
         tiles = AttentionTiles(512, 512, 256, 512, 256, 512, 256, 256, 512, 256)
         runtime = trainer.AttentionRuntime("c" * 64, "cache", tiles, 0.0)
         expected = trainer.attention_runtime_metadata(runtime)
@@ -874,7 +881,7 @@ class TrainerStaticTests(unittest.TestCase):
             kernels={"loss_backend": "tiled"},
             model={"semantic_vocab_size": 50_257},
         )
-        config = trainer.resolve_config(
+        config = _resolve_config(
             parser.parse_args(["--profile", "official"]),
             "tpu",
             experiment_config=experiment_config,
@@ -993,8 +1000,8 @@ class TrainerStaticTests(unittest.TestCase):
     def test_stop_after_step_truncates_without_moving_the_schedule(self) -> None:
         parser = trainer.build_parser()
         horizon = ["--profile", "dev", "--tier", "250m", "--tokens-per-parameter", "5"]
-        full = trainer.resolve_config(parser.parse_args(horizon), "tpu")
-        stopped = trainer.resolve_config(
+        full = _resolve_config(parser.parse_args(horizon), "tpu")
+        stopped = _resolve_config(
             parser.parse_args([*horizon, "--stop-after-step", "60"]),
             "tpu",
         )
@@ -1019,7 +1026,7 @@ class TrainerStaticTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     parser.parse_args([*horizon, removed, "100"])
         with self.assertRaisesRegex(ValueError, "past the"):
-            trainer.resolve_config(
+            _resolve_config(
                 parser.parse_args([*horizon, "--stop-after-step", str(full.steps + 1)]),
                 "tpu",
             )
@@ -1142,7 +1149,7 @@ class TrainerStaticTests(unittest.TestCase):
     ) -> None:
         parser = trainer.build_parser()
         config = replace(
-            trainer.resolve_config(parser.parse_args(["--profile", "smoke"]), "cpu"),
+            _resolve_config(parser.parse_args(["--profile", "smoke"]), "cpu"),
             diagnostics_every=1,
         )
         host_params = trainer.init_params(config, 7)
@@ -1516,9 +1523,7 @@ class SalvageTests(unittest.TestCase):
 
     def _config(self, steps: int = 200):
         parser = trainer.build_parser()
-        resolved = trainer.resolve_config(
-            parser.parse_args(["--profile", "dev"]), "tpu"
-        )
+        resolved = _resolve_config(parser.parse_args(["--profile", "dev"]), "tpu")
         return replace(
             resolved,
             steps=steps,
