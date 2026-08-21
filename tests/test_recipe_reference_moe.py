@@ -32,15 +32,19 @@ trainer = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = trainer
 SPEC.loader.exec_module(trainer)
 
-_EXPERIMENT_CONFIG, _CONFIG_SHA256 = trainer.load_experiment_config()
+_LOADED_CONFIGS = {
+    profile: trainer.load_experiment_config(profile)
+    for profile in ("smoke", "dev", "official")
+}
 
 
 def _resolve_config(args, platform: str):
+    experiment_config, config_sha256 = _LOADED_CONFIGS[trainer.selected_profile(args)]
     return trainer.resolve_config(
         args,
         platform,
-        experiment_config=_EXPERIMENT_CONFIG,
-        config_sha256=_CONFIG_SHA256,
+        experiment_config=experiment_config,
+        config_sha256=config_sha256,
     )
 
 
@@ -333,11 +337,9 @@ class ContextPresetTests(unittest.TestCase):
         )
 
     def test_moe_defaults_to_8k_and_can_select_the_aligned_1k_preset(self) -> None:
-        experiment_config, _ = trainer.load_experiment_config()
-        native_tier, native_context = experiment_config.resolve_selection("dev")
-        short_tier, short_context = experiment_config.resolve_selection(
-            "dev", context="1k"
-        )
+        experiment_config, _ = trainer.load_experiment_config("dev")
+        native_tier, native_context = experiment_config.resolve_selection()
+        short_tier, short_context = experiment_config.resolve_selection(context="1k")
 
         self.assertEqual(native_tier, short_tier)
         self.assertEqual(native_context, "8k")

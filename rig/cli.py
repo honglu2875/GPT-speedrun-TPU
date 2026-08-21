@@ -59,6 +59,7 @@ from .config import (
     save_config,
     with_overrides,
 )
+from .configfile import PROFILE_CONFIG_FILENAMES, profile_config_filename
 from .data import (
     DataError,
     FRESH10_DOMAINS,
@@ -432,8 +433,8 @@ def command_doctor(args: argparse.Namespace) -> int:
     return 0 if healthy else 1
 
 
-def _recipe_entry(root: Path, recipe: str) -> tuple[Path, Path]:
-    """Resolve one recipe's two required files without permitting path traversal."""
+def _recipe_entry(root: Path, recipe: str, profile: str) -> tuple[Path, Path]:
+    """Resolve a recipe entry and selected config without path traversal."""
 
     if not _NAME.fullmatch(recipe):
         raise ConfigError(
@@ -446,7 +447,7 @@ def _recipe_entry(root: Path, recipe: str) -> tuple[Path, Path]:
     except ValueError as exc:
         raise ConfigError("recipe path escapes recipes directory") from exc
     trainer = recipe_dir / "train.py"
-    experiment_config = recipe_dir / "config.yaml"
+    experiment_config = recipe_dir / profile_config_filename(profile)
     if not trainer.is_file() or trainer.is_symlink():
         raise ConfigError(f"recipe entry script not found: {trainer}")
     if not experiment_config.is_file() or experiment_config.is_symlink():
@@ -485,7 +486,7 @@ def command_run(args: argparse.Namespace) -> int:
     target_loss = _effective_target_loss(
         profile, requested=None, development_default=config.target_loss
     )
-    recipe_dir, trainer = _recipe_entry(root, args.recipe)
+    recipe_dir, trainer = _recipe_entry(root, args.recipe, profile)
     scientific_args = _scientific_trainer_args(args)
     python_executable = root / ".venv" / "bin" / "python"
     style.heading("Resolving recipe plan")
@@ -728,7 +729,7 @@ def command_profile(args: argparse.Namespace) -> int:
         raise ConfigError("XProf capture requires a fixed-TPP dev or official profile")
     color = args.color or config.color
     style = Style(color)
-    recipe_dir, trainer = _recipe_entry(root, args.recipe)
+    recipe_dir, trainer = _recipe_entry(root, args.recipe, profile)
     scientific_args = _scientific_trainer_args(args)
     python_executable = root / ".venv" / "bin" / "python"
     plan = resolve_recipe_plan(
@@ -1193,16 +1194,20 @@ def command_clone(args: argparse.Namespace) -> int:
     destination = root / "recipes" / args.name
     if not (source / "train.py").is_file():
         raise ConfigError(f"source recipe does not exist: {source}")
-    source_config = source / "config.yaml"
-    if not source_config.is_file() or source_config.is_symlink():
-        raise ConfigError(
-            f"source recipe configuration does not exist: {source_config}"
-        )
+    source_configs = tuple(
+        source / filename for filename in PROFILE_CONFIG_FILENAMES.values()
+    )
+    for source_config in source_configs:
+        if not source_config.is_file() or source_config.is_symlink():
+            raise ConfigError(
+                f"source recipe configuration does not exist: {source_config}"
+            )
     if destination.exists():
         raise ConfigError(f"destination already exists: {destination}")
     destination.mkdir(parents=True)
     shutil.copy2(source / "train.py", destination / "train.py")
-    shutil.copy2(source_config, destination / "config.yaml")
+    for source_config in source_configs:
+        shutil.copy2(source_config, destination / source_config.name)
     if (source / "README.md").is_file():
         shutil.copy2(source / "README.md", destination / "README.md")
     print(f"cloned {args.source} -> {args.name} ({destination})")

@@ -91,10 +91,12 @@ filenames:
 
 ```text
 recipes/<algorithm>/train.py
-recipes/<algorithm>/config.yaml
+recipes/<algorithm>/config.yaml  # official
+recipes/<algorithm>/dev.yaml
+recipes/<algorithm>/smoke.yaml
 ```
 
-A schema-3 candidate directory defines a family, not one isolated shape. Its
+A schema-5 candidate directory defines a family, not one isolated shape. Its
 entry must resolve the 60M, 125M, 250M, 500M, and 1B ballparks through `--tier`;
 `make run` defaults to 125M. Candidate admission is based on the 60M, 125M, and
 250M scaling trend. The 500M and 1B tiers are confirmation/hero runs and are not

@@ -2,9 +2,10 @@
 
 `train.py` is a readable pure-JAX GPT family, not a claimed record. Model,
 fixed-TPP CompleteP-hybrid AdamW, batching, sharding, timing, evaluation, and checkpoint logic
-remain visible in this one entry file. The strict sibling `config.yaml` defines
-five architecture tiers, two coupled context presets, and three execution
-profiles.
+remain visible in this one entry file. Three strict standalone documents select
+the execution contract: `config.yaml` is official, `dev.yaml` is development,
+and `smoke.yaml` is the tiny CPU wiring test. Each document is complete; no YAML
+inheritance or runtime profile overlay is involved.
 
 The non-smoke tiers are:
 

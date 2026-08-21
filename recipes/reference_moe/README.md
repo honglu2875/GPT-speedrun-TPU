@@ -5,6 +5,10 @@ eight-expert, top-2 routed MLP. The fork keeps the same named context contracts;
 it defaults to `8k`, while `--context 1k` selects the short-context contract on
 demand.
 
+Like `reference`, this fork has three complete configuration documents:
+`config.yaml` for official runs, `dev.yaml` for development runs, and
+`smoke.yaml` for the routed CPU check. `--profile` only selects the file.
+
 | | `reference` | `reference_moe` |
 |---|---|---|
 | context presets | `1k` default, `8k` optional | same presets, `8k` default |

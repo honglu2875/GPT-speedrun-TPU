@@ -111,6 +111,8 @@ class HarnessRunTests(unittest.TestCase):
         recipe.mkdir(parents=True)
         (recipe / "train.py").write_text(FAKE_TRAINER, encoding="utf-8")
         (recipe / "config.yaml").write_bytes(FAKE_CONFIG)
+        (recipe / "dev.yaml").write_bytes(FAKE_CONFIG)
+        (recipe / "smoke.yaml").write_bytes(FAKE_CONFIG)
         (self.root / "uv.lock").write_bytes(b"version = 1\n")
 
     def tearDown(self) -> None:
@@ -625,6 +627,10 @@ class HarnessRunTests(unittest.TestCase):
         )
         self.assertIsNone(outcome.checkpoint_path)
         self.assertIsNone(outcome.record["checkpoint"])
+        self.assertEqual(
+            outcome.record["provenance"]["config_yaml"]["path"],
+            "recipes/tiny/dev.yaml",
+        )
         validated = verify_run(
             outcome.run_dir,
             require_checkpoint=False,

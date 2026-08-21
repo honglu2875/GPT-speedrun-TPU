@@ -124,7 +124,7 @@ class RecipeArgumentValidationTests(unittest.TestCase):
                 validate_standard_data_arguments(self.parse(*arguments))
 
     def test_xprof_validation_pins_the_complete_capture_window(self) -> None:
-        validate_standard_xprof_arguments(self.parse(), profile="dev")
+        validate_standard_xprof_arguments(self.parse(), execution_type="dev")
         valid = self.parse(
             "--xprof-dir",
             "trace",
@@ -134,9 +134,9 @@ class RecipeArgumentValidationTests(unittest.TestCase):
             "10",
             "--diagnostic-mode",
         )
-        validate_standard_xprof_arguments(valid, profile="dev")
+        validate_standard_xprof_arguments(valid, execution_type="dev")
 
-        for arguments, profile, message in (
+        for arguments, execution_type, message in (
             (("--xprof-start-step", "1"), "dev", "require --xprof-dir"),
             (("--xprof-dir", "trace"), "dev", "requires both"),
             (("--diagnostic-mode",), "dev", "requires --xprof-dir"),
@@ -161,7 +161,7 @@ class RecipeArgumentValidationTests(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, message),
             ):
                 validate_standard_xprof_arguments(
-                    self.parse(*arguments), profile=profile
+                    self.parse(*arguments), execution_type=execution_type
                 )
 
     def test_diagnostic_mode_rejects_downstream_inputs(self) -> None:
@@ -177,7 +177,7 @@ class RecipeArgumentValidationTests(unittest.TestCase):
             "manifest.yaml",
         )
         with self.assertRaisesRegex(ValueError, "downstream evaluation data"):
-            validate_standard_xprof_arguments(args, profile="dev")
+            validate_standard_xprof_arguments(args, execution_type="dev")
 
     def test_reporting_validation_requires_positive_finite_peak(self) -> None:
         validate_standard_reporting_arguments(self.parse())

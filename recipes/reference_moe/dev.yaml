@@ -1,15 +1,9 @@
-# Canonical official configuration for recipes/reference/train.py.
-#
-# This is a complete standalone document: no defaults are inherited from the
-# development or smoke configurations. The family uses the fixed-TPP CompleteP
-# hybrid described in docs/COMPLETEP.md.
+# Standalone development configuration for recipes/reference_moe/train.py.
 schema_version: 5
-execution_type: official
+execution_type: dev
 family:
   default_tier: 125m
-  # A context preset is a coupled training contract: sequence length, the
-  # recipe-local batch anchor used by m_B, and the document-attention policy.
-  default_context: 1k
+  default_context: 8k
   contexts:
     1k:
       seq_len: 1024
@@ -26,8 +20,6 @@ family:
     base_depth: 12
     depth_alpha: 1.0
     init_std: 0.02
-    # Match the official nanoGPT-mup implementation: each head contracts over
-    # its own fixed 64-wide q/k coordinate, independent of the number of heads.
     attention_scale: inverse_head_dim
     embeddings: untied
   tiers:
@@ -37,6 +29,10 @@ family:
         heads: 6
         d_model: 384
         mlp_mult: 4
+        experts: 8
+        expert_top_k: 2
+        expert_mult: 2
+        router_aux_coefficient: 0.01
         normalization: rms_norm
         position_encoding: rope_base_10000
         mlp_activation: gelu
@@ -48,6 +44,10 @@ family:
         heads: 10
         d_model: 640
         mlp_mult: 4
+        experts: 8
+        expert_top_k: 2
+        expert_mult: 2
+        router_aux_coefficient: 0.01
         normalization: rms_norm
         position_encoding: rope_base_10000
         mlp_activation: gelu
@@ -59,6 +59,10 @@ family:
         heads: 14
         d_model: 896
         mlp_mult: 4
+        experts: 8
+        expert_top_k: 2
+        expert_mult: 2
+        router_aux_coefficient: 0.01
         normalization: rms_norm
         position_encoding: rope_base_10000
         mlp_activation: gelu
@@ -70,6 +74,10 @@ family:
         heads: 20
         d_model: 1280
         mlp_mult: 4
+        experts: 8
+        expert_top_k: 2
+        expert_mult: 2
+        router_aux_coefficient: 0.01
         normalization: rms_norm
         position_encoding: rope_base_10000
         mlp_activation: gelu
@@ -81,6 +89,10 @@ family:
         heads: 28
         d_model: 1792
         mlp_mult: 4
+        experts: 8
+        expert_top_k: 2
+        expert_mult: 2
+        router_aux_coefficient: 0.01
         normalization: rms_norm
         position_encoding: rope_base_10000
         mlp_activation: gelu
@@ -90,7 +102,7 @@ family:
 run:
   training:
     duration:
-      tokens_per_parameter: 20.0
+      tokens_per_parameter: 5.0
     sampling: shuffled_epochs
     dtype: bfloat16
   kernels:
@@ -98,8 +110,6 @@ run:
     loss_backend: tiled
     vocab_tile_size: 2048
   optimizer:
-    # 2^-8, the optimum measured by the fixed-TPP learning-rate sweep at
-    # 60M/125M and by both depth ablations. See docs/HYPERPARAMETER_TRANSFER.md.
     learning_rate: 0.00390625
     min_lr_ratio: 0.1
     warmup_ratio: 0.1
@@ -109,10 +119,10 @@ run:
     beta2: 0.95
     grad_clip: 0.0
   evaluation:
-    prediction_budget: 10485760
-    eval_batches: 80
-    val_every: 500
+    prediction_budget: 0
+    eval_batches: 8
+    val_every: 0
     val_probe_batches: 8
   logging:
-    diagnostics_every: 500
-    log_every: 500
+    diagnostics_every: 10
+    log_every: 10

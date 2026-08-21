@@ -52,6 +52,7 @@ from rig.attention import (
     resolve_attention_runtime,
 )
 from rig.recipe_args import (
+    StandardExecutionType,
     add_standard_config_arguments,
     add_standard_data_arguments,
     add_standard_reporting_arguments,
@@ -61,7 +62,7 @@ from rig.recipe_args import (
     validate_standard_reporting_arguments,
     validate_standard_xprof_arguments,
 )
-from rig.configfile import read_config_document
+from rig.configfile import profile_config_filename, read_config_document
 from rig.configschema import (
     Bounds,
     ConfigSchema,
@@ -160,11 +161,9 @@ from rig.kernels import (
 
 
 SCHEMA_VERSION = 1
-CONFIG_SCHEMA_VERSION = 4
-CONFIG_FILENAME = "config.yaml"
+CONFIG_SCHEMA_VERSION = 5
 RECIPE_DIR = Path(__file__).resolve().parent
 RECIPE_NAME = RECIPE_DIR.name
-CONFIG_PATH = RECIPE_DIR / CONFIG_FILENAME
 _VALID_PROFILES = ("smoke", "dev", "official")
 _DOMAIN_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _TIER_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
@@ -191,7 +190,7 @@ class Config:
     mlp_activation: str
     tier: str
     # Stable run-protocol name, derived from the typed model definition rather
-    # than declared independently in config.yaml.
+    # than declared independently in the selected YAML.
     declared_parameters: int | None
     parameterization: str
     base_width: int
@@ -224,7 +223,8 @@ class Config:
     dtype_name: str
     config_schema_version: int
     config_sha256: str
-    config_profile: str
+    config_filename: str
+    execution_type: str
     context_preset: str
     config_overrides: tuple[tuple[str, int | str], ...]
     # Optimizer step after which to stop. steps, warmup, and m_D still resolve
@@ -278,7 +278,7 @@ TierName = Annotated[str, Matches(_TIER_NAME.pattern)]
 ContextName = Annotated[str, Matches(_CONTEXT_NAME.pattern)]
 Probability = Annotated[float, Bounds(ge=0.0, le=1.0)]
 OpenProbability = Annotated[float, Bounds(ge=0.0, lt=1.0)]
-DepthAlpha = Annotated[float, Bounds(ge=0.5, le=1.0)]
+DepthAlpha = Annotated[float, Bounds(ge=0.0, le=1.0)]
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,21 +298,21 @@ class ContextPreset:
 
 @dataclass(frozen=True, slots=True)
 class ParameterizationDefinition:
-    """The fixed-TPP CompleteP contract shared by every family tier."""
+    """Initialization and optimizer scaling shared by every family tier."""
 
-    name: Literal["completep_fixed_tpp_v1"]
+    name: Literal["standard", "completep_fixed_tpp_v1"]
     base_tier: TierName
     base_width: PositiveInt
     base_depth: PositiveInt
     depth_alpha: DepthAlpha
     init_std: PositiveFloat
-    attention_scale: Literal["inverse_head_dim"]
-    embeddings: Literal["untied"]
+    attention_scale: Literal["inverse_sqrt_head_dim", "inverse_head_dim"]
+    embeddings: Literal["tied", "untied"]
 
 
 @dataclass(frozen=True, slots=True)
 class ModelDefinition:
-    """Architecture fields represented literally in ``config.yaml``."""
+    """Architecture fields represented literally in the selected YAML."""
 
     layers: PositiveInt
     heads: PositiveInt
@@ -335,13 +335,13 @@ class ModelDefinition:
 
         if self.semantic_vocab_size > self.vocab_size:
             raise ValueError(
-                f"config.yaml {label}.semantic_vocab_size must not exceed vocab_size"
+                f"{label}.semantic_vocab_size must not exceed vocab_size"
             )
         if self.d_model % self.heads:
-            raise ValueError(f"config.yaml {label}.d_model must be divisible by heads")
+            raise ValueError(f"{label}.d_model must be divisible by heads")
         if self.head_dim % 2:
             raise ValueError(
-                f"config.yaml {label} head dimension must be even for RoPE"
+                f"{label} head dimension must be even for RoPE"
             )
 
 
@@ -376,17 +376,26 @@ ComputeDtype = Literal["bfloat16", "float32"]
 
 
 @dataclass(frozen=True, slots=True)
-class SmokeTraining:
-    steps: PositiveInt
-    batch_size: PositiveInt
-    seq_len: PositiveInt
-    sampling: Sampling
-    dtype: ComputeDtype
+class DurationDefinition:
+    """One explicit stopping policy; exactly one field must be present."""
+
+    steps: PositiveInt | None = None
+    tokens_per_parameter: PositiveFloat | None = None
+
+    def validate(self, label: str) -> None:
+        if (self.steps is None) == (self.tokens_per_parameter is None):
+            raise ValueError(
+                f"{label} must define exactly one of steps and tokens_per_parameter"
+            )
+
+    @property
+    def is_fixed_tpp(self) -> bool:
+        return self.tokens_per_parameter is not None
 
 
 @dataclass(frozen=True, slots=True)
-class LadderTraining:
-    tokens_per_parameter: PositiveFloat
+class TrainingSettings:
+    duration: DurationDefinition
     sampling: Sampling
     dtype: ComputeDtype
 
@@ -412,6 +421,7 @@ class OptimizerSettings:
 
 @dataclass(frozen=True, slots=True)
 class EvaluationSettings:
+    prediction_budget: NonnegativeInt
     eval_batches: PositiveInt
     val_every: NonnegativeInt
     val_probe_batches: PositiveInt
@@ -424,119 +434,97 @@ class LoggingSettings:
 
 
 @dataclass(frozen=True, slots=True)
-class SmokeProfileDefinition:
-    training: SmokeTraining
-    model: ModelDefinition
+class RunDefinition:
+    training: TrainingSettings
     kernels: KernelSettings
     optimizer: OptimizerSettings
     evaluation: EvaluationSettings
     logging: LoggingSettings
-
-
-@dataclass(frozen=True, slots=True)
-class LadderProfileDefinition:
-    training: LadderTraining
-    model: Literal["family_tier"]
-    kernels: KernelSettings
-    optimizer: OptimizerSettings
-    evaluation: EvaluationSettings
-    logging: LoggingSettings
-
-
-@dataclass(frozen=True, slots=True)
-class ProfileDefinitions:
-    smoke: SmokeProfileDefinition
-    dev: LadderProfileDefinition
-    official: LadderProfileDefinition
 
 
 @dataclass(frozen=True, slots=True)
 class ExperimentConfig(ConfigSchema):
-    """Complete typed representation of the recipe's ``config.yaml``."""
+    """Complete typed representation of one selected standalone YAML file."""
 
-    schema_version: Literal[4]
+    schema_version: Literal[5]
+    execution_type: StandardExecutionType
     family: FamilyDefinition
-    profiles: ProfileDefinitions
+    run: RunDefinition
 
-    def validate(self) -> None:
+    def validate(self, label: str) -> None:
         """Enforce the few scientific contracts involving multiple fields."""
 
         family = self.family
         if family.default_context not in family.contexts:
             raise ValueError(
-                "config.yaml family.default_context must name a defined context preset"
+                f"{label} family.default_context must name a defined context preset"
             )
         if family.default_tier not in family.tiers:
-            raise ValueError("config.yaml family.default_tier must name a defined tier")
+            raise ValueError(f"{label} family.default_tier must name a defined tier")
         base_tier = family.parameterization.base_tier
         if base_tier not in family.tiers:
             raise ValueError(
-                "config.yaml family.parameterization.base_tier must name a defined tier"
+                f"{label} family.parameterization.base_tier must name a defined tier"
             )
 
         for tier_name, tier in family.tiers.items():
-            label = f"family.tiers.{tier_name}.model"
-            tier.model.validate(label)
-            if tier.model.head_dim != 64:
+            model_label = f"{label} family.tiers.{tier_name}.model"
+            tier.model.validate(model_label)
+            if (
+                family.parameterization.attention_scale == "inverse_head_dim"
+                and tier.model.head_dim != 64
+            ):
                 raise ValueError(
-                    f"config.yaml family.tiers.{tier_name} must use 64-wide heads"
+                    f"{label} family.tiers.{tier_name} must use 64-wide heads"
                 )
 
-        self.profiles.smoke.model.validate("profiles.smoke.model")
-        for name, profile in (
-            ("smoke", self.profiles.smoke),
-            ("dev", self.profiles.dev),
-            ("official", self.profiles.official),
+        run = self.run
+        run.training.duration.validate(f"{label} run.training.duration")
+        if (
+            run.kernels.attention_backend != "dense"
+            and run.training.dtype != "bfloat16"
         ):
-            if (
-                profile.kernels.attention_backend != "dense"
-                and profile.training.dtype != "bfloat16"
-            ):
-                raise ValueError(
-                    f"config.yaml profiles.{name}.kernels.attention_backend "
-                    f"{profile.kernels.attention_backend} requires "
-                    "training.dtype bfloat16"
-                )
-            if (
-                profile.evaluation.val_every
-                and profile.evaluation.val_probe_batches
-                > profile.evaluation.eval_batches
-            ):
-                raise ValueError(
-                    f"config.yaml profiles.{name}.evaluation.val_probe_batches "
-                    "must not exceed eval_batches"
-                )
-        self._validate_official_evaluation(family.default_context)
+            raise ValueError(
+                f"{label} run.kernels.attention_backend "
+                f"{run.kernels.attention_backend} requires training.dtype bfloat16"
+            )
+        if (
+            run.evaluation.val_every
+            and run.evaluation.val_probe_batches > run.evaluation.eval_batches
+        ):
+            raise ValueError(
+                f"{label} run.evaluation.val_probe_batches must not exceed eval_batches"
+            )
+        self._validate_evaluation(family.default_context, label)
 
-    def _validate_official_evaluation(self, context_name: str) -> None:
-        """Check the fixed official validation prefix for one context preset."""
+    def _validate_evaluation(self, context_name: str, label: str) -> None:
+        """Check an explicitly requested fixed validation prediction budget."""
 
-        official = self.profiles.official
+        evaluation = self.run.evaluation
+        validation_tokens = evaluation.prediction_budget
+        if not validation_tokens:
+            return
         tokens_per_step = self.family.contexts[context_name].tokens_per_step
-        validation_tokens = 10_485_760
         if validation_tokens % tokens_per_step:
             raise ValueError(
-                "config.yaml profiles.official batch_size * seq_len must divide "
-                f"the official {validation_tokens:,}-prediction validation prefix"
+                f"{label} batch_size * seq_len must divide the configured "
+                f"{validation_tokens:,}-prediction validation prefix"
             )
         required_eval_batches = validation_tokens // tokens_per_step
-        if official.evaluation.eval_batches != required_eval_batches:
+        if evaluation.eval_batches != required_eval_batches:
             raise ValueError(
-                "config.yaml profiles.official.evaluation.eval_batches must be "
-                f"{required_eval_batches} for the official validation prefix"
+                f"{label} run.evaluation.eval_batches must be {required_eval_batches} "
+                "for the configured validation prefix"
             )
 
     def resolve_selection(
         self,
-        profile: str,
         *,
         tier: str | None = None,
         context: str | None = None,
+        label: str = "experiment config",
     ) -> tuple[str, str]:
         """Resolve runtime selectors on an already-validated config."""
-
-        if profile not in _VALID_PROFILES:
-            raise ValueError(f"unknown experiment profile: {profile!r}")
 
         tier_name = tier or self.family.default_tier
         if tier_name not in self.family.tiers:
@@ -551,8 +539,7 @@ class ExperimentConfig(ConfigSchema):
                 + ", ".join(sorted(self.family.contexts))
             )
 
-        if profile == "official":
-            self._validate_official_evaluation(context_name)
+        self._validate_evaluation(context_name, label)
 
         return tier_name, context_name
 
@@ -560,12 +547,26 @@ class ExperimentConfig(ConfigSchema):
 _UINT64_MASK = (1 << 64) - 1
 
 
-def load_experiment_config() -> tuple[ExperimentConfig, str]:
-    """Load and validate the typed YAML config with its source digest."""
+def experiment_config_path(profile: str) -> Path:
+    """Return the sole configuration document selected by ``profile``."""
 
-    mapping, source_sha256 = read_config_document(CONFIG_PATH)
-    experiment_config = ExperimentConfig.from_mapping(mapping)
-    experiment_config.validate()
+    if profile not in _VALID_PROFILES:
+        raise ValueError(f"unknown experiment profile: {profile!r}")
+    return RECIPE_DIR / profile_config_filename(profile)
+
+
+def load_experiment_config(profile: str) -> tuple[ExperimentConfig, str]:
+    """Load and validate one standalone YAML config with its source digest."""
+
+    path = experiment_config_path(profile)
+    mapping, source_sha256 = read_config_document(path)
+    experiment_config = ExperimentConfig.from_mapping(mapping, label=path.name)
+    if experiment_config.execution_type != profile:
+        raise ValueError(
+            f"{path.name} execution_type must be {profile!r}; "
+            f"got {experiment_config.execution_type!r}"
+        )
+    experiment_config.validate(path.name)
     return experiment_config, source_sha256
 
 
@@ -573,7 +574,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = new_recipe_parser(
         description=(
             "Train a decoder-only GPT with JAX. Static experiment settings come "
-            "from config.yaml beside this entry script."
+            "from the profile-selected YAML beside this entry script."
         )
     )
     run = parser.add_argument_group("run")
@@ -633,9 +634,10 @@ def validate_args(
     experiment_config: ExperimentConfig,
 ) -> None:
     profile = selected_profile(args)
-    experiment_config.resolve_selection(profile, tier=args.tier, context=args.context)
-    if profile == "smoke" and args.context is not None:
-        raise ValueError("--context is not applicable to the smoke profile")
+    config_filename = profile_config_filename(profile)
+    experiment_config.resolve_selection(
+        tier=args.tier, context=args.context, label=config_filename
+    )
     if args.tokens_per_parameter is not None and (
         not math.isfinite(args.tokens_per_parameter) or args.tokens_per_parameter <= 0.0
     ):
@@ -646,7 +648,9 @@ def validate_args(
         raise ValueError("--base-learning-rate must be finite and positive")
     validate_standard_data_arguments(args)
     validate_standard_reporting_arguments(args)
-    validate_standard_xprof_arguments(args, profile=profile)
+    validate_standard_xprof_arguments(
+        args, execution_type=experiment_config.execution_type
+    )
 
 
 def should_compile_evaluation(
@@ -671,103 +675,84 @@ def resolve_config(
     config_sha256: str,
 ) -> Config:
     profile = selected_profile(args)
+    config_filename = profile_config_filename(profile)
     selected_tier_name, selected_context_name = experiment_config.resolve_selection(
-        profile, tier=args.tier, context=args.context
+        tier=args.tier, context=args.context, label=config_filename
     )
     family = experiment_config.family
     base_tier_name = family.parameterization.base_tier
     base_tpp_parameters = family.tiers[base_tier_name].tpp_parameters
-    if profile == "smoke":
-        definition = experiment_config.profiles.smoke
-        model = definition.model
-        tpp_parameters = None
-    else:
-        definition = (
-            experiment_config.profiles.dev
-            if profile == "dev"
-            else experiment_config.profiles.official
-        )
-        tier = family.tiers[selected_tier_name]
-        model = tier.model
-        tpp_parameters = tier.tpp_parameters
+    definition = experiment_config.run
+    tier = family.tiers[selected_tier_name]
+    model = tier.model
+    duration = definition.training.duration
+    tpp_parameters = tier.tpp_parameters if duration.is_fixed_tpp else None
     kernels = definition.kernels
     optimizer = definition.optimizer
     evaluation = definition.evaluation
     logging = definition.logging
-
-    if profile == "smoke":
-        if not isinstance(definition, SmokeProfileDefinition):
-            raise AssertionError("smoke selection resolved a ladder profile")
-        training = definition.training
-        batch_anchor = training.batch_size
-        seq_len = training.seq_len
-        document_masking = False
-        requested_tpp = args.tokens_per_parameter
-        tier_name = "smoke"
-        parameterization = "standard"
-        base_width = model.d_model
-        base_depth = model.layers
-        depth_alpha = 0.0
-        init_std = 0.02
-        attention_scale = "inverse_sqrt_head_dim"
-        embeddings = "tied"
-        context_preset = "smoke"
-    else:
-        if not isinstance(definition, LadderProfileDefinition):
-            raise AssertionError("ladder selection resolved the smoke profile")
-        training = definition.training
-        context = family.contexts[selected_context_name]
-        family_parameterization = family.parameterization
-        batch_anchor = context.reference_batch_size
-        seq_len = context.seq_len
-        document_masking = context.document_masking
-        requested_tpp = args.tokens_per_parameter or training.tokens_per_parameter
-        tier_name = selected_tier_name
-        parameterization = family_parameterization.name
-        base_width = family_parameterization.base_width
-        base_depth = family_parameterization.base_depth
-        depth_alpha = family_parameterization.depth_alpha
-        init_std = family_parameterization.init_std
-        attention_scale = family_parameterization.attention_scale
-        embeddings = family_parameterization.embeddings
-        context_preset = selected_context_name
+    training = definition.training
+    context = family.contexts[selected_context_name]
+    family_parameterization = family.parameterization
+    batch_anchor = context.reference_batch_size
+    seq_len = context.seq_len
+    document_masking = context.document_masking
+    requested_tpp = (
+        args.tokens_per_parameter
+        if args.tokens_per_parameter is not None
+        else duration.tokens_per_parameter
+    )
+    tier_name = selected_tier_name
+    parameterization = family_parameterization.name
+    base_width = family_parameterization.base_width
+    base_depth = family_parameterization.base_depth
+    depth_alpha = family_parameterization.depth_alpha
+    init_std = family_parameterization.init_std
+    attention_scale = family_parameterization.attention_scale
+    embeddings = family_parameterization.embeddings
+    context_preset = selected_context_name
 
     batch_size = args.batch_size or batch_anchor
     tokens_per_step = batch_size * seq_len
     early_stop = getattr(args, "stop_after_step", None)
-    if profile == "smoke":
+    if not duration.is_fixed_tpp:
         if args.tokens_per_parameter is not None:
-            raise ValueError("--tokens-per-parameter cannot override the smoke profile")
+            raise ValueError(
+                "--tokens-per-parameter cannot override a fixed-step configuration"
+            )
         if early_stop is not None:
-            raise ValueError("--stop-after-step requires a fixed-TPP profile")
-        steps = training.steps
+            raise ValueError("--stop-after-step requires a fixed-TPP configuration")
+        if duration.steps is None:
+            raise AssertionError("fixed-step duration has no step count")
+        steps = duration.steps
     else:
         if requested_tpp is None:
-            raise AssertionError("non-smoke profile did not resolve a TPP horizon")
+            raise AssertionError("fixed-TPP duration did not resolve a horizon")
         if tpp_parameters is None:
-            raise AssertionError("fixed-TPP profile has no parameter denominator")
+            raise AssertionError("fixed-TPP duration has no parameter denominator")
         ideal_tokens = float(tpp_parameters) * requested_tpp
         steps = max(1, int(math.floor(ideal_tokens / tokens_per_step + 0.5)))
     if early_stop is not None and requested_tpp is None:
-        raise ValueError("--stop-after-step requires a fixed-TPP profile")
+        raise ValueError("--stop-after-step requires a fixed-TPP configuration")
     if early_stop is not None and early_stop > steps:
         raise ValueError(
             f"--stop-after-step {early_stop:,} is past the {steps:,}-step "
             "horizon this configuration resolves to"
         )
 
-    if profile == "official":
-        validation_tokens = 10_485_760
+    if evaluation.prediction_budget:
+        validation_tokens = evaluation.prediction_budget
         predictions_per_batch = batch_size * seq_len
         if validation_tokens % predictions_per_batch:
             raise ValueError(
-                "official validation requires batch_size * seq_len to divide "
+                "configured validation requires batch_size * seq_len to divide "
                 f"{validation_tokens:,} exactly; got {predictions_per_batch:,}"
             )
         required_eval_batches = validation_tokens // predictions_per_batch
         if evaluation.eval_batches != required_eval_batches:
             raise ValueError(
-                "official config.yaml validation must cover exactly 10,485,760 "
+                f"{config_filename} validation must cover exactly "
+                f"{validation_tokens:,} "
                 f"predictions; set eval_batches to {required_eval_batches}"
             )
         eval_batches = required_eval_batches
@@ -777,7 +762,7 @@ def resolve_config(
     val_probe_batches = evaluation.val_probe_batches
     if val_every > 0 and val_probe_batches > eval_batches:
         raise ValueError(
-            "config.yaml val_probe_batches must not exceed the canonical evaluation batch "
+            f"{config_filename} val_probe_batches must not exceed the canonical evaluation batch "
             f"count ({eval_batches}); got {val_probe_batches}"
         )
     log_every = steps if args.diagnostic_mode else logging.log_every
@@ -788,11 +773,11 @@ def resolve_config(
     attention_backend = kernels.attention_backend
     if attention_backend != "dense" and platform != "tpu":
         raise ValueError(
-            f"config.yaml attention_backend {attention_backend} requires a TPU runtime"
+            f"{config_filename} attention_backend {attention_backend} requires a TPU runtime"
         )
     if attention_backend != "dense" and compute_dtype != jnp.bfloat16:
         raise ValueError(
-            f"config.yaml attention_backend {attention_backend} currently requires "
+            f"{config_filename} attention_backend {attention_backend} currently requires "
             "dtype bfloat16"
         )
 
@@ -882,7 +867,8 @@ def resolve_config(
         dtype_name=dtype_name,
         config_schema_version=experiment_config.schema_version,
         config_sha256=config_sha256,
-        config_profile=profile,
+        config_filename=config_filename,
+        execution_type=experiment_config.execution_type,
         context_preset=context_preset,
         config_overrides=overrides,
     )
@@ -966,9 +952,9 @@ def experiment_config_metadata(config: Config) -> dict[str, Any]:
 
     return {
         "schema_version": config.config_schema_version,
-        "path": CONFIG_FILENAME,
+        "path": config.config_filename,
         "sha256": config.config_sha256,
-        "profile": config.config_profile,
+        "profile": config.execution_type,
         "context_preset": config.context_preset,
         "overrides": dict(config.config_overrides),
         "resolved": {
@@ -1034,13 +1020,13 @@ def resolved_plan_metadata(config: Config) -> dict[str, Any]:
         "schema_version": 2,
         "config_schema_version": config.config_schema_version,
         "config_sha256": config.config_sha256,
-        "profile": config.config_profile,
+        "profile": config.execution_type,
         "context_preset": config.context_preset,
         "document_masking": config.document_masking,
         "tier": config.tier,
         "run_kind": (
             "smoke"
-            if config.config_profile == "smoke"
+            if config.target_tokens_per_parameter is None
             else ("diagnostic" if config.stop_after_step is not None else "full")
         ),
         "parameterization": config.parameterization,
@@ -1598,25 +1584,28 @@ def traced_flops(config: Config, params: Mapping[str, Any]) -> FlopBreakdown:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any] | None:
-    experiment_config, config_sha256 = load_experiment_config()
-    validate_args(args, experiment_config)
     profile = selected_profile(args)
-    if profile != "smoke" and not args.train_data and not args.val_data:
-        raise ValueError("non-smoke runs require explicit --train-data and --val-data")
+    experiment_config, config_sha256 = load_experiment_config(profile)
+    validate_args(args, experiment_config)
+    if (
+        experiment_config.execution_type != "smoke"
+        and not args.train_data
+        and not args.val_data
+    ):
+        raise ValueError(
+            f"{profile_config_filename(profile)} requires explicit --train-data "
+            "and --val-data"
+        )
     process_index, process_count = initialize_distributed_runtime()
     is_controller = is_controller_process(process_index)
     console = Console(args.color, active=is_controller)
     console.banner()
-    using_builtin_data = not args.train_data and not args.val_data
 
     devices = jax.devices()
     if not devices:
         raise RuntimeError("JAX reported no devices")
-    validate_official_topology(profile, devices)
+    validate_official_topology(experiment_config.execution_type, devices)
     platform = devices[0].platform
-    if profile == "smoke" and platform != "cpu":
-        # Smoke remains tiny on accelerators too; this is informational only.
-        console.phase("Smoke configuration", f"running on {platform.upper()}")
 
     dataset = load_dataset(
         train_data=args.train_data,
@@ -1705,8 +1694,8 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         "run configuration",
         (
             *standard_identity_rows(
-                config_filename=CONFIG_FILENAME,
-                config_profile=config.config_profile,
+                config_filename=config.config_filename,
+                config_profile=config.execution_type,
                 config_sha256=config.config_sha256,
                 devices=devices,
                 process_count=process_count,
@@ -2252,11 +2241,11 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     )
     peak_tflops = inferred_peak_tflops(args.peak_tflops, devices)
     mfu = achieved_tflops / peak_tflops if peak_tflops is not None else 0.0
-    smoke_contract = profile == "smoke" or using_builtin_data
+    using_builtin_data = not args.train_data and not args.val_data
     dataset_id = args.dataset_id or (
-        "builtin-byte-v1" if smoke_contract else "fineweb10b-gpt2"
+        "builtin-byte-v1" if using_builtin_data else "fineweb10b-gpt2"
     )
-    tokenizer_id = args.tokenizer_id or ("byte" if smoke_contract else "gpt2")
+    tokenizer_id = args.tokenizer_id or ("byte" if using_builtin_data else "gpt2")
     result: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "status": "ok",
@@ -2396,11 +2385,16 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.print_plan:
         try:
-            experiment_config, config_sha256 = load_experiment_config()
+            profile = selected_profile(args)
+            experiment_config, config_sha256 = load_experiment_config(profile)
             validate_args(args, experiment_config)
             planned = resolve_config(
                 args,
-                "cpu" if selected_profile(args) == "smoke" else "tpu",
+                (
+                    "cpu"
+                    if experiment_config.run.kernels.attention_backend == "dense"
+                    else "tpu"
+                ),
                 experiment_config=experiment_config,
                 config_sha256=config_sha256,
             )

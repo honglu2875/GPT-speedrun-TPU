@@ -1,14 +1,11 @@
-# Canonical official configuration for recipes/reference/train.py.
+# Standalone development configuration for recipes/reference/train.py.
 #
-# This is a complete standalone document: no defaults are inherited from the
-# development or smoke configurations. The family uses the fixed-TPP CompleteP
-# hybrid described in docs/COMPLETEP.md.
+# Scientific model and optimizer settings intentionally match config.yaml. The
+# shorter horizon and denser reporting make this suitable for research sweeps.
 schema_version: 5
-execution_type: official
+execution_type: dev
 family:
   default_tier: 125m
-  # A context preset is a coupled training contract: sequence length, the
-  # recipe-local batch anchor used by m_B, and the document-attention policy.
   default_context: 1k
   contexts:
     1k:
@@ -26,8 +23,6 @@ family:
     base_depth: 12
     depth_alpha: 1.0
     init_std: 0.02
-    # Match the official nanoGPT-mup implementation: each head contracts over
-    # its own fixed 64-wide q/k coordinate, independent of the number of heads.
     attention_scale: inverse_head_dim
     embeddings: untied
   tiers:
@@ -90,7 +85,7 @@ family:
 run:
   training:
     duration:
-      tokens_per_parameter: 20.0
+      tokens_per_parameter: 5.0
     sampling: shuffled_epochs
     dtype: bfloat16
   kernels:
@@ -109,10 +104,10 @@ run:
     beta2: 0.95
     grad_clip: 0.0
   evaluation:
-    prediction_budget: 10485760
-    eval_batches: 80
-    val_every: 500
+    prediction_budget: 0
+    eval_batches: 8
+    val_every: 0
     val_probe_batches: 8
   logging:
-    diagnostics_every: 500
-    log_every: 500
+    diagnostics_every: 10
+    log_every: 10

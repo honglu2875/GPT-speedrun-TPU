@@ -50,7 +50,7 @@ help:
 	  '  make report    rebuild report.html from integrity-checked run logs' \
 	  '' \
 	  'Useful overrides: TIER=500m CONTEXT=8k TPP=5 BATCH_SIZE=128 NAME=my-run TARGET=reference' \
-	  'Preparation: DATASET=8B TRAIN_SHARDS=79. Empty run overrides use config.yaml.'
+	  'Preparation: DATASET=8B TRAIN_SHARDS=79. Empty run overrides use the selected YAML.'
 
 # Everything that can be verified without an accelerator. There is no hosted CI,
 # so this is the gate: run it before committing and before any TPU time. It is
@@ -108,14 +108,16 @@ validate-target:
 	  printf '%s\n' 'Missing regular target entry: recipes/$(TARGET)/train.py' >&2; \
 	  exit 2; \
 	fi
-	@if [[ ! -f "$(TARGET_DIR)/config.yaml" || -L "$(TARGET_DIR)/config.yaml" ]]; then \
-	  printf '%s\n' 'Missing regular target config: recipes/$(TARGET)/config.yaml' >&2; \
-	  exit 2; \
-	fi
-	@if ! grep -Eq '^schema_version:[[:space:]]*4[[:space:]]*$$' "$(TARGET_DIR)/config.yaml"; then \
-	  printf '%s\n' 'TARGET is a legacy fixed-model recipe. Clone the current reference to create a tiered family.' >&2; \
-	  exit 2; \
-	fi
+	@for config in config.yaml dev.yaml smoke.yaml; do \
+	  if [[ ! -f "$(TARGET_DIR)/$$config" || -L "$(TARGET_DIR)/$$config" ]]; then \
+	    printf '%s\n' "Missing regular target config: recipes/$(TARGET)/$$config" >&2; \
+	    exit 2; \
+	  fi; \
+	  if ! grep -Eq '^schema_version:[[:space:]]*5[[:space:]]*$$' "$(TARGET_DIR)/$$config"; then \
+	    printf '%s\n' "TARGET config $$config is not a current schema-5 family document." >&2; \
+	    exit 2; \
+	  fi; \
+	done
 
 # Full SHA-256 data checks plus a small BF16 matmul and topology-wide collective.
 preflight: require-prepare
@@ -124,7 +126,7 @@ preflight: require-prepare
 	  --color always
 
 # The saved profile/data/checkpoint defaults come from make prepare. The
-# target's complete experiment definition lives in its sibling config.yaml.
+# target's complete experiment definition lives in the profile-selected YAML.
 run: validate-target preflight
 	$(UV_RUN) rig run "$(TARGET)" --tier "$(TIER)" \
 	  $(if $(CONTEXT),--context "$(CONTEXT)",) \

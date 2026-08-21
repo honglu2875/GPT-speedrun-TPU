@@ -2,7 +2,8 @@
 
 A simple GPT pretraining rig for Cloud TPU slices, from a single host to
 larger multi-host slices. Every algorithm is a polished JAX entry program named
-`train.py`, with a sibling `config.yaml`; shared code handles
+`train.py`, with standalone `config.yaml`, `dev.yaml`, and `smoke.yaml`
+documents; shared code handles
 reproducible data, machine checks, run capture, protocol validation, and
 leaderboards.
 
@@ -85,7 +86,8 @@ tightened explicitly.
 `make run` requires that saved file to contain a default profile; otherwise it
 stops and asks for `make prepare`. `TARGET` defaults to `reference`. A custom
 target must be a folder beneath `recipes/` containing regular, non-symlink
-`train.py` and `config.yaml` files. New candidates use schema 3 family configs
+`train.py`, `config.yaml`, `dev.yaml`, and `smoke.yaml` files. New candidates
+use schema 5 family configs
 with 60M, 125M, 250M, 500M, and 1B tiers; `TIER` defaults to `125m`.
 
 For a multi-host run using the conventional `shm` cache, preparation requires
@@ -511,11 +513,13 @@ dimensions. Early-stopped diagnostics are never ranked.
 
 ## Create an algorithm
 
-Every entry has the same two-file path contract:
+Every entry has the same explicit configuration layout:
 
 ```text
 recipes/<algorithm>/train.py
-recipes/<algorithm>/config.yaml
+recipes/<algorithm>/config.yaml  # official
+recipes/<algorithm>/dev.yaml
+recipes/<algorithm>/smoke.yaml
 ```
 
 Clone the current reference without overwriting anything:
@@ -524,16 +528,21 @@ Clone the current reference without overwriting anything:
 uv run --frozen --no-sync rig clone reference my_experiment
 ```
 
-The clone copies both files byte-for-byte. Keep the implementation visible in
-`train.py` and the experiment-defining model, optimizer, schedule, objective,
-kernel, and validation settings in `config.yaml`. Runtime locations, run
+The clone copies the entry program and all three configuration documents
+byte-for-byte. Keep
+the implementation visible in `train.py` and the experiment-defining model,
+optimizer, schedule, objective, kernel, and validation settings in the selected
+YAML. Runtime locations, run
 identity, seed, and profiling destinations remain command-line concerns.
 Fundamental shared data/protocol/UI utilities are welcome when they make entries
 shorter and easier to compare.
 
-The YAML is schema-versioned and contains complete `smoke`, `dev`, and
-`official` profiles. The trainer resolves it relative to its own file—not the
-caller's working directory—and rejects duplicate/unknown keys, unsafe YAML
+Each YAML is schema-versioned and complete: `config.yaml` is official,
+`dev.yaml` is development, and `smoke.yaml` is the CPU smoke configuration.
+`--profile` only selects one of these files; there is no inheritance, overlay,
+or unselected profile block. The trainer resolves the selected document
+relative to its own file—not the caller's working directory—and rejects
+duplicate/unknown keys, unsafe YAML
 features, type/range errors, symlinks, and attempts to replace static settings
 with hidden launch flags. The harness records both the source SHA-256 and the
 fully resolved profile. The small public research surface—tier, context preset,

@@ -60,6 +60,7 @@ class CliTests(unittest.TestCase):
             recipe.mkdir(parents=True)
             (recipe / "train.py").write_text("pass\n", encoding="utf-8")
             (recipe / "config.yaml").write_text("schema_version: 1\n", encoding="utf-8")
+            (recipe / "dev.yaml").write_text("schema_version: 1\n", encoding="utf-8")
             manifest = root / "manifest.json"
             manifest.write_text("{}\n", encoding="utf-8")
             prepared = PreparedDataset(
@@ -146,6 +147,8 @@ class CliTests(unittest.TestCase):
             (source / "train.py").write_text("print('train')\n", encoding="utf-8")
             config_bytes = b"steps: 20\r\nlearning_rate: 3.0e-4\r\n"
             (source / "config.yaml").write_bytes(config_bytes)
+            (source / "dev.yaml").write_bytes(b"steps: 2\r\n")
+            (source / "smoke.yaml").write_bytes(b"steps: 1\r\n")
             (source / "README.md").write_text("# Source\n", encoding="utf-8")
             args = cli.build_parser().parse_args(["clone", "source", "variant"])
 
@@ -154,6 +157,10 @@ class CliTests(unittest.TestCase):
 
             destination = root / "recipes" / "variant"
             self.assertEqual((destination / "config.yaml").read_bytes(), config_bytes)
+            self.assertEqual((destination / "dev.yaml").read_bytes(), b"steps: 2\r\n")
+            self.assertEqual(
+                (destination / "smoke.yaml").read_bytes(), b"steps: 1\r\n"
+            )
             self.assertEqual(
                 (destination / "train.py").read_text(encoding="utf-8"),
                 "print('train')\n",
@@ -473,6 +480,7 @@ class CliTests(unittest.TestCase):
             recipe.mkdir(parents=True)
             (recipe / "train.py").write_text("pass\n", encoding="utf-8")
             (recipe / "config.yaml").write_text("schema_version: 1\n", encoding="utf-8")
+            (recipe / "dev.yaml").write_text("schema_version: 1\n", encoding="utf-8")
             (root / ".rig.toml").write_text("[rig]\n", encoding="utf-8")
             config = LocalConfig(
                 data_path="shm",

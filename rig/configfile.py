@@ -1,4 +1,4 @@
-"""Strict reading of a recipe's sibling ``config.yaml``.
+"""Strict reading and selection of a recipe's explicit YAML configurations.
 
 This is the *reader*, not the schema. It resolves the path, bounds the file,
 rejects the YAML features that would make a config non-obvious, and loads
@@ -23,15 +23,34 @@ import yaml
 
 
 MAX_CONFIG_BYTES = 256 * 1024
+PROFILE_CONFIG_FILENAMES = {
+    "smoke": "smoke.yaml",
+    "dev": "dev.yaml",
+    "official": "config.yaml",
+}
+
+
+def profile_config_filename(profile: str) -> str:
+    """Return the standalone recipe config selected by an execution profile.
+
+    Unknown names retain the historical ``config.yaml`` convention for trusted
+    third-party recipes using :mod:`rig.harness` directly. The public CLI only
+    admits the three standard profiles above.
+    """
+
+    return PROFILE_CONFIG_FILENAMES.get(profile, "config.yaml")
 
 
 class StrictSafeLoader(yaml.SafeLoader):
     """Safe YAML loader which rejects duplicate mapping keys."""
 
+    config_label = "experiment config"
+
 
 def _construct_unique_mapping(
     loader: StrictSafeLoader, node: yaml.nodes.MappingNode, deep: bool = False
 ) -> dict[Any, Any]:
+    label = loader.config_label
     loader.flatten_mapping(node)
     result: dict[Any, Any] = {}
     for key_node, value_node in node.value:
@@ -39,9 +58,9 @@ def _construct_unique_mapping(
         try:
             duplicate = key in result
         except TypeError as exc:
-            raise ValueError("config.yaml mapping keys must be scalar values") from exc
+            raise ValueError(f"{label} mapping keys must be scalar values") from exc
         if duplicate:
-            raise ValueError(f"config.yaml contains duplicate key {key!r}")
+            raise ValueError(f"{label} contains duplicate key {key!r}")
         result[key] = loader.construct_object(value_node, deep=deep)
     return result
 
@@ -54,19 +73,22 @@ StrictSafeLoader.add_constructor(
 def read_config_document(path: Path) -> tuple[Mapping[str, Any], str]:
     """Return the single strict YAML mapping in ``path`` and the file's sha256."""
 
+    label = path.name
+
+    class FileLoader(StrictSafeLoader):
+        config_label = label
+
     if path.is_symlink() or not path.is_file():
         raise ValueError(
             f"required experiment config must be a regular, non-symlink file: {path}"
         )
     raw = path.read_bytes()
     if len(raw) > MAX_CONFIG_BYTES:
-        raise ValueError(
-            f"config.yaml exceeds the {MAX_CONFIG_BYTES:,}-byte safety limit"
-        )
+        raise ValueError(f"{label} exceeds the {MAX_CONFIG_BYTES:,}-byte safety limit")
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise ValueError("config.yaml must be UTF-8") from exc
+        raise ValueError(f"{label} must be UTF-8") from exc
     try:
         forbidden_tokens = (
             yaml.tokens.AliasToken,
@@ -74,18 +96,26 @@ def read_config_document(path: Path) -> tuple[Mapping[str, Any], str]:
             yaml.tokens.DirectiveToken,
             yaml.tokens.TagToken,
         )
-        for token in yaml.scan(text, Loader=StrictSafeLoader):
+        for token in yaml.scan(text, Loader=FileLoader):
             if isinstance(token, forbidden_tokens):
                 kind = type(token).__name__.removesuffix("Token").lower()
-                raise ValueError(f"config.yaml may not contain YAML {kind}s")
-        documents = list(yaml.load_all(text, Loader=StrictSafeLoader))
+                raise ValueError(f"{label} may not contain YAML {kind}s")
+        documents = list(yaml.load_all(text, Loader=FileLoader))
     except yaml.YAMLError as exc:
-        raise ValueError(f"invalid config.yaml YAML: {exc}") from exc
+        raise ValueError(f"invalid {label} YAML: {exc}") from exc
     if len(documents) != 1:
-        raise ValueError("config.yaml must contain exactly one YAML document")
+        raise ValueError(f"{label} must contain exactly one YAML document")
     document = documents[0]
     if not isinstance(document, Mapping):
-        raise ValueError("config.yaml document must be a mapping")
+        raise ValueError(f"{label} document must be a mapping")
     if any(not isinstance(key, str) for key in document):
-        raise ValueError("config.yaml document keys must be strings")
+        raise ValueError(f"{label} document keys must be strings")
     return document, hashlib.sha256(raw).hexdigest()
+
+
+__all__ = (
+    "MAX_CONFIG_BYTES",
+    "PROFILE_CONFIG_FILENAMES",
+    "profile_config_filename",
+    "read_config_document",
+)

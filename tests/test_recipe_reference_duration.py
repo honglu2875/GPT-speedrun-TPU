@@ -49,7 +49,7 @@ def _resolve(module, *, tpp: float, batch: int = 128, learning_rate: float = 2**
             str(learning_rate),
         ]
     )
-    experiment_config, config_sha256 = module.load_experiment_config()
+    experiment_config, config_sha256 = module.load_experiment_config("dev")
     return module.resolve_config(
         args,
         "tpu",

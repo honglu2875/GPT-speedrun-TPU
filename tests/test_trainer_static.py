@@ -34,7 +34,10 @@ trainer = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = trainer
 SPEC.loader.exec_module(trainer)
 
-_EXPERIMENT_CONFIG, _CONFIG_SHA256 = trainer.load_experiment_config()
+_LOADED_CONFIGS = {
+    profile: trainer.load_experiment_config(profile)
+    for profile in ("smoke", "dev", "official")
+}
 
 
 def _resolve_config(
@@ -46,16 +49,20 @@ def _resolve_config(
 ):
     """Resolve through the one production API while keeping tests concise."""
 
+    profile = trainer.selected_profile(args)
+    default_config, default_sha256 = _LOADED_CONFIGS[profile]
     return trainer.resolve_config(
         args,
         platform,
-        experiment_config=experiment_config or _EXPERIMENT_CONFIG,
-        config_sha256=config_sha256 or _CONFIG_SHA256,
+        experiment_config=experiment_config or default_config,
+        config_sha256=config_sha256 or default_sha256,
     )
 
 
 def _validate_args(args, experiment_config=None) -> None:
-    trainer.validate_args(args, experiment_config or _EXPERIMENT_CONFIG)
+    profile = trainer.selected_profile(args)
+    default_config, _ = _LOADED_CONFIGS[profile]
+    trainer.validate_args(args, experiment_config or default_config)
 
 
 # Tracing needs real parameters, so shrink the model to keep these tests
@@ -98,14 +105,9 @@ def _replace_experiment_config(
     family = experiment_config.family
     tier_name = tier or family.default_tier
     selected_context_name = context_name or family.default_context
-    if profile == "smoke":
-        definition = experiment_config.profiles.smoke
-    elif profile == "dev":
-        definition = experiment_config.profiles.dev
-    elif profile == "official":
-        definition = experiment_config.profiles.official
-    else:
-        raise ValueError(f"unknown test profile: {profile!r}")
+    if experiment_config.execution_type != profile:
+        raise ValueError(f"test config does not describe {profile!r}")
+    definition = experiment_config.run
     if training:
         definition = replace(
             definition,
@@ -117,29 +119,22 @@ def _replace_experiment_config(
             kernels=replace(definition.kernels, **kernels),
         )
     if model:
-        if profile == "smoke":
-            definition = replace(definition, model=replace(definition.model, **model))
-        else:
-            selected_tier = family.tiers[tier_name]
-            selected_tier = replace(
-                selected_tier,
-                model=replace(selected_tier.model, **model),
-            )
-            family = replace(
-                family,
-                tiers={**family.tiers, tier_name: selected_tier},
-            )
+        selected_tier = family.tiers[tier_name]
+        selected_tier = replace(
+            selected_tier,
+            model=replace(selected_tier.model, **model),
+        )
+        family = replace(
+            family,
+            tiers={**family.tiers, tier_name: selected_tier},
+        )
     if context:
         selected_context = replace(family.contexts[selected_context_name], **context)
         family = replace(
             family,
             contexts={**family.contexts, selected_context_name: selected_context},
         )
-    profiles = replace(
-        experiment_config.profiles,
-        **{profile: definition},
-    )
-    return replace(experiment_config, family=family, profiles=profiles)
+    return replace(experiment_config, family=family, run=definition)
 
 
 @dataclass(frozen=True)
@@ -188,7 +183,7 @@ class TrainerStaticTests(unittest.TestCase):
             "500m": (502_602_240, 19, 1280, 20),
             "1b": (989_943_808, 21, 1792, 28),
         }
-        experiment_config, config_sha256 = trainer.load_experiment_config()
+        experiment_config, config_sha256 = trainer.load_experiment_config("official")
         for tier, (parameters, layers, width, heads) in expected.items():
             with self.subTest(tier=tier):
                 self.assertEqual(
@@ -284,14 +279,16 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertEqual(twenty_tpp.data_multiplier, config.data_multiplier)
 
     def test_yaml_config_is_authoritative_strict_and_versioned(self) -> None:
-        source = trainer.CONFIG_PATH.read_text(encoding="utf-8")
-        experiment_config, config_sha256 = trainer.load_experiment_config()
-        tier_name, context_name = experiment_config.resolve_selection("official")
-        official = experiment_config.profiles.official
+        config_path = trainer.experiment_config_path("official")
+        source = config_path.read_text(encoding="utf-8")
+        experiment_config, config_sha256 = trainer.load_experiment_config("official")
+        tier_name, context_name = experiment_config.resolve_selection()
+        official = experiment_config.run
         context = experiment_config.family.contexts[context_name]
         model = experiment_config.family.tiers[tier_name].model
-        self.assertEqual(experiment_config.schema_version, 4)
-        self.assertEqual(official.training.tokens_per_parameter, 20.0)
+        self.assertEqual(experiment_config.schema_version, 5)
+        self.assertEqual(experiment_config.execution_type, "official")
+        self.assertEqual(official.training.duration.tokens_per_parameter, 20.0)
         self.assertEqual(context_name, "1k")
         self.assertEqual(context.reference_batch_size, 128)
         self.assertEqual(context.seq_len, 1024)
@@ -304,32 +301,47 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertNotIn("\n      parameters:", source)
         self.assertEqual(
             config_sha256,
-            hashlib.sha256(trainer.CONFIG_PATH.read_bytes()).hexdigest(),
+            hashlib.sha256(config_path.read_bytes()).hexdigest(),
         )
+
+        expected_files = {
+            "smoke": "smoke.yaml",
+            "dev": "dev.yaml",
+            "official": "config.yaml",
+        }
+        for profile, filename in expected_files.items():
+            with self.subTest(profile=profile):
+                selected, _ = trainer.load_experiment_config(profile)
+                self.assertEqual(trainer.experiment_config_path(profile).name, filename)
+                self.assertEqual(selected.execution_type, profile)
+        dev, _ = trainer.load_experiment_config("dev")
+        self.assertEqual(dev.family, experiment_config.family)
+        self.assertEqual(dev.run.optimizer, official.optimizer)
+        self.assertEqual(dev.run.kernels, official.kernels)
 
         invalid = {
             "duplicate": source.replace(
-                "schema_version: 4", "schema_version: 4\nschema_version: 4", 1
+                "schema_version: 5", "schema_version: 5\nschema_version: 5", 1
             ),
             "unknown": source + "\nunknown: true\n",
-            "anchor": source.replace("schema_version: 4", "schema_version: &v 4", 1),
-            "alias": source.replace(
-                "schema_version: 4", "schema_version: &v 4\nextra: *v", 1
+            "route mismatch": source.replace(
+                "execution_type: official", "execution_type: dev", 1
             ),
-            "tag": source.replace("schema_version: 4", "schema_version: !!int 4", 1),
+            "anchor": source.replace("schema_version: 5", "schema_version: &v 5", 1),
+            "alias": source.replace(
+                "schema_version: 5", "schema_version: &v 5\nextra: *v", 1
+            ),
+            "tag": source.replace("schema_version: 5", "schema_version: !!int 5", 1),
             "directive": "%YAML 1.2\n---\n" + source,
             "multiple documents": source + "\n---\n{}\n",
             "nonfinite": source.replace(
-                "learning_rate: 0.0003", "learning_rate: .nan", 1
-            ),
-            "invalid unselected profile": source.replace(
-                "warmup_ratio: 0.1", "warmup_ratio: -1", 1
+                "learning_rate: 0.00390625", "learning_rate: .nan", 1
             ),
             "official validation prefix": source.replace(
                 "eval_batches: 80", "eval_batches: 79", 1
             ),
             "missing sampling": source.replace(
-                "      sampling: random_windows\n", "", 1
+                "    sampling: shuffled_epochs\n", "", 1
             ),
         }
         with tempfile.TemporaryDirectory() as directory:
@@ -339,49 +351,48 @@ class TrainerStaticTests(unittest.TestCase):
                     path = root / "config.yaml"
                     path.write_text(contents, encoding="utf-8")
                     with (
-                        patch.object(trainer, "CONFIG_PATH", path),
+                        patch.object(
+                            trainer, "experiment_config_path", return_value=path
+                        ),
                         self.assertRaises(ValueError),
                     ):
-                        trainer.load_experiment_config()
+                        trainer.load_experiment_config("official")
             path = root / "config.yaml"
             path.write_bytes(b"#" * (configfile.MAX_CONFIG_BYTES + 1))
             with (
-                patch.object(trainer, "CONFIG_PATH", path),
+                patch.object(trainer, "experiment_config_path", return_value=path),
                 self.assertRaisesRegex(ValueError, "safety limit"),
             ):
-                trainer.load_experiment_config()
+                trainer.load_experiment_config("official")
 
             target = root / "target.yaml"
             target.write_text(source, encoding="utf-8")
             symlink = root / "config-link.yaml"
             symlink.symlink_to(target)
             with (
-                patch.object(trainer, "CONFIG_PATH", symlink),
+                patch.object(trainer, "experiment_config_path", return_value=symlink),
                 self.assertRaisesRegex(ValueError, "non-symlink"),
             ):
-                trainer.load_experiment_config()
+                trainer.load_experiment_config("official")
 
             shuffled_source = source.replace(
-                "      sampling: shuffled_epochs\n      dtype: bfloat16",
-                "      sampling: random_windows\n      dtype: bfloat16",
+                "    sampling: shuffled_epochs\n    dtype: bfloat16",
+                "    sampling: random_windows\n    dtype: bfloat16",
                 1,
             )
             path.write_text(shuffled_source, encoding="utf-8")
-            with patch.object(trainer, "CONFIG_PATH", path):
-                shuffled, _ = trainer.load_experiment_config()
-                self.assertEqual(
-                    shuffled.profiles.dev.training.sampling,
-                    "random_windows",
-                )
+            with patch.object(trainer, "experiment_config_path", return_value=path):
+                shuffled, _ = trainer.load_experiment_config("official")
+                self.assertEqual(shuffled.run.training.sampling, "random_windows")
 
-        _, long_context_name = experiment_config.resolve_selection("dev", context="8k")
+        _, long_context_name = experiment_config.resolve_selection(context="8k")
         long_context = experiment_config.family.contexts[long_context_name]
         self.assertEqual(long_context_name, "8k")
         self.assertEqual(long_context.reference_batch_size, 16)
         self.assertEqual(long_context.seq_len, 8192)
         self.assertTrue(long_context.document_masking)
         with self.assertRaisesRegex(ValueError, "unknown context preset"):
-            experiment_config.resolve_selection("dev", context="not-defined")
+            experiment_config.resolve_selection(context="not-defined")
 
     def test_static_cli_values_are_rejected_but_diagnostic_overrides_resolve(
         self,
@@ -629,7 +640,7 @@ class TrainerStaticTests(unittest.TestCase):
         self,
     ) -> None:
         parser = trainer.build_parser()
-        experiment_config, config_sha256 = trainer.load_experiment_config()
+        experiment_config, config_sha256 = trainer.load_experiment_config("official")
         dense = _resolve_config(
             parser.parse_args(["--profile", "official"]),
             "tpu",
@@ -669,7 +680,7 @@ class TrainerStaticTests(unittest.TestCase):
     def test_flash_flops_include_right_padding_for_odd_sequences(self) -> None:
         parser = trainer.build_parser()
         common = ["--profile", "dev"]
-        experiment_config, config_sha256 = trainer.load_experiment_config()
+        experiment_config, config_sha256 = trainer.load_experiment_config("dev")
         dense = _resolve_config(
             parser.parse_args(common),
             "tpu",
@@ -793,7 +804,7 @@ class TrainerStaticTests(unittest.TestCase):
 
     def test_trainable_flash_attention_backends_are_tpu_only(self) -> None:
         parser = trainer.build_parser()
-        experiment_config, config_sha256 = trainer.load_experiment_config()
+        experiment_config, config_sha256 = trainer.load_experiment_config("dev")
         for backend in ("jax_flash", "tpu_flash"):
             with self.subTest(backend=backend):
                 args = parser.parse_args(["--profile", "dev"])
@@ -897,7 +908,7 @@ class TrainerStaticTests(unittest.TestCase):
             with np.load(output / runlog.CHECKPOINT_NAME) as checkpoint:
                 metadata = json.loads(bytes(checkpoint["metadata.json"]).decode())
         self.assertEqual(metadata["model"]["attention_tuning"], expected)
-        self.assertEqual(metadata["configuration"]["path"], "config.yaml")
+        self.assertEqual(metadata["configuration"]["path"], "smoke.yaml")
         self.assertEqual(metadata["configuration"]["sha256"], config.config_sha256)
         self.assertEqual(metadata["configuration"]["resolved"]["model"]["layers"], 2)
 
@@ -923,7 +934,7 @@ class TrainerStaticTests(unittest.TestCase):
 
     def test_kernel_provenance_does_not_change_fixed_model_contract(self) -> None:
         parser = trainer.build_parser()
-        experiment_config, config_sha256 = trainer.load_experiment_config()
+        experiment_config, config_sha256 = trainer.load_experiment_config("official")
         experiment_config = _replace_experiment_config(
             experiment_config,
             profile="official",

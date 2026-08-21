@@ -7,6 +7,8 @@ from 5 to 20 tokens per parameter?
 This is intentionally a recipe fork, not a `reference` flag. The reference
 family keeps its opinionated fixed-TPP reanchoring, while this arm is free to
 change the optimizer parameterization without expanding the public CLI.
+Its official, development, and smoke settings are complete standalone
+`config.yaml`, `dev.yaml`, and `smoke.yaml` documents respectively.
 
 ## The only scientific difference
 
@@ -41,7 +43,7 @@ signal-to-noise.
 
 ## Scope
 
-- The duration anchor is explicit in `config.yaml`; this is not a general
+- The duration anchor is explicit in every selected YAML; this is not a general
   claim that 5 TPP is universal.
 - Whole-step rounding determines the achieved token count, but the multiplier
   uses the requested TPP so the 5-TPP anchor remains exactly identical.

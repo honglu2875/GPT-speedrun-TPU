@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Callable, TextIO
 
 from ..cohort import validate_cohort
+from ..configfile import profile_config_filename
 from ..plan import RecipePlan, validate_recipe_plan
 from .cluster import (
     build_distributed_launch_command,
@@ -653,7 +654,7 @@ def _validate_config(
     trainer = recipe_dir / "train.py"
     if not trainer.is_file() or trainer.is_symlink():
         raise ConfigurationError(f"recipe entry script not found: {trainer}")
-    recipe_config = recipe_dir / "config.yaml"
+    recipe_config = recipe_dir / profile_config_filename(config.profile)
     if not recipe_config.is_file() or recipe_config.is_symlink():
         raise ConfigurationError(
             f"recipe configuration file not found: {recipe_config}"
@@ -662,7 +663,7 @@ def _validate_config(
     if plan.payload["config_sha256"] != actual_config_sha256:
         raise ConfigurationError(
             "recipe plan config_sha256 does not match the current sibling "
-            f"config.yaml: expected {actual_config_sha256}, "
+            f"{recipe_config.name}: expected {actual_config_sha256}, "
             f"got {plan.payload['config_sha256']}"
         )
 

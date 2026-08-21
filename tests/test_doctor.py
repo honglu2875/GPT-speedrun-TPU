@@ -21,6 +21,12 @@ def _tree(root: Path) -> None:
     (root / "recipes" / "reference" / "config.yaml").write_text(
         "k: v\n", encoding="utf-8"
     )
+    (root / "recipes" / "reference" / "dev.yaml").write_text(
+        "k: dev\n", encoding="utf-8"
+    )
+    (root / "recipes" / "reference" / "smoke.yaml").write_text(
+        "k: smoke\n", encoding="utf-8"
+    )
 
 
 class SourceDigestTests(unittest.TestCase):
@@ -31,7 +37,7 @@ class SourceDigestTests(unittest.TestCase):
             first, files = source_digest(root)
             second, again = source_digest(root)
             self.assertEqual(first, second)
-            self.assertEqual((files, again), (4, 4))
+            self.assertEqual((files, again), (6, 6))
 
     def test_any_covered_byte_changes_the_digest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -44,7 +50,7 @@ class SourceDigestTests(unittest.TestCase):
 
     def test_entry_program_and_config_are_covered(self) -> None:
         # A peer running a stale trainer is exactly what this must catch.
-        for name in ("train.py", "config.yaml"):
+        for name in ("train.py", "config.yaml", "dev.yaml", "smoke.yaml"):
             with self.subTest(file=name):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)

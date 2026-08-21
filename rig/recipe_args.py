@@ -11,9 +11,12 @@ from __future__ import annotations
 import argparse
 import math
 from pathlib import Path
-from typing import Sequence
+from typing import Literal, Sequence
 
 from rig.arguments import COLORS, positive_int
+
+
+StandardExecutionType = Literal["smoke", "dev", "official"]
 
 
 def new_recipe_parser(*, description: str) -> argparse.ArgumentParser:
@@ -156,7 +159,7 @@ def validate_standard_data_arguments(args: argparse.Namespace) -> None:
 
 
 def validate_standard_xprof_arguments(
-    args: argparse.Namespace, *, profile: str
+    args: argparse.Namespace, *, execution_type: StandardExecutionType
 ) -> None:
     """Validate relationships among arguments added by the XProf helper."""
 
@@ -174,7 +177,7 @@ def validate_standard_xprof_arguments(
         raise ValueError(
             "--omit-checkpoint and --diagnostic-mode are mutually exclusive"
         )
-    if args.omit_checkpoint and profile != "dev":
+    if args.omit_checkpoint and execution_type != "dev":
         raise ValueError("--omit-checkpoint is restricted to development research runs")
     if args.diagnostic_mode and args.downstream_manifest is not None:
         raise ValueError(
@@ -192,6 +195,7 @@ def validate_standard_reporting_arguments(args: argparse.Namespace) -> None:
 
 
 __all__ = (
+    "StandardExecutionType",
     "add_standard_config_arguments",
     "add_standard_data_arguments",
     "add_standard_reporting_arguments",
