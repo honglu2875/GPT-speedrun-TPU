@@ -432,7 +432,7 @@ def command_doctor(args: argparse.Namespace) -> int:
     return 0 if healthy else 1
 
 
-def _recipe_entry(root: Path, recipe: str) -> tuple[Path, Path, Path]:
+def _recipe_entry(root: Path, recipe: str) -> tuple[Path, Path]:
     """Resolve one recipe's two required files without permitting path traversal."""
 
     if not _NAME.fullmatch(recipe):
@@ -451,7 +451,7 @@ def _recipe_entry(root: Path, recipe: str) -> tuple[Path, Path, Path]:
         raise ConfigError(f"recipe entry script not found: {trainer}")
     if not experiment_config.is_file() or experiment_config.is_symlink():
         raise ConfigError(f"recipe configuration file not found: {experiment_config}")
-    return recipe_dir, trainer, experiment_config
+    return recipe_dir, trainer
 
 
 def _scientific_trainer_args(args: argparse.Namespace) -> list[str]:
@@ -485,7 +485,7 @@ def command_run(args: argparse.Namespace) -> int:
     target_loss = _effective_target_loss(
         profile, requested=None, development_default=config.target_loss
     )
-    recipe_dir, trainer, experiment_config = _recipe_entry(root, args.recipe)
+    recipe_dir, trainer = _recipe_entry(root, args.recipe)
     scientific_args = _scientific_trainer_args(args)
     python_executable = root / ".venv" / "bin" / "python"
     style.heading("Resolving recipe plan")
@@ -493,8 +493,6 @@ def command_run(args: argparse.Namespace) -> int:
         python_executable=python_executable,
         trainer=trainer,
         arguments=(
-            "--config",
-            str(experiment_config),
             "--profile",
             profile,
             *scientific_args,
@@ -730,15 +728,13 @@ def command_profile(args: argparse.Namespace) -> int:
         raise ConfigError("XProf capture requires a fixed-TPP dev or official profile")
     color = args.color or config.color
     style = Style(color)
-    recipe_dir, trainer, experiment_config = _recipe_entry(root, args.recipe)
+    recipe_dir, trainer = _recipe_entry(root, args.recipe)
     scientific_args = _scientific_trainer_args(args)
     python_executable = root / ".venv" / "bin" / "python"
     plan = resolve_recipe_plan(
         python_executable=python_executable,
         trainer=trainer,
         arguments=(
-            "--config",
-            str(experiment_config),
             "--profile",
             profile,
             *scientific_args,
@@ -775,8 +771,6 @@ def command_profile(args: argparse.Namespace) -> int:
     trainer_command = [
         str(python_executable),
         str(trainer),
-        "--config",
-        str(experiment_config),
         "--output-dir",
         str(output_dir),
         "--seed",

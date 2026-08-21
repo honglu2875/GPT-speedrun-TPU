@@ -51,7 +51,6 @@ class RecipeArgumentDeclarationTests(unittest.TestCase):
         self.assertEqual(
             _option_strings(parser, "run"),
             {
-                "--config",
                 "--output-dir",
                 "--seed",
                 "--profile",
@@ -102,10 +101,8 @@ class RecipeArgumentDeclarationTests(unittest.TestCase):
         self.assertEqual(args.data_format, "auto")
         self.assertEqual(args.val_fraction, 0.05)
 
-    def test_profile_environment_default_is_bounded_by_recipe_choices(self) -> None:
+    def test_profile_environment_cannot_select_a_scientific_profile(self) -> None:
         with patch.dict(os.environ, {"RIG_PROFILE": "official"}, clear=True):
-            self.assertEqual(_parser().parse_args([]).profile, "official")
-        with patch.dict(os.environ, {"RIG_PROFILE": "unknown"}, clear=True):
             self.assertIsNone(_parser().parse_args([]).profile)
 
     def test_parser_never_abbreviates_protocol_flags(self) -> None:

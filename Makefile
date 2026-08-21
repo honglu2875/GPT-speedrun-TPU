@@ -65,9 +65,8 @@ check:
 	@printf '\n== every recipe resolves a deterministic dev plan ==\n'
 	@for entry in $(CURDIR)/recipes/*/train.py; do \
 	  name=$$(basename $$(dirname $$entry)); \
-	  config=$$(dirname $$entry)/config.yaml; \
 	  JAX_PLATFORMS=cpu $(UV_RUN) python $$entry \
-	    --config $$config --profile dev --print-plan \
+	    --profile dev --print-plan \
 	    | $(UV_RUN) python -m json.tool >/dev/null \
 	    && printf 'recipes/%s ok\n' "$$name" || exit 1; \
 	done

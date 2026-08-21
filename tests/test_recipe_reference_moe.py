@@ -32,6 +32,17 @@ trainer = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = trainer
 SPEC.loader.exec_module(trainer)
 
+_EXPERIMENT_CONFIG, _CONFIG_SHA256 = trainer.load_experiment_config()
+
+
+def _resolve_config(args, platform: str):
+    return trainer.resolve_config(
+        args,
+        platform,
+        experiment_config=_EXPERIMENT_CONFIG,
+        config_sha256=_CONFIG_SHA256,
+    )
+
 
 EXPERTS = 8
 TOP_K = 2
@@ -217,7 +228,7 @@ class ActiveParameterTests(unittest.TestCase):
         # platform="tpu" only gets past the guard on tpu_flash; nothing here
         # executes, and parameter counts do not depend on the backend.
         parser = trainer.build_parser()
-        return trainer.resolve_config(
+        return _resolve_config(
             parser.parse_args(["--tier", tier, "--profile", "dev"]), "tpu"
         )
 
@@ -334,9 +345,7 @@ class ContextPresetTests(unittest.TestCase):
 class RoutedModelTests(unittest.TestCase):
     def _config(self):
         parser = trainer.build_parser()
-        config = trainer.resolve_config(
-            parser.parse_args(["--profile", "smoke"]), "cpu"
-        )
+        config = _resolve_config(parser.parse_args(["--profile", "smoke"]), "cpu")
         from dataclasses import replace
 
         return replace(config, layers=2, d_model=128, heads=2, seq_len=64)

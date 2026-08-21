@@ -51,42 +51,13 @@ StrictSafeLoader.add_constructor(
 )
 
 
-def resolve_sibling_config_path(requested: Path | None, expected: Path) -> Path:
-    """Resolve the one accepted config path: ``expected``, and nothing else.
-
-    ``--config`` exists so a run records which file it read, not so a run can
-    read a different one. Accepting an arbitrary path would let a recipe be
-    measured against a configuration that is not the one beside it.
-    """
-
-    if expected.is_symlink() or not expected.is_file():
-        raise ValueError(
-            "required sibling experiment config must be a regular, "
-            f"non-symlink file: {expected}"
-        )
-    try:
-        resolved_expected = expected.expanduser().resolve(strict=True)
-    except OSError as exc:
-        raise ValueError(
-            f"required sibling experiment config is unavailable: {expected}"
-        ) from exc
-    candidate = expected if requested is None else requested
-    if candidate.is_symlink():
-        raise ValueError("--config may not be a symlink")
-    try:
-        resolved = candidate.expanduser().resolve(strict=True)
-    except OSError as exc:
-        raise ValueError(f"experiment config is unavailable: {candidate}") from exc
-    if resolved != resolved_expected:
-        raise ValueError(
-            f"--config must name the config.yaml beside train.py: {expected}"
-        )
-    return resolved_expected
-
-
 def read_config_document(path: Path) -> tuple[Mapping[str, Any], str]:
     """Return the single strict YAML mapping in ``path`` and the file's sha256."""
 
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(
+            f"required experiment config must be a regular, non-symlink file: {path}"
+        )
     raw = path.read_bytes()
     if len(raw) > MAX_CONFIG_BYTES:
         raise ValueError(

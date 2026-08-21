@@ -15,7 +15,7 @@ def resolve(name: str, *arguments: str):
     return resolve_recipe_plan(
         python_executable=sys.executable,
         trainer=recipe / "train.py",
-        arguments=("--config", str(recipe / "config.yaml"), *arguments),
+        arguments=arguments,
         cwd=ROOT,
     )
 

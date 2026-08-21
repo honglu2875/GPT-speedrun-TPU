@@ -49,7 +49,13 @@ def _resolve(module, *, tpp: float, batch: int = 128, learning_rate: float = 2**
             str(learning_rate),
         ]
     )
-    return module.resolve_config(args, "tpu")
+    experiment_config, config_sha256 = module.load_experiment_config()
+    return module.resolve_config(
+        args,
+        "tpu",
+        experiment_config=experiment_config,
+        config_sha256=config_sha256,
+    )
 
 
 class ReferenceDurationTests(unittest.TestCase):

@@ -42,7 +42,6 @@ from .validation import (
 _RECIPE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _RESERVED_PASSTHROUGH_FLAGS = (
-    "--config",
     "--output-dir",
     "--seed",
     "--profile",
@@ -83,8 +82,6 @@ def run_recipe(config: RunConfig) -> RunOutcome:
     trainer_command = [
         config.python_executable or sys.executable,
         str(recipe_dir / "train.py"),
-        "--config",
-        str(recipe_config),
         "--output-dir",
         str(run_dir),
         "--seed",
@@ -99,7 +96,6 @@ def run_recipe(config: RunConfig) -> RunOutcome:
     managed_environment = {
         "RIG_RUN_ID": run_id,
         "RIG_OUTPUT_DIR": str(run_dir),
-        "RIG_PROFILE": config.profile,
         # Every attempt receives a fresh persistent cache. This keeps cold
         # compilation reproducible and prevents run order from advantaging
         # later recipes.

@@ -38,7 +38,6 @@ import time
 from pathlib import Path
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--config", required=True)
 parser.add_argument("--output-dir", required=True)
 parser.add_argument("--seed", required=True, type=int)
 parser.add_argument("--profile", required=True)
@@ -65,7 +64,7 @@ if args.make_cache:
 if not args.omit_checkpoint:
     (output / "model.npz").write_bytes(b"tiny checkpoint")
 (output / "training.csv").write_text("step,train_loss\n1,2.5\n")
-(output / "seen.json").write_text(json.dumps({"config": args.config, "seed": args.seed, "profile": args.profile, "tag": args.tag, "seeded": args.seeded}))
+(output / "seen.json").write_text(json.dumps({"seed": args.seed, "profile": args.profile, "tag": args.tag, "seeded": args.seeded}))
 result = {
     "schema_version": 1,
     "status": "ok",
@@ -216,7 +215,6 @@ class HarnessRunTests(unittest.TestCase):
         self.assertEqual(
             json.loads((outcome.run_dir / "seen.json").read_text()),
             {
-                "config": str(self.root / "recipes" / "tiny" / "config.yaml"),
                 "seed": 1337,
                 "profile": "default",
                 "tag": ["one", "two"],
@@ -304,7 +302,7 @@ class HarnessRunTests(unittest.TestCase):
         self.assertIn("runs", arguments["output_dir"].parts)
 
     def test_rejects_reserved_trainer_flags_but_not_other_arguments(self) -> None:
-        for flag in ("--config", "--output-dir", "--seed", "--profile"):
+        for flag in ("--output-dir", "--seed", "--profile"):
             for arguments in (
                 (flag, "value"),
                 (f"{flag}=value",),
