@@ -111,7 +111,7 @@ profiles:
     training:
       steps: 2
       batch_size: 4
-      seq_len: 32
+      seq_len: 64
       sampling: random_windows
       dtype: float32
     model:
@@ -122,7 +122,8 @@ profiles:
       # Routing stays on in the smoke profile: a profile block replaces the
       # tier's model wholesale, so omitting these silently made the fast
       # self-check run a dense model and never touch the routed path at all.
-      # 4 x 32 x top_k = 256 rows, a multiple of the grouped matmul's 128 tile.
+      # FLOP accounting deliberately traces one sequence. 64 tokens x top_k=2
+      # gives its grouped matmul 128 rows, exactly one MegaBlox m-tile.
       experts: 8
       expert_top_k: 2
       expert_mult: 2

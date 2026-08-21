@@ -33,6 +33,8 @@ TARGET_ENTRY := $(TARGET_DIR)/train.py
 
 UV_BASE = $(UV) --cache-dir "$(UV_CACHE_DIR)"
 UV_RUN = $(UV_BASE) run --frozen --no-sync
+VENV_BIN ?= $(CURDIR)/.venv/bin
+VENV_PYTHON ?= $(VENV_BIN)/python
 
 .PHONY: help check prepare require-prepare validate-target preflight run baseline profile report study-export
 
@@ -56,22 +58,32 @@ help:
 # also keeps it from wedging on a multi-host slice a single process cannot init.
 check:
 	@printf '\n== test suite ==\n'
-	$(UV_RUN) python -m pytest tests/ -q
+	$(VENV_PYTHON) -m pytest tests/ -q
 	@printf '\n== static sanity checks ==\n'
-	$(UV_RUN) ruff check .
+	$(VENV_BIN)/ruff check .
 	@printf '\n== the CLI is importable and its surface is intact ==\n'
-	$(UV_RUN) rig --help >/dev/null && printf 'rig --help ok\n'
-	$(UV_RUN) rig settings >/dev/null && printf 'rig settings ok\n'
+	$(VENV_BIN)/rig --help >/dev/null && printf 'rig --help ok\n'
+	$(VENV_BIN)/rig settings >/dev/null && printf 'rig settings ok\n'
 	@printf '\n== every recipe resolves a deterministic dev plan ==\n'
 	@for entry in $(CURDIR)/recipes/*/train.py; do \
 	  name=$$(basename $$(dirname $$entry)); \
-	  JAX_PLATFORMS=cpu $(UV_RUN) python $$entry \
+	  JAX_PLATFORMS=cpu "$(VENV_PYTHON)" "$$entry" \
 	    --profile dev --print-plan \
-	    | $(UV_RUN) python -m json.tool >/dev/null \
+	    | "$(VENV_PYTHON)" -m json.tool >/dev/null \
 	    && printf 'recipes/%s ok\n' "$$name" || exit 1; \
 	done
+	@printf '\n== every recipe completes a real CPU smoke run ==\n'
+	@smoke_root=$$(mktemp -d /tmp/rig-smoke-check.XXXXXX); \
+	trap 'rm -rf -- "$$smoke_root"' EXIT; \
+	for entry in $(CURDIR)/recipes/*/train.py; do \
+	  name=$$(basename $$(dirname $$entry)); \
+	  JAX_PLATFORMS=cpu "$(VENV_PYTHON)" "$$entry" \
+	    --profile smoke --output-dir "$$smoke_root/$$name" \
+	    --seed 1337 --color never >/dev/null \
+	    && printf 'recipes/%s smoke ok\n' "$$name" || exit 1; \
+	done
 	@printf '\n== the report builds from the recorded runs ==\n'
-	$(UV_RUN) rig report --runs "$(RUNS_PATH)" --output "$(CURDIR)/.check-report.html"
+	$(VENV_BIN)/rig report --runs "$(RUNS_PATH)" --output "$(CURDIR)/.check-report.html"
 	@rm -f "$(CURDIR)/.check-report.html"
 	@printf '\nall checks passed\n\n'
 
