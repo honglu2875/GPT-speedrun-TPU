@@ -78,7 +78,6 @@ class RecipeArgumentDeclarationTests(unittest.TestCase):
                 "--val-data",
                 "--data-dtype",
                 "--val-fraction",
-                "--vocab-size",
                 "--dataset-id",
                 "--tokenizer-id",
                 "--data-format",
