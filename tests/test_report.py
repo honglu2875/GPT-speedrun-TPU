@@ -757,17 +757,26 @@ class StudyExportTests(unittest.TestCase):
             self.assertEqual(summary["readme"].name, "README.md")
             self.assertEqual(summary["readme"].read_text(encoding="utf-8"), "")
 
-    def test_it_carries_the_ledger_and_a_curves_only_snapshot(self) -> None:
+    def test_it_carries_the_ledger_and_both_browser_views(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             summary = export_study(self._runs(root), root / "out", "demo")
             path = summary["path"]
             self.assertTrue((path / "records.jsonl").is_file())
+            full = json.loads(gzip.decompress((path / "full.json.gz").read_bytes()))
             snapshot = json.loads(
                 gzip.decompress((path / "snapshot.json.gz").read_bytes())
             )
+            self.assertEqual(
+                summary["full_bytes"], (path / "full.json.gz").stat().st_size
+            )
+        # The full payload is the unthinned view loaded explicitly by the study
+        # browser. Raw .riglog files remain the archive of record.
+        self.assertEqual(full["meta"]["maxChartPoints"], 0)
+        self.assertTrue(full["timeCharts"])
         # The snapshot is the overview the browser loads first, before anything
         # larger is fetched, so it carries curves and nothing else.
+        self.assertEqual(snapshot["meta"]["maxChartPoints"], 200)
         self.assertEqual(snapshot["diagnosticCharts"], [])
         self.assertEqual(snapshot["layerCharts"], [])
         self.assertTrue(snapshot["timeCharts"])

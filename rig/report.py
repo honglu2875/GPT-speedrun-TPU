@@ -1578,8 +1578,9 @@ def export_study(
     """Lay a study out the way the dataset repository expects it.
 
     One folder per run under ``<target>/<study>/``, named for what varies
-    rather than for a timestamp, plus the ledger and a curves-only snapshot the
-    study browser can load before fetching anything larger.
+    rather than for a timestamp, plus the ledger and the two report payloads
+    consumed by the study browser: a compact curves-only snapshot and a full
+    view containing every recorded sample.
 
     The README is written empty on purpose. Nothing here can infer why a sweep
     was run or what it showed, and a plausible-looking generated description
@@ -1634,24 +1635,37 @@ def export_study(
     (destination / "README.md").write_text("", encoding="utf-8")
 
     snapshot_bytes = 0
+    full_bytes = 0
     if exported:
         with tempfile.TemporaryDirectory() as scratch:
-            page = Path(scratch) / "snapshot.html"
-            build_report(destination, page, max_chart_points=200, layer_snapshots=4)
-            match = re.search(
-                r'<script type="application/gzip-base64" id="report-data">(.*?)</script>',
-                page.read_text(encoding="utf-8"),
-                re.S,
+            full_page = Path(scratch) / "full.html"
+            build_report(
+                destination,
+                full_page,
+                max_chart_points=0,
+                layer_snapshots=0,
             )
-            if match:
-                payload = json.loads(
-                    gzip.decompress(base64.b64decode(match.group(1).strip()))
-                )
-                payload["diagnosticCharts"] = []
-                payload["layerCharts"] = []
-                blob = gzip.compress(json.dumps(payload).encode("utf-8"), 9)
-                (destination / "snapshot.json.gz").write_bytes(blob)
-                snapshot_bytes = len(blob)
+            full_blob = _embedded_report_blob(full_page)
+            (destination / "full.json.gz").write_bytes(full_blob)
+            full_bytes = len(full_blob)
+
+            snapshot_page = Path(scratch) / "snapshot.html"
+            build_report(
+                destination,
+                snapshot_page,
+                max_chart_points=200,
+                layer_snapshots=4,
+            )
+            payload = json.loads(gzip.decompress(_embedded_report_blob(snapshot_page)))
+            payload["diagnosticCharts"] = []
+            payload["layerCharts"] = []
+            snapshot_blob = gzip.compress(
+                json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+                compresslevel=9,
+                mtime=0,
+            )
+            (destination / "snapshot.json.gz").write_bytes(snapshot_blob)
+            snapshot_bytes = len(snapshot_blob)
 
     total = sum(f.stat().st_size for f in destination.rglob("*") if f.is_file())
     return {
@@ -1660,8 +1674,28 @@ def export_study(
         "ledgered": len(ledger),
         "bytes": total,
         "snapshot_bytes": snapshot_bytes,
+        "full_bytes": full_bytes,
         "readme": destination / "README.md",
     }
+
+
+def _embedded_report_blob(report: Path) -> bytes:
+    """Extract the browser-consumable gzip payload from a rendered report."""
+
+    match = re.search(
+        r'<script type="application/gzip-base64" id="report-data">(.*?)</script>',
+        report.read_text(encoding="utf-8"),
+        re.S,
+    )
+    if match is None:
+        raise ReportError(f"rendered report has no embedded payload: {report}")
+    try:
+        blob = base64.b64decode(match.group(1).strip(), validate=True)
+    except ValueError as exc:
+        raise ReportError(f"rendered report payload is invalid: {report}") from exc
+    if not blob.startswith(b"\x1f\x8b"):
+        raise ReportError(f"rendered report payload is not gzip data: {report}")
+    return blob
 
 
 def build_study_browser(

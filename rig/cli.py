@@ -1178,7 +1178,8 @@ def command_report(args: argparse.Namespace) -> int:
         print(
             f"study {summary['path']}: {summary['runs']} run(s), "
             f"{summary['ledgered']} ledgered, {summary['bytes'] / 1e6:.1f} MB "
-            f"(snapshot {summary['snapshot_bytes'] / 1e6:.2f} MB)"
+            f"(snapshot {summary['snapshot_bytes'] / 1e6:.2f} MB, "
+            f"full view {summary['full_bytes'] / 1e6:.1f} MB)"
         )
         if not summary["runs"]:
             return 1

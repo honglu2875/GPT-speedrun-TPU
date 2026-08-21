@@ -286,7 +286,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--study-export-target",
         type=Path,
         default=None,
-        help="export selected runs as a study folder instead of rendering HTML",
+        help=(
+            "export selected runs plus snapshot and full browser payloads as a "
+            "study folder instead of rendering HTML"
+        ),
     )
     report.add_argument(
         "--study-name",
