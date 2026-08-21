@@ -330,35 +330,6 @@ def built_in_dataset(seed: int) -> TokenDataset:
     )
 
 
-def find_split_files(directory: Path, split: str) -> list[Path]:
-    patterns = (
-        (
-            "fineweb_train_*.bin",
-            "*_train_*.bin",
-            "train_*.bin",
-            "train.bin",
-            "train.npy",
-            "train.txt",
-        )
-        if split == "train"
-        else (
-            "fineweb_val_*.bin",
-            "*_val_*.bin",
-            "val_*.bin",
-            "validation_*.bin",
-            "val.bin",
-            "validation.bin",
-            "val.npy",
-            "validation.npy",
-            "val.txt",
-        )
-    )
-    paths: set[Path] = set()
-    for pattern in patterns:
-        paths.update(path for path in directory.glob(pattern) if path.is_file())
-    return sorted(paths)
-
-
 def load_token_file(path: Path, raw_dtype: str, data_format: str) -> np.ndarray:
     path = path.expanduser().resolve()
     if not path.is_file():
@@ -401,40 +372,12 @@ def load_token_file(path: Path, raw_dtype: str, data_format: str) -> np.ndarray:
     return np.memmap(path, dtype=dtype, mode="r")
 
 
-def split_shards(
-    shards: Sequence[np.ndarray], validation_fraction: float
-) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    total = sum(len(shard) for shard in shards)
-    train_limit = int(total * (1.0 - validation_fraction))
-    if train_limit <= 0 or train_limit >= total:
-        raise ValueError(
-            "data is too short to create nonempty train and validation splits"
-        )
-    train: list[np.ndarray] = []
-    validation: list[np.ndarray] = []
-    cursor = 0
-    for shard in shards:
-        shard_end = cursor + len(shard)
-        if shard_end <= train_limit:
-            train.append(shard)
-        elif cursor >= train_limit:
-            validation.append(shard)
-        else:
-            cut = train_limit - cursor
-            train.append(shard[:cut])
-            validation.append(shard[cut:])
-        cursor = shard_end
-    return train, validation
-
-
 def load_dataset(
     *,
-    data_path: Path | None,
     train_data: Sequence[Path],
     val_data: Sequence[Path],
     data_dtype: str,
     data_format: str,
-    val_fraction: float,
     seed: int,
 ) -> TokenDataset:
     """Open the training and validation shards named by a run's arguments.
@@ -444,35 +387,23 @@ def load_dataset(
     dataset.
     """
 
-    if data_path is None and not train_data and not val_data:
+    if not train_data and not val_data:
         return built_in_dataset(seed)
+    if not train_data or not val_data:
+        raise ValueError("training and validation shards must be supplied together")
 
     train_paths = [path.expanduser().resolve() for path in train_data]
     validation_paths = [path.expanduser().resolve() for path in val_data]
-    if data_path is not None:
-        data_path = data_path.expanduser().resolve()
-        if data_path.is_dir():
-            train_paths.extend(find_split_files(data_path, "train"))
-            if not validation_paths:
-                validation_paths.extend(find_split_files(data_path, "val"))
-        else:
-            train_paths.append(data_path)
-    # Preserve CLI/discovery order but prevent a path from being sampled twice.
+    # Preserve CLI order but prevent a path from being sampled twice.
     train_paths = list(dict.fromkeys(train_paths))
     validation_paths = list(dict.fromkeys(validation_paths))
-    if not train_paths:
-        location = data_path if data_path is not None else "explicit arguments"
-        raise FileNotFoundError(f"no training shards found from {location}")
 
     train_shards = [
         load_token_file(path, data_dtype, data_format) for path in train_paths
     ]
-    if validation_paths:
-        validation_shards = [
-            load_token_file(path, data_dtype, data_format) for path in validation_paths
-        ]
-    else:
-        train_shards, validation_shards = split_shards(train_shards, val_fraction)
+    validation_shards = [
+        load_token_file(path, data_dtype, data_format) for path in validation_paths
+    ]
 
     source = f"{len(train_shards)} train + {len(validation_shards)} val shard(s)"
     return TokenDataset(
@@ -567,140 +498,102 @@ def load_downstream_domains(
     *,
     manifest: Path | None,
     root: Path | None,
-    documents: Sequence[Path],
     vocab_size: int,
 ) -> tuple[DownstreamDomain, ...]:
-    """Load canonical manifest shards or repeatable standalone documents."""
+    """Load canonical downstream domains from a versioned manifest."""
 
-    if manifest is None and not documents:
+    if manifest is None:
         return ()
-    if manifest is not None:
-        manifest_path = manifest.expanduser().resolve()
-        if not manifest_path.is_file():
-            raise FileNotFoundError(f"downstream manifest not found: {manifest_path}")
+    manifest_path = manifest.expanduser().resolve()
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"downstream manifest not found: {manifest_path}")
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid downstream manifest JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("downstream manifest must contain a JSON object")
+    if payload.get("schema_version") != 1 or payload.get("kind") != "fresh10":
+        raise ValueError(
+            "downstream manifest must use schema_version=1 and kind='fresh10'"
+        )
+    tokenizer = payload.get("tokenizer")
+    tokenizer_vocab = (
+        tokenizer.get("vocab_size") if isinstance(tokenizer, dict) else None
+    )
+    if (
+        not isinstance(tokenizer, dict)
+        or tokenizer.get("name") != "gpt2"
+        or isinstance(tokenizer_vocab, bool)
+        or not isinstance(tokenizer_vocab, int)
+        or tokenizer_vocab != 50_257
+        or tokenizer_vocab > vocab_size
+    ):
+        raise ValueError(
+            "downstream manifest must use the 50,257-token GPT-2 tokenizer, "
+            f"which must fit the model vocabulary ({vocab_size})"
+        )
+    root = root.expanduser().resolve() if root is not None else manifest_path.parent
+    domain_payloads = payload.get("domains")
+    if not isinstance(domain_payloads, list) or not domain_payloads:
+        raise ValueError("downstream manifest domains must be a nonempty list")
+    domains: list[DownstreamDomain] = []
+    seen: set[str] = set()
+    for entry in domain_payloads:
+        if not isinstance(entry, dict):
+            raise ValueError("each downstream manifest domain must be an object")
+        name = entry.get("name")
+        if not isinstance(name, str) or not _DOMAIN_NAME.fullmatch(name):
+            raise ValueError(f"invalid downstream domain name: {name!r}")
+        if name in seen:
+            raise ValueError(f"duplicate downstream domain: {name}")
+        seen.add(name)
+        relative = entry.get("path")
+        if not isinstance(relative, str) or not relative:
+            raise ValueError(f"fresh10 {name}.path must be a nonempty string")
+        unresolved = Path(relative)
+        if unresolved.is_absolute() or ".." in unresolved.parts:
+            raise ValueError(f"fresh10 {name}.path must stay below the data root")
+        shard_path = (root / unresolved).resolve()
         try:
-            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"invalid downstream manifest JSON: {exc}") from exc
-        if not isinstance(payload, dict):
-            raise ValueError("downstream manifest must contain a JSON object")
-        if payload.get("schema_version") != 1 or payload.get("kind") != "fresh10":
-            raise ValueError(
-                "downstream manifest must use schema_version=1 and kind='fresh10'"
-            )
-        tokenizer = payload.get("tokenizer")
-        tokenizer_vocab = (
-            tokenizer.get("vocab_size") if isinstance(tokenizer, dict) else None
-        )
+            shard_path.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"fresh10 {name}.path escapes the data root") from exc
+        expected_bytes = entry.get("bytes")
         if (
-            not isinstance(tokenizer, dict)
-            or tokenizer.get("name") != "gpt2"
-            or isinstance(tokenizer_vocab, bool)
-            or not isinstance(tokenizer_vocab, int)
-            or tokenizer_vocab != 50_257
-            or tokenizer_vocab > vocab_size
+            expected_bytes is not None
+            and shard_path.stat().st_size
+            != _manifest_integer(expected_bytes, f"{name}.bytes", minimum=1)
         ):
-            raise ValueError(
-                "downstream manifest must use the 50,257-token GPT-2 tokenizer, "
-                f"which must fit the model vocabulary ({vocab_size})"
-            )
-        root = root.expanduser().resolve() if root is not None else manifest_path.parent
-        domain_payloads = payload.get("domains")
-        if not isinstance(domain_payloads, list) or not domain_payloads:
-            raise ValueError("downstream manifest domains must be a nonempty list")
-        domains: list[DownstreamDomain] = []
-        seen: set[str] = set()
-        for entry in domain_payloads:
-            if not isinstance(entry, dict):
-                raise ValueError("each downstream manifest domain must be an object")
-            name = entry.get("name")
-            if not isinstance(name, str) or not _DOMAIN_NAME.fullmatch(name):
-                raise ValueError(f"invalid downstream domain name: {name!r}")
-            if name in seen:
-                raise ValueError(f"duplicate downstream domain: {name}")
-            seen.add(name)
-            relative = entry.get("path")
-            if not isinstance(relative, str) or not relative:
-                raise ValueError(f"fresh10 {name}.path must be a nonempty string")
-            unresolved = Path(relative)
-            if unresolved.is_absolute() or ".." in unresolved.parts:
-                raise ValueError(f"fresh10 {name}.path must stay below the data root")
-            shard_path = (root / unresolved).resolve()
-            try:
-                shard_path.relative_to(root)
-            except ValueError as exc:
-                raise ValueError(f"fresh10 {name}.path escapes the data root") from exc
-            expected_bytes = entry.get("bytes")
-            if (
-                expected_bytes is not None
-                and shard_path.stat().st_size
-                != _manifest_integer(expected_bytes, f"{name}.bytes", minimum=1)
+            raise ValueError(f"fresh10 {name} shard size does not match its manifest")
+        expected_hash = entry.get("sha256")
+        if expected_hash is not None:
+            if not isinstance(expected_hash, str) or not re.fullmatch(
+                r"[0-9a-f]{64}", expected_hash
             ):
-                raise ValueError(
-                    f"fresh10 {name} shard size does not match its manifest"
-                )
-            expected_hash = entry.get("sha256")
-            if expected_hash is not None:
-                if not isinstance(expected_hash, str) or not re.fullmatch(
-                    r"[0-9a-f]{64}", expected_hash
-                ):
-                    raise ValueError(f"fresh10 {name}.sha256 is invalid")
-                if file_sha256(shard_path) != expected_hash:
-                    raise ValueError(f"fresh10 {name} shard SHA-256 does not match")
-            tokens = load_token_file(shard_path, "uint16", "llmc")
-            expected_tokens = _manifest_integer(
-                entry.get("tokens"), f"{name}.tokens", minimum=2
-            )
-            if len(tokens) != expected_tokens:
-                raise ValueError(
-                    f"fresh10 {name} has {len(tokens):,} tokens; expected "
-                    f"{expected_tokens:,}"
-                )
-            documents = entry.get("documents")
-            if not isinstance(documents, list):
-                raise ValueError(f"fresh10 {name}.documents must be a list")
-            domains.append(
-                _validate_domain(
-                    name,
-                    tokens,
-                    documents,
-                    expected_scored_tokens=entry.get("scored_tokens"),
-                    vocab_size=vocab_size,
-                )
-            )
-        return tuple(domains)
-
-    grouped: dict[str, list[np.ndarray]] = {}
-    for specification in documents:
-        if not isinstance(specification, str) or "=" not in specification:
-            raise ValueError("--downstream-data must use DOMAIN=PATH")
-        name, raw_path = specification.split("=", 1)
-        if not _DOMAIN_NAME.fullmatch(name) or not raw_path:
-            raise ValueError(f"invalid --downstream-data value: {specification!r}")
-        grouped.setdefault(name, []).append(
-            load_token_file(Path(raw_path), "uint16", "auto")
+                raise ValueError(f"fresh10 {name}.sha256 is invalid")
+            if file_sha256(shard_path) != expected_hash:
+                raise ValueError(f"fresh10 {name} shard SHA-256 does not match")
+        tokens = load_token_file(shard_path, "uint16", "llmc")
+        expected_tokens = _manifest_integer(
+            entry.get("tokens"), f"{name}.tokens", minimum=2
         )
-    domains = []
-    for name, shards in grouped.items():
-        documents_payload: list[dict[str, int]] = []
-        cursor = 0
-        for shard in shards:
-            if len(shard) < 2:
-                raise ValueError(
-                    f"downstream document for {name!r} has fewer than 2 tokens"
-                )
-            documents_payload.append(
-                {
-                    "token_offset": cursor,
-                    "token_count": len(shard),
-                    "score_offset": cursor + 1,
-                    "scored_tokens": len(shard) - 1,
-                }
+        if len(tokens) != expected_tokens:
+            raise ValueError(
+                f"fresh10 {name} has {len(tokens):,} tokens; expected "
+                f"{expected_tokens:,}"
             )
-            cursor += len(shard)
-        tokens = np.concatenate(tuple(np.asarray(shard) for shard in shards))
+        documents = entry.get("documents")
+        if not isinstance(documents, list):
+            raise ValueError(f"fresh10 {name}.documents must be a list")
         domains.append(
-            _validate_domain(name, tokens, documents_payload, vocab_size=vocab_size)
+            _validate_domain(
+                name,
+                tokens,
+                documents,
+                expected_scored_tokens=entry.get("scored_tokens"),
+                vocab_size=vocab_size,
+            )
         )
     return tuple(domains)
 

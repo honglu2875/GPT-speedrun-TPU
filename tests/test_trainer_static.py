@@ -384,6 +384,9 @@ class TrainerStaticTests(unittest.TestCase):
             ("--attention-backend", "dense"),
             ("--learning-rate", "0.001"),
             ("--eval-batches", "1"),
+            ("--data-path", "data"),
+            ("--val-fraction", "0.1"),
+            ("--downstream-data", "science=data.bin"),
         ):
             with self.subTest(option=option), redirect_stderr(StringIO()):
                 with self.assertRaises(SystemExit):
@@ -501,8 +504,8 @@ class TrainerStaticTests(unittest.TestCase):
                 "--xprof-steps",
                 "1",
                 "--diagnostic-mode",
-                "--downstream-data",
-                "science=data.bin",
+                "--downstream-manifest",
+                "fresh10.json",
             ],
         )
         for command in invalid_commands:
@@ -699,6 +702,42 @@ class TrainerStaticTests(unittest.TestCase):
             dataset.batch("train", rng, 1, 7, 7)
         with self.assertRaisesRegex(ValueError, "do not fit"):
             dataset.validation_batch(0, 1, 7, 7)
+
+    def test_dataset_loader_requires_explicit_train_and_validation_shards(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            train = root / "train.npy"
+            validation = root / "validation.npy"
+            np.save(train, np.arange(32, dtype=np.uint16))
+            np.save(validation, np.arange(16, dtype=np.uint16))
+
+            dataset = rig_tokens.load_dataset(
+                train_data=[train],
+                val_data=[validation],
+                data_dtype="uint16",
+                data_format="auto",
+                seed=7,
+            )
+            self.assertEqual((len(dataset.train), len(dataset.validation)), (32, 16))
+            with self.assertRaisesRegex(ValueError, "supplied together"):
+                rig_tokens.load_dataset(
+                    train_data=[train],
+                    val_data=[],
+                    data_dtype="uint16",
+                    data_format="auto",
+                    seed=7,
+                )
+
+    def test_non_smoke_execution_requires_explicit_shards_before_jax_init(self) -> None:
+        args = trainer.build_parser().parse_args(["--profile", "dev"])
+        with (
+            patch.object(trainer, "initialize_distributed_runtime") as initialize,
+            self.assertRaisesRegex(ValueError, "explicit --train-data"),
+        ):
+            trainer.run(args)
+        initialize.assert_not_called()
 
     def test_shuffled_epoch_stream_is_bijective_deterministic_and_rank_disjoint(
         self,
@@ -1270,33 +1309,6 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertNotIn((12, 99), pairs)
         self.assertEqual(sum(int(mask.sum()) for _, _, mask in batches), 5)
 
-    def test_repeatable_downstream_data_groups_standalone_documents(self) -> None:
-        parser = trainer.build_parser()
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            first = root / "first.npy"
-            second = root / "second.npy"
-            np.save(first, np.asarray([99, 1, 2], dtype=np.uint16))
-            np.save(second, np.asarray([99, 3, 4, 5], dtype=np.uint16))
-            args = parser.parse_args(
-                [
-                    "--downstream-data",
-                    f"science={first}",
-                    "--downstream-data",
-                    f"science={second}",
-                ]
-            )
-            domains = rig_tokens.load_downstream_domains(
-                manifest=args.downstream_manifest,
-                root=args.downstream_root,
-                documents=args.downstream_data,
-                vocab_size=256,
-            )
-        self.assertEqual(len(domains), 1)
-        self.assertEqual(domains[0].name, "science")
-        self.assertEqual(domains[0].scored_tokens, 5)
-        self.assertEqual(len(domains[0].documents), 2)
-
     def test_gpt2_downstream_manifest_fits_padded_model_vocabulary(self) -> None:
         parser = trainer.build_parser()
         with tempfile.TemporaryDirectory() as directory:
@@ -1341,7 +1353,6 @@ class TrainerStaticTests(unittest.TestCase):
             domains = rig_tokens.load_downstream_domains(
                 manifest=args.downstream_manifest,
                 root=args.downstream_root,
-                documents=args.downstream_data,
                 vocab_size=50_304,
             )
             self.assertEqual(domains[0].scored_tokens, 2)
@@ -1349,7 +1360,6 @@ class TrainerStaticTests(unittest.TestCase):
                 rig_tokens.load_downstream_domains(
                     manifest=args.downstream_manifest,
                     root=args.downstream_root,
-                    documents=args.downstream_data,
                     vocab_size=50_000,
                 )
 

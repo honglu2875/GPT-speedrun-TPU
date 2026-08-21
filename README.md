@@ -488,8 +488,8 @@ The entry trainer accepts the frozen set with
 `--downstream-manifest data/manifests/fresh10.json --downstream-root PATH`.
 It reuses one fixed-shape masked evaluation executable, excludes padding and
 cross-document targets, and writes the domain rows plus `fresh10_macro` to
-`validation.csv`. Repeat `--downstream-data DOMAIN=PATH` for small standalone
-pretokenized documents outside the canonical set.
+`validation.csv`. Downstream data is manifest-only so its document boundaries,
+tokenizer, byte sizes, and content hashes remain part of the run contract.
 
 Useful commands:
 
