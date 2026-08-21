@@ -94,9 +94,9 @@ def add_standard_xprof_arguments(parser: argparse.ArgumentParser) -> None:
 
 def add_standard_data_arguments(parser: argparse.ArgumentParser) -> None:
     """Add ``--data``/``--data-path``, ``--train-data``, ``--val-data``,
-    ``--data-dtype``, ``--val-fraction``, ``--vocab-size``, ``--dataset-id``,
-    ``--tokenizer-id``, ``--data-format``, ``--downstream-manifest``,
-    ``--downstream-root``, and ``--downstream-data`` in a ``data`` group.
+    ``--data-dtype``, ``--val-fraction``, ``--dataset-id``, ``--tokenizer-id``,
+    ``--data-format``, ``--downstream-manifest``, ``--downstream-root``, and
+    ``--downstream-data`` in a ``data`` group.
     """
 
     data = parser.add_argument_group("data")
@@ -129,9 +129,6 @@ def add_standard_data_arguments(parser: argparse.ArgumentParser) -> None:
         help="dtype for raw .bin token files",
     )
     data.add_argument("--val-fraction", type=float, default=0.05)
-    data.add_argument(
-        "--vocab-size", type=positive_int, default=None, help=argparse.SUPPRESS
-    )
     data.add_argument(
         "--dataset-id", default=None, help="stable dataset identifier for records"
     )

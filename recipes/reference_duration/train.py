@@ -182,10 +182,9 @@ class Config:
     position_encoding: str
     mlp_activation: str
     tier: str
-    # Stable run-protocol names; both values are derived from the typed model
-    # definitions rather than declared independently in config.yaml.
+    # Stable run-protocol name, derived from the typed model definition rather
+    # than declared independently in config.yaml.
     declared_parameters: int | None
-    base_parameters: int
     parameterization: str
     base_width: int
     base_depth: int
@@ -846,7 +845,6 @@ def resolve_config(
         mlp_activation=model.mlp_activation,
         tier=tier_name,
         declared_parameters=tpp_parameters,
-        base_parameters=base_tpp_parameters,
         parameterization=parameterization,
         base_width=base_width,
         base_depth=base_depth,

@@ -1,10 +1,10 @@
 """Strict reading of a recipe's sibling ``config.yaml``.
 
 This is the *reader*, not the schema. It resolves the path, bounds the file,
-rejects the YAML features that would make a config non-obvious, loads exactly
-one document, and offers typed accessors for pulling values out of it. What the
-keys mean, which are required, and how they become a training configuration is
-each recipe's own business and stays in its entry program.
+rejects the YAML features that would make a config non-obvious, and loads
+exactly one string-keyed document. What the keys mean, which are required, and
+how they become a training configuration is each recipe's own business and
+stays in its entry program.
 
 The strictness is deliberate. A config that decides what a run measures should
 read exactly as it is written, so anchors, aliases, tags, directives, duplicate
@@ -16,9 +16,8 @@ configuration by content, not by path.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 import hashlib
-import math
 
 import yaml
 
@@ -45,70 +44,6 @@ def _construct_unique_mapping(
             raise ValueError(f"config.yaml contains duplicate key {key!r}")
         result[key] = loader.construct_object(value_node, deep=deep)
     return result
-
-
-def config_mapping(value: Any, label: str) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping):
-        raise ValueError(f"config.yaml {label} must be a mapping")
-    if any(not isinstance(key, str) for key in value):
-        raise ValueError(f"config.yaml {label} keys must be strings")
-    return value
-
-
-def config_keys(
-    value: Any,
-    label: str,
-    required: set[str],
-    *,
-    optional: set[str] = frozenset(),
-) -> Mapping[str, Any]:
-    mapping = config_mapping(value, label)
-    keys = set(mapping)
-    missing = sorted(required - keys)
-    unknown = sorted(keys - required - optional)
-    if missing:
-        raise ValueError(
-            f"config.yaml {label} is missing required key(s): {', '.join(missing)}"
-        )
-    if unknown:
-        raise ValueError(
-            f"config.yaml {label} contains unknown key(s): {', '.join(unknown)}"
-        )
-    return mapping
-
-
-def config_int(value: Any, label: str, *, minimum: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-        raise ValueError(
-            f"config.yaml {label} must be an integer >= {minimum}; got {value!r}"
-        )
-    return value
-
-
-def config_float(value: Any, label: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"config.yaml {label} must be a finite number")
-    try:
-        result = float(value)
-    except OverflowError as exc:
-        raise ValueError(f"config.yaml {label} must be a finite number") from exc
-    if not math.isfinite(result):
-        raise ValueError(f"config.yaml {label} must be a finite number")
-    return result
-
-
-def config_bool(value: Any, label: str) -> bool:
-    if not isinstance(value, bool):
-        raise ValueError(f"config.yaml {label} must be true or false; got {value!r}")
-    return value
-
-
-def config_choice(value: Any, label: str, choices: Sequence[str]) -> str:
-    if not isinstance(value, str) or value not in choices:
-        raise ValueError(
-            f"config.yaml {label} must be one of {', '.join(choices)}; got {value!r}"
-        )
-    return value
 
 
 StrictSafeLoader.add_constructor(
@@ -177,4 +112,9 @@ def read_config_document(path: Path) -> tuple[Mapping[str, Any], str]:
         raise ValueError(f"invalid config.yaml YAML: {exc}") from exc
     if len(documents) != 1:
         raise ValueError("config.yaml must contain exactly one YAML document")
-    return config_mapping(documents[0], "document"), hashlib.sha256(raw).hexdigest()
+    document = documents[0]
+    if not isinstance(document, Mapping):
+        raise ValueError("config.yaml document must be a mapping")
+    if any(not isinstance(key, str) for key in document):
+        raise ValueError("config.yaml document keys must be strings")
+    return document, hashlib.sha256(raw).hexdigest()

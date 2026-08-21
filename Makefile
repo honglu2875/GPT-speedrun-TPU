@@ -34,7 +34,7 @@ TARGET_ENTRY := $(TARGET_DIR)/train.py
 UV_BASE = $(UV) --cache-dir "$(UV_CACHE_DIR)"
 UV_RUN = $(UV_BASE) run --frozen --no-sync
 
-.PHONY: help check prepare require-prepare validate-target preflight run baseline profile report
+.PHONY: help check prepare require-prepare validate-target preflight run baseline profile report study-export
 
 help:
 	@printf '%s\n' \
@@ -72,7 +72,7 @@ check:
 	    && printf 'recipes/%s ok\n' "$$name" || exit 1; \
 	done
 	@printf '\n== the report builds from the recorded runs ==\n'
-	$(UV_RUN) rig report --runs "$(RUNS_PATH)" --output "$(CURDIR)/.check-report.html" | tail -1
+	$(UV_RUN) rig report --runs "$(RUNS_PATH)" --output "$(CURDIR)/.check-report.html"
 	@rm -f "$(CURDIR)/.check-report.html"
 	@printf '\nall checks passed\n\n'
 
