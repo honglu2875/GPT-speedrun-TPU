@@ -1,9 +1,10 @@
 # Versioned model-family definition for recipes/reference/train.py.
 #
-# A tier selects a complete architecture. Profiles select execution budgets and
-# kernels; smoke deliberately remains a tiny inline wiring test. The family uses
-# the fixed-TPP CompleteP hybrid described in docs/COMPLETEP.md.
-schema_version: 4
+# A tier supplies the dimensions that vary along the size ladder; architecture
+# holds the family invariants. Profiles select execution budgets and kernels,
+# while smoke deliberately remains a complete tiny inline wiring test. The
+# family uses the fixed-TPP CompleteP hybrid described in docs/COMPLETEP.md.
+schema_version: 5
 family:
   default_tier: 125m
   # A context preset is a coupled training contract: sequence length, the
@@ -29,62 +30,34 @@ family:
     # its own fixed 64-wide q/k coordinate, independent of the number of heads.
     attention_scale: inverse_head_dim
     embeddings: untied
+  architecture:
+    mlp_mult: 4
+    normalization: rms_norm
+    position_encoding: rope_base_10000
+    mlp_activation: gelu
+    vocab_size: 50304
+    semantic_vocab_size: 50304
   tiers:
     60m:
-      model:
-        layers: 12
-        heads: 6
-        d_model: 384
-        mlp_mult: 4
-        normalization: rms_norm
-        position_encoding: rope_base_10000
-        mlp_activation: gelu
-        vocab_size: 50304
-        semantic_vocab_size: 50304
+      layers: 12
+      heads: 6
+      d_model: 384
     125m:
-      model:
-        layers: 12
-        heads: 10
-        d_model: 640
-        mlp_mult: 4
-        normalization: rms_norm
-        position_encoding: rope_base_10000
-        mlp_activation: gelu
-        vocab_size: 50304
-        semantic_vocab_size: 50304
+      layers: 12
+      heads: 10
+      d_model: 640
     250m:
-      model:
-        layers: 16
-        heads: 14
-        d_model: 896
-        mlp_mult: 4
-        normalization: rms_norm
-        position_encoding: rope_base_10000
-        mlp_activation: gelu
-        vocab_size: 50304
-        semantic_vocab_size: 50304
+      layers: 16
+      heads: 14
+      d_model: 896
     500m:
-      model:
-        layers: 19
-        heads: 20
-        d_model: 1280
-        mlp_mult: 4
-        normalization: rms_norm
-        position_encoding: rope_base_10000
-        mlp_activation: gelu
-        vocab_size: 50304
-        semantic_vocab_size: 50304
+      layers: 19
+      heads: 20
+      d_model: 1280
     1b:
-      model:
-        layers: 21
-        heads: 28
-        d_model: 1792
-        mlp_mult: 4
-        normalization: rms_norm
-        position_encoding: rope_base_10000
-        mlp_activation: gelu
-        vocab_size: 50304
-        semantic_vocab_size: 50304
+      layers: 21
+      heads: 28
+      d_model: 1792
 
 profiles:
   smoke:

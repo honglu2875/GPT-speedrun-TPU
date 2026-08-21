@@ -100,7 +100,7 @@ validate-target:
 	  printf '%s\n' 'Missing regular target config: recipes/$(TARGET)/config.yaml' >&2; \
 	  exit 2; \
 	fi
-	@if ! grep -Eq '^schema_version:[[:space:]]*4[[:space:]]*$$' "$(TARGET_DIR)/config.yaml"; then \
+	@if ! grep -Eq '^schema_version:[[:space:]]*5[[:space:]]*$$' "$(TARGET_DIR)/config.yaml"; then \
 	  printf '%s\n' 'TARGET is a legacy fixed-model recipe. Clone the current reference to create a tiered family.' >&2; \
 	  exit 2; \
 	fi

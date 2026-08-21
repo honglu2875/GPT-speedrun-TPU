@@ -155,7 +155,7 @@ from rig.kernels import (
 
 
 SCHEMA_VERSION = 1
-CONFIG_SCHEMA_VERSION = 4
+CONFIG_SCHEMA_VERSION = 5
 CONFIG_FILENAME = "config.yaml"
 RECIPE_DIR = Path(__file__).resolve().parent
 RECIPE_NAME = RECIPE_DIR.name
@@ -286,7 +286,7 @@ class ParameterizationDefinition:
 
 @dataclass(frozen=True, slots=True)
 class ModelDefinition:
-    """Architecture fields represented literally in ``config.yaml``."""
+    """Fully resolved architecture used by the trainer."""
 
     layers: PositiveInt
     heads: PositiveInt
@@ -307,6 +307,17 @@ class ModelDefinition:
         """Width of one attention head."""
 
         return self.d_model // self.heads
+
+    @property
+    def tpp_parameters(self) -> int:
+        """Dense-equivalent parameter denominator used by the fixed-TPP ladder."""
+
+        width = self.d_model
+        return (
+            2 * self.vocab_size * width
+            + self.layers * (12 * width * width + 11 * width)
+            + width
+        )
 
     def validate(self, label: str) -> None:
         """Enforce architecture relations that no single annotation can express."""
@@ -335,18 +346,45 @@ class ModelDefinition:
 
 @dataclass(frozen=True, slots=True)
 class TierDefinition:
-    model: ModelDefinition
+    """Only the dimensions that vary along the model-size ladder."""
 
-    @property
-    def tpp_parameters(self) -> int:
-        """Dense-equivalent parameter denominator used by the fixed-TPP ladder."""
+    layers: PositiveInt
+    heads: PositiveInt
+    d_model: PositiveInt
 
-        model = self.model
-        width = model.d_model
-        return (
-            2 * model.vocab_size * width
-            + model.layers * (12 * width * width + 11 * width)
-            + width
+
+@dataclass(frozen=True, slots=True)
+class ArchitectureDefinition:
+    """Architecture invariants shared by every non-smoke routed tier."""
+
+    mlp_mult: PositiveInt
+    normalization: Literal["rms_norm"]
+    position_encoding: Literal["rope_base_10000"]
+    mlp_activation: Literal["gelu"]
+    vocab_size: PositiveInt
+    semantic_vocab_size: PositiveInt
+    experts: NonnegativeInt = 0
+    expert_top_k: PositiveInt = 2
+    expert_mult: PositiveInt = 2
+    router_aux_coefficient: NonnegativeFloat = 0.01
+
+    def resolve(self, tier: TierDefinition) -> ModelDefinition:
+        """Combine shared invariants with one tier's scaling dimensions."""
+
+        return ModelDefinition(
+            layers=tier.layers,
+            heads=tier.heads,
+            d_model=tier.d_model,
+            mlp_mult=self.mlp_mult,
+            normalization=self.normalization,
+            position_encoding=self.position_encoding,
+            mlp_activation=self.mlp_activation,
+            vocab_size=self.vocab_size,
+            semantic_vocab_size=self.semantic_vocab_size,
+            experts=self.experts,
+            expert_top_k=self.expert_top_k,
+            expert_mult=self.expert_mult,
+            router_aux_coefficient=self.router_aux_coefficient,
         )
 
 
@@ -356,7 +394,13 @@ class FamilyDefinition:
     default_context: ContextName
     contexts: Annotated[dict[ContextName, ContextPreset], Length(ge=1)]
     parameterization: ParameterizationDefinition
+    architecture: ArchitectureDefinition
     tiers: Annotated[dict[TierName, TierDefinition], Length(ge=1)]
+
+    def model_for_tier(self, tier_name: TierName) -> ModelDefinition:
+        """Resolve a complete model from the family invariants and one tier."""
+
+        return self.architecture.resolve(self.tiers[tier_name])
 
 
 Sampling = Literal["random_windows", "shuffled_epochs"]
@@ -442,7 +486,7 @@ class ProfileDefinitions:
 class ExperimentConfig(ConfigSchema):
     """Complete typed representation of the recipe's ``config.yaml``."""
 
-    schema_version: Literal[4]
+    schema_version: Literal[5]
     family: FamilyDefinition
     profiles: ProfileDefinitions
 
@@ -462,10 +506,11 @@ class ExperimentConfig(ConfigSchema):
                 "config.yaml family.parameterization.base_tier must name a defined tier"
             )
 
-        for tier_name, tier in family.tiers.items():
-            label = f"family.tiers.{tier_name}.model"
-            tier.model.validate(label)
-            if tier.model.head_dim != 64:
+        for tier_name in family.tiers:
+            label = f"family.tiers.{tier_name}"
+            model = family.model_for_tier(tier_name)
+            model.validate(label)
+            if model.head_dim != 64:
                 raise ValueError(
                     f"config.yaml family.tiers.{tier_name} must use 64-wide heads"
                 )
@@ -664,7 +709,7 @@ def resolve_config(
     )
     family = experiment_config.family
     base_tier_name = family.parameterization.base_tier
-    base_tpp_parameters = family.tiers[base_tier_name].tpp_parameters
+    base_tpp_parameters = family.model_for_tier(base_tier_name).tpp_parameters
     if profile == "smoke":
         definition = experiment_config.profiles.smoke
         model = definition.model
@@ -675,9 +720,8 @@ def resolve_config(
             if profile == "dev"
             else experiment_config.profiles.official
         )
-        tier = family.tiers[selected_tier_name]
-        model = tier.model
-        tpp_parameters = tier.tpp_parameters
+        model = family.model_for_tier(selected_tier_name)
+        tpp_parameters = model.tpp_parameters
     kernels = definition.kernels
     optimizer = definition.optimizer
     evaluation = definition.evaluation

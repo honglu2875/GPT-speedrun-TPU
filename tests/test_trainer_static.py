@@ -120,15 +120,26 @@ def _replace_experiment_config(
         if profile == "smoke":
             definition = replace(definition, model=replace(definition.model, **model))
         else:
-            selected_tier = family.tiers[tier_name]
-            selected_tier = replace(
-                selected_tier,
-                model=replace(selected_tier.model, **model),
-            )
-            family = replace(
-                family,
-                tiers={**family.tiers, tier_name: selected_tier},
-            )
+            dimension_names = {"layers", "heads", "d_model"}
+            dimension_overrides = {
+                name: value for name, value in model.items() if name in dimension_names
+            }
+            architecture_overrides = {
+                name: value
+                for name, value in model.items()
+                if name not in dimension_names
+            }
+            if dimension_overrides:
+                selected_tier = replace(family.tiers[tier_name], **dimension_overrides)
+                family = replace(
+                    family,
+                    tiers={**family.tiers, tier_name: selected_tier},
+                )
+            if architecture_overrides:
+                family = replace(
+                    family,
+                    architecture=replace(family.architecture, **architecture_overrides),
+                )
     if context:
         selected_context = replace(family.contexts[selected_context_name], **context)
         family = replace(
@@ -192,7 +203,8 @@ class TrainerStaticTests(unittest.TestCase):
         for tier, (parameters, layers, width, heads) in expected.items():
             with self.subTest(tier=tier):
                 self.assertEqual(
-                    experiment_config.family.tiers[tier].tpp_parameters, parameters
+                    experiment_config.family.model_for_tier(tier).tpp_parameters,
+                    parameters,
                 )
                 config = _resolve_config(
                     parser.parse_args(["--profile", "official", "--tier", tier]),
@@ -279,8 +291,8 @@ class TrainerStaticTests(unittest.TestCase):
         tier_name, context_name = experiment_config.resolve_selection("official")
         official = experiment_config.profiles.official
         context = experiment_config.family.contexts[context_name]
-        model = experiment_config.family.tiers[tier_name].model
-        self.assertEqual(experiment_config.schema_version, 4)
+        model = experiment_config.family.model_for_tier(tier_name)
+        self.assertEqual(experiment_config.schema_version, 5)
         self.assertEqual(official.training.tokens_per_parameter, 20.0)
         self.assertEqual(context_name, "1k")
         self.assertEqual(context.reference_batch_size, 128)
@@ -290,8 +302,11 @@ class TrainerStaticTests(unittest.TestCase):
         self.assertEqual(official.training.sampling, "shuffled_epochs")
         self.assertEqual(official.training.dtype, "bfloat16")
         self.assertFalse(hasattr(experiment_config, "__dict__"))
+        self.assertFalse(hasattr(experiment_config.family.architecture, "__dict__"))
         self.assertFalse(hasattr(model, "__dict__"))
         self.assertNotIn("\n      parameters:", source)
+        self.assertNotIn("\n      model:", source)
+        self.assertEqual(source.count("semantic_vocab_size: 50304"), 1)
         self.assertEqual(
             config_sha256,
             hashlib.sha256(trainer.CONFIG_PATH.read_bytes()).hexdigest(),
@@ -299,14 +314,14 @@ class TrainerStaticTests(unittest.TestCase):
 
         invalid = {
             "duplicate": source.replace(
-                "schema_version: 4", "schema_version: 4\nschema_version: 4", 1
+                "schema_version: 5", "schema_version: 5\nschema_version: 5", 1
             ),
             "unknown": source + "\nunknown: true\n",
-            "anchor": source.replace("schema_version: 4", "schema_version: &v 4", 1),
+            "anchor": source.replace("schema_version: 5", "schema_version: &v 5", 1),
             "alias": source.replace(
-                "schema_version: 4", "schema_version: &v 4\nextra: *v", 1
+                "schema_version: 5", "schema_version: &v 5\nextra: *v", 1
             ),
-            "tag": source.replace("schema_version: 4", "schema_version: !!int 4", 1),
+            "tag": source.replace("schema_version: 5", "schema_version: !!int 5", 1),
             "directive": "%YAML 1.2\n---\n" + source,
             "multiple documents": source + "\n---\n{}\n",
             "nonfinite": source.replace(
