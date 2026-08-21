@@ -225,6 +225,13 @@ class TrainerStaticTests(unittest.TestCase):
             ["--profile", "dev", "--tier", "250m", "--tokens-per-parameter", "5"]
         )
         config = _resolve_config(args, "tpu")
+        for derived_name in (
+            "width_multiplier",
+            "depth_multiplier",
+            "tokens_per_parameter",
+            "compute_dtype",
+        ):
+            self.assertNotIn(derived_name, trainer.Config.__slots__)
         params = {
             "token_embedding": np.zeros((1, 1), dtype=np.float32),
             "blocks": [
@@ -240,6 +247,9 @@ class TrainerStaticTests(unittest.TestCase):
         lr, epsilon, decay = trainer.optimizer_hyperparameter_trees(params, config)
         width = 896 / 384
         depth = 16 / 12
+        self.assertEqual(config.width_multiplier, width)
+        self.assertEqual(config.depth_multiplier, depth)
+        self.assertEqual(config.compute_dtype, trainer.jnp.bfloat16)
         self.assertAlmostEqual(lr["token_embedding"], 1.0)
         self.assertAlmostEqual(epsilon["token_embedding"], width**-1)
         self.assertAlmostEqual(lr["blocks"][0]["qkv_w"], width**-1)

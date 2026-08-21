@@ -159,7 +159,7 @@ class RoutedMlpTests(unittest.TestCase):
         config = trainer.Config.__new__(trainer.Config)
         object.__setattr__(config, "experts", EXPERTS)
         object.__setattr__(config, "expert_top_k", TOP_K)
-        object.__setattr__(config, "compute_dtype", jnp.float32)
+        object.__setattr__(config, "dtype_name", "float32")
 
         sharded = trainer.make_mesh_routed_mlp(config, mesh)
         with jax.set_mesh(mesh):
