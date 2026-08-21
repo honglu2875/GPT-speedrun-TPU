@@ -37,7 +37,7 @@ Supersedes the former `LR_TRANSFER.md`.
 | **TPP** | tokens per parameter — training tokens divided by parameter count. Sets the token horizon |
 | **µP** | Maximal Update Parameterization. Rescales initialization, LR, and multipliers so activation and update magnitudes stay width-invariant |
 | **CompleteP** | µP extended so the rules also hold as *depth* grows ([Dey et al.](https://arxiv.org/abs/2505.01618)) |
-| **Complete(d)P** | a *separate, later* paper ([Mlodozeniec et al.](https://arxiv.org/abs/2512.22382)) extending CompleteP to **batch** and **duration** — the `(d)` is duration, not depth. This repository borrows selected corrections but does not implement its cross-horizon duration transfer. Rules in [COMPLETEP.md](COMPLETEP.md) |
+| **Complete(d)P** | a *separate, later* paper ([Mlodozeniec et al.](https://arxiv.org/abs/2512.22382)) extending CompleteP to **batch** and **duration** — the `(d)` is duration, not depth. The baseline borrows selected corrections and omits cross-horizon duration transfer; an isolated fork tests it at 60M/125M. Rules in [COMPLETEP.md](COMPLETEP.md), results in [duration-ablation.md](reports/duration-ablation.md) |
 | **m_N / m_L / m_D_ladder** | width, depth, and fixed-TPP model-ladder multipliers relative to the 60M anchor (`D384`, `L12`). `m_D_ladder = P/P₀`; it deliberately omits `TPP/TPP₀` |
 | **tier** | a named size rung of the family: 60m, 125m, 250m, 500m, 1b. Measured here: 60m through 500m |
 | **nat** | unit of the loss (natural-log cross-entropy) |
@@ -475,10 +475,12 @@ initialization and data order, not run-to-run nondeterminism.
 - **Not qualifying numbers.** Every run used the dev profile, so each loss is 8
   probe batches, not canonical validation. Rankings at fixed everything-else
   are valid; the absolute losses are not official results.
-- **No cross-horizon scaling ablation.** Study 3 measures 20 TPP and finds the
-  same LR/batch optimum, but the implementation reanchors `m_D_ladder` at each
-  TPP. It does not compare that behavior against a true `TPP/TPP₀` multiplier.
-  The Complete(d)P duration rule therefore remains untested here.
+- **The cross-horizon ablation is limited to the two small tiers.** Study 3
+  itself uses only reanchored `m_D_ladder`, but a subsequent 42-run
+  [60M/125M duration ablation](reports/duration-ablation.md) compares it with a
+  true `TPP/TPP_0` multiplier at 20 TPP. The added factor is not beneficial in
+  that matrix. It remains untested at 250M and above, and the treatment bundles
+  LR, beta, epsilon, and weight-decay changes rather than isolating one scalar.
 - **250M's `2^-6` shoulder is untested in Study 2.** The optimum is bracketed
   by `2^-7` and `2^-9` at every batch, but the far upper shoulder rests on
   Study 1's batch-128 measurement alone.

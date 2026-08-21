@@ -35,8 +35,9 @@ both Adam `1 - beta` values by four relative to the reanchored arm.
 
 The special batch-512 point is the paper's SDE iso-horizon construction:
 `m_B = 4` cancels the 4× duration factor. It processes four times the tokens in
-the same 19,173 optimizer steps as the 500M/5-TPP/batch-128 anchor, with the
-same effective optimizer hyperparameters and improved gradient signal-to-noise.
+the same number of optimizer steps as that tier's 5-TPP/batch-128 anchor, with
+the same effective optimizer hyperparameters and improved gradient
+signal-to-noise.
 
 ## Scope
 
@@ -44,15 +45,31 @@ same effective optimizer hyperparameters and improved gradient signal-to-noise.
   claim that 5 TPP is universal.
 - Whole-step rounding determines the achieved token count, but the multiplier
   uses the requested TPP so the 5-TPP anchor remains exactly identical.
-- The v4-32 experiment uses `reference` as the reanchored control and this
-  recipe as the duration-scaled treatment, with paired seeds.
+- The completed v4-32 experiments use `reference` as the reanchored control and
+  this recipe as the duration-scaled treatment, with paired seeds at 60M and
+  125M.
 - As in the paper, the claim is tied to the fixed 10%-warmup cosine schedule.
+
+## Result
+
+The 42-run 20-TPP matrix does not support adding the cross-horizon factor to
+this family. The duration treatment's best measured base LR remains `2^-8`,
+not the compensated `2^-7`. At 125M, compensation costs 0.02683 nats and the
+duration treatment at `2^-8` costs 0.03964 nats against `reference`; both are
+separated across three seeds. At 60M the means point the same way but the
+corresponding comparisons are noise-limited. Batch 512 is substantially worse
+at 60M and tied with duration batch 128 at 125M, where both trail reference.
+
+See the full [duration-ablation report](../../docs/reports/duration-ablation.md)
+for the grid, mean ± SD tables, statistical comparisons, limitations, and raw
+log links. This fork remains useful as an explicit experimental control; its
+rules are not the default recommendation.
 
 Inspect a point without training:
 
 ```bash
 uv run --frozen --no-sync recipes/reference_duration/train.py \
-  --profile dev --tier 500m --context 1k --tokens-per-parameter 20 \
+  --profile dev --tier 125m --context 1k --tokens-per-parameter 20 \
   --batch-size 512 --print-plan
 ```
 
@@ -60,8 +77,8 @@ Run through the harness:
 
 ```bash
 uv run --frozen --no-sync rig run reference_duration \
-  --cluster v4-32 --profile dev --context 1k --tier 500m \
+  --cluster v4-32 --profile dev --context 1k --tier 125m \
   --tokens-per-parameter 20 --batch-size 512 \
   --base-learning-rate 0.00390625 --seed 1337 \
-  --checkpoint-policy none --name 500m-d20-bs512-lr2e-8-s1337
+  --checkpoint-policy none --name 125m-d20-iso-bs512-lr2e-8-s1337
 ```

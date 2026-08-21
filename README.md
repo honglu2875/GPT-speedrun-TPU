@@ -23,9 +23,12 @@ For hyperparameter transfer, the family implements an opinionated
 
 The measured base-LR optimum is `2^-8` and the measured batch optimum is 128
 across the 60M–250M 5-TPP ladder, with the same neighborhood observed at 500M
-and 20 TPP. Those results support this repository's reanchored setup; they do
-not establish the full Complete(d)P duration prescription. The exact contract
-and limitations are in [docs/COMPLETEP.md](docs/COMPLETEP.md).
+and 20 TPP. A 42-run
+[60M/125M ablation](docs/reports/duration-ablation.md) found no benefit from
+adding the cross-horizon factor to this recipe. Those results support the
+reanchored setup; they do not establish or refute the full Complete(d)P
+prescription outside it. The exact contract and limitations are in
+[docs/COMPLETEP.md](docs/COMPLETEP.md).
 
 ## Start here
 

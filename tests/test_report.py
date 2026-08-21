@@ -700,6 +700,34 @@ class StudyExportTests(unittest.TestCase):
             folders, ["60m-5tpp-bs1-lr2e-8-s1337", "60m-moe-5tpp-bs1-lr2e-8-s1337"]
         )
 
+    def test_a_duration_run_does_not_overwrite_the_reference_run_beside_it(
+        self,
+    ) -> None:
+        """Parameterization is part of a mixed study's run identity."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = self._runs(root)
+            second = sorted(p for p in runs.iterdir() if p.is_dir())[1]
+            payload = json.loads((second / "result.json").read_text(encoding="utf-8"))
+            payload["seed"] = 1337
+            payload["contract"]["model"] = {
+                "parameterization": "completedp_duration_v1"
+            }
+            (second / "result.json").write_text(json.dumps(payload), encoding="utf-8")
+
+            summary = export_study(runs, root / "out", "demo")
+            folders = sorted(p.name for p in summary["path"].iterdir() if p.is_dir())
+
+        self.assertEqual(summary["runs"], 2)
+        self.assertEqual(
+            folders,
+            [
+                "60m-5tpp-bs1-lr2e-8-s1337",
+                "60m-duration-5tpp-bs1-lr2e-8-s1337",
+            ],
+        )
+
     def test_it_falls_back_to_the_run_id_when_it_cannot_name_a_run(self) -> None:
         """A run missing its tier or learning rate is still worth exporting.
 

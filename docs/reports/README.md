@@ -8,7 +8,7 @@ exact.
 ## The logs live on HuggingFace
 
 **[huggingface.co/datasets/quintic/rig-logs](https://huggingface.co/datasets/quintic/rig-logs)**
-— 300 runs across ten studies, laid out as `<study>/<run-name>/`, at full
+— 342 runs across twelve studies, laid out as `<study>/<run-name>/`, at full
 recorded resolution. That is the archive of record; its
 [dataset card](https://huggingface.co/datasets/quintic/rig-logs/blob/main/README.md)
 mirrors this catalog and adds archive and reproduction metadata.
@@ -81,9 +81,10 @@ bent into a timeline.
 
 ## The study browser
 
-[`study-browser.html`](study-browser.html) carries no data at all — 53 KB. It
+[`study-browser.html`](study-browser.html) carries no run data at all — about
+56 KB. It
 lists the studies, renders each one's card from the dataset, and fetches only
-that study's overview (0.05–0.30 MB) when you pick one. The full logs are a
+that study's overview (0.05–1.0 MB) when you pick one. The full logs are a
 second, separately labelled click that states the size before it starts:
 6.4 MB for the 8k sweep, 138 MB for the 500M one. Nothing downloads on load.
 
@@ -104,6 +105,9 @@ TPU v6 lite at 1 process and 8 chips; the 125M cohort is entirely TPU v4 at 4
 processes and 16 chips. `batch-size-sweep-500M` remains the only individual
 study that mixes the two topologies.
 
+Both duration-ablation cohorts are TPU v4 at 4 processes and 16 chips, so their
+60M-to-125M comparison does not cross a hardware boundary.
+
 ## Contents
 
 | report | runs | tier(s) | what varies | logs |
@@ -117,6 +121,7 @@ study that mixes the two topologies.
 | [moe-lr-sweep-8k](moe-lr-sweep-8k.html) | 18 | 60M/125M | LR × seed, top-2 of 8 experts | [`moe-lr-sweep-8k`](https://huggingface.co/datasets/quintic/rig-logs/tree/main/moe-lr-sweep-8k) |
 | [batch-size-grid-8k](batch-size-grid-8k.html) | 42 | 60M/125M | batch × LR × seed at 8k, dense and routed | [`batch-size-grid-8k`](https://huggingface.co/datasets/quintic/rig-logs/tree/main/batch-size-grid-8k) |
 | [seed-variance](seed-variance.html) | 63 | 60M/125M | seed at a fixed MoE recipe | [`seed-variance-60M`](https://huggingface.co/datasets/quintic/rig-logs/tree/main/seed-variance-60M), [`seed-variance-125M`](https://huggingface.co/datasets/quintic/rig-logs/tree/main/seed-variance-125M) |
+| [duration-ablation](duration-ablation.md) | 42 | 60M/125M | fixed-TPP reference vs cross-horizon duration scaling | [`duration-ablation-60M`](https://huggingface.co/datasets/quintic/rig-logs/tree/main/duration-ablation-60M), [`duration-ablation-125M`](https://huggingface.co/datasets/quintic/rig-logs/tree/main/duration-ablation-125M) |
 | [transfer-charts](transfer-charts.html) | — | — | derived figures, not a run dashboard | — |
 
 Each study also carries a compact `snapshot.json.gz` (0.05–1.0 MB of thinned
@@ -370,6 +375,47 @@ hardware-controlled test of variance scaling with model size.
 
 The two Hugging Face study cards hold the current reproduction commands and
 the pre-`102a264672c8453700a02e321495a14c585e58ea` AdamW compatibility note.
+
+## duration-ablation.md
+
+42 runs: two matching 21-run cohorts at 60M and 125M, all at 20 TPP. Each tier
+contains a three-point LR bracket for both the fixed-TPP reference and the
+cross-horizon duration treatment, plus the treatment's batch-512 iso-horizon
+point; every cell has seeds 1337–1339.
+
+The reference keeps its `2^-8` base-LR optimum. The duration rule predicts that
+`2^-7` should compensate for its additional fourfold `m_D`, but that point is
+worse at both tiers and separated at 125M. Batch 512 is worse at 60M and tied
+with duration batch 128 at 125M, where both trail reference. The
+[report](duration-ablation.md) gives the full mean ± SD and Welch-comparison
+tables, explains why this is not a universal refutation of Complete(d)P, and
+links the two full-resolution studies.
+
+The earlier 60M study was not lost: [`batch-size-sweep-60M`](batch-size-sweep-60M.html)
+is the separate 75-run batch × LR grid at 5 TPP. The new 60M cohort changes the
+horizon to 20 TPP and introduces the duration treatment; it does not duplicate
+that grid.
+
+```bash
+for tier in 60m 125m; do
+  for seed in 1337 1338 1339; do
+    for lr in 0.0078125 0.00390625 0.001953125; do
+      rig run reference --context 1k --cluster v4-32 --profile dev \
+        --tier "$tier" --tokens-per-parameter 20 --batch-size 128 \
+        --base-learning-rate "$lr" --seed "$seed" \
+        --checkpoint-policy none --name "${tier}-r20-bs128-lr${lr}-s${seed}"
+      rig run reference_duration --context 1k --cluster v4-32 --profile dev \
+        --tier "$tier" --tokens-per-parameter 20 --batch-size 128 \
+        --base-learning-rate "$lr" --seed "$seed" \
+        --checkpoint-policy none --name "${tier}-d20-bs128-lr${lr}-s${seed}"
+    done
+    rig run reference_duration --context 1k --cluster v4-32 --profile dev \
+      --tier "$tier" --tokens-per-parameter 20 --batch-size 512 \
+      --base-learning-rate 0.00390625 --seed "$seed" \
+      --checkpoint-policy none --name "${tier}-d20-iso-bs512-lr2e-8-s${seed}"
+  done
+done
+```
 
 ## transfer-charts.html
 

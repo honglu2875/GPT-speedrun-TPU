@@ -1555,11 +1555,21 @@ def _study_run_name(result: Mapping[str, Any]) -> str:
     batch = tokens // steps // sequence
     exponent = round(math.log2(rate))
     tpp = round(metrics.get("tokens_per_parameter") or 0)
-    # Routing is not derivable from any of the coordinates above, so a study
-    # holding both families at one tier, batch, rate, and seed would name two
-    # different runs identically and export one on top of the other.
+    # Routing and the duration treatment are not derivable from the coordinates
+    # above. A mixed study can therefore contain distinct runs at the same
+    # tier, batch, rate, and seed; retain those distinctions in the archive
+    # name so one run cannot be exported on top of another.
     routed = "-moe" if (metrics.get("experts") or 0) else ""
-    return f"{tier}{routed}-{tpp}tpp-bs{batch}-lr2e{exponent}-s{result.get('seed')}"
+    model = (result.get("contract") or {}).get("model") or {}
+    duration = (
+        "-duration"
+        if model.get("parameterization") == "completedp_duration_v1"
+        else ""
+    )
+    return (
+        f"{tier}{routed}{duration}-{tpp}tpp-bs{batch}-lr2e{exponent}"
+        f"-s{result.get('seed')}"
+    )
 
 
 def export_study(

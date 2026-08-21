@@ -69,7 +69,10 @@ Complete(d)P paper without the `fixed-TPP` qualification.
 
 The isolated [`reference_duration`](../recipes/reference_duration/) fork adds
 the omitted `TPP / 5` factor so the two policies can be compared without
-changing this default contract.
+changing this default contract. Its completed 60M/125M ablation does not
+support importing that factor into the default: the compensated learning-rate
+move loses at 125M and batch 512 provides no improvement. See the
+[full report](reports/duration-ablation.md) for the results and limitations.
 
 Primary sources:
 
