@@ -195,12 +195,9 @@ class Config:
     init_std: float
     attention_scale: str
     embeddings: str
-    width_multiplier: float
-    depth_multiplier: float
     data_multiplier: float
     batch_multiplier: float
     target_tokens_per_parameter: float | None
-    tokens_per_parameter: float | None
     learning_rate: float
     min_lr_ratio: float
     warmup_steps: int
@@ -219,7 +216,6 @@ class Config:
     attention_backend: str
     loss_backend: str
     vocab_tile_size: int
-    compute_dtype: Any
     dtype_name: str
     config_schema_version: int
     config_sha256: str
@@ -246,6 +242,37 @@ class Config:
         """Last optimizer step this run takes; steps stays the schedule horizon."""
 
         return self.stop_after_step or self.steps
+
+    @property
+    def width_multiplier(self) -> float:
+        """Width ratio derived from the selected and base tiers."""
+
+        return self.d_model / float(self.base_width)
+
+    @property
+    def depth_multiplier(self) -> float:
+        """Depth ratio derived from the selected and base tiers."""
+
+        return self.layers / float(self.base_depth)
+
+    @property
+    def tokens_per_parameter(self) -> float | None:
+        """Achieved full-schedule TPP after rounding to whole optimizer steps."""
+
+        if self.declared_parameters is None:
+            return None
+        return (
+            self.steps
+            * self.batch_size
+            * self.seq_len
+            / float(self.declared_parameters)
+        )
+
+    @property
+    def compute_dtype(self) -> Any:
+        """JAX dtype derived from the serializable dtype name."""
+
+        return jnp.bfloat16 if self.dtype_name == "bfloat16" else jnp.float32
 
 
 TierName = Annotated[str, Matches(_TIER_NAME.pattern)]
@@ -803,14 +830,7 @@ def resolve_config(
         override_values.append(("context", args.context))
     overrides = tuple(override_values)
 
-    width_multiplier = model.d_model / float(base_width)
-    depth_multiplier = model.layers / float(base_depth)
     batch_multiplier = batch_size / float(batch_anchor)
-    achieved_tpp = (
-        steps * tokens_per_step / float(tpp_parameters)
-        if tpp_parameters is not None
-        else None
-    )
     # This project reanchors every TPP ladder. The multiplier captures only the
     # model-size-induced data growth within one fixed-TPP ladder; it deliberately
     # omits any cross-horizon TPP / TPP_0 factor.
@@ -857,12 +877,9 @@ def resolve_config(
         init_std=init_std,
         attention_scale=attention_scale,
         embeddings=embeddings,
-        width_multiplier=width_multiplier,
-        depth_multiplier=depth_multiplier,
         data_multiplier=data_multiplier,
         batch_multiplier=batch_multiplier,
         target_tokens_per_parameter=requested_tpp,
-        tokens_per_parameter=achieved_tpp,
         learning_rate=base_learning_rate,
         min_lr_ratio=optimizer.min_lr_ratio,
         warmup_steps=warmup_steps,
@@ -881,7 +898,6 @@ def resolve_config(
         attention_backend=attention_backend,
         loss_backend=kernels.loss_backend,
         vocab_tile_size=kernels.vocab_tile_size,
-        compute_dtype=compute_dtype,
         dtype_name=dtype_name,
         config_schema_version=experiment_config.schema_version,
         config_sha256=config_sha256,
