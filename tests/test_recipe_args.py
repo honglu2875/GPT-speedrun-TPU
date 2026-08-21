@@ -71,18 +71,14 @@ class RecipeArgumentDeclarationTests(unittest.TestCase):
         self.assertEqual(
             _option_strings(parser, "data"),
             {
-                "--data",
-                "--data-path",
                 "--train-data",
                 "--val-data",
                 "--data-dtype",
-                "--val-fraction",
                 "--dataset-id",
                 "--tokenizer-id",
                 "--data-format",
                 "--downstream-manifest",
                 "--downstream-root",
-                "--downstream-data",
             },
         )
         self.assertEqual(_option_strings(parser, "optimization"), {"--peak-tflops"})
@@ -96,10 +92,8 @@ class RecipeArgumentDeclarationTests(unittest.TestCase):
         self.assertEqual(args.color, "auto")
         self.assertEqual(args.train_data, [])
         self.assertEqual(args.val_data, [])
-        self.assertEqual(args.downstream_data, [])
         self.assertEqual(args.data_dtype, "uint16")
         self.assertEqual(args.data_format, "auto")
-        self.assertEqual(args.val_fraction, 0.05)
 
     def test_profile_environment_cannot_select_a_scientific_profile(self) -> None:
         with patch.dict(os.environ, {"RIG_PROFILE": "official"}, clear=True):
@@ -119,18 +113,9 @@ class RecipeArgumentValidationTests(unittest.TestCase):
     ) -> None:
         validate_standard_data_arguments(self.parse())
         for arguments, message in (
-            (("--val-fraction", "0"), "between 0 and 1"),
-            (("--val-fraction", "1"), "between 0 and 1"),
+            (("--train-data", "train.bin"), "must be supplied together"),
+            (("--val-data", "val.bin"), "must be supplied together"),
             (("--downstream-root", "root"), "requires --downstream-manifest"),
-            (
-                (
-                    "--downstream-manifest",
-                    "manifest.yaml",
-                    "--downstream-data",
-                    "math=math.txt",
-                ),
-                "mutually exclusive",
-            ),
         ):
             with (
                 self.subTest(arguments=arguments),

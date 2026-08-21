@@ -83,21 +83,12 @@ def add_standard_xprof_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def add_standard_data_arguments(parser: argparse.ArgumentParser) -> None:
-    """Add ``--data``/``--data-path``, ``--train-data``, ``--val-data``,
-    ``--data-dtype``, ``--val-fraction``, ``--dataset-id``, ``--tokenizer-id``,
-    ``--data-format``, ``--downstream-manifest``, ``--downstream-root``, and
-    ``--downstream-data`` in a ``data`` group.
+    """Add ``--train-data``, ``--val-data``, ``--data-dtype``,
+    ``--dataset-id``, ``--tokenizer-id``, ``--data-format``,
+    ``--downstream-manifest``, and ``--downstream-root`` in a ``data`` group.
     """
 
     data = parser.add_argument_group("data")
-    data.add_argument(
-        "--data",
-        "--data-path",
-        dest="data_path",
-        type=Path,
-        default=None,
-        help="train file or directory containing discovered train/val shards",
-    )
     data.add_argument(
         "--train-data",
         type=Path,
@@ -118,7 +109,6 @@ def add_standard_data_arguments(parser: argparse.ArgumentParser) -> None:
         default="uint16",
         help="dtype for raw .bin token files",
     )
-    data.add_argument("--val-fraction", type=float, default=0.05)
     data.add_argument(
         "--dataset-id", default=None, help="stable dataset identifier for records"
     )
@@ -143,13 +133,6 @@ def add_standard_data_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="directory containing shards named by --downstream-manifest",
     )
-    data.add_argument(
-        "--downstream-data",
-        action="append",
-        default=[],
-        metavar="DOMAIN=PATH",
-        help="standalone downstream document; repeat paths and domains as needed",
-    )
 
 
 def add_standard_reporting_arguments(group: argparse._ArgumentGroup) -> None:
@@ -166,14 +149,10 @@ def add_standard_reporting_arguments(group: argparse._ArgumentGroup) -> None:
 def validate_standard_data_arguments(args: argparse.Namespace) -> None:
     """Validate relationships among arguments added by the data helper."""
 
-    if not 0.0 < args.val_fraction < 1.0:
-        raise ValueError("--val-fraction must be between 0 and 1")
+    if bool(args.train_data) != bool(args.val_data):
+        raise ValueError("--train-data and --val-data must be supplied together")
     if args.downstream_root is not None and args.downstream_manifest is None:
         raise ValueError("--downstream-root requires --downstream-manifest")
-    if args.downstream_manifest is not None and args.downstream_data:
-        raise ValueError(
-            "--downstream-manifest and --downstream-data are mutually exclusive"
-        )
 
 
 def validate_standard_xprof_arguments(
@@ -197,9 +176,7 @@ def validate_standard_xprof_arguments(
         )
     if args.omit_checkpoint and profile != "dev":
         raise ValueError("--omit-checkpoint is restricted to development research runs")
-    if args.diagnostic_mode and (
-        args.downstream_manifest is not None or args.downstream_data
-    ):
+    if args.diagnostic_mode and args.downstream_manifest is not None:
         raise ValueError(
             "--diagnostic-mode cannot be combined with downstream evaluation data"
         )

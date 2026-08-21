@@ -7,8 +7,7 @@ batch is sharded over every visible device.  ``--smoke`` selects a tiny CPU-
 friendly configuration and the built-in byte corpus means the script never
 requires a download.
 
-Prepared data can be supplied as a directory of llm.c-style FineWeb shards,
-individual NumPy/token/text files, or repeatable explicit shard paths. The
+Prepared data is supplied as explicit train and validation shard paths. The
 final stdout line of a competition run is a machine-readable result and is
 intentionally never colorized. Diagnostic XProf runs deliberately omit it.
 """
@@ -1986,14 +1985,14 @@ def traced_flops(config: Config, params: Mapping[str, Any]) -> FlopBreakdown:
 def run(args: argparse.Namespace) -> dict[str, Any] | None:
     experiment_config, config_sha256 = load_experiment_config()
     validate_args(args, experiment_config)
+    profile = selected_profile(args)
+    if profile != "smoke" and not args.train_data and not args.val_data:
+        raise ValueError("non-smoke runs require explicit --train-data and --val-data")
     process_index, process_count = initialize_distributed_runtime()
     is_controller = is_controller_process(process_index)
     console = Console(args.color, active=is_controller)
     console.banner()
-    profile = selected_profile(args)
-    using_builtin_data = (
-        args.data_path is None and not args.train_data and not args.val_data
-    )
+    using_builtin_data = not args.train_data and not args.val_data
 
     devices = jax.devices()
     if not devices:
@@ -2005,12 +2004,10 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         console.phase("Smoke configuration", f"running on {platform.upper()}")
 
     dataset = load_dataset(
-        data_path=args.data_path,
         train_data=args.train_data,
         val_data=args.val_data,
         data_dtype=args.data_dtype,
         data_format=args.data_format,
-        val_fraction=args.val_fraction,
         seed=args.seed,
     )
     config = resolve_config(
@@ -2023,7 +2020,6 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     downstream_domains = load_downstream_domains(
         manifest=args.downstream_manifest,
         root=args.downstream_root,
-        documents=args.downstream_data,
         vocab_size=config.semantic_vocab_size,
     )
     diagnostic_mode = args.diagnostic_mode
