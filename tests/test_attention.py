@@ -223,7 +223,12 @@ class RecipeAttentionWiringTests(unittest.TestCase):
             "make_mesh_attention",
             "resolve_attention_runtime",
         }
-        for recipe in ("reference", "reference_duration", "reference_moe"):
+        for recipe in (
+            "reference",
+            "reference_duration",
+            "reference_moe",
+            "no_bias_moe",
+        ):
             with self.subTest(recipe=recipe):
                 path = ROOT / "recipes" / recipe / "train.py"
                 tree = ast.parse(path.read_text(encoding="utf-8"))

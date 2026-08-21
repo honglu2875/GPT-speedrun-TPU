@@ -35,6 +35,8 @@ class RecipePlanTests(unittest.TestCase):
             "dense_8k": resolve("reference", *common, "--context", "8k"),
             "moe_8k": resolve("reference_moe", *common),
             "moe_1k": resolve("reference_moe", *common, "--context", "1k"),
+            "no_bias_moe_8k": resolve("no_bias_moe", *common),
+            "no_bias_moe_1k": resolve("no_bias_moe", *common, "--context", "1k"),
         }
 
         expected_tokens = {plan.expected_tokens for plan in plans.values()}
@@ -55,12 +57,20 @@ class RecipePlanTests(unittest.TestCase):
         self.assertEqual(plans["dense_8k"].payload["batch_size"], 16)
         self.assertEqual(plans["moe_8k"].payload["batch_size"], 16)
         self.assertEqual(plans["moe_1k"].payload["batch_size"], 128)
+        self.assertEqual(plans["no_bias_moe_8k"].payload["batch_size"], 16)
+        self.assertEqual(plans["no_bias_moe_1k"].payload["batch_size"], 128)
         self.assertEqual(plans["dense_1k"].payload["sequence_length"], 1024)
         self.assertEqual(plans["dense_8k"].payload["sequence_length"], 8192)
         self.assertFalse(plans["dense_1k"].payload["document_masking"])
         self.assertTrue(plans["dense_8k"].payload["document_masking"])
         self.assertEqual(plans["moe_8k"].payload["context_preset"], "8k")
         self.assertEqual(plans["moe_1k"].payload["context_preset"], "1k")
+        self.assertEqual(
+            plans["no_bias_moe_8k"].payload["context_preset"], "8k"
+        )
+        self.assertEqual(
+            plans["no_bias_moe_1k"].payload["context_preset"], "1k"
+        )
         self.assertEqual(
             {plan.validation_predictions for plan in plans.values()},
             {1_048_576},

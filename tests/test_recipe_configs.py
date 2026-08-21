@@ -9,7 +9,7 @@ from rig.configfile import read_config_document
 
 
 ROOT = Path(__file__).parents[1]
-RECIPES = ("reference", "reference_duration", "reference_moe")
+RECIPES = ("reference", "reference_duration", "reference_moe", "no_bias_moe")
 
 
 class StandaloneRecipeConfigTests(unittest.TestCase):

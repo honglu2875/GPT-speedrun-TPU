@@ -52,8 +52,16 @@ def apply_rotary(x: jax.Array) -> jax.Array:
     ).reshape(x.shape)
 
 
-def linear(x: jax.Array, weight: jax.Array, bias: jax.Array, dtype: Any) -> jax.Array:
-    return jnp.einsum("...d,df->...f", x, weight.astype(dtype)) + bias.astype(dtype)
+def linear(
+    x: jax.Array,
+    weight: jax.Array,
+    bias: jax.Array | None,
+    dtype: Any,
+) -> jax.Array:
+    """Apply a linear projection, optionally with an additive bias."""
+
+    projected = jnp.einsum("...d,df->...f", x, weight.astype(dtype))
+    return projected if bias is None else projected + bias.astype(dtype)
 
 
 def parameter_count(params: Any) -> int:
