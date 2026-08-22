@@ -103,6 +103,12 @@ study browser, which knows the corresponding raw-log location. Browsers that
 support the File System Access API show a native destination-and-filename
 picker; other browsers retain the ordinary download fallback.
 
+The first explicit full-view load also stores the compressed `full.json.gz` in
+browser-managed Cache Storage. Reopening the same published study reuses that
+copy; a changed published size selects a new cache entry and removes the older
+version for that study. The cache is best-effort—the browser may evict it, and
+clearing site data removes it—so the Hugging Face copy remains authoritative.
+
 ## Hardware is part of a result
 
 The same configuration and seed lands 0.004–0.023 nats apart on a 16-chip

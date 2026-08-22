@@ -1967,9 +1967,7 @@ function mdToHtml(src){
  closeList();
  if(fence&&buf.length)out.push('<pre class="md-code">'+esc(buf.join('\n'))+'</pre>');
  return out.join('')}
-async function fetchGzipJson(url,onProgress){
- const response=await fetch(url);
- if(!response.ok)throw new Error(url.split('/').pop()+' → HTTP '+response.status);
+async function decodeGzipJson(response,onProgress){
  const total=Number(response.headers.get('content-length')||0),reader=response.body.getReader(),chunks=[];
  let got=0;
  for(;;){const {done,value}=await reader.read();if(done)break;chunks.push(value);got+=value.length;if(onProgress)onProgress(got,total)}
@@ -1977,6 +1975,29 @@ async function fetchGzipJson(url,onProgress){
   throw new Error('this browser cannot inflate the payload (needs DecompressionStream)');
  const stream=new Blob(chunks).stream().pipeThrough(new DecompressionStream('gzip'));
  return JSON.parse(await new Response(stream).text())}
+async function fetchGzipJson(url,onProgress){
+ const response=await fetch(url);
+ if(!response.ok)throw new Error(url.split('/').pop()+' → HTTP '+response.status);
+ return decodeGzipJson(response,onProgress)}
+const FULL_CACHE='rig-study-full-v1';
+function fullCacheKey(url,version){return url+'?rig-cache-version='+encodeURIComponent(String(version))}
+async function openFullCache(){
+ if(!('caches' in window))return null;
+ try{return await caches.open(FULL_CACHE)}catch(error){return null}}
+async function cachedFullPayload(url,version,onProgress){
+ let cache=await openFullCache();const key=fullCacheKey(url,version);
+ if(cache){
+  let hit=null;try{hit=await cache.match(key)}catch(error){cache=null}
+  if(hit)try{return{payload:await decodeGzipJson(hit,(got,total)=>{if(onProgress)onProgress(got,total,true)}),cache:'hit'}}
+  catch(error){try{await cache.delete(key)}catch(ignored){}}}
+ const response=await fetch(url);
+ if(!response.ok)throw new Error(url.split('/').pop()+' → HTTP '+response.status);
+ const writing=cache?cache.put(key,response.clone()).then(async()=>{
+  const prefix=url+'?rig-cache-version=';
+  for(const request of await cache.keys())if(request.url.startsWith(prefix)&&request.url!==new URL(key).href)await cache.delete(request);
+  return true}).catch(()=>false):Promise.resolve(false),
+  payload=await decodeGzipJson(response,(got,total)=>{if(onProgress)onProgress(got,total,false)}),stored=await writing;
+ return{payload,cache:stored?'stored':'unavailable'}}
 function mb(n){return (n/1048576).toFixed(n<10485760?1:0)+' MB'}
 function withStudySource(payload,remote,study){return{...payload,rawSource:{repo:remote.repo,study:study.name}}}
 function chooseStudy(remote){
@@ -2020,9 +2041,11 @@ function chooseStudy(remote){
       fullButton.disabled=true;
       const status=detail.querySelector('#study-progress');
       try{
-       const full=await fetchGzipJson(base+'full.json.gz',(got,total)=>{
-        status.textContent='Downloading '+mb(got)+(total?' of '+mb(total):'')+'…'});
-       status.textContent='Rendering…';cameFromPicker=true;root.remove();resolve(withStudySource(full,remote,study))}
+       const loaded=await cachedFullPayload(base+'full.json.gz',study.full,(got,total,cached)=>{
+        status.textContent=(cached?'Reading cached ':'Downloading ')+mb(got)+(total?' of '+mb(total):'')+'…'}),
+        full=loaded.payload;
+       fullCacheStatus=loaded.cache;status.textContent=loaded.cache==='hit'?'Rendering cached report…':loaded.cache==='stored'?'Rendering… cached for next time.':'Rendering… browser cache unavailable.';
+       cameFromPicker=true;root.remove();resolve(withStudySource(full,remote,study))}
       catch(error){status.textContent='Download failed: '+String(error&&error.message||error);
        fullButton.disabled=false}}}
     catch(error){detail.innerHTML='<div class="study-status bad">Could not load: '
@@ -2040,7 +2063,7 @@ async function loadPayload(){
  const payload=JSON.parse(await new Response(stream).text());
  return payload.remote?chooseStudy(payload.remote):payload}
 const smoothCache=new WeakMap();
-let axis='flops', xScale='log', family='grad', smoothing='raw', charts=[], frame=0, focusItem=null;
+let axis='flops', xScale='log', family='grad', smoothing='raw', charts=[], frame=0, focusItem=null, fullCacheStatus=null;
 // hoverX follows the pointer, pinnedX survives until clicked again, layerStep
 // is the snapshot the layer charts show. All three are in step space, which is
 // axis-independent, so they stay put when the x axis switches to FLOPs.
@@ -2066,9 +2089,10 @@ function init(){
   back.onclick=()=>location.reload();
   const eyebrow=document.querySelector('.top .eyebrow');
   if(eyebrow&&eyebrow.parentNode)eyebrow.parentNode.insertBefore(back,eyebrow);}
- $('footer').textContent=cameFromPicker
+ const cacheNote=fullCacheStatus==='hit'?' · full payload from browser cache':fullCacheStatus==='stored'?' · full payload cached by browser':fullCacheStatus==='unavailable'?' · browser cache unavailable':'';
+ $('footer').textContent=(cameFromPicker
   ?`Generated ${new Date(D.meta.generatedAt).toLocaleString()} · fetched from HuggingFace`
-  :`Generated ${new Date(D.meta.generatedAt).toLocaleString()} · portable HTML · no network or external JavaScript`;
+  :`Generated ${new Date(D.meta.generatedAt).toLocaleString()} · portable HTML · no network or external JavaScript`)+cacheNote;
  document.querySelectorAll('input[name=axis]').forEach(r=>r.addEventListener('change',()=>{if(!r.checked)return;axis=r.value;resetViews();updateAxisHint();schedule()}));
  document.querySelectorAll('input[name=x-scale]').forEach(r=>r.addEventListener('change',()=>{if(!r.checked)return;xScale=r.value;resetViews();updateAxisHint();schedule()}));
  document.querySelectorAll('input[name=smoothing]').forEach(r=>r.addEventListener('change',()=>{if(!r.checked)return;smoothing=r.value;updateSmoothingControls(true);schedule()}));

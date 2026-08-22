@@ -814,6 +814,10 @@ class StudyBrowserTests(unittest.TestCase):
         self.assertIn("'/tree/main/'", html)
         self.assertIn("Browse raw logs", html)
         self.assertIn("Load full report (", html)
+        self.assertIn("const FULL_CACHE='rig-study-full-v1'", html)
+        self.assertIn("cache.put(key,response.clone())", html)
+        self.assertIn("cachedFullPayload(base+'full.json.gz',study.full", html)
+        self.assertIn("full payload from browser cache", html)
         self.assertIn("study.full?", html)
         self.assertNotIn("Download full logs", html)
 
