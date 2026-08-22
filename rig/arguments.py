@@ -1,8 +1,9 @@
 """The public ``rig`` command-line grammar.
 
 Keeping argument declaration separate from command execution makes the public
-surface reviewable as one small, side-effect-free module.  Unknown options are
-rejected here; commands never forward an untyped tail to a recipe.
+surface reviewable as one small, side-effect-free module. Unknown options are
+rejected here unless ``rig run`` places them after an explicit ``--`` recipe
+boundary; command execution validates that tail before forwarding it.
 """
 
 from __future__ import annotations
@@ -130,6 +131,10 @@ def build_parser() -> argparse.ArgumentParser:
         "run",
         help="execute, validate, and record one recipe",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        epilog=(
+            "Recipe-local options may follow an explicit boundary, for example: "
+            "rig run my_recipe --profile dev -- --my-option value"
+        ),
     )
     run.add_argument("recipe", help="folder name beneath recipes/")
     run.add_argument("--profile", choices=PROFILES)

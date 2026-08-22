@@ -175,7 +175,7 @@ class Style:
 def main(argv: Iterable[str] | None = None) -> int:
     parser = build_parser()
     arguments = list(argv) if argv is not None else sys.argv[1:]
-    args = parser.parse_args(arguments)
+    args = _parse_arguments(parser, arguments)
     try:
         if args.command == "prepare":
             return command_prepare(args)
@@ -210,6 +210,26 @@ def main(argv: Iterable[str] | None = None) -> int:
         print(f"\n  {style.text('error:', 'red', 'bold')} {exc}\n", file=sys.stderr)
         return 1
     return 0
+
+
+def _parse_arguments(
+    parser: argparse.ArgumentParser,
+    arguments: Sequence[str],
+) -> argparse.Namespace:
+    """Parse the public CLI and isolate an explicit recipe-local ``--`` tail."""
+
+    public_arguments = list(arguments)
+    recipe_arguments: tuple[str, ...] = ()
+    if public_arguments[:1] == ["run"] and "--" in public_arguments:
+        boundary = public_arguments.index("--")
+        recipe_arguments = tuple(public_arguments[boundary + 1 :])
+        if not recipe_arguments:
+            parser.error("rig run -- must be followed by recipe-local arguments")
+        public_arguments = public_arguments[:boundary]
+    args = parser.parse_args(public_arguments)
+    if args.command == "run":
+        args.recipe_args = recipe_arguments
+    return args
 
 
 def _work_runs_elsewhere(config: LocalConfig) -> bool:
@@ -487,6 +507,52 @@ def _scientific_trainer_args(args: argparse.Namespace) -> list[str]:
     return result
 
 
+_MANAGED_TRAINER_FLAGS = frozenset(
+    {
+        "--output-dir",
+        "--seed",
+        "--profile",
+        "--omit-checkpoint",
+        "--print-plan",
+        "--tier",
+        "--context",
+        "--tokens-per-parameter",
+        "--base-learning-rate",
+        "--batch-size",
+        "--stop-after-step",
+        "--train-data",
+        "--val-data",
+        "--data-dtype",
+        "--data-format",
+        "--dataset-id",
+        "--tokenizer-id",
+        "--downstream-manifest",
+        "--downstream-root",
+        "--color",
+        "--diagnostic-mode",
+        "--xprof-dir",
+        "--xprof-start-step",
+        "--xprof-steps",
+        "--help",
+    }
+)
+
+
+def _recipe_specific_trainer_args(args: argparse.Namespace) -> list[str]:
+    """Validate and return arguments after ``rig run``'s explicit boundary."""
+
+    result = [str(value) for value in getattr(args, "recipe_args", ())]
+    for argument in result:
+        flag = argument.split("=", 1)[0]
+        if flag in _MANAGED_TRAINER_FLAGS:
+            raise ConfigError(
+                f"recipe-local arguments may not override harness-managed {flag}"
+            )
+        if argument == "--":
+            raise ConfigError("recipe-local arguments cannot contain another --")
+    return result
+
+
 def command_run(args: argparse.Namespace) -> int:
     config = load_config(cluster=getattr(args, "cluster", None))
     root = repo_root()
@@ -502,6 +568,7 @@ def command_run(args: argparse.Namespace) -> int:
     )
     recipe_dir, trainer = _recipe_entry(root, args.recipe, profile)
     scientific_args = _scientific_trainer_args(args)
+    recipe_args = _recipe_specific_trainer_args(args)
     python_executable = root / ".venv" / "bin" / "python"
     style.heading("Resolving recipe plan")
     plan = resolve_recipe_plan(
@@ -511,6 +578,7 @@ def command_run(args: argparse.Namespace) -> int:
             "--profile",
             profile,
             *scientific_args,
+            *recipe_args,
         ),
         cwd=recipe_dir,
     )
@@ -591,6 +659,7 @@ def command_run(args: argparse.Namespace) -> int:
     )
     trainer_args = [
         *scientific_args,
+        *recipe_args,
         "--data-format",
         "llmc",
         "--dataset-id",

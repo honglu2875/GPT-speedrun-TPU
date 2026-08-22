@@ -557,8 +557,18 @@ duplicate/unknown keys, unsafe YAML
 features, type/range errors, symlinks, and attempts to replace static settings
 with hidden launch flags. The harness records both the source SHA-256 and the
 fully resolved profile. The small public research surface—tier, context preset,
-TPP, base learning rate, batch size, and diagnostic stop point—is recorded explicitly;
-fold other experiment settings into the cloned YAML before publishing a result.
+TPP, base learning rate, batch size, and diagnostic stop point—is recorded
+explicitly. A cloned research recipe may expose additional typed options and
+receive them after an explicit `--` boundary; the harness passes the same tail
+to plan resolution and training and records it verbatim in `trainer_command`:
+
+```bash
+rig run my_experiment --profile dev -- --my-recipe-option value
+```
+
+The boundary cannot override harness-owned identity, data, or execution flags.
+Fold a settled experiment's defaults into its YAML before publishing a stable
+result.
 
 ## Comparable cohorts
 

@@ -53,6 +53,42 @@ class CliTests(unittest.TestCase):
             with self.subTest(removed=removed), self.assertRaises(SystemExit):
                 parser.parse_args(["run", "reference", removed, "1"])
 
+    def test_run_recipe_arguments_require_an_explicit_boundary(self) -> None:
+        parser = cli.build_parser()
+        args = cli._parse_arguments(
+            parser,
+            [
+                "run",
+                "variant",
+                "--profile",
+                "dev",
+                "--",
+                "--expert-load-scaling-mode",
+                "gradient",
+                "--expert-load-scaling-strength=0.5",
+            ],
+        )
+        self.assertEqual(
+            args.recipe_args,
+            (
+                "--expert-load-scaling-mode",
+                "gradient",
+                "--expert-load-scaling-strength=0.5",
+            ),
+        )
+        self.assertEqual(
+            cli._recipe_specific_trainer_args(args), list(args.recipe_args)
+        )
+
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                ["run", "variant", "--expert-load-scaling-mode", "gradient"]
+            )
+        with self.assertRaisesRegex(ConfigError, "harness-managed --seed"):
+            cli._recipe_specific_trainer_args(
+                SimpleNamespace(recipe_args=("--seed=5",))
+            )
+
     def test_run_passes_profile_as_harness_state_not_trainer_passthrough(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -90,7 +126,8 @@ class CliTests(unittest.TestCase):
                 checkpoint_policy="none",
                 color="never",
             )
-            args = cli.build_parser().parse_args(
+            args = cli._parse_arguments(
+                cli.build_parser(),
                 [
                     "run",
                     "variant",
@@ -103,6 +140,9 @@ class CliTests(unittest.TestCase):
                     "--name",
                     "profile-boundary",
                     "--skip-data-check",
+                    "--",
+                    "--variant-mode",
+                    "fast",
                 ]
             )
             outcome = SimpleNamespace(
@@ -138,6 +178,8 @@ class CliTests(unittest.TestCase):
             self.assertNotIn("--profile", run_config.trainer_args)
             self.assertIn("--tier", run_config.trainer_args)
             self.assertIn("--batch-size", run_config.trainer_args)
+            self.assertIn("--variant-mode", plan_arguments)
+            self.assertIn("--variant-mode", run_config.trainer_args)
             self.assertEqual(
                 run_config.trainer_args[
                     run_config.trainer_args.index("--train-data") + 1

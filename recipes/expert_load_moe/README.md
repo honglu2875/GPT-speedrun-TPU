@@ -192,7 +192,9 @@ matched arms possible without editing the frozen config:
 
 ```bash
 uv run --frozen --no-sync rig run expert_load_moe --tier 125m --profile dev \
+  -- \
   --expert-load-scaling-mode update --expert-load-scaling-strength 0.5
 uv run --frozen --no-sync rig run expert_load_moe --tier 125m --profile dev \
+  -- \
   --expert-load-scaling-mode gradient --expert-load-scaling-strength 1.0
 ```
