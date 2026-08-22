@@ -45,7 +45,7 @@ family:
         experts: 8
         expert_top_k: 2
         expert_mult: 2
-        router_aux_coefficient: 0.001
+        router_aux_coefficient: 0.03
         normalization: rms_norm
         position_encoding: rope_base_10000
         mlp_activation: gelu
