@@ -1015,6 +1015,16 @@ def _report_payload(
                 "fresh10Loss": fresh_loss,
                 "qualified": qualified,
                 "hasLayerStats": bool(run.layer_stats) or run.has_layer_diagnostics(),
+                "riglogs": sorted(
+                    {
+                        artifact
+                        for artifact in (result.get("artifacts") or {}).values()
+                        if isinstance(artifact, str)
+                        and artifact.endswith(logpack.SUFFIX)
+                        and "/" not in artifact
+                        and "\\" not in artifact
+                    }
+                ),
             }
         )
 
@@ -1116,6 +1126,11 @@ def _report_payload(
             "defaultXScale": "log",
             "flopsLabel": "Estimated cumulative FLOPs",
             "maxChartPoints": max_chart_points,
+            # The chart budget uses 0 as the sentinel for an unthinned payload,
+            # but a browser control always needs a positive upper bound. Keep
+            # those meanings separate so full-resolution reports do not clamp
+            # their smoothing span to one sample.
+            "smoothingMaxSamples": max_chart_points or _MAX_CHART_POINTS,
             "profile": "official",
         },
         "runs": run_rows,
@@ -1726,6 +1741,7 @@ def build_study_browser(
             "defaultXScale": "log",
             "flopsLabel": "Estimated cumulative FLOPs",
             "maxChartPoints": _MAX_CHART_POINTS or 1_400,
+            "smoothingMaxSamples": _MAX_CHART_POINTS,
             "profile": "official",
         },
         "remote": {"repo": repo, "studies": [dict(entry) for entry in studies]},
@@ -1872,7 +1888,7 @@ _HTML = r"""<!doctype html>
 <main class="main">
   <div class="top">
     <div><div class="eyebrow">Static performance dossier</div><h1>Training, at a glance.</h1><div class="stats" id="stats"></div></div>
-    <div><button class="ghost mobile-runs" id="open-runs">Choose runs</button><div class="axis-control" role="radiogroup" aria-label="Time-series x-axis"><label><input type="radio" name="axis" value="flops" checked><span>equi-FLOP</span></label><label><input type="radio" name="axis" value="step"><span>equi-step</span></label></div><div class="axis-hint" id="axis-hint">Estimated cumulative FLOPs</div><div class="export-row"><button class="ghost" id="export-runs" type="button">Export selection</button><span class="export-status" id="export-status" role="status" aria-live="polite"></span></div></div>
+    <div><button class="ghost mobile-runs" id="open-runs">Choose runs</button><div class="axis-control" role="radiogroup" aria-label="Time-series x-axis"><label><input type="radio" name="axis" value="flops" checked><span>equi-FLOP</span></label><label><input type="radio" name="axis" value="step"><span>equi-step</span></label></div><div class="axis-hint" id="axis-hint">Estimated cumulative FLOPs</div><div class="export-row"><button class="ghost" id="export-runs" type="button">Export selection</button><button class="ghost" id="export-riglogs" type="button" hidden>Export .riglogs</button><span class="export-status" id="export-status" role="status" aria-live="polite"></span></div></div>
   </div>
   <div class="analysis-controls" aria-label="Scientific chart controls">
     <span class="control-title">Timeline x scale</span>
@@ -1962,6 +1978,7 @@ async function fetchGzipJson(url,onProgress){
  const stream=new Blob(chunks).stream().pipeThrough(new DecompressionStream('gzip'));
  return JSON.parse(await new Response(stream).text())}
 function mb(n){return (n/1048576).toFixed(n<10485760?1:0)+' MB'}
+function withStudySource(payload,remote,study){return{...payload,rawSource:{repo:remote.repo,study:study.name}}}
 function chooseStudy(remote){
  // Nothing is fetched until a study is picked, and the only thing a pick
  // fetches is the small overview. Anything larger is a separate, labelled act.
@@ -1997,7 +2014,7 @@ function chooseStudy(remote){
         +mb(study.full)+')</button><span class="study-warn">Loads a '+mb(study.full)
         +' report payload from Hugging Face. Nothing is fetched until you click.</span>':'')
       +'</div><div class="study-status" id="study-progress"></div>';
-     detail.querySelector('#study-go').onclick=()=>{cameFromPicker=true;root.remove();resolve(payload)};
+     detail.querySelector('#study-go').onclick=()=>{cameFromPicker=true;root.remove();resolve(withStudySource(payload,remote,study))};
      const fullButton=detail.querySelector('#study-full');
      if(fullButton)fullButton.onclick=async()=>{
       fullButton.disabled=true;
@@ -2005,7 +2022,7 @@ function chooseStudy(remote){
       try{
        const full=await fetchGzipJson(base+'full.json.gz',(got,total)=>{
         status.textContent='Downloading '+mb(got)+(total?' of '+mb(total):'')+'…'});
-       status.textContent='Rendering…';cameFromPicker=true;root.remove();resolve(full)}
+       status.textContent='Rendering…';cameFromPicker=true;root.remove();resolve(withStudySource(full,remote,study))}
       catch(error){status.textContent='Download failed: '+String(error&&error.message||error);
        fullButton.disabled=false}}}
     catch(error){detail.innerHTML='<div class="study-status bad">Could not load: '
@@ -2030,12 +2047,14 @@ let axis='flops', xScale='log', family='grad', smoothing='raw', charts=[], frame
 let hoverX=null, hoverPx=null, pinnedX=null, layerStep=null, layerSteps=[];
 const $=id=>document.getElementById(id), esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt=(n,d=3)=>{if(n==null||!Number.isFinite(+n))return '—';n=+n;const a=Math.abs(n);if(a>=1e18)return (n/1e18).toFixed(2)+' EF';if(a>=1e15)return (n/1e15).toFixed(2)+' PF';if(a>=1e12)return (n/1e12).toFixed(2)+' T';if(a>=1e9)return (n/1e9).toFixed(2)+' B';if(a>=1e6)return (n/1e6).toFixed(2)+' M';if(a>=1e3)return (n/1e3).toFixed(2)+' k';if(a>0&&a<.001)return n.toExponential(2);const f=n.toFixed(d);return d?f.replace(/(\.\d*?[1-9])0+$|\.0+$/,'$1'):f};
-function effectiveSpan(normalize=false){const input=$('smoothing-level'),maximum=D.meta.maxChartPoints;let span=Math.round(Number(input.value));if(!Number.isFinite(span))span=21;span=Math.max(1,Math.min(maximum,span));if((smoothing==='mean'||smoothing==='median')&&span%2===0)span=span===maximum?Math.max(1,span-1):span+1;if(normalize)input.value=String(span);return span}
+function smoothingMaximum(){const explicit=Number(D.meta.smoothingMaxSamples);if(Number.isFinite(explicit)&&explicit>0)return Math.round(explicit);const budget=Number(D.meta.maxChartPoints);return Number.isFinite(budget)&&budget>0?Math.round(budget):1400}
+function effectiveSpan(normalize=false){const input=$('smoothing-level'),maximum=smoothingMaximum();let span=Math.round(Number(input.value));if(!Number.isFinite(span))span=21;span=Math.max(1,Math.min(maximum,span));if((smoothing==='mean'||smoothing==='median')&&span%2===0)span=span===maximum?Math.max(1,span-1):span+1;if(normalize)input.value=String(span);return span}
 function smoothingName(){const span=effectiveSpan();return smoothing==='ema'?`EMA (span ${span})`:smoothing==='mean'?`centered mean (${span})`:smoothing==='median'?`centered median (${span})`:'raw'}
 function updateSmoothingControls(normalize=false){const input=$('smoothing-level'),span=effectiveSpan(normalize);input.disabled=smoothing==='raw';$('smoothing-level-label').textContent=smoothing==='ema'?'Span':smoothing==='raw'?'Span':'Window';let detail;if(smoothing==='raw')detail='Exact recorded samples; no display smoothing.';else if(smoothing==='ema'){const alpha=2/(span+1);detail=`Causal EMA initialized at the first point; span ${span} gives α = 2/(span + 1) = ${alpha.toPrecision(4)}.`}else if(smoothing==='mean')detail=`Centered ${span}-sample arithmetic mean, with truncated endpoint windows; this avoids EMA phase lag but blurs peaks and is sensitive to outliers.`;else detail=`Centered ${span}-sample median, with truncated endpoint windows; this rejects isolated spikes and preserves step edges, but is not an amplitude average.`;$('smoothing-hint').textContent=detail+' Smoothing is display-only: a faint raw trace remains underneath and tooltips retain the raw sample. The learning-rate schedule and layer snapshots stay raw. Timeline x axes default to logarithmic; non-positive samples are hidden until Linear is selected. Categorical layer-snapshot axes remain linear. Span/window counts embedded plot samples. Drag a rectangle to zoom both axes; double-click or ↺ resets; the wheel never changes chart axes. Hovering any timeline draws a synchronized crosshair on all of them; a single click pins a vertical line there and clicking again clears it. The layer-snapshot step dragger marks its position on every timeline with a fainter dashed line.'}
 function updateAxisHint(){$('axis-hint').textContent=(axis==='flops'?'Estimated cumulative FLOPs':'Optimizer step')+(xScale==='log'?' · logarithmic':' · linear')}
 function init(){
- $('smoothing-level').max=String(D.meta.maxChartPoints);
+ $('smoothing-level').max=String(smoothingMaximum());
+ $('export-riglogs').hidden=!D.rawSource;
  $('stats').innerHTML=`<span class="pill"><strong>${D.meta.included}</strong> included</span><span class="pill"><strong>${D.meta.skipped}</strong> excluded</span><span class="pill">default <strong>equi-FLOP · log x</strong></span>`;
  $('notices').innerHTML=D.notices.map(n=>`<div class="notice">${esc(n)}</div>`).join('');
  $('notices-count').textContent=D.notices.length?'('+D.notices.length+')':'';
@@ -2058,6 +2077,7 @@ function init(){
  $('run-search').oninput=e=>{const q=e.target.value.toLowerCase();document.querySelectorAll('.run-toggle').forEach(x=>x.hidden=!x.dataset.search.includes(q))};
  $('open-runs').onclick=()=>{$('sidebar').classList.add('open')}; $('close-runs').onclick=()=>{$('sidebar').classList.remove('open')};
  $('export-runs').onclick=()=>{exportSelection()};
+ $('export-riglogs').onclick=()=>{exportRiglogs()};
  $('focus-close').onclick=()=>closeFocus(); $('focus-reset').onclick=()=>{if(focusItem){focusItem.view=null;redraw(focusItem)}};
  $('layer-step').addEventListener('input',e=>{const i=Number(e.target.value);if(layerSteps[i]!==undefined)setLayerStep(layerSteps[i])});
  $('layer-step-last').addEventListener('click',()=>{if(!layerSteps.length)return;$('layer-step').value=String(layerSteps.length-1);setLayerStep(layerSteps[layerSteps.length-1])});
@@ -2279,23 +2299,77 @@ async function packPayload(payload){
  // Chunked: String.fromCharCode.apply overflows the call stack on megabytes.
  for(let i=0;i<bytes.length;i+=0x8000)binary+=String.fromCharCode.apply(null,bytes.subarray(i,i+0x8000));
  return btoa(binary)}
+async function chooseSaveFile(name,description,mime,extension){
+ if(typeof window.showSaveFilePicker!=='function')return null;
+ return window.showSaveFilePicker({suggestedName:name,types:[{description,accept:{[mime]:[extension]}}]})}
+async function saveBlob(blob,name,handle){
+ if(handle){const output=await handle.createWritable();await output.write(blob);await output.close();return handle.name||name}
+ const url=URL.createObjectURL(blob),a=document.createElement('a');
+ a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();
+ setTimeout(()=>URL.revokeObjectURL(url),30000);return name}
+function cancelled(error){return error&&error.name==='AbortError'}
+function setExportBusy(busy){$('export-runs').disabled=busy;$('export-riglogs').disabled=busy}
 function exportStatus(message,bad){const el=$('export-status');el.textContent=message||'';el.classList.toggle('bad',!!bad)}
 async function exportSelection(){
- const button=$('export-runs');
  if(!visible.size){exportStatus('Select at least one run to export.',true);return}
- button.disabled=true;exportStatus('Preparing export…');
+ const payload=selectedPayload(),name='report-'+exportSlug(payload.runs)+'.html';
+ setExportBusy(true);exportStatus('Choose where to save the report…');
  try{
+  const handle=await chooseSaveFile(name,'Self-contained rig report','text/html','.html');
   if(!shell)throw new Error('page shell was not captured');
-  const payload=selectedPayload(),encoded=await packPayload(payload),
+  exportStatus('Preparing export…');
+  const encoded=await packPayload(payload),
    html=shell.replace(PAYLOAD_SLOT,()=>encoded);
   if(html.length<=shell.length)throw new Error('could not splice the payload into the page shell');
-  const name='report-'+exportSlug(payload.runs)+'.html',
-   url=URL.createObjectURL(new Blob([html],{type:'text/html'})),a=document.createElement('a');
-  a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();
-  setTimeout(()=>URL.revokeObjectURL(url),30000);
-  exportStatus(name+' · '+payload.runs.length+' run'+(payload.runs.length===1?'':'s')+' · '+(html.length/1048576).toFixed(1)+' MB')}
- catch(error){exportStatus('Export failed: '+String(error&&error.message||error),true)}
- finally{button.disabled=false}}
+  const saved=await saveBlob(new Blob([html],{type:'text/html'}),name,handle);
+  exportStatus(saved+' · '+payload.runs.length+' run'+(payload.runs.length===1?'':'s')+' · '+(html.length/1048576).toFixed(1)+' MB')}
+ catch(error){exportStatus(cancelled(error)?'Export cancelled.':'Export failed: '+String(error&&error.message||error),!cancelled(error))}
+ finally{setExportBusy(false)}}
+const tarEncoder=new TextEncoder();
+function tarText(header,offset,width,value){const bytes=tarEncoder.encode(value);if(bytes.length>width)throw new Error('archive path is too long: '+value);header.set(bytes,offset)}
+function tarOctal(header,offset,width,value){const encoded=Math.floor(value).toString(8);if(encoded.length>=width)throw new Error('archive entry is too large');tarText(header,offset,width,encoded.padStart(width-1,'0')+'\0')}
+function tarHeader(path,size){
+ const header=new Uint8Array(512),slash=path.lastIndexOf('/'),name=slash<0?path:path.slice(slash+1),prefix=slash<0?'':path.slice(0,slash);
+ tarText(header,0,100,name);if(prefix)tarText(header,345,155,prefix);
+ tarOctal(header,100,8,0o644);tarOctal(header,108,8,0);tarOctal(header,116,8,0);
+ tarOctal(header,124,12,size);tarOctal(header,136,12,0);header.fill(32,148,156);header[156]=48;
+ tarText(header,257,6,'ustar\0');tarText(header,263,2,'00');
+ const checksum=header.reduce((sum,value)=>sum+value,0).toString(8).padStart(6,'0');
+ tarText(header,148,8,checksum+'\0 ');return header}
+function tarArchive(entries){
+ const parts=[];for(const entry of entries){parts.push(tarHeader(entry.path,entry.blob.size),entry.blob);const padding=(512-entry.blob.size%512)%512;if(padding)parts.push(new Uint8Array(padding))}
+ parts.push(new Uint8Array(1024));return new Blob(parts,{type:'application/x-tar'})}
+function safeArchivePart(value){const part=String(value).replace(/[^A-Za-z0-9._-]+/g,'-').replace(/^\.+/,'');return part||'run'}
+function riglogNames(run){
+ const declared=Array.isArray(run.riglogs)?run.riglogs.filter(name=>typeof name==='string'&&/^[A-Za-z0-9._-]+\.riglog$/.test(name)):[];
+ return declared.length?declared:['training.riglog','diagnostics.riglog','diagnostics-partial.riglog']}
+async function fetchRiglogs(runs){
+ const source=D.rawSource;if(!source||!source.repo||!source.study)throw new Error('raw .riglogs are available from reports opened through the study browser');
+ const repo=String(source.repo).split('/').map(encodeURIComponent).join('/'),base=HF+repo+'/resolve/main/'+encodeURIComponent(source.study)+'/',entries=[];
+ let attempted=0,total=runs.reduce((count,run)=>count+riglogNames(run).length,0);
+ for(const run of runs)for(const name of riglogNames(run)){
+  attempted++;exportStatus('Fetching .riglogs '+attempted+'/'+total+' · '+run.id+'/'+name+'…');
+  const response=await fetch(base+encodeURIComponent(run.id)+'/'+encodeURIComponent(name));
+  if(response.status===404&&name!=='training.riglog')continue;
+  if(!response.ok)throw new Error(run.id+'/'+name+' → HTTP '+response.status);
+  const blob=await response.blob(),magic=new Uint8Array(await blob.slice(0,8).arrayBuffer()),expected=[82,73,71,76,79,71,0,1];
+  if(magic.length!==expected.length||expected.some((value,index)=>magic[index]!==value))throw new Error(run.id+'/'+name+' is not a valid .riglog');
+  entries.push({path:safeArchivePart(run.id)+'/'+name,blob})}
+ if(!entries.length)throw new Error('the selected runs did not publish any .riglog files');
+ return entries}
+async function exportRiglogs(){
+ const runs=D.runs.filter(run=>visible.has(run.id));
+ if(!runs.length){exportStatus('Select at least one run to export.',true);return}
+ const name='riglogs-'+exportSlug(runs)+'.tar.gz';setExportBusy(true);exportStatus('Choose where to save the .riglog archive…');
+ try{
+  const handle=await chooseSaveFile(name,'Selected raw rig logs','application/gzip','.gz');
+  if(typeof CompressionStream!=='function')throw new Error('this browser cannot compress the archive (needs CompressionStream)');
+  const entries=await fetchRiglogs(runs);exportStatus('Packing '+entries.length+' original .riglog file'+(entries.length===1?'':'s')+'…');
+  const stream=tarArchive(entries).stream().pipeThrough(new CompressionStream('gzip')),
+   blob=await new Response(stream).blob(),saved=await saveBlob(blob,name,handle);
+  exportStatus(saved+' · '+entries.length+' .riglog file'+(entries.length===1?'':'s')+' · '+mb(blob.size))}
+ catch(error){exportStatus(cancelled(error)?'Export cancelled.':'Export failed: '+String(error&&error.message||error),!cancelled(error))}
+ finally{setExportBusy(false)}}
 loadPayload().then(payload=>{
  D=payload;
  runMap=new Map(D.runs.map(r=>[r.id,r]));

@@ -96,6 +96,13 @@ raw `.riglog` files remain the archive of record. Every report payload the
 browser fetches is ordinary JSON, so the page never needs to understand the
 packed log format.
 
+The run selector can save either a self-contained HTML report for the visible
+runs or a `.tar.gz` containing their original training and diagnostic
+`.riglog` files. The latter is available when a report was opened through the
+study browser, which knows the corresponding raw-log location. Browsers that
+support the File System Access API show a native destination-and-filename
+picker; other browsers retain the ordinary download fallback.
+
 ## Hardware is part of a result
 
 The same configuration and seed lands 0.004–0.023 nats apart on a 16-chip

@@ -191,7 +191,9 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(payload["meta"]["defaultXAxis"], "flops")
         self.assertEqual(payload["meta"]["defaultXScale"], "log")
         self.assertEqual(payload["meta"]["maxChartPoints"], 64)
+        self.assertEqual(payload["meta"]["smoothingMaxSamples"], 64)
         self.assertTrue(payload["runs"][0]["selected"])
+        self.assertEqual(payload["runs"][0]["riglogs"], [TRAINING_LOG_NAME])
         self.assertEqual(payload["runs"][0]["classification"], "official")
         self.assertEqual(payload["runs"][0]["flopSource"], "traced")
         train = next(
@@ -626,6 +628,10 @@ class ChartPointBudgetTests(unittest.TestCase):
         payload = self._report(steps, max_chart_points=0)
         chart = next(c for c in payload["timeCharts"] if c["key"] == "train_loss")
         self.assertEqual(len(chart["series"][0]["points"]), steps)
+        # Zero means unthinned to the report builder, not a zero-sample upper
+        # bound for the browser's smoothing control.
+        self.assertEqual(payload["meta"]["maxChartPoints"], 0)
+        self.assertEqual(payload["meta"]["smoothingMaxSamples"], 1400)
 
     def test_a_spike_survives_at_full_resolution(self) -> None:
         payload = self._report(4000, max_chart_points=0)
@@ -773,10 +779,12 @@ class StudyExportTests(unittest.TestCase):
         # The full payload is the unthinned view loaded explicitly by the study
         # browser. Raw .riglog files remain the archive of record.
         self.assertEqual(full["meta"]["maxChartPoints"], 0)
+        self.assertEqual(full["meta"]["smoothingMaxSamples"], 1400)
         self.assertTrue(full["timeCharts"])
         # The snapshot is the overview the browser loads first, before anything
         # larger is fetched, so it carries curves and nothing else.
         self.assertEqual(snapshot["meta"]["maxChartPoints"], 200)
+        self.assertEqual(snapshot["meta"]["smoothingMaxSamples"], 200)
         self.assertEqual(snapshot["diagnosticCharts"], [])
         self.assertEqual(snapshot["layerCharts"], [])
         self.assertTrue(snapshot["timeCharts"])
@@ -795,6 +803,14 @@ class StudyBrowserTests(unittest.TestCase):
 
         payload = _payload(html)
         self.assertEqual(payload["remote"]["studies"], studies)
+        self.assertEqual(payload["meta"]["smoothingMaxSamples"], 1400)
+        self.assertIn("function smoothingMaximum()", html)
+        # Already-published full payloads predate smoothingMaxSamples. Their
+        # maxChartPoints=0 sentinel must still resolve to a positive limit.
+        self.assertIn(
+            "return Number.isFinite(budget)&&budget>0?Math.round(budget):1400}",
+            html,
+        )
         self.assertIn("'/tree/main/'", html)
         self.assertIn("Browse raw logs", html)
         self.assertIn("Load full report (", html)
@@ -1130,7 +1146,10 @@ class ClientSourceGuardTests(unittest.TestCase):
             build_report(runs, root / "report.html")
             html = (root / "report.html").read_text(encoding="utf-8")
         self.assertIn('id="export-runs"', html)
+        self.assertIn('id="export-riglogs"', html)
         self.assertIn('id="export-status"', html)
+        self.assertIn("window.showSaveFilePicker", html)
+        self.assertEqual(html.count("await chooseSaveFile("), 2)
         # Exactly one live slot: the constant. The payload itself is base64,
         # whose alphabet cannot produce it.
         self.assertEqual(html.count("@@RIG_PAYLOAD@@"), 1)
@@ -1138,8 +1157,34 @@ class ClientSourceGuardTests(unittest.TestCase):
     def test_export_refuses_an_empty_selection(self) -> None:
         script = self._script()
         start = script.index("async function exportSelection(){")
-        end = script.index("loadPayload().then(", start)
+        end = script.index("const tarEncoder", start)
         self.assertIn("if(!visible.size)", script[start:end])
+
+    def test_riglog_export_preserves_the_original_container(self) -> None:
+        """Raw export fetches source files; it does not rebuild them from plots.
+
+        A report may be thinned and its charts do not carry the packed column
+        descriptors. Reconstructing from that payload would produce a plausible
+        but incomplete file, so selected logs are archived byte-for-byte.
+        """
+
+        script = self._script()
+        start = script.index("async function fetchRiglogs(runs){")
+        end = script.index("loadPayload().then(", start)
+        body = script[start:end]
+        self.assertIn("response.blob()", body)
+        self.assertIn("expected=[82,73,71,76,79,71,0,1]", body)
+        self.assertIn("tarArchive(entries)", body)
+        self.assertIn("new CompressionStream('gzip')", body)
+        self.assertNotIn("selectedPayload()", body)
+
+    def test_study_picker_attaches_the_raw_log_location(self) -> None:
+        script = self._script()
+        self.assertIn(
+            "rawSource:{repo:remote.repo,study:study.name}",
+            script,
+        )
+        self.assertIn("$('export-riglogs').hidden=!D.rawSource", script)
 
     def test_export_filters_every_chart_family_to_the_selection(self) -> None:
         # A subset export must not smuggle unselected runs' series along.
